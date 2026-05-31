@@ -23,7 +23,6 @@ Usage:
   wwdc-reports wwdc25 [--locale en]
   wwdc-reports archive --year 2026 [--locale en]
   wwdc-reports transcripts --year 2026 --raw-data raw_data.json [--out-dir transcripts-en]
-  wwdc-reports ingest --year 2026 [--locale en]
   wwdc-reports init-year --year 2026
   wwdc-reports split --year 2026 [--raw-data years/2026/raw/raw_data.json]
   wwdc-reports topics --year 2026 [--raw-data years/2026/raw/raw_data.json]
@@ -37,9 +36,9 @@ Global options:
   --event-id <id>         Video event id, default: wwdc<year>
   --event-short <id>      Metadata event key, default: wwdc<yy>
   --locale <locale>       Apple metadata locale, default: en
-  --out-dir <path>        Output directory for archive/transcripts, default: current directory for archive
+  --out-dir <path>        Output directory for crawl/transcripts, default: current directory
   --transcripts-dir <path> Transcript output directory for crawl, default: <out-dir>/transcripts-<locale>
-  --source <kind>         crawl/archive metadata source: html or json, default: html for crawl and json for archive
+  --html-url <url>        Override the collection HTML URL used to discover sessions
   --force                 Re-fetch and overwrite existing transcript files
   --concurrency <n>       Transcript fetch concurrency, default: 4
   --limit <n>             Crawl only the first n transcripts, useful for smoke tests
@@ -81,7 +80,7 @@ function makeConfig(args) {
     locale: args.locale,
     projectRoot: args['project-root'],
     dataRoot: args['data-root'],
-    metadataUrl: args['metadata-url']
+    collectionUrl: args['html-url']
   });
 }
 
@@ -108,7 +107,7 @@ function writeTranscriptSummary(io, result) {
 
 export async function main(argv = process.argv.slice(2), io = defaultIo()) {
   const args = parseArgs(argv);
-  const command = args._[0] ?? (args.help ? 'help' : 'archive');
+  const command = args._[0] ?? (args.help ? 'help' : 'crawl');
   if (command === 'wwdc25' && args.year === undefined) args.year = '2025';
   const config = makeConfig(args);
 
@@ -131,17 +130,15 @@ export async function main(argv = process.argv.slice(2), io = defaultIo()) {
       eventShort: config.eventShort,
       displayName: config.displayName,
       locale: config.locale,
-      metadataUrl: config.metadataUrl
+      collectionUrl: config.collectionUrl
     });
     writeLine(io, `Initialized ${config.displayName} workspace at ${config.dataRoot}`);
     return 0;
   }
-  if (command === 'crawl' || command === 'crawl-all' || command === 'wwdc25') {
+  if (command === 'crawl' || command === 'wwdc25') {
     const outputDir = path.resolve(args['out-dir'] ?? process.cwd());
-    const source = args.source ?? 'html';
     const metadata = await ingestRawData(config, {
-      url: args.url,
-      htmlUrl: source === 'html' ? (args['html-url'] ?? config.collectionUrl) : undefined,
+      htmlUrl: args['html-url'] ?? config.collectionUrl,
       outputDir
     });
     writeLine(io, `Wrote ${metadata.rawDataPath}`);
@@ -157,12 +154,11 @@ export async function main(argv = process.argv.slice(2), io = defaultIo()) {
     if (transcriptResult.failed > 0) return 1;
     return 0;
   }
-  if (command === 'archive' || command === 'ingest') {
-    const source = args.source ?? 'json';
+  if (command === 'archive') {
+    const outputDir = path.resolve(args['out-dir'] ?? process.cwd());
     const result = await ingestRawData(config, {
-      url: args.url,
-      htmlUrl: source === 'html' ? (args['html-url'] ?? config.collectionUrl) : undefined,
-      outputDir: args['out-dir'] ?? process.cwd()
+      htmlUrl: args['html-url'] ?? config.collectionUrl,
+      outputDir
     });
     writeLine(io, `Wrote ${result.rawDataPath}`);
     writeLine(io, `Wrote ${result.snapshotPath}`);

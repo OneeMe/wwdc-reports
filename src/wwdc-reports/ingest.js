@@ -4,19 +4,6 @@ import path from 'node:path';
 import { writeJson } from './fs-utils.js';
 import { rawDataFromCollectionHtml } from './html-metadata.js';
 
-export async function fetchJson(url, options = {}) {
-  const response = await fetch(url, {
-    headers: {
-      'user-agent': options.userAgent ?? 'wwdc-reports/0.1 no-key local pipeline',
-      'accept': 'application/json'
-    }
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
-  }
-  return response.json();
-}
-
 export async function fetchHtml(url, options = {}) {
   const response = await fetch(url, {
     headers: {
@@ -31,10 +18,8 @@ export async function fetchHtml(url, options = {}) {
 }
 
 export async function fetchRawData(config, options = {}) {
-  if (options.htmlUrl) {
-    return rawDataFromCollectionHtml(await fetchHtml(options.htmlUrl, options), config);
-  }
-  return fetchJson(options.url ?? config.metadataUrl, options);
+  const url = options.htmlUrl ?? config.collectionUrl;
+  return rawDataFromCollectionHtml(await fetchHtml(url, options), config);
 }
 
 export async function ingestRawData(config, options = {}) {

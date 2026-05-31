@@ -11,7 +11,7 @@ describe('event config', () => {
     assert.equal(config.eventId, 'wwdc2025');
     assert.equal(config.eventShort, 'wwdc25');
     assert.equal(config.displayName, 'WWDC25');
-    assert.equal(config.metadataUrl, 'https://developer.apple.com/wwdc25/services/data/?locale=en');
+    assert.equal(config.collectionUrl, 'https://developer.apple.com/videos/wwdc2025/');
     assert.equal(config.rawDataPath, path.join('/repo', 'years', '2025', 'raw', 'raw_data.json'));
   });
 

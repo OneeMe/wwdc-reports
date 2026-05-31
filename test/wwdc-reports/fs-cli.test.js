@@ -6,9 +6,7 @@ import { describe, it } from 'node:test';
 
 import rawData from '../fixtures/raw_data_minimal.json' with { type: 'json' };
 import { main, parseArgs } from '../../src/wwdc-reports/cli.js';
-import { createEventConfig } from '../../src/wwdc-reports/event-config.js';
 import { listJsonFiles, pathExists, readJson, writeJson } from '../../src/wwdc-reports/fs-utils.js';
-import { ingestRawData } from '../../src/wwdc-reports/ingest.js';
 
 function makeIo() {
   let output = '';
@@ -17,25 +15,6 @@ function makeIo() {
     stderr: { write: () => {} },
     get output() { return output; }
   };
-}
-
-async function withMockFetch(responseBody, fn) {
-  const originalFetch = globalThis.fetch;
-  const calls = [];
-  globalThis.fetch = async (url, options) => {
-    calls.push({ url, options });
-    return {
-      ok: true,
-      status: 200,
-      statusText: 'OK',
-      json: async () => responseBody
-    };
-  };
-  try {
-    return await fn(calls);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
 }
 
 async function withMockFetchRouter(handler, fn) {
@@ -88,40 +67,7 @@ describe('cli', () => {
     assert.match(io.output, /No-key WWDC raw metadata and transcript archiver/);
   });
 
-  it('archives raw metadata into a requested output directory', async () => {
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-archive-'));
-    const config = createEventConfig({ year: '2026', locale: 'en' });
-
-    await withMockFetch(rawData, async (calls) => {
-      const result = await ingestRawData(config, { outputDir: tmp });
-      assert.equal(calls[0].url, 'https://developer.apple.com/wwdc26/services/data/?locale=en');
-      assert.deepEqual(calls[0].options.headers, {
-        'user-agent': 'wwdc-reports/0.1 no-key local pipeline',
-        'accept': 'application/json'
-      });
-      assert.equal(result.rawDataPath, path.join(tmp, 'raw_data.json'));
-      assert.match(path.basename(result.snapshotPath), /^raw_data_wwdc26_en_\d{8}T\d{6}Z\.json$/);
-      assert.deepEqual(await readJson(result.rawDataPath), rawData);
-      assert.deepEqual(await readJson(result.snapshotPath), rawData);
-    });
-  });
-
-  it('runs the archive command with --out-dir and no credential headers', async () => {
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-cli-archive-'));
-    const io = makeIo();
-
-    await withMockFetch(rawData, async (calls) => {
-      assert.equal(await main(['archive', '--year', '2026', '--locale', 'en', '--out-dir', tmp], io), 0);
-      assert.equal(calls[0].url, 'https://developer.apple.com/wwdc26/services/data/?locale=en');
-      assert.equal('authorization' in calls[0].options.headers, false);
-      assert.equal('x-api-key' in calls[0].options.headers, false);
-      assert.equal('cookie' in calls[0].options.headers, false);
-      assert.equal(await pathExists(path.join(tmp, 'raw_data.json')), true);
-      assert.equal((await listJsonFiles(tmp)).length, 2);
-    });
-  });
-
-  it('runs crawl as one command: archive metadata then crawl transcripts', async () => {
+  it('runs crawl as one command: fetch metadata then crawl transcripts', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-cli-crawl-'));
     const io = makeIo();
     const html = '<section id="transcript-content"><span data-start="7">Hello WWDC</span></section>';
@@ -189,15 +135,20 @@ describe('cli', () => {
     });
   });
 
-  it('defaults to archive when no command is provided', async () => {
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-cli-archive-'));
+  it('defaults to crawl when no command is provided', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-cli-default-'));
     const io = makeIo();
 
-    await withMockFetch(rawData, async () => {
+    await withMockFetchRouter(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      text: async () => '<main>No videos posted yet.</main>'
+    }), async (calls) => {
       assert.equal(await main(['--year', '2026', '--out-dir', tmp], io), 0);
+      assert.equal(calls[0].url, 'https://developer.apple.com/videos/wwdc2026/');
       assert.match(io.output, /Wrote .*raw_data\.json/);
       assert.equal(await pathExists(path.join(tmp, 'raw_data.json')), true);
-      assert.equal((await listJsonFiles(tmp)).length, 2);
     });
   });
 

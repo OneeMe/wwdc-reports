@@ -29,7 +29,6 @@ export function createEventConfig(options = {}) {
     topicsAndVideosPath: path.join(rawDir, 'topics_and_videos.json'),
     sessionsOutputDir: path.join(processedDir, 'sessions'),
     indexPath: path.join(processedDir, 'index.md'),
-    metadataUrl: options.metadataUrl ?? `https://developer.apple.com/${eventShort}/services/data/?locale=${locale}`,
     collectionUrl: options.collectionUrl ?? `https://developer.apple.com/videos/${eventId}/`,
     videoUrlTemplate: options.videoUrlTemplate ?? 'https://developer.apple.com/videos/play/{eventId}/{sessionCode}/'
   };

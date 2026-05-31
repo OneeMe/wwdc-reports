@@ -2,12 +2,12 @@
 
 A no-key Node.js script for archiving each year's public WWDC raw metadata and video transcripts into the current directory.
 
-The project is being rebuilt around a small dependency-free CLI. Its primary job is to fetch public Apple Developer WWDC raw materials and archive them locally: a stable `raw_data.json`, timestamped metadata snapshots, and per-session transcript text files. Existing Python scripts, prompts, reports, and historical data snapshots live under `legacy/` as references, not compatibility targets for the new implementation.
+The project is a small dependency-free CLI. Its primary job is to fetch public Apple Developer WWDC raw materials and archive them locally: a stable `raw_data.json`, timestamped metadata snapshots, and per-session transcript text files. Existing Python scripts, prompts, reports, and historical data snapshots live under `legacy/` as references, not compatibility targets for the new implementation.
 
 ## Goals
 
 - **No API keys by default**: the core workflow uses public Apple Developer URLs and local files only.
-- **Archive-first**: `archive` writes raw metadata into the current directory by default; `transcripts` writes raw transcript text files locally.
+- **Crawl-first**: `crawl` fetches metadata from the public video collection page and writes transcript text files locally in one step.
 - **Open-source friendly**: code, templates, docs, and tiny synthetic fixtures can be published without bundling full Apple transcripts or private credentials.
 - **Local-first**: generated Markdown is written locally. No transcript or metadata is uploaded to third-party services by the core CLI.
 
@@ -34,14 +34,11 @@ The package currently has no runtime npm dependencies and requires Node.js 20 or
 # One command: fetch public metadata and crawl all transcripts into this directory.
 node ./bin/wwdc-reports.js crawl --year 2025 --locale en
 
-# WWDC25 shortcut for the same no-key local archive flow.
+# WWDC25 shortcut for the same crawl flow.
 node ./bin/wwdc-reports.js wwdc25
 
-# Fetch public WWDC metadata and archive it into the current directory.
-node ./bin/wwdc-reports.js archive --year 2026 --locale en
-
-# The default command is also archive, so this is equivalent.
-node ./bin/wwdc-reports.js --year 2026 --locale en
+# The default command is also crawl, so this is equivalent.
+node ./bin/wwdc-reports.js --year 2025 --locale en
 ```
 
 The one-command crawl writes:
@@ -53,14 +50,7 @@ The one-command crawl writes:
 ./transcripts-en/_manifest.json
 ```
 
-The metadata-only archive writes:
-
-```text
-./raw_data.json
-./raw_data_wwdc26_en_<timestamp>.json
-```
-
-Use `--out-dir` if you want a different archive directory:
+Use `--out-dir` if you want a different output directory:
 
 ```sh
 node ./bin/wwdc-reports.js crawl --year 2025 --locale en --out-dir ./archives/wwdc25
@@ -68,10 +58,10 @@ node ./bin/wwdc-reports.js crawl --year 2025 --locale en --out-dir ./archives/ww
 
 ## Crawl WWDC transcripts
 
-The `crawl` command is the recommended path. If you want manual control, you can still run metadata archiving and transcript crawling as two separate steps:
+If you want manual control, you can still run metadata fetching and transcript crawling as two separate steps:
 
 ```sh
-# Step 1: archive public metadata into ./raw_data.json
+# Step 1: fetch public metadata into ./raw_data.json
 node ./bin/wwdc-reports.js archive --year 2025 --locale en
 
 # Step 2: crawl all WWDC25 transcripts into ./transcripts-en/*.txt
@@ -80,13 +70,11 @@ node ./bin/wwdc-reports.js transcripts --year 2025 --raw-data raw_data.json
 
 The transcript crawler uses static public HTML from Apple Developer video pages; when metadata provides a localized `webPermalink`, that URL is used directly. It does not use Selenium, browser cookies, API keys, or LLM services. Existing non-empty transcript files are skipped by default. Each run also writes `transcripts-<locale>/_manifest.json`, which records every attempted session plus `written`, `skipped`, `missing`, or `failed` status. Use `--force` to refresh existing transcript files:
 
-By default, `crawl` derives the session list from the public Apple Developer video collection page, because older `https://developer.apple.com/wwdc25/services/data/` metadata endpoints may disappear after the event. If you explicitly want the legacy JSON service path, pass `--source json`; if you want `archive` to use the collection page instead of JSON, pass `--source html`.
-
 ```sh
 node ./bin/wwdc-reports.js transcripts --year 2025 --raw-data raw_data.json --force
 ```
 
-Use `--out-dir` for a different local archive directory:
+Use `--out-dir` for a different local output directory:
 
 ```sh
 node ./bin/wwdc-reports.js transcripts --year 2025 --raw-data raw_data.json --out-dir ./archives/wwdc25/transcripts-en
