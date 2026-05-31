@@ -1,0 +1,548 @@
+00:06 Hi, I'm Matt and I'm an OS kernel engineer.
+00:10 Today, I'll teach you how to use Instruments to optimize code for Apple silicon CPUs.
+00:15 Using CPU resources efficiently can avoid noticeable wait times
+00:19 when your app needs to process large amounts of data or quickly respond
+00:23 to an interaction.
+00:25 But predicting how software performs is difficult for two reasons.
+00:29 The first is the layers of abstraction between your Swift source code
+00:33 and what actually ends up running.
+00:36 The source code you write for your app is compiled into machine instructions
+00:40 that eventually execute on a CPU.
+00:43 But your code doesn't run in isolation:
+00:46 it's augmented by compiler-generated support code, the Swift runtime,
+00:50 and other system frameworks, all of which may invoke
+00:53 kernel system calls to handle privileged operations on behalf of your app.
+00:59 This makes it hard to know the cost of software abstractions your code relies on.
+01:04 The second reason that your code's performance is difficult to predict
+01:07 is how the CPU carries out the instructions it's given.
+01:11 Within a single CPU, its functional units work in parallel
+01:15 to execute instructions efficiently.
+01:18 To support this, instructions will be executed out-of-order,
+01:21 only giving the appearance of in-order execution.
+01:25 And CPUs also benefit from several layers of memory caches
+01:29 that ensure quick access to data.
+01:31 These characteristics dramatically accelerate common coding patterns,
+01:35 such as linear scans through memory or defensive checks
+01:38 like early exits for rare conditions.
+01:41 But some data structures, algorithms, or implementation approaches
+01:45 are difficult for the CPU to execute efficiently without careful optimization
+01:49 or even significant restructuring.
+01:52 We're going to cover the right path to optimizing your code for the CPU.
+01:56 We'll start by reviewing how to approach performance investigations,
+02:00 guided by data to focus on the biggest potential speed-ups first.
+02:03 Then, we'll consider the traditional profiling approaches
+02:06 that are a great first step in identifying excessive CPU usage in your code.
+02:11 To dive deeper and fill in the gaps from profiling,
+02:14 we'll use Processor Trace
+02:15 to record every instruction and measure the costs of software abstractions.
+02:20 And finally, we'll use the improved CPU Counters instrument to analyze
+02:23 CPU bottlenecks and understand how to micro-optimize our algorithm.
+02:28 Let's get started by putting ourselves in the right mindset
+02:31 to approach performance investigations.
+02:33 The first step is to keep an open mind:
+02:36 sources of slowdowns can be surprising and unexpected.
+02:40 Collect data to test assumptions and verify that your mental model
+02:43 for how the code executes is accurate.
+02:47 For instance, consider other causes of slowdowns
+02:49 in addition to single-threaded CPU performance.
+02:53 Aside from executing on a CPU,
+02:55 threads and tasks can also spend time blocked,
+02:58 waiting on resources like files or access to shared mutable state.
+03:03 The "Visualize and optimize Swift concurrency" session covers tools
+03:06 for understanding why your tasks might be off-CPU.
+03:11 When your threads are unblocked and on-CPU,
+03:13 it's possible there's an API that's being misused,
+03:16 like applying the wrong quality of service class to your code
+03:19 or implicitly creating too many threads.
+03:22 Read the documentation on Tuning your code's performance for more details.
+03:26 But if it's efficiency that's the problem, you either need to change the algorithm
+03:30 and its associated data structures
+03:32 or the implementation, which is how the algorithm
+03:35 is expressed in the programming language.
+03:37 Use tools to determine which branches of this tree you should focus on first.
+03:42 Try Xcode's built-in CPU Gauge to detect if CPUs are heavily used
+03:47 while interacting with your app.
+03:49 To analyze the blocking behaviors between threads and which threads will ultimately
+03:53 unblock them, use the System Trace instrument.
+03:57 And for issues impacting the UI or your app's main thread,
+04:00 use the specialized Hangs instrument.
+04:02 The Analyzing hangs with Instruments session contains more details
+04:06 on how to confirm that your app's CPU usage needs to be optimized.
+04:10 But even with guidance from tools, be careful about the kinds of optimizations
+04:14 you implement.
+04:15 Ruthless micro-optimization can make your code more difficult
+04:18 to extend and reason about.
+04:21 And it often relies on compiler optimizations that can be fragile,
+04:24 like auto-vectorization or reference count elision.
+04:28 Before you commit to intrusive micro-optimizations, seek out alternatives
+04:33 that might avoid the slow operations altogether.
+04:36 Consider why the code is running in the first place.
+04:39 Maybe you can avoid doing the work at all and just delete the code.
+04:43 Thanks for watching this session and...
+04:45 just kidding.
+04:46 But seriously,
+04:48 This usually is impossible, but it's a good check on your assumptions
+04:51 about how important the results of the work are.
+04:55 You could also try to do the work later outside of the critical path,
+04:59 or only when the results will be visible to someone.
+05:02 In the same vein, precomputing values can also hide the time
+05:06 it takes to complete the work.
+05:08 This might even involve baking in values at build time.
+05:12 However, these approaches could consume power unnecessarily
+05:15 or increase the download size of your app.
+05:18 For repeated operations with the same inputs, caching is another solution,
+05:22 but one that often comes with its own set of hard problems,
+05:25 like cache invalidation or dealing with increased memory usage.
+05:29 Once you've exhausted attempts to avoid doing the work
+05:32 when its performance is noticeable,
+05:34 you need the CPU to do the work faster.
+05:37 That's what we'll be focusing on today.
+05:40 Prioritize your optimization efforts on code that will have
+05:43 the largest impact on user experience.
+05:46 Usually, this is code involved in the critical path of someone interacting
+05:49 with your app, where they'll notice performance issues,
+05:52 but can also be longer-running operations that consume power.
+05:56 For this session, we'll focus on searching through prepared lists of integers
+06:00 because it's on my app's critical path.
+06:04 My app is already using binary search, a classic algorithm that uses a sorted array
+06:09 to find an element by successively halving the search space.
+06:13 In this example, there are 16 elements in the array and we're searching
+06:16 for the element holding the number 5.
+06:19 5 is less than the element in the middle of the array, 20,
+06:22 so its element must be in the first half.
+06:25 5 is also smaller than the element in the middle of the first half, 9,
+06:29 so it must be in the first quarter of the array.
+06:32 We narrow in on the matching element after comparing with 3, in only 4 steps.
+06:37 This is the binary search implementation from a framework used by my app.
+06:42 It's a standalone function
+06:43 that uses the metaphor of finding a needle in a haystack
+06:46 to name its parameters.
+06:48 It supports searching for a Comparable needle through the haystack Collection.
+06:53 The algorithm tracks two variables:
+06:55 the start of our current search area in start
+06:58 and the number of elements remaining to search in length.
+07:01 While there's remaining elements to search,
+07:04 it checks the middle value of the search space.
+07:06 If the needle is less than the value, then it just halves the search space,
+07:10 leaving start intact.
+07:12 If the needle is equal, then the element has been found
+07:15 and the middle index is returned.
+07:17 Otherwise, the start position needs to be adjusted
+07:20 to just after the middle element and the search space reduced by half.
+07:25 We'll prepare to optimize this algorithm incrementally,
+07:28 confirming at each step that we're making progress
+07:31 by comparing search throughput,
+07:33 or the number of searches the algorithm can complete each second.
+07:36 Don't feel limited to only taking huge leaps forward every time you make a change:
+07:41 some optimizations might be hard to quantify, but small improvements will add up over time.
+07:48 To help us optimize continuously,
+07:50 I've written an automated test to measure search throughput.
+07:54 We don't need a particularly robust setup: we just want an estimate of performance.
+07:59 This repeat-while loop calls the search closure
+08:02 until the specified duration has elapsed.
+08:05 I'm using an OS signpost interval around the calls to the search closure
+08:09 so tools can narrow in on the portion of the test we're optimizing.
+08:13 And I chose the points of interest category since Instruments includes it by default.
+08:19 The timing itself uses a ContinuousClock, which unlike Date,
+08:23 can't go backwards and has low-overhead.
+08:25 It's a simple, but effective approach to gathering some rough data
+08:29 on the performance of the algorithm.
+08:31 My test is called searchCollection and simulates how my app uses binary search.
+08:36 We'll run the searches for one second with a descriptive name for the signposts,
+08:40 in case we run multiple tests in a single recording.
+08:44 A loop inside the closure will invoke the binary search function to amortize
+08:48 the cost of checking the time.
+08:50 Let's run this test under an Instruments profiler to analyze
+08:54 the CPU performance of binary search.
+08:56 There are two CPU-focused profilers to choose from:
+08:59 the Time Profiler and the CPU Profiler.
+09:02 The classic Time Profiler instrument periodically samples what's running
+09:06 on the system's CPUs, based on a timer.
+09:10 In this example, we have some work happening on two CPUs.
+09:14 At each sample point, Time Profiler captures the user space call stacks
+09:18 of each thread running on the CPU.
+09:21 Instruments can then visualize those samples as a call tree or flame graph
+09:25 in its detail view to give an approximation of what code
+09:28 is important to optimize for CPU performance.
+09:31 This is helpful for analyzing how work is distributed over time or which threads
+09:36 are active at the same time.
+09:37 But using a timer to sample call stacks suffers from a problem called aliasing.
+09:42 Aliasing is when some periodic work on the system happens at the same cadence
+09:47 as the sampling timer.
+09:48 Here, the blue regions are responsible for most of the CPU time,
+09:52 but the orange functions happen to be running whenever the sampler collects a call stack.
+09:57 This makes orange unfairly over-represented in the Instruments call tree.
+10:02 To avoid this problem, we can switch to the CPU Profiler.
+10:06 It samples CPUs independently, based on the clock frequency of each CPU.
+10:12 You should prefer CPU Profiler over Time Profiler for CPU optimization
+10:17 because it's more accurate and more fairly weights software consuming CPU resources.
+10:22 These bells represent when a CPU's cycle counter samples the running call stack.
+10:28 Apple silicon CPUs are asymmetric and some of them will run at a slower,
+10:32 but more power-efficient clock frequency than others.
+10:36 Individual CPUs that scale up their frequency will be sampled more often,
+10:40 without Time Profiler's bias against faster-running CPUs.
+10:45 We'll use CPU Profiler to find out which parts of my binary search function
+10:49 consume the most CPU cycles.
+10:51 In Xcode's test navigator
+10:54 you can quickly launch Instruments from a unit test
+10:57 by secondary-clicking on the test name
+11:00 and selecting its Profile item.
+11:03 In this case, we'll select Profile searchCollection.
+11:07 This opens Instruments and presents the template chooser.
+11:11 I'll choose CPU Profiler.
+11:13 In the recorder settings, we'll switch to deferred mode
+11:16 for lower overhead and start recording.
+11:19 The default immediate mode for profilers can be useful to confirm
+11:22 your interactions with an app are captured.
+11:24 But for an automated test on the same machine as Instruments,
+11:27 we want to minimize any overhead that might be added by our tools
+11:31 by waiting until the recording stops to analyze it.
+11:35 New documents in Instruments are often daunting.
+11:38 The window is divided into two halves.
+11:40 The top holds the tracks that show activity on the timeline.
+11:44 Each track can contain multiple lanes with charts to indicate levels or regions.
+11:50 Below the timeline is the detail view with summary information
+11:54 about the timeline range being inspected.
+11:56 Any extended details are shown on the right side.
+12:00 To get oriented, we'll find the region where searches are happening
+12:04 in the Points of Interest track.
+12:06 Secondary-clicking on the region will offer to set the inspection range,
+12:10 limiting the detail view below to only the data captured in the signpost interval.
+12:15 We can click on the test runner process track
+12:18 to show the CPU profile in the detail view, below the timeline.
+12:23 This view shows a call tree of the functions in the test
+12:25 that were sampled by each CPU's cycle counter.
+12:28 Holding down option and clicking on the chevron next to the first function listed
+12:32 will expand the tree until the first point
+12:34 where the sample counts diverge significantly,
+12:37 which is close to our binary search function.
+12:41 We'll focus on our binary search function by clicking the arrow next to its name
+12:46 and selecting the Focus on Subtree item.
+12:49 Each function is weighted by the sample count
+12:52 multiplied by the number of cycles between each sample.
+12:56 This call tree is showing a lot of samples taken in functions called by binary search
+13:00 to deal with the Collection type.
+13:03 This protocol witness is showing up in about a quarter of our samples.
+13:06 There are allocations and even Array's checks for Objective-C types.
+13:11 We can avoid the overheads of Array
+13:13 and the generics if we switch to a container type
+13:15 that better matches the kind of data we're searching through.
+13:18 Let's try the new Span type.
+13:21 Span can be used instead of Collection when elements are stored contiguously in memory,
+13:26 which is common for many kinds of data structures.
+13:29 It's effectively a base address and count.
+13:32 But it also prevents escaping, or leaking, the memory reference
+13:35 outside of the functions it's used in.
+13:37 For more details on Span, watch
+13:39 the Improve memory usage and performance with Swift session.
+13:44 Adopting Span only requires changing the haystack and return types to Span,
+13:49 the algorithm itself is unchanged.
+13:52 This small change makes searching four times faster.
+13:56 But this version of binary search is still impacting my app
+13:59 and I'd like to investigate whether Span's bounds checking
+14:02 is contributing to the overhead.
+14:04 To dig in deeper, we'll switch to a new tool called Processor Trace.
+14:09 Starting in Instruments 16.3, Processor Trace can collect a complete trace
+14:14 of all the instructions your app's process executes in user space.
+14:18 This is a fundamental shift in how you can measure software performance:
+14:23 there's no sampling bias
+14:24 and only a negligible 1% impact to your app's performance.
+14:28 Processor Trace requires specialized CPU features
+14:31 that are only available on Mac and iPad Pro with M4 or iPhone with A18.
+14:37 Before we jump in, we'll need to set up our device for processor tracing.
+14:41 On a Mac, turn on the setting under Privacy & Security and Developer Tools.
+14:46 For iPhone or iPad, the setting is located in the Developer section.
+14:50 For the best experience with Processor Trace,
+14:52 try to limit your tracing to only a few seconds.
+14:55 Unlike sampling with CPU Profiler, you don't need to batch up your work:
+15:00 even a single instance of the code you want to optimize can be enough.
+15:04 Let's run Processor Trace on the Span version of binary search.
+15:08 Our test now only needs a handful of iterations.
+15:12 To profile this test, I'll secondary-click the test icon in the line number gutter.
+15:17 This shows the same menu as the one we used before, but can be more convenient
+15:21 than switching navigators.
+15:23 I'll select the Processor Trace template
+15:27 and start recording.
+15:31 Processor Trace has to deal with a lot of data,
+15:34 so capturing and analyzing it can take some time.
+15:38 Processor Trace sets up the CPU to record every branching decision.
+15:42 The cycle count and the current time are also recorded to track how long the CPU
+15:46 spends in each function.
+15:48 Instruments then uses your app's and system framework's executable binaries
+15:52 to reconstruct an execution path and annotate function calls
+15:55 with the cycles elapsed and time durations.
+15:58 We limit the time spent tracing because even though the CPU is recording
+16:02 as little information as possible,
+16:04 it can still be gigabytes of data per second
+16:06 for a multi-threaded application.
+16:08 Now that the document is ready, let's zoom in so we can inspect
+16:11 our binary search function calls.
+16:14 Searching now only takes up a tiny fraction of the full recording,
+16:17 so we'll find it in the Regions of Interest List
+16:20 in the details view below the timeline
+16:22 and then secondary-click its row and select Set Inspection Range and Zoom.
+16:28 To locate the thread that's executing binary search,
+16:31 we'll secondary-click the Start Thread cell and select Pin Thread in Timeline.
+16:37 Processor Trace adds a new function call flame graph to each thread track,
+16:40 so I'll drag the pin's divider up to make space for it.
+16:45 Processor Trace shows execution visually as a flame graph.
+16:48 A flame graph is a graphical representation of function costs and relationships:
+16:53 the width of the bars represents how much time the function took to execute
+16:57 and the rows represent nested call stacks.
+16:59 But most flame graphs show data from sampling and their cost is only
+17:03 an estimate based on a sample count.
+17:06 Processor Trace's timeline flame graph is different:
+17:09 it shows the calls made over time
+17:11 exactly as they would have been executed on the CPU.
+17:15 The colors of each bar represent the kinds of binaries they're from:
+17:20 brown for system frameworks,
+17:22 magenta for the Swift runtime and standard library,
+17:25 and blue for code compiled into your app's binary or any custom frameworks.
+17:31 The first part of this trace is showing the overhead of emitting the signpost,
+17:35 so let's zoom in further on the binary search code near the end of the range.
+17:40 I'll hold down option, click, and drag across the timeline to zoom in.
+17:45 I can select any binary search function call from the 10 iterations
+17:49 and set the inspection range and zoom with a secondary click.
+17:52 This is the power of Processor Trace
+17:54 we can see all the calls made by a single function
+17:57 that only runs for a few hundred nanoseconds.
+18:00 We could zoom in even further,
+18:02 but let's use the Function Calls summary below the timeline.
+18:05 This shows the same information as the timeline, but as a table,
+18:09 with the full names of functions being called for short periods of time.
+18:13 I'll sort this table by cycles.
+18:16 My initial assumption that bounds checks were causing slowdowns was wrong.
+18:20 This implementation of binary search is still dealing with protocol metadata overheads
+18:25 and can't inline the number comparisons, which ends up being a sizable
+18:29 percentage of the search's total cycle count.
+18:32 This is because the generic Comparable parameter is not specialized for the type
+18:36 of elements being used.
+18:39 Since my code is in a framework linked by my app,
+18:42 the Swift compiler cannot produce
+18:43 a specialized version of binary search, just for the types passed by callers.
+18:50 When this causes overheads in code from a framework,
+18:52 you should add the inlinable annotation to the framework's function
+18:56 to generate specialized implementations
+18:58 within the framework client's binary executables.
+19:02 But inlining can make code harder to analyze
+19:04 because it gets mixed with any callers.
+19:07 I'd like to avoid inlining into the test harness, so for this function,
+19:11 I'll just manually specialize it for the Int type used by the app
+19:14 and test, with a new function name.
+19:17 The code loses a lot of generality while becoming about 1.7 times faster.
+19:23 We need to keep optimizing
+19:25 because binary search is still contributing to slowdowns in the app.
+19:28 It's pretty odd to spend so much time on optimizing a single function
+19:33 you'll periodically reassess and collect more data to notice a different part
+19:37 of your code responsible for the inefficiency.
+19:39 Our specialized Span binary search isn't showing any unexpected function calls
+19:44 in the Processor Trace either, so we should understand how the code is running
+19:48 on the CPU to make further progress.
+19:51 With the CPU Counters instrument, we can find out what bottlenecks
+19:55 the code is hitting when running on CPU.
+19:57 Before we start using Instruments again,
+19:59 we need to build a mental model of how a CPU works.
+20:03 At a basic level, a CPU is just following a list of instructions,
+20:07 modifying registers and memory, and interacting with peripheral devices.
+20:13 When a CPU is executing, it has to follow a series of steps,
+20:17 which are broadly categorized into two phases.
+20:20 The first is Instruction Delivery to ensure the CPU has instructions to execute.
+20:25 Then, Instruction Processing is responsible for executing them.
+20:29 In Instruction Delivery, instructions are fetched and decoded into micro-operations
+20:34 that are easier for the CPU to execute.
+20:37 Most instructions decode into a single micro-operation, but some instructions
+20:41 do multiple things, like issuing a memory request and incrementing an index value.
+20:47 To process a micro-operation, it's sent to the map and schedule units,
+20:51 which route and dispatch the operation.
+20:54 From there, the operation is assigned to an execution unit, or the load-store unit
+20:58 if the operation needs to access memory.
+21:04 It would be pretty slow if the CPU had to run these phases serially
+21:08 before it can start to fetch again, so Apple silicon processors are pipelined.
+21:13 Once one unit is finished with work, it can move onto the next operation,
+21:17 keeping each unit busy.
+21:21 Pipelining and making extra copies of the execution units
+21:24 supports instruction-level parallelism.
+21:28 It's different from process or thread-level parallelism
+21:31 that you would access with Swift Concurrency or Grand Central Dispatch,
+21:34 where multiple CPUs execute different operating system threads.
+21:39 Instruction-level parallelism allows a single CPU to take advantage of times
+21:43 when units might otherwise be idle and use hardware resources efficiently,
+21:47 keeping all parts of the pipeline busy.
+21:50 Your Swift source code is not directly in control of this parallelism,
+21:54 but instead must help the compiler generate an amenable sequence of instructions.
+22:00 Unfortunately parallelizable instruction sequences are not immediately intuitive
+22:05 due to the interaction between units in a CPU.
+22:08 Every arrow between the units shows where operations can stall in the pipeline,
+22:13 limiting the available parallelism.
+22:15 We call these bottlenecks.
+22:18 To find out which bottleneck is relevant to our workload,
+22:21 Apple silicon CPUs can count interesting events in each unit
+22:25 and other characteristics of the instructions being executed.
+22:29 The CPU Counters instrument reads these counters to build
+22:32 higher-level metrics out of them.
+22:35 This year, we've added preset modes for these counters to make them much easier to use.
+22:40 Instruments uses them in a guided, iterative methodology for analyzing
+22:44 the performance of your code, called bottleneck analysis.
+22:48 Let's use it to find out why our binary search is still slow, despite not having
+22:52 any apparent function call overheads.
+22:56 The CPU Counters instrument relies on sampling the workload, so we need to
+22:59 return to the test harness we used with CPU Profiler to measure throughput again.
+23:05 Let's profile a test of the specialized Span implementation with Instruments.
+23:11 We'll select the CPU Counters template.
+23:15 There's now a guided configuration with curated modes to measure with.
+23:21 If you're curious about what each mode does, there's documentation available
+23:25 by clicking on the info icon next to the mode selection.
+23:28 Let's get counting.
+23:34 This initial CPU Bottlenecks mode breaks up the work done by the CPU
+23:38 into four broad categories that account for all of the CPU's potential performance.
+23:43 Instruments shows these categories as a colored stacked bar chart
+23:47 and a summary table in the detail view.
+23:50 During recording, Instruments will collect CPU counter data for the threads
+23:53 used in our test and convert them into bottleneck percentages.
+23:57 We'll use the Points of Interest to orient ourselves, like before,
+24:00 to zoom and select our searches.
+24:04 We'll then pin the thread that is running our binary search implementation to the timeline.
+24:11 Hovering over its CPU Bottleneck lane shows a high percentage
+24:15 in the discarded bottleneck.
+24:17 The details view below shows the metric aggregations in the inspection range.
+24:21 Selecting the Discarded Bottleneck row shows a description in the extended detail
+24:26 view on the right.
+24:29 Instruments also presents a remark above the chart in the timeline.
+24:33 Clicking that remark shows more details below.
+24:37 This is useful, but I still don't know
+24:39 what part of search is responsible for the bottleneck.
+24:42 Secondary-clicking the Discarded Sampling cell
+24:44 under the Suggested Next Mode column
+24:46 offers the option to profile the workload again
+24:49 with a different mode.
+24:51 Let's try it out.
+24:52 This mode is a little different from CPU Bottlenecks.
+24:55 It's still gathering counter data, but it's also setting up the counters
+24:58 to trigger sampling.
+25:00 The sample data is just limited to the instruction
+25:03 that's generating discarded work.
+25:05 To show those, let's orient ourselves again with Points of Interest.
+25:11 Then, we'll select the test process track
+25:15 and navigate to Instruction Samples below the timeline.
+25:20 This isn't a call stack, but the exact instruction that's causing the problem.
+25:24 We can open the Source Viewer by clicking on the arrow next to the function name
+25:28 to show the source code that was sampled
+25:31 because the CPU followed the wrong branch direction.
+25:34 Here, the comparisons being done
+25:36 between the needle and the middle value are incorrectly predicted.
+25:40 To understand why these source lines are responsible for so many bad predictions,
+25:44 we need to learn a bit more about CPUs.
+25:48 CPUs are sneaky and execute instructions out-of-order.
+25:52 It only appears like instructions execute sequentially
+25:55 thanks to an extra re-ordering step as instructions complete.
+26:00 This means CPUs look ahead and make predictions
+26:02 about which instructions will execute next.
+26:05 The branch predictors responsible are usually accurate, but can take wrong paths
+26:09 when there's no consistent pattern from prior execution
+26:12 about whether a branch will be taken or not.
+26:16 The loop in our binary search algorithm has two kinds of branches.
+26:20 The first loop condition is usually taken until the end of the loop,
+26:23 so is well-predicted and didn't show up in sampling.
+26:27 But the check for the needle is effectively a random branch,
+26:30 so it's no wonder the predictors have trouble with it.
+26:34 I've rewritten the loop body to avoid difficult to predict
+26:37 branches that affect control flow.
+26:40 The if statement's body is only assigning a value based on the condition.
+26:44 This allows the Swift compiler to generate a conditional move instruction,
+26:48 and avoid branching to a different instruction.
+26:51 Returning from a function or breaking a loop based on a condition
+26:55 must be implemented with a branch, so I also had to remove the early return.
+27:00 I've used unchecked arithmetic to avoid branches that would terminate the program.
+27:04 This is one of the areas where micro-optimization becomes fragile
+27:07 and easy to disrupt, not to mention less safe and understandable.
+27:12 When we make a change like this, you should go back to the initial
+27:15 CPU Bottlenecks mode to check how it impacts the rest of the bottlenecks.
+27:20 I've already collected a trace of our new, branchless binary search,
+27:24 which is now about twice as fast as the version with branches.
+27:28 It's now almost completely bottlenecked on Instruction Processing.
+27:32 Instruments indicates that we should re-run the workload
+27:35 with the Instruction Processing mode.
+27:39 That mode had remarks that recommended running the L1D Cache Miss Sampling mode.
+27:44 The cache miss samples show that accessing memory from the array is the reason
+27:48 the CPU isn't able to execute instructions efficiently.
+27:52 Let's learn more about CPUs and memory to find out why.
+27:57 CPUs access memory through a hierarchy of caches that make repeated accesses
+28:01 to the same address, or even predictable access patterns, much faster.
+28:07 It starts with the L1 caches that are located within each CPU.
+28:11 These can't store much data, but offer the fastest access to memory.
+28:16 A slower L2 cache sits outside of the CPUs and provides a lot more headroom.
+28:21 And finally, requests that miss both caches and need to access main memory
+28:26 become 50 times slower than the fast path.
+28:29 These caches also group memory into 64- or 128 byte segments called cache lines:
+28:36 even if an instruction only requests 4 bytes, the caches will pull in more data
+28:40 with the expectation that subsequent instructions
+28:43 will need to access other bytes nearby.
+28:46 Let's consider how this impacts our binary search algorithm.
+28:50 In this example, the blue lines are elements in the array,
+28:53 while the grey capsules are the cache lines that the CPU caches operate on.
+28:58 The array starts completely out of the cache.
+29:01 The first comparison brings in a cache line and several elements into the L1 data cache.
+29:07 But the next comparison experiences a cache miss.
+29:11 And subsequent iterations keep missing in the cache.
+29:15 This continues until the search narrows in on a cache-line sized region.
+29:20 Binary search turns out to be a pathological case
+29:23 for the CPU's memory hierarchy.
+29:26 But if we can tolerate reordering the elements
+29:28 to be more friendly to the cache,
+29:30 then we can put the search points on the same cache line.
+29:34 This is called an Eytzinger layout, after a 16th century Austrian genealogist
+29:38 who organized family trees this way.
+29:41 This isn't a general optimization we can make without significant consequences.
+29:46 This improves search speed at the cost of in-order traversal speed,
+29:50 making that operation now miss in the cache.
+29:53 Let's go back to the first example of binary search to show how to re-arrange
+29:57 a sorted array to an Eytzinger layout.
+29:59 Starting with the middle element as the root,
+30:02 we'll model the binary search operation as a tree,
+30:05 where midpoints are descendant nodes.
+30:08 An Eytzinger layout is arranged as the breadth-first traversal of that tree.
+30:14 The elements closer to the root of the tree are arranged more densely,
+30:17 and are more likely to share cache lines.
+30:20 Searching for 5 again now spends the first three steps in the same cache line.
+30:26 The leaf nodes are sorted at the end of the array,
+30:29 which will incur an unavoidable cache miss.
+30:33 I've recorded a CPU Bottlenecks trace of the Eytzinger binary search,
+30:36 which shows it's two times faster again than the branchless search.
+30:41 But this example highlights something interesting,
+30:44 it's still technically bottlenecked on Instruction Processing.
+30:48 We've made our implementation more cache-friendly, but the workload is still
+30:52 inherently memory-bound.
+30:55 You should monitor performance to know when to stop and optimize other code
+30:58 in your app,
+30:59 because our search is now no longer impacting
+31:02 critical path performance.
+31:04 During this process, we've significantly improved search throughput.
+31:08 First, with CPU Profiler, we were able to get a significant speedup when switching
+31:13 from Collection to Span.
+31:16 Then, Processor Trace showed us the overheads of unspecialized generics.
+31:21 And finally, we dialed up the performance significantly
+31:24 with some micro-optimizations, guided by Bottleneck Analysis.
+31:28 Overall, we made our search function about 25 times faster with Instruments.
+31:33 To achieve these speedups, we started in the correct mindset,
+31:37 using tools to confirm our guesses and develop an intuition
+31:40 about the cost of abstractions.
+31:43 We successively applied more detailed tools to find unexpected overheads.
+31:48 These were as easy to address as they are to overlook if you don't actually measure.
+31:53 And then, once software overheads were addressed,
+31:56 we looked at CPU bottleneck-focused optimizations.
+31:59 We became more aware of and maybe even sympathetic to features of the CPU
+32:03 that are taken for granted.
+32:05 This order was important: we have to ensure the CPU-focused tools
+32:09 aren't confused by extra software runtime overheads.
+32:14 To apply this to your own apps,
+32:16 collect data and follow leads with the performance mindset.
+32:19 Write performance tests so you can repeatedly measure with these Instruments.
+32:23 Provide feedback or ask questions about using the tools on the forums.
+32:27 Watch the sessions I mentioned earlier and the WWDC24 session on Swift performance,
+32:32 which will help you build a more accurate mental model of the costs
+32:36 of Swift's powerful abstractions.
+32:38 And to better understand how CPUs execute your code,
+32:41 read the Apple Silicon CPU Optimization Guide.
+32:44 Thanks for watching
+32:45 and I hope you have fun using Instruments to find optimization needles
+32:49 in your code's haystacks.

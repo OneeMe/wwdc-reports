@@ -1,0 +1,542 @@
+00:06 Hello!
+00:07 I’m Nate Cook, and I work on the Swift Standard Library.
+00:10 Today we’re going to explore how to understand
+00:12 and improve your code’s performance,
+00:14 in part by using some new additions
+00:16 to the language and the standard library in Swift 6.2.
+00:20 We'll get to use the new InlineArray and Span types,
+00:23 try out value generics, and learn about non-escapable types.
+00:27 We'll use all those new tools to eliminate retains and releases,
+00:31 exclusivity and uniqueness checks, and other extra work.
+00:35 I'll also debut a new open source library that uses all these tools
+00:38 to make writing binary parsers fast and safe.
+00:41 It's called Swift Binary Parsing.
+00:44 The library focuses on speed and provides tools for managing
+00:47 several different kinds of safety.
+00:50 We all want our code to be fast, and Swift gives us the tools to make that happen.
+00:55 But sometimes, things just aren't as speedy as we expect.
+00:58 In this session, we'll practice figuring out where our code is spending its time,
+01:03 and then try out several kinds of performance optimizations...
+01:06 Picking the right algorithms.
+01:08 Getting rid of extra allocations.
+01:11 Eliminating exclusivity checks.
+01:14 Moving from heap to stack allocations.
+01:16 And cutting down on reference counting.
+01:19 In our exploration, we’ll be looking at a little app I built.
+01:23 It’s a viewer for an image format called QOI,
+01:26 and includes a hand-written parser for the format.
+01:29 QOI is a lossless image format that is simple enough that its specification fits
+01:35 on a single page, making it useful for trying out different approaches
+01:39 and seeing their performance.
+01:41 The QOI format uses a standard idiom for binary formats,
+01:45 with a fixed size header followed by a data section,
+01:48 which includes a dynamic number of differently sized encoded pixels.
+01:52 The encoded pixels take several forms.
+01:55 A pixel can be an RGB or RGBA value, a difference from the previous pixel,
+02:00 a lookup into a cache of previously seen pixels, or...
+02:03 just the number of times to repeat the previous pixel.
+02:07 Alright – let’s try out my QOI Parser App!
+02:11 I can open this icon file, which is only a few kilobytes,
+02:14 and it loads immediately.
+02:17 This photo of a bird is a bit bigger.
+02:19 It can take a few seconds to load…
+02:21 And there it is.
+02:24 What's taking so long?
+02:25 When you see a noticeable slowdown working with real-world data, it’s often a sign
+02:30 of incorrect usage of an algorithm or data structure.
+02:33 Let’s use Instruments to find and tackle the source of this problem.
+02:37 In my parsing library, I’ve written a test that parses that same bird image
+02:41 that was slow to load.
+02:43 I can click the run button to run the test...
+02:48 And it passes after a few seconds.
+02:50 In addition to using this test to check for correctness,
+02:53 I can also profile the test to see its performance in Instruments.
+02:57 This time, I use a secondary click on the run button.
+03:01 There's an option in the menu to profile the test.
+03:05 I love this feature.
+03:06 When profiling a test, I can focus on the specific part of my code
+03:10 that I'm interested in.
+03:12 I’ll select that option now to launch Instruments.
+03:17 Instruments opens with its template chooser, showing all the different ways
+03:20 that it can help you understand your code’s performance.
+03:23 We're going to use two different instruments today,
+03:25 so I'll start out with the blank template.
+03:28 I can add instruments by clicking on the add instrument button.
+03:32 I'll add the Allocations instrument to help understand
+03:35 how my parser is allocating memory.
+03:38 And since I'm really interested in knowing where my app
+03:41 is spending its time, I'll add the “Time Profiler” instrument.
+03:46 The Time Profiler is a great place to start for performance questions.
+03:51 Let's hide the sidebar to make a little more room for the results.
+03:55 And then use the record button to kick off the test.
+04:00 We can see a few things in the results window.
+04:04 The instruments included in the profile are listed at the top of the window.
+04:08 We'll use the “Time Profiler” first, so I’ll keep that selected.
+04:12 At the bottom is the detail view for the selected tool.
+04:16 On the left is a list of captured calls...
+04:19 And on the right is the heaviest stack trace for the currently selected call.
+04:25 I’d like to see the most frequently captured calls first,
+04:28 regardless of how they're reached,
+04:29 so I’ll click on the Call Tree button
+04:33 and then check the “Invert Call Tree” checkbox
+04:37 I can switch to a graphical view by using this button
+04:39 at the top of the detail view.
+04:41 When I click, the view switches to show the profile as a flame graph.
+04:47 Each of the bars in the flame graph shows the proportion
+04:49 of the times a call was captured during the profile.
+04:53 In this case, there's a huge bar dominating the process,
+04:56 labeled “platform_memmove”.
+04:58 That same symbol also shows up in the stack trace, memmove is a system call
+05:02 for copying data, so that huge bar indicates that the parser is spending most
+05:07 of its time copying data around, instead of just reading it.
+05:10 But, that should not be happening.
+05:13 Let’s figure out which part of my code is causing all that copying.
+05:17 I want to see all the frames in the stack trace,
+05:19 so I’ll click the “show all frames” button at the top of the view.
+05:24 At the top of the trace are system calls, including platform_memmove,
+05:27 and then some specialized versions of methods provided
+05:30 by the Foundation Data type.
+05:32 You might have seen specialized methods like these in a stack trace, or when debugging.
+05:37 These specialized methods are type-specific versions of generic code
+05:41 that the Swift compiler generates for you.
+05:45 Finally, we come to a method that I defined, readByte.
+05:50 Since this is the closest function in my code to the problem,
+05:53 it's the right place to start.
+05:55 To jump straight to this method,
+05:56 I can use a secondary click and then choose “Reveal in Xcode.”
+06:02 And here’s the declaration of the readByte method in Xcode.
+06:06 Instruments sent me right to this line, where I’m dropping the first byte and then
+06:10 calling the Data initializer.
+06:12 With Instruments, I was able to identify all those memmove calls as a potential
+06:16 source of slowness in my library, and then jump straight to the specific line
+06:20 of code that is causing all of that copying.
+06:24 This helper method is really important...
+06:27 because my parsing code calls readByte over and over
+06:30 while consuming the raw binary data.
+06:33 I thought that this would just shrink the data,
+06:35 returning the first byte and moving the start of the data forward
+06:38 every time I called the readByte method.
+06:41 Instead, it actually copies the entire contents
+06:44 of the data into a new allocation, each time I read a byte.
+06:49 That's a lot more work than I expected.
+06:52 Let's fix this mistake.
+06:54 I'm back in Xcode now, editing the readByte method.
+06:59 Because the Data type is designed to shrink from both ends,
+07:02 we actually have access to a collection method called `popFirst()`.
+07:06 popFirst() returns the first byte in `data`,
+07:09 and then slides the front of the collection forward,
+07:11 shrinking it by one byte.
+07:13 Just what we want.
+07:15 With that fixed, I can switch back to my test, and run the profile again.
+07:21 Instruments opens automatically, with the test already running
+07:25 with the same profiling configuration.
+07:27 Excellent!
+07:28 That huge platform_memmove bar is gone from the flame graph.
+07:35 When I benchmark my code, I can also see an absolutely huge speed up
+07:39 as a result of that change!
+07:41 That's fantastic, but with an algorithmic change like this, the absolute change
+07:45 isn't necessarily the whole story.
+07:48 In my original version, the relationship between the size of the image and the time
+07:52 it took to parse was quadratic.
+07:54 As the images I was parsing got larger,
+07:57 the time it took to parse got drastically longer.
+08:00 With the copying fix in place, the relationship is now linear.
+08:04 There's more of a direct match between the size of the image
+08:07 and the time it takes to parse.
+08:09 We have a bunch more improvements coming up
+08:11 that will improve the linear performance,
+08:13 and we'll be able to compare those improvements more directly.
+08:18 With that issue out of the way,
+08:19 let's take a look at another common performance pitfall: extra allocations.
+08:25 Let’s look at what the heaviest stack trace is now.
+08:29 These calls show that we’re seeing a lot of traffic to the methods
+08:32 that allocate and deallocate a Swift array.
+08:35 Allocating and deallocating memory can be expensive.
+08:38 My parser will be faster if I can figure out
+08:40 where these extra allocations are coming from,
+08:42 and eliminate them.
+08:45 To see the allocations that my parser is making,
+08:47 I can use the Allocations instrument that we added earlier.
+08:51 There are a couple different indicators that my code
+08:53 is probably causing unnecessary allocations.
+08:57 First is the sheer number:
+09:00 Nearly a million allocations on the way to parsing one image?
+09:03 I think we can do better.
+09:05 Second, we can see that nearly all of those allocations are transient allocations,
+09:10 which are marked as short-lived by the Allocations instrument
+09:15 To find the source of the problem,
+09:16 I’ll switch the detail panel to the Call Tree view.
+09:19 First, I click on the pop-up button labeled Statistics.
+09:23 And then I’ll choose Call Trees.
+09:26 With the top thread selected,
+09:28 I’ll look at the stack trace to find the part
+09:30 of my code that’s closest to the problem.
+09:32 Since this stack trace is not inverted,
+09:34 I need to start looking at the bottom of the trace.
+09:38 The first symbol from my parser is this RGBAPixel.data method.
+09:43 When I click on that method, it’s revealed in the call tree detail window.
+09:47 And when I use secondary click on the method there,
+09:51 I can choose Reveal in Xcode to jump right to the source.
+09:56 This method seems to be the source of the extra allocations
+10:00 I can see that every time it’s called,
+10:02 it returns an array with either the RGB values,
+10:04 or RGBA values of the pixel.
+10:07 That means it’s going to create an array and allocate room
+10:10 for at least three elements every time it’s called.
+10:14 To find out where it’s being used, I’ll use a secondary click on the function name
+10:18 and choose “Show callers.”
+10:22 The caller is this closure in our main parsing function,
+10:25 which is just one part of this big flatMap and prefix chain.
+10:29 To understand why this code is making so many separate allocations,
+10:33 let’s look at how the allocations pile up, step by step.
+10:38 First, the readEncodedPixels method parses the binary data into encoded pixels –
+10:43 these are the different pixel types I mentioned earlier –
+10:45 and it needs to allocate enough space to store them.
+10:50 Next, decodePixels is called for each encoded pixel,
+10:53 to produce one or more RGBA pixels.
+10:56 Most encodings just turn into a single pixel, but there’s one encoding
+11:00 that says we need to repeat the previous pixel a certain number of times.
+11:03 To support that, decodePixels always returns an array.
+11:07 Each one of those arrays needs to be allocated.
+11:11 The “flattening” part of flatMap takes all of those little arrays
+11:14 that we just created and merges them into one much larger array.
+11:18 That’s a new allocation,
+11:20 and all the small arrays we just created are deallocated.
+11:24 This prefix method puts a cap on the number of pixels
+11:27 that we can produce.
+11:30 The second flatMap starts by calling RGBAPixel.data,
+11:34 the method that we flagged when we used the Allocations instrument.
+11:38 We saw earlier that it returns an array
+11:40 with either three or four elements.
+11:43 What we’re seeing now means that one of those 3- or 4-element arrays
+11:46 is being created for every single pixel in the final image.
+11:50 Sometimes the compiler is able to optimize some of these extra allocations away,
+11:56 but as we saw in the trace, that won't always happen.
+12:01 Next, the small arrays are flattened into one big new array again.
+12:06 And finally, that big array of RGB or RGBA pixel data
+12:10 is copied into a new Data instance so that it can be returned.
+12:15 There is a certain elegance to these lines of code.
+12:18 They pack a lot of power into a few short, chained method calls.
+12:21 But just because it’s shorter, doesn’t mean it’s faster.
+12:25 Instead of working through all those different steps,
+12:28 and eventually ending up with a Data instance to return,
+12:31 what if we allocate the data first,
+12:33 and then write each pixel as we decode from the binary source data.
+12:37 That way, we can do all the same processing
+12:40 without needing any of those intermediate allocations.
+12:43 I’m back in my parsing function.
+12:45 Let’s rewrite this method to eliminate all those extra allocations.
+12:53 The first thing we’ll do is calculate "totalBytes": the final size
+12:56 for the result data.
+12:58 Then we'll allocate "pixelData", with just the right amount of storage.
+13:02 The "offset" variable keeps track of how much data we've written.
+13:05 This up-front allocation means we won’t have to make additional allocations
+13:09 as we work our way through the binary data.
+13:14 Next, we’ll parse each piece of data and process it immediately.
+13:18 We can use a switch statement to deal with the parsed pixel.
+13:23 For the encoded pixels that indicate a run,
+13:26 we’ll loop the required number of times, writing out the pixel data each time.
+13:32 For any other kind of pixel, we'll decode and write that directly into the data.
+13:37 That’s the full rewrite, with no allocations
+13:40 other than the data that we need to return.
+13:42 Let’s verify that we’ve fixed this issue by profiling our test again.
+13:50 We can see right away that the number of allocations is far lower.
+13:53 To see the actual number of allocations in my code, I can use the filter.
+13:58 I'll click into the filter field at the bottom of the window.
+14:01 And type “QOI.init.”
+14:05 This filters out any call tree
+14:06 that doesn’t include QOI.init somewhere in the stack trace.
+14:11 The remaining lines show
+14:12 that now our parser code only makes a handful of allocations,
+14:15 for a total of just under two megabytes.
+14:18 When I hold down option and click on the disclosure triangle, the call tree expands.
+14:24 The expanded tree shows what we want.
+14:30 The only thing we're really allocating is the Data that stores our resulting image.
+14:36 Looking at benchmarks, that’s another great improvement!
+14:39 By cutting out those extra allocations,
+14:41 we’ve reduced the execution time by over half.
+14:45 So far we’ve made two algorithmic changes to our parser,
+14:49 eliminating a lot of accidental copying
+14:51 and then reducing the number of allocations.
+14:54 For our next few improvements, we’ll use some more advanced techniques
+14:58 to allow the Swift compiler
+14:59 to eliminate a lot of the automatic memory management work
+15:02 that happens at runtime.
+15:05 First, let’s talk about how arrays and other collection types work.
+15:10 Swift’s Array type is one of the most common tools in our toolbox,
+15:13 because it’s fast, safe, and easy to use.
+15:17 Arrays can grow or shrink as needed,
+15:18 so you don’t have to know in advance how many items you’ll be working with.
+15:22 Swift handles the memory for you behind the scenes.
+15:26 Arrays are also value types, which means that changes
+15:28 to one copy of an array don’t affect other copies.
+15:32 If you make a copy of an array, by assigning it to a different variable,
+15:35 or passing it off to a function,
+15:37 Swift doesn’t immediately duplicate the elements.
+15:40 Instead, it uses an optimization called copy-on-write,
+15:44 which delays that duplication until you actually change one of the arrays.
+15:49 These features make arrays a great general-purpose collection,
+15:52 but they also have some trade-offs.
+15:55 To support its dynamic size and multiple references,
+15:58 Array stores its contents in a separate allocation, often on the heap.
+16:03 The Swift runtime uses reference counting
+16:05 to keep track of the number of copies of each array,
+16:08 and when you make a change,
+16:09 arrays make a uniqueness check to see if they need to copy their elements.
+16:14 Finally, to make sure your code stays safe,
+16:16 Swift enforces exclusivity, which means that two different things
+16:20 can’t modify the same data at the same time.
+16:24 While this rule is often enforced at compile time,
+16:26 it sometimes can only be enforced at runtime.
+16:29 Now that we’ve learned about these low-level concepts,
+16:32 let’s look at how they show up in our profiling.
+16:35 We’ll start by looking for runtime checks for exclusivity,
+16:38 which can add work to your program and get in the way of optimizations.
+16:42 Before we can start looking for exclusivity checks,
+16:45 we actually have a good problem.
+16:47 We've improved our performance enough
+16:49 that Instruments isn't really getting enough time to inspect the parser process.
+16:53 We can give it a little more to look at by looping over the parsing code –
+16:57 50 times ought to do the trick.
+17:01 Let’s take a look at this richer profile.
+17:09 Exclusivity tests show up in a trace as the ‘swift_beginAccess’
+17:13 and 'swiftendAccess' symbols.
+17:16 Once again, I’ll click in the filter box at the bottom of the window.
+17:20 Then enter the symbol name.
+17:26 At the top of the flame graph, swift_beginAccess appears a few times,
+17:31 with the symbols that require this checking right below.
+17:34 Those symbols are the accessors for the previous pixel and the pixel cache,
+17:38 which are stored in my parser's State class.
+17:41 I’ll switch back to Xcode and find that declaration.
+17:45 Here it is…
+17:46 State is a class with those two properties we saw in the flame graph.
+17:50 Modifying a class instance is one of the situations
+17:53 where Swift has to check for exclusivity at runtime,
+17:57 so this declaration is the reason we’re seeing what we’re seeing.
+18:00 We can eliminate that checking
+18:02 by moving these properties out of the class,
+18:04 and putting them directly in the parser type.
+18:11 Next, we’ll do a find-replace,
+18:13 to remove the `state.` accesses for previousPixel and pixelCache.
+18:19 When I build, the compiler lets me know there’s a little more work to do.
+18:24 Since the state properties aren’t nested in a class anymore,
+18:28 I can’t modify them in a non-mutating method.
+18:32 I’ll accept this fix to make the method mutating.
+18:38 There's one more to fix...
+18:44 And we're done.
+18:45 With that change in place, let’s go back to the test.
+18:51 And re-record a profile to see the change.
+18:59 I’ll filter on swift_beginAccess again.
+19:07 There's nothing there!
+19:08 We’ve completely removed the runtime exclusivity checking.
+19:12 Let’s take another look at those state variables.
+19:15 This is a good place to use a new Swift feature
+19:17 to move data from heap memory to stack memory
+19:20 and make sure that those exclusivity checks can’t creep back in.
+19:24 The pixel cache in our parser is an array of RGBAPixels –
+19:29 it’s initialized with 64 elements, and never changes size.
+19:33 This cache would be a great place to use the new InlineArray type.
+19:38 InlineArray is a new standard library type in Swift 6.2.
+19:42 Like a regular array, it stores multiple elements
+19:45 of the same kind in contiguous memory,
+19:48 but it has some important differences.
+19:50 First, inline arrays have a fixed size that you set at compile time.
+19:55 Unlike regular arrays that you can append to or remove from,
+19:58 InlineArray uses the new value generics feature
+20:02 to make its size a part of its type.
+20:05 That means that while you can make changes to the elements of an inline array,
+20:08 you can’t append or remove, or assign an inline array to one of a different size.
+20:19 Second, like the name implies, when you use an InlineArray,
+20:23 the elements are always stored inline instead of in a separate allocation.
+20:27 Inline arrays don’t share storage between copies,
+20:30 and don’t use copy-on-write.
+20:32 Instead, they’re copied whenever you make a copy.
+20:35 This eliminates the need for all the reference counting and uniqueness
+20:39 and exclusivity checks that regular arrays require.
+20:43 This different copying behavior
+20:44 of InlineArray is a bit of a double-edged sword –
+20:47 if your usage of an Array requires making copies or sharing references
+20:51 between different variables or classes, an InlineArray might not the right choice.
+20:57 In this case, however, the pixel cache is a fixed size array
+21:01 that is modified in place, but never copied.
+21:04 A perfect place to use `InlineArray`.
+21:08 For our final optimization,
+21:09 we’ll use the standard library’s new span types
+21:12 to eliminate most of the reference counting while parsing.
+21:16 Back in the time profiler flame graph,
+21:18 let’s use filtering again to only look at our QOI parser.
+21:22 I’ll add QOI.init in the filter box.
+21:26 The view changes to focus on only the stack traces
+21:29 that include our parsing initializer.
+21:32 Let’s look for the retain and release symbols.
+21:34 swift_retain is this pink bar, showing up in 7% of samples,
+21:38 and swift_release is this one, showing up in another 7%.
+21:43 The uniqueness check that we talked about earlier also shows up here,
+21:46 in another 3% of samples.
+21:50 To figure out where these are coming from, I’ll click back onto swift_release
+21:55 and just like we’ve done before,
+21:57 I’ll scan down the heaviest stack trace to find the first userdefined method.
+22:02 It looks like it’s the same readByte method that we started with.
+22:07 This time, it isn’t an algorithmic issue that we’re dealing with,
+22:11 but the use of `Data` itself.
+22:13 Just like `Array`, `Data` usually stores its memory on the heap,
+22:16 and needs to be reference counted.
+22:19 These reference counting operations - retain and release - are very efficient,
+22:23 but can add up to a significant chunk of time when they happen in a tight loop,
+22:26 just like this method.
+22:28 To deal with this, we want to move
+22:30 from working with a high-level collection type
+22:32 like `Data` or `Array` to a type
+22:34 that doesn’t cause this explosion of reference counting.
+22:37 Up until Swift 6.2, you might have used a method
+22:40 like `withUnsafeBufferPointer` to access the underlying storage of a collection.
+22:44 Those methods let you manually manage memory,
+22:47 with no reference counting, but they introduce unsafety into your code.
+22:53 It's worth asking - why are pointers unsafe?
+22:56 Swift calls them unsafe because they get around
+22:59 many of the language's safety guarantees.
+23:02 They can point to both initialized and uninitialized memory,
+23:05 they drop some type guarantees,
+23:07 and they can escape from their context,
+23:09 leading to a risk of accessing memory that's no longer allocated.
+23:13 When you use unsafe pointers,
+23:15 you are fully responsible for keeping your code's safety intact.
+23:19 The compiler can't help you out.
+23:21 This processUsingBuffer function does use unsafe pointers correctly.
+23:25 The usage stays entirely within the unsafe buffer pointer closure,
+23:29 with only the result of the calculation returned at the end.
+23:33 On the other hand,
+23:35 this `getPointerToBytes()` function is dangerous.
+23:37 It contains two major programming errors.
+23:41 The function creates an array of bytes
+23:43 and calls the with UnsafeBufferPointer method,
+23:45 but instead of limiting use of the pointer to the closure,
+23:48 it returns the pointer to the outer scope.
+23:51 Error number 1.
+23:53 Even worse, the code then returns
+23:55 that no-longer valid pointer from the function itself.
+23:58 Error number 2!
+24:00 Both of these errors extend the pointer's life
+24:02 beyond the lifetime of what it's pointing to,
+24:05 creating a dangerous leftover reference to moved or deallocated memory.
+24:10 To help with this,
+24:11 Swift 6.2 introduces a new group of types called Spans.
+24:15 Spans are a new way to work
+24:17 with the contiguous memory belonging to a collection.
+24:20 Importantly, spans use the new “non-escapable” language feature,
+24:24 which allows the compiler to tie their lifetimes
+24:26 to the collection that provides them.
+24:28 The memory that a span provides access to is guaranteed to live
+24:32 as long as the span, with no chance of a lingering reference.
+24:36 Because every span type is declared as non-Escapable,
+24:39 the compiler prevents you from escaping
+24:41 or returning a span outside the context where you retrieved it.
+24:46 This "processUsingSpan" method shows how you can use a span to write simpler,
+24:50 safer code than pointers allow.
+24:53 To get a Span over the array's elements, just use the span property.
+24:57 Without using a closure, we have access to the array's storage
+25:01 that’s just as efficient as unsafe pointers,
+25:03 without any of the unsafety.
+25:06 We can see the non-escapable language feature in action
+25:08 if we try to rewrite the dangerous function from before.
+25:12 The first thing we'll run into is
+25:14 that we can’t even write this same function signature with `Span`.
+25:17 Because a span's lifetime is tied to the collection that provides it,
+25:21 without any collection or span being passed in,
+25:24 there’s nowhere to get a lifetime for the span being passed out.
+25:28 What if we try to hide the span from compiler, by capturing it in a closure.
+25:33 In this function, I’ll create an array, access its span,
+25:37 and then try to return a closure that captures that span.
+25:40 But even that doesn’t work.
+25:42 The compiler recognizes that capturing the span lets it escape,
+25:45 and points out that its lifetime depends on the local array.
+25:49 This compiler-checked requirement that a span doesn't escape its scope
+25:53 means that retains and releases aren’t necessary.
+25:56 We get the performance of using an unsafe buffer without any of the unsafety.
+26:01 The `Span` family includes typed and raw versions of both read-only
+26:05 and mutable spans,
+26:06 for working with existing collections,
+26:08 as well as an output span that you can use to initialize a new collection.
+26:13 The family also includes UTF8Span, a new type that's designed for safe
+26:18 and efficient Unicode processing.
+26:21 Back in our code, let’s implement this same readByte method for RawSpan.
+26:27 We'll start by adding a RawSpan extension...
+26:31 and defining the readByte method.
+26:34 The API for RawSpan is a little different from Data, but it does the same thing
+26:38 as our implementation above.
+26:40 It loads the first byte,
+26:41 shrinks the RawSpan, and then returns the loaded value.
+26:45 Note that this unsafeLoad method is named this way only
+26:49 because it can be unsafe to load certain kinds of types.
+26:52 Loading a built-in integer type, like we're doing here, is always safe.
+26:57 Next, we'll update our parsing methods.
+27:04 These two parsing methods should use RawSpan
+27:06 instead of Data as a parameter.
+27:16 I'll also need to make a change at the call site.
+27:20 Instead of passing the data itself,
+27:22 we’ll get the data's RawSpan and pass that into the parsing method.
+27:25 I'll access Data's RawSpan using the `bytes` property.
+27:29 This rawBytes value is non-escapable.
+27:31 I wouldn't be able to return it from this function,
+27:33 but I can pass it into the parsing method without any problems.
+27:39 With that change, I'm all done with the update to use RawSpan.
+27:44 To save even more low-level work,
+27:46 we can also adopt the new OutputSpan in our parsing method.
+27:51 Instead of creating a zero-initialized Data,
+27:54 we'll use the new rawCapacity initializer,
+27:57 that provides an OutputSpan to gradually fill in the uninitialized data.
+28:07 OutputSpan keeps track of how much data you've written,
+28:09 so we can use its count property instead of this separate offset variable.
+28:15 And we'll use a different variation of our write-to method
+28:18 that writes to the outputSpan instead of a Data instance.
+28:27 Let's take a look at that method's implementation.
+28:32 The write(to:) method is able to call OutputSpan's append method
+28:35 for each channel in the pixel.
+28:37 Since OutputSpan is a non-escapable type that is designed for this kind of use,
+28:42 this is both simpler and more efficient than writing into the `Data` instance,
+28:46 and safer than dropping down to an unsafe buffer pointer.
+28:50 With those changes finished, I’ll jump back to my test.
+28:53 and record a new profile.
+29:02 I'll filter on QOI.init.
+29:06 And in the flame graph we can see that those swift_retain
+29:09 and swift_release blocks are gone!
+29:11 That actually looks great.
+29:13 Let's stop there and see the results of adopting InlineArray and RawSpan.
+29:18 With these latest changes,
+29:20 our memory management work has made our parsing six times as fast,
+29:23 without resorting to any unsafe code.
+29:26 That's 16 times faster than we were after getting rid of the quadratic algorithm,
+29:30 and over 700 times faster than what we started with!
+29:34 We've covered a lot in this session.
+29:36 While revising this image parsing library, we made two algorithmic changes
+29:40 to operate more efficiently and to reduce allocations.
+29:43 We used new standard library types, InlineArray and RawSpan,
+29:47 to eliminate runtime memory management,
+29:49 and learned about the new non-escapable language feature.
+29:53 The new Swift Binary Parsing library is built on top of these same features.
+29:57 The library is designed for building safe, efficient parsers of binary formats,
+30:02 and supports developers in handling multiple different kinds of safety.
+30:06 The library provides a whole set of parsing initializers and other tools
+30:10 that guide you to safely consume values from raw, binary data.
+30:15 Here’s an example of a parser for the QOI header,
+30:19 written using the new library.
+30:21 This shows several of its features, including ParserSpan,
+30:25 a customized raw span type for parsing binary data.
+30:28 And parsing initializers that prevent integer overflow
+30:31 and let you specify signedness, bit width, and byte order.
+30:36 The library also provides validating parsers
+30:38 for your own custom raw-representable types,
+30:41 and optional-producing operators, for safely making calculations
+30:45 with untrusted, newly parsed values.
+30:48 We're already using the Binary Parsing library inside Apple,
+30:52 and it's publicly available today!
+30:54 We encourage you to take a look and try it out.
+30:57 You can join the community by posting in the Swift forums or opening issues
+31:01 or pull requests on GitHub.
+31:04 Thanks so much for joining me on this journey
+31:06 through optimizing our Swift code!
+31:08 Try using Xcode and Instruments to profile a test
+31:11 of the performance-critical parts of your own app.
+31:14 You can explore the new InlineArray and Span types in the documentation,
+31:18 or by downloading the new version of Xcode.
+31:21 Have a great WWDC!

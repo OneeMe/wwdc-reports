@@ -113,7 +113,43 @@ node ./bin/wwdc-reports.js topics --year 2025 --data-root legacy/data --raw-data
 node ./bin/wwdc-reports.js transcripts --year 2025 --raw-data legacy/data/raw/raw_data.json --out-dir transcripts-en
 ```
 
-## Data layout
+## Published dataset (jsDelivr CDN)
+
+This repository also publishes the latest crawl output under `data/` so any
+client can fetch it without running the CLI. A daily GitHub Action
+(`.github/workflows/refresh-data.yml`) re-crawls every year already present
+under `data/` and commits any diff. jsDelivr mirrors the public repository,
+so the stable URLs are:
+
+```text
+# Catalog of every published year (schemaVersion, sessionCount, locales, …)
+https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/index.json
+
+# Per-year session metadata (title, description, topics, webPermalink, …)
+https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/wwdc25/raw_data.json
+
+# Transcript manifest (per-session status, line count, source URL)
+https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/wwdc25/transcripts-en/_manifest.json
+
+# Single session transcript (timestamped lines, `MM:SS text` per line)
+https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/wwdc25/transcripts-en/238.txt
+```
+
+jsDelivr caches each path for ~12 hours by default. Pin a specific commit
+SHA instead of `@main` when you need byte-stable output for archival.
+
+## Open the dataset for a new year
+
+```sh
+# Bootstrap an empty year directory, then crawl into it once.
+mkdir -p data/wwdc26
+node ./bin/wwdc-reports.js crawl --year 2026 --locale en --out-dir data/wwdc26
+node scripts/build-index.mjs
+git add data/wwdc26 data/index.json && git commit -m "feat(data): add WWDC26"
+```
+
+After the first manual commit, the daily Action will keep that year up to
+date until you remove the directory.
 
 The main archive command writes into the current directory by default. Optional generated data can live under yearly workspaces:
 
