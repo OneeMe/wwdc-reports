@@ -53,7 +53,23 @@ Published at `https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/`.
       "description": "assistive access is a distinctive...",
       "webPermalink": "https://developer.apple.com/videos/play/wwdc2025/238/",
       "primaryTopicID": "accessibility-inclusion",
-      "topicIds": ["accessibility-inclusion"]
+      "topicIds": ["accessibility-inclusion"],
+      "resources": [
+        {
+          "type": "document",
+          "title": "AssistiveAccess",
+          "url": "https://developer.apple.com/documentation/SwiftUI/AssistiveAccess"
+        }
+      ],
+      "codeSnippets": [
+        {
+          "title": "Create a scene for Assistive Access",
+          "seconds": 321,
+          "timestamp": "5:21",
+          "url": "https://developer.apple.com/videos/play/wwdc2025/238/?time=321",
+          "code": "import SwiftUI"
+        }
+      ]
     }
   }
 }
@@ -70,6 +86,26 @@ Published at `https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/`.
 | `webPermalink` | string | Apple Developer video page URL |
 | `primaryTopicID` | string | Main topic ID |
 | `topicIds` | string[] | All related topic IDs |
+| `resources` | object[] | Optional Resources links from the Apple session page |
+| `codeSnippets` | object[] | Optional Code tab snippets from the Apple session page |
+
+### Resource fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Apple page class/category, e.g. `document`, `download`, `guide` |
+| `title` | string | Link label |
+| `url` | string | Absolute URL |
+
+### Code snippet fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | string | Snippet label from the Code tab |
+| `seconds` | number | Video timestamp in seconds |
+| `timestamp` | string | Display timestamp |
+| `url` | string | Apple video URL with `?time=` |
+| `code` | string | Raw code text |
 
 ## Transcript file
 

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { writeJson } from './fs-utils.js';
 import { rawDataFromCollectionHtml } from './html-metadata.js';
+import { sessionSupplementMetadataFromHtml } from './session-metadata.js';
 
 export async function fetchHtml(url, options = {}) {
   const response = await fetch(url, {
@@ -19,7 +20,40 @@ export async function fetchHtml(url, options = {}) {
 
 export async function fetchRawData(config, options = {}) {
   const url = options.htmlUrl ?? config.collectionUrl;
-  return rawDataFromCollectionHtml(await fetchHtml(url, options), config);
+  const data = rawDataFromCollectionHtml(await fetchHtml(url, options), config);
+  if (options.enrichSessionDetails === false) return data;
+  return enrichRawDataWithSessionDetails(data, options);
+}
+
+async function enrichOneSession(video, options) {
+  const pageUrl = String(video?.webPermalink ?? '').trim();
+  if (!pageUrl) return;
+
+  try {
+    const html = await fetchHtml(pageUrl, options);
+    const metadata = sessionSupplementMetadataFromHtml(html, { pageUrl });
+    if (metadata.resources.length > 0) video.resources = metadata.resources;
+    if (metadata.codeSnippets.length > 0) video.codeSnippets = metadata.codeSnippets;
+  } catch (error) {
+    video.supplementFetchError = error.message;
+  }
+}
+
+export async function enrichRawDataWithSessionDetails(rawData, options = {}) {
+  const videos = Object.values(rawData?.videos ?? {});
+  const concurrency = Math.max(1, Math.floor(Number(options.detailConcurrency ?? options.concurrency ?? 4) || 4));
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < videos.length) {
+      const video = videos[nextIndex];
+      nextIndex += 1;
+      await enrichOneSession(video, options);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, videos.length) }, () => worker()));
+  return rawData;
 }
 
 export async function ingestRawData(config, options = {}) {

@@ -1,13 +1,13 @@
 # WWDC Reports
 
-A no-key Node.js script for archiving each year's public WWDC raw metadata and video transcripts into the current directory.
+A no-key Node.js script for archiving each year's public WWDC raw metadata, session resources, code snippets, and video transcripts into the current directory.
 
-The project is a small dependency-free CLI. Its primary job is to fetch public Apple Developer WWDC raw materials and archive them locally: a stable `raw_data.json`, timestamped metadata snapshots, and per-session transcript text files. Existing Python scripts, prompts, reports, and historical data snapshots live under `legacy/` as references, not compatibility targets for the new implementation.
+The project is a small dependency-free CLI. Its primary job is to fetch public Apple Developer WWDC raw materials and archive them locally: a stable `raw_data.json`, timestamped metadata snapshots, per-session resource/code metadata, and per-session transcript text files. Existing Python scripts, prompts, reports, and historical data snapshots live under `legacy/` as references, not compatibility targets for the new implementation.
 
 ## Goals
 
 - **No API keys by default**: the core workflow uses public Apple Developer URLs and local files only.
-- **Crawl-first**: `crawl` fetches metadata from the public video collection page and writes transcript text files locally in one step.
+- **Crawl-first**: `crawl` fetches metadata from the public video collection page, enriches sessions from their detail pages, and writes transcript text files locally in one step.
 - **Open-source friendly**: code, templates, docs, and tiny synthetic fixtures can be published without bundling full Apple transcripts or private credentials.
 - **Local-first**: generated Markdown is written locally. No transcript or metadata is uploaded to third-party services by the core CLI.
 
@@ -49,6 +49,16 @@ The one-command crawl writes:
 ./transcripts-en/<session-code>.txt
 ./transcripts-en/_manifest.json
 ```
+
+`raw_data.json` starts with the public collection cards, then enriches each
+session from its Apple Developer video page. When available, a video entry now
+includes:
+
+- `resources`: top-level Resources links from the session page, such as docs,
+  sample-code pages, GitHub repositories, or demo/project links. HD/SD video
+  downloads are excluded.
+- `codeSnippets`: the time-linked snippets from the page's Code tab, including
+  title, timestamp, URL, and raw code text.
 
 Use `--out-dir` if you want a different output directory:
 
@@ -125,7 +135,7 @@ so the stable URLs are:
 # Catalog of every published year (schemaVersion, sessionCount, locales, …)
 https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/index.json
 
-# Per-year session metadata (title, description, topics, webPermalink, …)
+# Per-year session metadata (title, description, topics, webPermalink, resources, codeSnippets, …)
 https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/wwdc25/raw_data.json
 
 # Transcript manifest (per-session status, line count, source URL)

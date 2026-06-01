@@ -70,7 +70,16 @@ describe('cli', () => {
   it('runs crawl as one command: fetch metadata then crawl transcripts', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-cli-crawl-'));
     const io = makeIo();
-    const html = '<section id="transcript-content"><span data-start="7">Hello WWDC</span></section>';
+    const sessionHtml = `
+      <h2>Resources</h2>
+      <ul class="links small">
+        <li class="download"><a href="https://github.com/apple/swift">Swift</a></li>
+      </ul>
+      <section id="transcript-content"><span data-start="7">Hello WWDC</span></section>
+      <li class="sample-code-main-container">
+        <p>0:08 - <a class="jump-to-time-sample" href="/videos/play/wwdc2026/101/?time=8" data-start-time="8">Create a value</a></p>
+        <pre class="code-source"><code><span class="syntax-keyword">let</span> greeting = <span class="syntax-string">&quot;Hello&quot;</span></code></pre>
+      </li>`;
 
     const collectionHtml = `
       <a href="/videos/play/wwdc2026/101/" class="vc-card">
@@ -94,15 +103,30 @@ describe('cli', () => {
         ok: true,
         status: 200,
         statusText: 'OK',
-        text: async () => html
+        text: async () => sessionHtml
       };
     }, async (calls) => {
       assert.equal(await main(['crawl', '--year', '2026', '--locale', 'en', '--out-dir', tmp, '--limit', '1'], io), 0);
+      assert.equal(calls.length, 3);
       assert.equal(calls[0].url, 'https://developer.apple.com/videos/wwdc2026/');
       assert.equal(calls[1].url, 'https://developer.apple.com/videos/play/wwdc2026/101/');
+      assert.equal(calls[2].url, 'https://developer.apple.com/videos/play/wwdc2026/101/');
       assert.equal('authorization' in calls[0].options.headers, false);
       assert.equal('cookie' in calls[1].options.headers, false);
       assert.equal(await pathExists(path.join(tmp, 'raw_data.json')), true);
+      const archived = await readJson(path.join(tmp, 'raw_data.json'));
+      assert.deepEqual(archived.videos['wwdc2026-101'].resources, [
+        { type: 'download', title: 'Swift', url: 'https://github.com/apple/swift' }
+      ]);
+      assert.deepEqual(archived.videos['wwdc2026-101'].codeSnippets, [
+        {
+          title: 'Create a value',
+          seconds: 8,
+          timestamp: '0:08',
+          url: 'https://developer.apple.com/videos/play/wwdc2026/101/?time=8',
+          code: 'let greeting = "Hello"'
+        }
+      ]);
       assert.equal(await fs.readFile(path.join(tmp, 'transcripts-en', '101.txt'), 'utf8'), '00:07 Hello WWDC\n');
       assert.equal(await pathExists(path.join(tmp, 'transcripts-en', '_manifest.json')), true);
       const manifest = await readJson(path.join(tmp, 'transcripts-en', '_manifest.json'));

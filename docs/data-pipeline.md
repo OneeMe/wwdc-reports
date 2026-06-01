@@ -1,6 +1,6 @@
 # Raw Archive Workflow
 
-The Node.js rewrite treats existing Python scripts as legacy references and defines a new no-key raw archive workflow. The primary command is `crawl`, which fetches public WWDC metadata and then crawls per-session transcript text in one local run. `archive` and `transcripts` remain manual sub-steps. Everything else is a local helper for inspecting or materializing already archived data.
+The Node.js rewrite treats existing Python scripts as legacy references and defines a new no-key raw archive workflow. The primary command is `crawl`, which fetches public WWDC metadata, enriches each session with public resources/code snippets, and then crawls per-session transcript text in one local run. `archive` and `transcripts` remain manual sub-steps. Everything else is a local helper for inspecting or materializing already archived data.
 
 ## Primary workflow
 
@@ -13,13 +13,16 @@ node ./bin/wwdc-reports.js crawl --year 2025 --locale en
 This command:
 
 1. Fetches public Apple Developer video collection HTML from `https://developer.apple.com/videos/<eventId>/` and derives a minimal raw metadata archive from the public cards.
-2. Writes both:
+2. Fetches each public Apple Developer video page and enriches the matching `videos` entry with:
+   - `resources` from the page's top-level Resources list, excluding HD/SD video downloads.
+   - `codeSnippets` from the page's Code tab, including time, URL, title, and code text.
+3. Writes both:
    - `./raw_data.json` as the stable latest archive.
    - `./raw_data_<eventShort>_<locale>_<timestamp>.json` as an immutable snapshot.
-3. Fetches each public Apple Developer video page, preferring the metadata `webPermalink` when available.
-4. Extracts `<section id="transcript-content">` from static HTML.
-5. Writes one raw transcript text file per session under `./transcripts-<locale>/` by default.
-6. Writes `./transcripts-<locale>/_manifest.json`, including every attempted session and whether it was `written`, `skipped`, `missing`, or `failed`.
+4. Fetches each public Apple Developer video page, preferring the metadata `webPermalink` when available.
+5. Extracts `<section id="transcript-content">` from static HTML.
+6. Writes one raw transcript text file per session under `./transcripts-<locale>/` by default.
+7. Writes `./transcripts-<locale>/_manifest.json`, including every attempted session and whether it was `written`, `skipped`, `missing`, or `failed`.
 
 For WWDC25, this shortcut is equivalent to `crawl --year 2025 --locale en`:
 
@@ -34,7 +37,7 @@ The older Apple JSON service URL can still be used with `--source json`, but it 
 ## Manual metadata archive workflow
 
 1. Run `archive` from the directory where you want the raw metadata stored.
-2. The CLI fetches public Apple Developer metadata from `https://developer.apple.com/<eventShort>/services/data/?locale=<locale>`.
+2. The CLI fetches public Apple Developer metadata from the public video collection page, then enriches each session from its Apple Developer video page.
 3. The CLI writes both:
    - `./raw_data.json` as the stable latest archive.
    - `./raw_data_<eventShort>_<locale>_<timestamp>.json` as an immutable snapshot.
@@ -68,7 +71,7 @@ Existing non-empty transcript files are skipped unless `--force` is passed. Sess
 
 2. `ingest`
    - Alias for `archive` kept as a secondary command name.
-   - Writes `raw_data.json` and a timestamped snapshot to `--out-dir` or the current directory.
+   - Writes enriched `raw_data.json` and a timestamped snapshot to `--out-dir` or the current directory.
 
 3. `transcripts`
    - Reads `raw_data.json`.

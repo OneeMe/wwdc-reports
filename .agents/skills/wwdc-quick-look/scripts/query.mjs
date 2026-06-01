@@ -9,10 +9,12 @@
  *   node query.mjs filter-topic --year 2025 --topic "Swift"
  *   node query.mjs search --year 2025 --keyword "privacy"
  *   node query.mjs show-session --year 2025 --code 238
+ *   node query.mjs resources --year 2025 --code 238
+ *   node query.mjs code --year 2025 --code 238 [--limit 3]
  *   node query.mjs transcript --year 2025 --code 238 [--limit 20]
  */
 
-const BASE = 'https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data';
+const BASE = process.env.WWDC_QUICK_LOOK_BASE_URL ?? 'https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data';
 
 async function fetchJson(url) {
   const r = await fetch(url);
@@ -56,6 +58,61 @@ function formatSessionTable(videos, topics, maxDesc = 120) {
 
 function escapeMd(text) {
   return String(text ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
+}
+
+function videosArray(data) {
+  return Object.values(data.videos ?? {});
+}
+
+function findVideo(data, code) {
+  return videosArray(data).find((v) => v.eventContentId === String(code));
+}
+
+function sessionSearchText(video) {
+  const resources = (video.resources ?? [])
+    .flatMap((resource) => [resource.type, resource.title, resource.url]);
+  const codeSnippets = (video.codeSnippets ?? [])
+    .flatMap((snippet) => [snippet.title, snippet.code]);
+  return [
+    video.title,
+    video.description,
+    ...resources,
+    ...codeSnippets
+  ].join('\n').toLowerCase();
+}
+
+function codeLanguage(code) {
+  const text = String(code ?? '');
+  if (/\b(import\s+SwiftUI|import\s+UIKit|struct\s+\w+\s*:\s*View|func\s+\w+)/.test(text)) return 'swift';
+  if (/^\s*(container|xcrun|swift|git|curl|npm|node)\b/m.test(text)) return 'sh';
+  return '';
+}
+
+function formatResourceList(resources) {
+  if (!resources || resources.length === 0) return 'No session resources available.\n';
+  let out = '| Type | Title | URL |\n';
+  out += '|------|-------|-----|\n';
+  for (const resource of resources) {
+    out += `| ${escapeMd(resource.type ?? '')} | ${escapeMd(resource.title ?? '')} | ${escapeMd(resource.url ?? '')} |\n`;
+  }
+  return out;
+}
+
+function formatCodeSnippets(snippets, limit) {
+  const items = (snippets ?? []).slice(0, limit ? Number(limit) : undefined);
+  if (items.length === 0) return 'No code snippets available.\n';
+
+  let out = '';
+  for (const snippet of items) {
+    const title = [snippet.timestamp, snippet.title].filter(Boolean).join(' - ');
+    out += `### ${title}\n\n`;
+    if (snippet.url) out += `[Open at timestamp](${snippet.url})\n\n`;
+    out += `\`\`\`${codeLanguage(snippet.code)}\n${snippet.code ?? ''}\n\`\`\`\n\n`;
+  }
+  if (limit && (snippets ?? []).length > Number(limit)) {
+    out += `*...${snippets.length - Number(limit)} more snippet(s). Use without --limit for all snippets.*\n`;
+  }
+  return out;
 }
 
 // ---- commands ----
@@ -120,13 +177,9 @@ async function cmdFilterTopic({ year, topic }) {
 async function cmdSearch({ year, keyword }) {
   const data = await loadYearData(year);
   const topics = data.topics ?? {};
-  const videos = Object.values(data.videos ?? {});
+  const videos = videosArray(data);
   const kw = keyword.toLowerCase();
-  const matched = videos.filter(
-    (v) =>
-      (v.title ?? '').toLowerCase().includes(kw) ||
-      (v.description ?? '').toLowerCase().includes(kw)
-  );
+  const matched = videos.filter((v) => sessionSearchText(v).includes(kw));
 
   let out = `## Sessions matching "${keyword}" (${matched.length})\n\n`;
   out += formatSessionTable(matched, topics);
@@ -135,19 +188,55 @@ async function cmdSearch({ year, keyword }) {
 
 async function cmdShowSession({ year, code }) {
   const data = await loadYearData(year);
-  const video = Object.values(data.videos ?? {}).find(
-    (v) => v.eventContentId === String(code)
-  );
+  const video = findVideo(data, code);
   if (!video) return `Session ${code} not found in WWDC${String(year).slice(-2)}.`;
 
   const topics = data.topics ?? {};
   const topicNames = (video.topicIds ?? []).map((id) => topics[id]?.title ?? id);
+  const resources = video.resources ?? [];
+  const codeSnippets = video.codeSnippets ?? [];
 
   let out = `## ${video.title}\n\n`;
   out += `- **Code:** ${video.eventContentId}\n`;
   out += `- **Topics:** ${topicNames.join(', ')}\n`;
   out += `- **Link:** ${video.webPermalink}\n`;
+  out += `- **Resources:** ${resources.length}\n`;
+  out += `- **Code snippets:** ${codeSnippets.length}\n`;
   out += `\n${video.description ?? ''}\n`;
+  if (resources.length > 0) {
+    out += `\n### Resources (${resources.length})\n\n`;
+    out += formatResourceList(resources);
+  }
+  if (codeSnippets.length > 0) {
+    out += `\n### Code snippets (${codeSnippets.length})\n\n`;
+    for (const snippet of codeSnippets.slice(0, 5)) {
+      out += `- ${snippet.timestamp ? `${snippet.timestamp} - ` : ''}${snippet.title ?? 'Untitled'}${snippet.url ? ` (${snippet.url})` : ''}\n`;
+    }
+    if (codeSnippets.length > 5) out += `- ...${codeSnippets.length - 5} more snippet(s)\n`;
+  }
+  return out;
+}
+
+async function cmdResources({ year, code }) {
+  const data = await loadYearData(year);
+  const video = findVideo(data, code);
+  if (!video) return `Session ${code} not found in WWDC${String(year).slice(-2)}.`;
+
+  const resources = video.resources ?? [];
+  let out = `## Resources for ${code} (${resources.length})\n\n`;
+  out += formatResourceList(resources);
+  return out;
+}
+
+async function cmdCode({ year, code, limit }) {
+  const data = await loadYearData(year);
+  const video = findVideo(data, code);
+  if (!video) return `Session ${code} not found in WWDC${String(year).slice(-2)}.`;
+
+  const snippets = video.codeSnippets ?? [];
+  const shown = limit ? Math.min(Number(limit), snippets.length) : snippets.length;
+  let out = `## Code snippets for ${code} (${shown}/${snippets.length})\n\n`;
+  out += formatCodeSnippets(snippets, limit);
   return out;
 }
 
@@ -212,6 +301,15 @@ async function main() {
       break;
     case 'show-session':
       result = await cmdShowSession({ year: args.year, code: args.code });
+      break;
+    case 'resources':
+    case 'session-resources':
+      result = await cmdResources({ year: args.year, code: args.code });
+      break;
+    case 'code':
+    case 'sample-code':
+    case 'code-snippets':
+      result = await cmdCode({ year: args.year, code: args.code, limit: args.limit });
       break;
     case 'transcript':
       result = await cmdTranscript({ year: args.year, code: args.code, limit: args.limit });
