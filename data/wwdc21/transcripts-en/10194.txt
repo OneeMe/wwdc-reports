@@ -1,0 +1,951 @@
+00:01 ♪ Bass music playing ♪
+00:07 ♪
+00:09 Ben Cohen: Hi, I'm Ben from the Swift team,
+00:11 and in this video,
+00:12 I'm going to walk through porting an existing application
+00:15 over to use Swift's new concurrency features.
+00:19 We'll see how these new features
+00:20 help you write clearer asynchronous code,
+00:23 and protect against possible race conditions,
+00:26 as well as look at some techniques
+00:27 for gradually moving your code to this new way of operating.
+00:34 I'm going to be using an app called Coffee Tracker,
+00:36 and it's based on a talk from WWDC 2020
+00:39 about creating and updating watch complications.
+00:43 This is a simple app that lets you track
+00:45 all the coffee you've drunk today,
+00:47 as well as a complication to show your current caffeine level
+00:49 on a watch face.
+00:52 It's a nice example to use for our purposes
+00:54 because although it's a small app,
+00:57 it shows lots of different things we want to think about,
+00:59 including how concurrency works with SwiftUI,
+01:02 delegate callbacks from the watch SDK, some I/O,
+01:05 and interfacing with asynchronous APIs
+01:08 in Apple's SDK.
+01:10 Now let's take a quick tour of the app.
+01:12 It's roughly broken up into three layers.
+01:15 First, there's the UI layer.
+01:18 This is mostly SwiftUI views,
+01:21 but in this we can also consider things
+01:22 like the complication data source as part of the UI layer.
+01:27 Next there's the model layer
+01:28 that comprises a couple of simple value types
+01:30 to represent caffeine drinks,
+01:32 as well as a model type called "Coffee model."
+01:36 Now, this is what you might call the UI Model.
+01:39 That is, the place where you hold data for display
+01:42 by the UI layer.
+01:44 It's an observable object that feeds our SwiftUI view,
+01:47 and all of the updates on it
+01:49 will need to be made on the main thread.
+01:52 I'm referring to it as a UI model
+01:54 because it might not be the full model
+01:56 of all of your application's data.
+01:59 It might just be a projection of your data model
+02:02 or a subset of it;
+02:03 just what you need to display on the UI at this moment.
+02:08 Finally, we have what you can think of as the back-end layer:
+02:12 processing that happens -- probably in the background --
+02:15 to populate your model or talk to the world outside your app.
+02:20 In our case, that's represented by this HealthKitController type
+02:24 that manages communication to HealthKit
+02:26 to save and load the user's caffeine intake.
+02:31 Now, before we start looking at code,
+02:33 let's talk about how concurrency is managed in the app.
+02:37 This architecture looks fairly clean,
+02:39 but when we layer on how concurrency is handled,
+02:42 we get a much messier picture.
+02:46 This app is essentially broken up into three concurrent queues
+02:50 on which code can be executing.
+02:53 Work in the UI and on the model is done in the main queue.
+02:57 The app also has a dispatch queue
+02:59 for doing work in the background.
+03:02 And finally, certain callbacks into completion handlers --
+03:05 like those returning results from HealthKit --
+03:07 are done on arbitrary queues.
+03:10 This is a pretty common situation.
+03:13 What seems like a simple application architecture
+03:15 ignores a lot of the hidden complexity
+03:17 in how it handles concurrency.
+03:21 Now, for a quick spoiler.
+03:23 In adopting Swift concurrency,
+03:25 we're going to go from this ad hoc concurrency architecture
+03:29 to something that will look like this.
+03:32 We're going to put our UI views and model on what's called
+03:35 the main actor.
+03:37 We're going to create new actors to operate in the background,
+03:41 and these types will pass thread-safe values
+03:43 between each other using the async/await feature.
+03:47 When we're done, the concurrency architecture
+03:50 should be as clear and easy to describe
+03:52 as the type architecture.
+03:55 Now we've used a few terms here you might not be familiar with,
+03:58 like "async/await" and "actors,"
+04:00 and we'll explain them briefly as we use them in code.
+04:04 But for a more in-depth explanation of these features,
+04:07 there are several other talks available
+04:08 that go into much more detail.
+04:12 So now we've seen the overall architecture,
+04:15 let's dive into the code.
+04:19 Here we have the different files.
+04:21 First, of some Swift UI views.
+04:24 And then we have our watch complication controller's
+04:26 extension delegate.
+04:30 We have the simple model type that represents a caffeine drink
+04:34 and a CoffeeData UI model that holds an array of these drinks.
+04:39 And finally, we have the HealthKitController.
+04:42 And it's in this layer I'm going to get started
+04:45 introducing some of Swift's new concurrency features
+04:48 into our app.
+04:51 The HealthKitController contains a few different calls
+04:53 into the HealthKit SDK that take completion handlers.
+04:58 Let's start by looking at this controller's save operation.
+05:01 So I just hit Control-6,
+05:02 and that brings up the list of functions in this file,
+05:05 and we're going to go to the save operation.
+05:09 Now, before we even get into the new concurrency features,
+05:12 let's talk a little bit about thread safety in Swift today.
+05:17 This code accesses some variables,
+05:19 isAvailable and store.
+05:22 Now, it looks like we're only reading these variables
+05:25 in this function.
+05:26 Is that safe?
+05:28 Well no, not if other code could be writing to them
+05:31 at the same time.
+05:32 To know whether or not this code is thread-safe,
+05:34 I need more information than just looking at this function.
+05:38 There's no use of dispatch queues or locks in it,
+05:40 so whatever makes this code thread-safe --
+05:42 assuming it is -- must be elsewhere.
+05:46 Maybe the caller serializes all calls to save
+05:48 through a queue.
+05:50 Or maybe the app is constructed in some way that means it's OK.
+05:53 But I can't know this just by looking at this function.
+05:58 Being able to do that --
+06:00 to look at this function and know certain things
+06:02 without having to go look at other parts of my program --
+06:06 is what we call local reasoning,
+06:08 and it's a really important goal for Swift.
+06:12 For example, Swift's emphasis on value types
+06:14 is about local reasoning.
+06:16 Unlike a reference type,
+06:18 you don't have to worry that a value type you've been passed
+06:21 is being mutated elsewhere in your program.
+06:24 A lot of the language features
+06:26 being introduced for concurrency in Swift 5.5
+06:30 are about giving you more opportunity
+06:32 to reason locally about your code.
+06:35 Now, as it happens,
+06:36 this function is entirely thread-safe,
+06:38 but I figured that out myself;
+06:40 the compiler isn't helping me spot these issues.
+06:43 So down here, we have a call to the HealthKit SDK
+06:47 to save a caffeineSample into the user's health data.
+06:51 And this takes a completion handler,
+06:52 and that completion handler takes two values:
+06:54 success or error.
+06:57 If the operation succeeds, there's no error;
+07:00 the error will be nil.
+07:01 This means we need to remember to check the status and then,
+07:05 when appropriate, unwrap the optional error down here.
+07:10 Now, this isn't normally how we handle errors in Swift.
+07:13 This would be much better
+07:15 as a method that can throw on failure.
+07:18 But that approach doesn't work with completion handlers.
+07:22 But now, with async methods,
+07:24 we can have asynchronous functions that can throw.
+07:29 This HealthKit save method now has an async equivalent
+07:34 that does exactly that,
+07:35 so let's switch over to using it.
+07:38 To do that, first we remove the completion handler,
+07:43 and we write "await" in front of the method call.
+07:51 This reminds us that it's an async function call,
+07:54 and the code will suspend at this point
+07:57 and allow other code to run.
+07:59 We'll come back to why this is important a little bit later.
+08:03 So if we compile, now that we've done this,
+08:07 we see that the compiler is telling us that we need a "try."
+08:12 And this is a big benefit of async functions;
+08:14 they can throw.
+08:16 There's no more having to remember
+08:17 to check an optional error.
+08:22 So we can add a "try" in front of this method call,
+08:27 and we want to handle the error right away.
+08:30 So we wrap this call in a do block...
+08:38 and then catch the error.
+08:45 We can remove this guard.
+08:47 And now that we're catching the error,
+08:50 it's no longer optional, so we can remove the unwrap.
+08:57 This also means we can rearrange our code
+09:02 to keep the happy path at the top
+09:05 so we can move the success logging line
+09:07 up right underneath the save
+09:11 and then just handle the error logging in the cache.
+09:16 Notice that save no longer returns a value.
+09:19 Returning success/failure was really duplicative
+09:22 with the error,
+09:23 so our new function only either throws
+09:26 or it's succeeded.
+09:32 Now that we've added the try-catch,
+09:34 we're getting one more error from the compiler.
+09:37 We're calling an asynchronous function,
+09:40 but we're calling it from within a synchronous function.
+09:44 This does not work.
+09:46 Asynchronous functions have a capability
+09:48 that synchronous functions don't have:
+09:50 the ability to give up control of the thread they're running on
+09:54 while they await.
+09:57 To do this,
+09:58 they have a separate way of handling their stack frame,
+10:00 and this isn't compatible with synchronous functions.
+10:04 So one option is to make this function async instead.
+10:12 So we can just add the async keyword
+10:15 after the function definition.
+10:17 And now, this file compiles.
+10:21 But the whole project doesn't compile yet.
+10:24 Making this function async has pushed the problem up a level
+10:28 to where it's being called.
+10:34 Here in my data model,
+10:35 I'm now getting that same compiler error
+10:37 because this function isn't async.
+10:40 Now I could keep going up the chain, but for now,
+10:43 let's see another technique to keep the changes localized.
+10:48 To call my async function,
+10:50 I'm going to spin off a new asynchronous task
+10:54 which will be allowed to call async functions.
+11:04 This async task is very similar to calling async
+11:07 on the global dispatch queue.
+11:09 You can't return a value back from it to the outer function
+11:13 because the block executes concurrently.
+11:16 So whatever you do with the detached closure
+11:19 needs to be self-contained.
+11:21 In this case, we're just calling save,
+11:24 which doesn't return a value, so that's fine.
+11:28 You also need to be careful that you're not touching
+11:31 global state that might get mutated simultaneously
+11:34 from other threads.
+11:36 And this is where it was relevant
+11:37 that save was completely thread-safe,
+11:40 otherwise we might be accidentally introducing
+11:43 new race conditions by adding this new task.
+11:50 Now that we've put it inside an async task,
+11:52 our awaited function compiles,
+11:55 and we've finished our first use of async/await in this app,
+11:58 we could run it right now.
+12:04 Let's do another one of those refactors
+12:07 and this time, look at some other techniques
+12:10 when migrating to async.
+12:13 So let's have a look at the call to request authorization
+12:19 of access to the user's health data.
+12:25 This similarly calls HealthKit with a completion handler.
+12:29 But unlike before, this function takes, itself,
+12:32 a completion handler.
+12:35 What I'm going to do is I'm going to create
+12:37 a second version of the function to become async
+12:39 while keeping the completion handler version.
+12:42 That way other parts of our code
+12:44 that call it with a completion handler
+12:46 can keep on working while we refactor.
+12:51 I can do this easily by using the "Create Async Alternative"
+12:54 refactoring action.
+12:56 That's available in the Code Action menu --
+12:58 which I can bring up with Command-Shift-A --
+13:02 and choose the option to add the async alternative.
+13:12 So this has added a second async version
+13:15 of the original call.
+13:20 And it's replaced the original completion handler code
+13:24 with code that creates a new async task...
+13:30 ...and then just awaits the async version of the function.
+13:37 Notice that the async refactoring
+13:40 has added a deprecation warning to the original one.
+13:45 These are going to help guide me to parts of my code
+13:48 that could next benefit from refactoring
+13:50 to call this new async version.
+13:53 Let's undo and go back for a moment
+13:55 to that original completion handler version.
+13:59 Inside this requestAuthorization callback,
+14:04 this callback can happen on an arbitrary thread.
+14:08 So you need to know that the code inside it is thread-safe.
+14:14 But I don't think it is.
+14:19 This assignment here might happen simultaneously
+14:23 with other code reading this value on other threads.
+14:27 And there's another example of a lack of local reasoning
+14:29 in this code.
+14:31 After that assignment, this completion handler is called,
+14:36 and I have no idea whether the code
+14:37 inside that completion handler is thread-safe.
+14:41 I'd have to go and look
+14:43 at all of the call sites to this function
+14:45 to look at how their completion handlers are written
+14:48 to know that this is OK.
+14:52 Now, let's redo again and see the refactored version.
+14:58 Now remember,
+15:01 an async task also runs on an arbitrary thread
+15:04 similar to a dispatch callback.
+15:07 So this forwarding version has similar problems
+15:10 to the completion handler version we had before.
+15:14 We haven't made our code any safer quite yet.
+15:18 We'll fix this soon
+15:19 by introducing actors into our code.
+15:21 But for now, we should note
+15:22 that just because we've converted this function to async
+15:25 does not mean we're free from race conditions.
+15:28 In fact, you should be aware of the risk of introducing
+15:30 new race conditions into your code
+15:32 if you only perform refactoring to introduce async functions.
+15:36 Now let's look at this new async function.
+15:40 The refactoring action has already converted
+15:43 the call with a completion handler here
+15:46 to call the new async version of this SDK API.
+15:52 But converting this function to async
+15:54 has highlighted something interesting.
+15:58 Here, when we were using the completion handler technique,
+16:01 we had a return without calling the completion handler.
+16:05 And this was probably a bug.
+16:08 The caller would have been left hanging.
+16:11 But with async functions, you must return a value,
+16:15 so now we're getting a compilation error,
+16:19 which we can resolve just by returning false for failure.
+16:26 And just like before,
+16:29 this new async version of requestAuthorization
+16:32 doesn't actually return a value,
+16:37 it either succeeds or it throws.
+16:43 So we just need to delete this return value.
+16:52 And instead on this path,
+16:55 we need to assume that it succeeded...
+17:01 ...and on the failure path, we need to return false.
+17:11 If I try and compile now,
+17:15 the project compiles because the old code elsewhere
+17:20 can still continue to call the completion handler version
+17:23 and we're now seeing these deprecation warnings
+17:26 when we're doing that, which can lead us
+17:27 to a next place that we might want to refactor.
+17:31 OK, let's do one more async conversion.
+17:35 Let's find the function to load data from HealthKit.
+17:42 We'll start -- just like before --
+17:44 by creating a stub for the old code to call.
+18:24 Then moving to the async version,
+18:28 incidentally, this one takes an optional completion handler
+18:33 the async equivalent of this
+18:35 would be to make this function have a discardable result.
+18:55 So next, we start moving down, replacing any use
+18:59 of the completion handler with returns.
+19:02 So for example, we can delete this completion handler
+19:04 and just return false.
+19:08 But once we move a little further,
+19:11 we start to hit a snag,
+19:13 and it has to do with how the HealthKit query API is arranged.
+19:19 Here, there's a completion handler
+19:22 but it's on this query object; whereas really,
+19:28 what I want to await is the execution of the query
+19:32 all the way down here at the bottom of the function.
+19:36 Incidentally, this hopping up and down around the function
+19:40 is another thing that async/await
+19:42 is great at helping resolve.
+19:44 So what I want to do is create a single async function
+19:48 that both creates the query and then executes it.
+19:53 We're going to do that now
+19:55 using a technique called a continuation.
+19:58 So I'm to go back up to the top of this function
+20:01 and I'm going to create a helper function
+20:03 called "queryHealthKit."
+20:08 I could do all of this work inside the existing function
+20:12 but it might get a little bit messy,
+20:14 so I like to keep it separate in a helper function.
+20:17 This function will be async, so we can await it,
+20:21 and it will throw because the query operation can fail.
+20:26 And this function is going to return the useful values here
+20:31 that are currently being passed into
+20:34 the completion handler on the query.
+20:38 So I'm going to take the logic for performing the query,
+20:42 cut it, and move it into the helper function.
+20:47 And I'm also going to take the execution of the query
+20:50 and move that too.
+20:56 Now, I need to somehow invert this code
+21:01 so that it can await the completion handler
+21:05 and return these values passed into the completion handler
+21:09 back from my new asynchronous function.
+21:13 And this is where I use a continuation.
+21:15 So in this function, we're going to return
+21:18 the results of trying to await a call to a
+21:22 withCheckedThrowingContinuation function.
+21:29 And this takes a block that takes a continuation.
+21:40 And we're going to move this code inside that block
+21:46 and then within the block, we're going to use the continuation
+21:49 to pass data back out of this function either
+21:52 by using the continuation
+21:58 to resume throwing the error here...
+22:04 ...or...
+22:08 ...to resume returning the values that we received
+22:12 into the completion handler.
+22:33 Now that we have this awaitable function,
+22:35 we can use it in our original code.
+22:43 So we assign the results from calling the function.
+23:01 And we need to handle the error that can be thrown.
+23:12 In fact, actually, I'm going to go up here
+23:14 and take this bit of logging and do that in the handler.
+23:23 And then we just need to move all of this success code
+23:28 up into the happy path.
+23:39 Finally, we need to address this closure.
+23:46 Here, we're using dispatch async back to the main thread.
+23:52 But we've ditched our completion handler,
+23:54 so there's no way of relaying this information
+23:56 back to the main thread using it.
+23:59 We need a different way.
+24:02 To resolve this, we're going to make our first use of actors.
+24:06 In Swift's concurrency model,
+24:08 there is a global actor called the main actor
+24:12 that coordinates all of its operations on the main thread.
+24:17 We can replace our dispatch main.async call
+24:23 with a call to main actor's run function.
+24:34 And this takes a block of code to run on the main actor.
+24:40 run is an async function, so we need to await it.
+24:48 Awaiting it is necessary
+24:50 because this function may need to suspend
+24:53 until the main thread is ready to process this operation.
+24:57 But because we await it,
+24:59 we can just remove our completion handler,
+25:12 and instead, return a value.
+25:27 OK, finally, the compiler is now giving me an error
+25:29 about a captured variable.
+25:35 This is a new error that only occurs
+25:38 inside asynchronous functions.
+25:42 Because closures in Swift capture variables by reference,
+25:46 when you capture a mutable variable --
+25:48 in this case, our newDrinks array --
+25:53 you create the possibility for shared mutable state,
+25:57 and that can be the source of race conditions.
+26:01 So when doing this,
+26:02 you need to ensure that you're making a copy of this value.
+26:07 One way to do this is to add newDrinks
+26:10 to the closure's capture list, like this.
+26:21 But often it's better to just avoid this problem
+26:24 by not having mutable variables in the first place.
+26:29 Here, we can do this by changing the code above instead.
+26:34 It's written this way because samples is optional.
+26:40 But instead what we could do
+26:44 is change newDrinks to an immutable value
+26:48 and either set the value here in the if branch
+26:53 or an add an "else"
+26:56 to set it to the empty array.
+27:00 We could also have done this with a nil coalescing operator
+27:02 if we prefer.
+27:04 Since this value is now declared with let instead of var,
+27:08 it's immutable and that resolves the issue
+27:11 without needing to make an additional capture.
+27:21 Now let's keep talking about the main actor
+27:24 by taking a look at this function
+27:26 that needed to be called on the main thread.
+27:32 At the top of this function,
+27:34 there's something that's a really great idea:
+27:38 there's an assert that the function
+27:40 is correctly running on the main thread.
+27:45 If you had ever made a mistake and called this function
+27:48 without wrapping it
+27:49 in a dispatch async to the main thread,
+27:51 you'd get an error in your debug builds,
+27:53 and you should definitely adopt this practice
+27:55 in some of your existing code.
+27:58 But this approach does have some limitations.
+28:01 You might forget to put an assert
+28:03 everywhere it's needed,
+28:05 and you can't assert on access to stored properties,
+28:08 or at least not without lots of boilerplate.
+28:11 It's much better if the compiler can enforce
+28:13 some of these rules for you,
+28:15 so you can't make mistakes like this at all.
+28:19 And that's how we use the main actor.
+28:23 I can annotate functions with "@MainActor."
+28:31 And that will require that the caller switch
+28:34 to the main actor before this function is run.
+28:42 Now that I've done this, I can remove the assertion
+28:45 because the compiler won't let this function be called anywhere
+28:48 other than on the main thread.
+28:56 We can prove that this is working
+28:58 by going back to the caller
+29:04 and moving this call outside of this MainActor.run block.
+29:13 And you see the compiler tells us, no,
+29:15 we can't call that from here
+29:17 because we're not on the main actor.
+29:20 Here's a way to think about this feature:
+29:22 it's a lot like optional values.
+29:24 We used to have values like pointers
+29:27 and had to remember check for nil,
+29:28 but it was easy to forget,
+29:30 and it's much better to let the compiler make sure
+29:32 this check always happens
+29:34 along with some language syntactic sugar
+29:36 to make it easier.
+29:37 Here, we're doing a similar thing,
+29:39 only instead of enforcing nil checks,
+29:41 it's enforcing what actor you're running on.
+29:47 Now that we've put this function on the main actor,
+29:50 we don't, strictly speaking, need this MainActor.run anymore.
+29:54 If you're outside of an actor,
+29:56 you can always run functions on that actor by awaiting them.
+30:01 And in fact, that's what the compiler is telling us here.
+30:03 It's saying that we need an await keyword
+30:06 in order to make the switch over to the main actor
+30:08 to run this function.
+30:10 So if we add it,
+30:15 then the code will compile
+30:16 even without this call being inside the run block.
+30:22 Here, we're using await on a synchronous function --
+30:25 updateModel is synchronous --
+30:27 but the await indicates that the function we're in
+30:30 may need to suspend to get itself onto the main actor.
+30:35 Think of this as similar to making
+30:36 a DispatchQueue.sync call, except with await,
+30:40 your function suspends instead of blocking
+30:43 and then resumes after the call to the main thread is complete.
+30:51 So, we don't need it here anymore,
+30:53 but this MainActor.run technique
+30:55 is still important for another reason.
+30:59 At each await,
+31:00 your function might suspend and other code might run.
+31:05 That's the point of awaiting:
+31:06 to let other code run instead of blocking.
+31:10 In this case, we only had one function to await,
+31:14 so it doesn't really matter,
+31:15 but sometimes you might want to run multiple calls
+31:18 on the main thread.
+31:21 For example, if you're working on UI updates,
+31:24 such as updating entries in a table view,
+31:27 you might not want the main run loop
+31:29 to turn in between the operations you perform.
+31:36 In that case, you would want to use MainActor.run
+31:39 to group together multiple calls to the main actor
+31:42 to ensure that each ran
+31:43 without any possible suspensions in between.
+31:58 So, we're now using the main actor
+32:00 to protect the code that needs to run on the main thread.
+32:05 But what about other code in this class?
+32:10 In particular, the code that mutates local variables,
+32:14 like the query anchor that we saw assigned to here.
+32:20 How can we guarantee those are free from race conditions?
+32:25 Or one way would be to just put everything
+32:28 in the HealthKitController on the main actor.
+32:32 If I go to the HealthKit controller definition,
+32:39 and just write "@MainActor"
+32:43 here on the class instead of on individual methods,
+32:46 that would protect every method on this type,
+32:50 and every stored property on it would be coordinated
+32:53 on the main thread.
+32:57 And for a simple application like this one,
+32:59 that would probably be an OK choice.
+33:02 But that also seems a little bit wrong.
+33:04 This HealthKitController is really the back end of our app;
+33:08 it seems unnecessary to be doing all of its work
+33:11 on the main thread.
+33:13 We want to leave that thread
+33:14 free to do UI-focused activities.
+33:19 So instead, we can change this class
+33:22 to, itself, be an actor.
+33:31 Unlike the main actor, which is a global actor,
+33:35 this actor type can be instantiated multiple times.
+33:38 In my project, I'm still only going to create one of them,
+33:41 but there are many other uses of actors
+33:43 where you might instantiate
+33:44 multiple copies of the same actor.
+33:47 For example, you might make each room in a chat server
+33:50 be its own actor.
+33:52 So now that we've made this class into an actor,
+33:55 let's see what the compiler says.
+33:59 OK. So we're getting some compilation errors.
+34:04 Now let's take a pause here and talk about compiler errors.
+34:08 These errors are guiding you towards the places in your code
+34:12 you need to update when you're migrating code
+34:14 to the new concurrency model.
+34:18 When you get these errors,
+34:19 make sure you understand what they're telling you.
+34:22 Resist the temptation to mash the fix-it button
+34:25 when you're not sure how or why it'll fix the issue.
+34:30 One thing to be wary of
+34:32 is getting into a cascade of errors.
+34:34 Sometimes you'll make a change --
+34:36 like converting a class to be an actor
+34:38 like we just did, or making a method async --
+34:40 and it'll generate some compiler errors.
+34:43 So you go to the site of those errors,
+34:45 and it's tempting to make more changes to fix those errors,
+34:48 like making that method async or putting it on the main actor.
+34:52 The trouble is that this can lead to even more errors,
+34:54 and quickly, you can feel overwhelmed.
+34:58 Instead, use techniques like we're using here
+35:01 in this walk-through,
+35:02 and try and keep the change isolated
+35:04 and done one step at a time with your project compiling
+35:08 and running in between.
+35:11 Add shims to allow your old code to keep working,
+35:14 even though you might end up deleting them later.
+35:17 That way, you can gradually move out from a point,
+35:20 tidying up the code as you go.
+35:23 Incidentally, what I did here is first convert
+35:27 the HealthKitController's methods to async
+35:29 and then make it into an actor.
+35:31 And I find it works out easiest if you do it that way around,
+35:35 rather than starting with the actor conversion.
+35:40 OK, so let's look at these errors by jumping down to them.
+35:45 They're down here on the function
+35:46 we put on the main actor.
+35:49 And this makes sense, because in this function,
+35:52 we're touching a stored property
+35:54 of our new HealthKitController actor,
+35:56 the model property.
+35:58 The actor protects its state and won't let functions,
+36:01 not on the actor -- such as this function
+36:04 that we've explicitly put on the main actor --
+36:07 touch its stored properties.
+36:09 Now looking at this function,
+36:10 it looks like the only state on the actor that it touches
+36:15 is the model object.
+36:18 Everything else is passed in as a function argument.
+36:21 And to me,
+36:22 this suggests that this function belongs on the model;
+36:27 that the model here actually ought to be self.
+36:30 So let's move it to the model.
+36:33 So we can take this function, cut it,
+36:38 go over to our CoffeeData UI model,
+36:43 and paste it in.
+36:47 It's going to be internal rather than private,
+36:50 so it can be called from the HealthKitController.
+36:54 And we just need to go through
+36:55 and remove all references to the model
+36:57 because that's now self.
+37:07 Finally, we need to go to where it was being called...
+37:15 ...and replace self here with a call to the model.
+37:20 So now, this HealthKitController file compiles,
+37:24 and I get a new set of errors from other files.
+37:28 Let's look at those errors.
+37:30 So here we're calling into those completion handler shims
+37:34 that we called earlier
+37:36 to allow us to keep passing in the completion handler
+37:39 even though we've rewritten this function to the async.
+37:42 These functions are now being protected by the actor
+37:44 so I can't call them directly.
+37:48 But they don't touch any other part of the actor's state
+37:51 if we look at them.
+37:55 All they're doing is spinning off a task
+37:58 and then awaiting a call to the async version of the function.
+38:02 Since they don't touch any part of the actor's internal state,
+38:06 I can mark them as what's called "nonisolated."
+38:15 Do the same down here.
+38:22 Marking something as nonisolated tells the compiler
+38:26 that you're not going to touch any of the isolated state,
+38:28 and therefore, this function can be called from anywhere.
+38:31 The switch over to the actor is actually happening automatically
+38:34 when we await the call into the async version of the function.
+38:41 Note that the compiler will check
+38:43 that this nonisolated claim is true.
+38:47 If I were to try and access some state of the actor --
+38:50 such as, for example,
+38:53 printing out the authorization status --
+38:59 the compiler will stop me.
+39:10 So now, I've completed my work
+39:12 converting the HealthKitController
+39:14 into an actor that protects its internal state
+39:16 from race conditions.
+39:19 Next, let's follow those deprecation breadcrumbs
+39:22 to the next file to work on,
+39:24 which is our CoffeeData model type.
+39:30 Now this class implements ObservableObject,
+39:34 and it has a Published property.
+39:39 Any updates to properties that are published to a SwiftUI View
+39:43 must be done on the main thread,
+39:47 so this class is probably a good candidate
+39:50 to put on the main actor.
+39:56 But there's also this background DispatchQueue
+40:02 for doing some work in the background.
+40:04 Let's have a look at how that's used.
+40:11 And it's just in two functions: load and save.
+40:15 That makes sense; you probably don't want
+40:17 to do your loading and saving on the main thread.
+40:23 When you see a pattern like this --
+40:25 where a queue is being used
+40:27 to coordinate some specific activities,
+40:30 but the rest of the class needs to be on the main thread --
+40:34 that's a sign that you want to factor that background code
+40:37 out into a separate actor.
+40:41 So let's do that.
+40:43 So let's go to the top of the file and create
+40:47 a new private actor...
+40:52 ...which we'll call "CoffeeDataStore."
+41:00 And let's open CoffeeData in another window.
+41:04 and start moving code across into our new actor.
+41:07 So we can give it its own logger.
+41:13 And let's tweak the category
+41:14 so we can tell when the actor is in use.
+41:17 And next, instead of this DispatchQueue,
+41:21 we're going to instantiate a copy of our new actor.
+41:33 Next, let's go to the save operation,
+41:36 and move that over.
+41:38 So we can take this function...
+41:42 ...cut it from here, and move it into the actor.
+41:47 Let's start by compiling and seeing what issues come up.
+41:52 So first, there's this currentDrinks property.
+41:56 This was a property of the model type
+41:58 before we moved this method out of the model into its actor.
+42:02 So how can we access it now?
+42:05 Well, the way actors relay information
+42:08 is they pass values between each other.
+42:12 So we should have this function
+42:14 take currentDrinks as an argument.
+42:24 This argument to save
+42:25 receives the list of currentDrinks to save
+42:29 that's passed in by the model type.
+42:32 So that resolves that.
+42:35 Next, savedDrinks.
+42:38 This is a copy of the values last saved
+42:41 to avoid saving unnecessarily when nothing has changed.
+42:46 This value is mutated by both the save
+42:49 and the load function,
+42:51 so it definitely needs protecting by the actor.
+42:56 So let's find it in our model...
+43:05 ...and move it over.
+43:09 OK, what's next?
+43:13 All right, this property dataURL,
+43:15 that's actually being used just by the load and save operation,
+43:19 so we can just move it over to be a private helper
+43:25 on the actor.
+43:33 OK, last issues to resolve.
+43:36 Now, here we're getting errors, and if we look,
+43:40 it appears that there's a closure
+43:41 that's capturing some state from the actor,
+43:45 so we need to fix that.
+43:48 So why is there a closure here?
+43:50 Well, if you look down,
+43:53 it's because the same piece of code
+43:56 is getting called in two places.
+44:01 And it turns out the compiler has flagged
+44:03 something really interesting for us.
+44:06 What this code is doing is checking if the watch extension
+44:10 is running in the background.
+44:13 And the idea is, if it's running in the background already,
+44:17 then don't go into the background queue;
+44:20 just stay on the main thread
+44:22 and perform the task of saving synchronously.
+44:27 But this doesn't seem right.
+44:29 You should never block the main thread
+44:31 to perform an I/O operation like saving,
+44:34 even when your app is running in the background.
+44:39 Why does the app do this?
+44:40 Well, we can trace it back
+44:42 to where the save operation is being called.
+44:52 It's being called from a didSet
+44:54 down here on currentDrinks.
+44:58 And that fires so that whenever the property is assigned,
+45:02 it saves the new values.
+45:06 Now, didSets are super convenient,
+45:08 but they can be a little too tempting.
+45:12 Let's look at all of the callers of the currentDrinks property.
+45:16 If we drill in all the way down here...
+45:25 ...we find that the save operation
+45:27 is ultimately synchronous
+45:29 because of the way it's being called from this function
+45:33 which is the call to handle background tasks
+45:37 from the WatchKit extension.
+45:41 Now this handle API has a contract.
+45:45 You're supposed to do all of your work, and then,
+45:48 when all your work is done, call this
+45:51 setTaskCompletedWithSnapshot method.
+45:57 And you must guarantee all your work is done
+46:00 when you call this
+46:01 because your watch app will be suspended.
+46:04 You can't have some I/O operation,
+46:06 like our save operation,
+46:08 still running when you say that you're done.
+46:11 This is a perfect example of how asynchrony
+46:14 forces global reasoning throughout your code.
+46:18 Let's visualize what's happening here.
+46:21 We start in handle(backgroundTasks:)
+46:24 which calls the load from HealthKit function.
+46:28 This takes a completion handler.
+46:31 But then we switch to updateModel(),
+46:33 which is performed synchronously,
+46:36 and so synchronously calls didSet,
+46:39 which synchronously saves.
+46:42 Once this is done, the completion handler is called
+46:46 and that notifies WatchKit that it's all done.
+46:50 It's the synchronous parts that force us to perform
+46:53 synchronous I/O on the main thread.
+46:56 How can we fix this?
+46:59 To fix it with completion handlers,
+47:01 you'd have to update each currently synchronous method
+47:04 to now take a completion handler.
+47:08 But you can't do that with a didSet;
+47:10 it doesn't take arguments, it just fires automatically
+47:13 when you update the property.
+47:16 But the good news is that all our async refactoring
+47:19 is going to pay off now, because updating functions
+47:21 from synchronous to be async is way easier.
+47:27 So first, let's go
+47:29 to the published property, currentDrinks,
+47:36 and let's change it to a private(set)
+47:39 so that we know all mutation is happening only from this file.
+47:50 And then let's take this didSet operation
+47:55 and instead move that logic into a new function...
+48:01 ...called "drinksUpdated()."
+48:06 We'll make it async,
+48:07 because it's going to call our save operation on our actor.
+48:17 And that needs to be an await...
+48:22 ...on the CoffeeData store,
+48:24 into which we're going to pass the new currentDrinks value.
+48:34 Then, we need to go to where currentDrinks is updated
+48:38 and ensure we call drinksUpdated afterwards.
+49:12 Now in this function, there's one thing to note.
+49:16 It's important that this operation --
+49:19 that takes a copy of currentDrinks,
+49:21 mutates it, and then writes it back --
+49:25 all happens atomically.
+49:29 And this is why the await keyword is vital;
+49:32 it indicates that at this point, this operation might suspend,
+49:37 and other functions --
+49:38 functions that might also update currentDrinks -- could run.
+49:43 So we need to make sure that our entire mutation
+49:46 and writeback happens before any awaits,
+49:51 otherwise, other functions coming
+49:53 and mutating currentDrinks could lead to an inconsistent state.
+50:01 So this function needs to be async.
+50:08 We can go to our save operation and eliminate
+50:11 this unnecessary background and foreground branch
+50:17 and just do the operation on the actor every time.
+50:35 OK. Finally, let's look at the load operation.
+50:39 Now here, the logic is split
+50:42 between code that needs to run in the background
+50:47 and code that needs to run on the main thread.
+50:54 So let's first take the first half --
+50:57 the background portion -- and move that into the actor.
+51:06 Now doing this, we notice another possible race condition.
+51:14 savedValues here was being mutated on the main queue,
+51:19 but if you remember the save operation,
+51:21 it was both read and written from the background queue.
+51:25 Now, as it happens, the way the app was constructed,
+51:28 the load only ever happened on startup, so this was fine.
+51:31 But again, that's relying on global reasoning,
+51:34 and it's the kind of assumption that can break in subtle ways
+51:37 when you make future changes.
+51:40 It's much better to let the actor ensure the program
+51:42 will always be correct.
+51:46 So we're going to fix that now.
+51:47 So first, let's remove this queue management...
+51:54 ...reindent the function, remove this other queue management.
+52:01 And just like with save,
+52:03 we need a way to pass back the loaded values,
+52:07 which we do just by returning a value
+52:09 from this load function on the actor.
+52:21 So now, let's hop back to the original load.
+52:27 And we've moved this logic, so we can just delete it...
+52:36 and replace it with a call to await...
+52:50 ...loading the drinks from the actor.
+52:59 Now, because we're awaiting the actor,
+53:03 that means this function needs to be async.
+53:12 And while we're here,
+53:16 we can clean up these deprecation warnings.
+53:44 And finally, because this load is now async,
+53:47 we need to await it here.
+53:55 And because we're awaiting it here,
+53:57 we need to create a task.
+54:05 But at this point, if we just used an async task,
+54:09 we're potentially introducing a new race condition.
+54:13 Remember, outside of an actor,
+54:16 this new task just runs on an arbitrary thread.
+54:21 We shouldn't mutate shared state,
+54:23 like currentDrinks, from an arbitrary thread.
+54:28 Now, one way to resolve this
+54:30 would be to put the load function on the main actor,
+54:34 But it's much better to move the entire of model type
+54:38 to the main actor.
+54:53 So we go to our CoffeeModel definition
+54:55 and add "MainActor" to our model type.
+55:01 By putting the model on the main actor,
+55:04 we're now guaranteeing that all access
+55:06 to CoffeeData's properties
+55:08 are going to be made from the main thread.
+55:12 And this is good because, as we noted earlier,
+55:15 it's an observable object and it has a published property.
+55:23 And properties published to SwiftUI
+55:25 must only be updated on the main thread.
+55:29 It also means any calls to async from the actor
+55:33 will also run on the actor.
+55:36 so we can remove any other "MainActor" annotations
+55:40 such as the one we added earlier.
+55:55 So now you might notice that when we compile
+55:59 we don't hit any compilation errors,
+56:01 unlike when we moved other things
+56:03 into an actor earlier.
+56:06 And that's because the places we're calling into our model
+56:09 are things like SwiftUI views.
+56:15 For example, let's go to DrinkListView.
+56:21 Now, this type displays a list of buttons on the screen.
+56:26 And then it calls addDrink, which is on our model type.
+56:30 But this DrinkListView is itself also on the main actor.
+56:35 And so its methods...
+56:40 ...can call into the CoffeeData model without an await.
+56:47 What is it that determines
+56:48 that this SwiftUI view is on the main actor?
+56:52 Well, it's inferred from its use of EnvironmentObject here.
+56:58 Any SwiftUI view that accesses shared state --
+57:02 such as environmental objects or an observed object --
+57:05 will always be on the main actor.
+57:11 Elsewhere...
+57:15 ...we're also accessing our model
+57:17 from this extension delegate call.
+57:25 Since this extension delegate
+57:28 is guaranteed to be called on the main thread,
+57:31 it's been annotated by WatchKit as running on the main actor,
+57:35 and so it can also call into our model type directly.
+57:43 Finally, now that we're here, let's refactor this method
+57:48 and get rid of this deprecated completion handler usage.
+57:53 We can instead wrap this section in a new asynchronous task.
+58:01 Remember, this handler is running on the main thread,
+58:05 so when we create a task,
+58:08 that task will also be running on the main thread.
+58:17 And inside this new task, we can now await...
+58:28 ...our call to load new data from HealthKit.
+58:41 And a really nice thing about
+58:42 getting rid of completion handlers
+58:46 is you can now compose functions together.
+58:49 So if you wanted, you could just move this await
+58:52 directly into the if statement.
+58:58 Once this function call returns,
+59:01 we know that all our work is complete because, inside it,
+59:05 we will awaiting the save operation.
+59:08 And so, we can now confidently call
+59:10 background.Task.setTaskCompleted
+59:14 knowing that we finished all of our I/O operations.
+59:19 We now have this nice, structured, top-down approach
+59:22 to waiting for an asynchronous operation
+59:24 before completing any more work.
+59:28 Incidentally, this structured approach to concurrency
+59:31 is another really important part of Swift's concurrency feature.
+59:35 To learn more, watch the associated talk,
+59:38 which covers how you can take advantage of this feature
+59:41 to structure more complex examples,
+59:43 such as waiting on multiple asynchronous operations
+59:46 to complete before continuing.
+59:50 If, while you watch this talk,
+59:52 you wondered exactly how some of these new features work,
+59:55 check out our under-the-hood talk
+59:57 that explores some of the technology in detail.
+01:00:01 So let's recap.
+01:00:03 We've taken some code that had sound type architecture
+01:00:07 but complex concurrency architecture
+01:00:09 that had some hidden race conditions
+01:00:11 that were really hard to spot.
+01:00:14 And with the help of the new concurrency features,
+01:00:16 we've rearchitected it so that the concurrency
+01:00:19 and type architecture are nicely aligned.
+01:00:23 And the compiler helped us find
+01:00:24 some hidden potential race conditions along the way.
+01:00:27 There's a lot more to Swift 5.5 we haven't covered,
+01:00:31 like structured concurrency with task groups,
+01:00:33 async sequences,
+01:00:35 and some great new asynchronous APIs in the SDK.
+01:00:39 There's also a few more refactorings
+01:00:42 we didn't do in this project
+01:00:43 that you might want to try yourself.
+01:00:46 The best way to learn these techniques
+01:00:48 is to try them out in your own apps,
+01:00:50 so have fun and enjoy these cleaner, safer ways to code.
+01:00:53 ♪

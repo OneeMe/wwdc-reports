@@ -1,0 +1,381 @@
+00:09 - Hello and welcome.
+00:11 My name is Marco Giordano,
+00:13 and I'm with the GPU Software Engineering team here at Apple.
+00:17 In this session I'll talk to you about
+00:19 how to scale workloads across Apple M1 GPUs.
+00:23 If you work on complex compute workloads and want to know how to
+00:26 take full advantage of Apple silicon hardware and achieve great scaling,
+00:31 this talk is the one for you.
+00:33 I will start by discussing compute scalability concepts
+00:36 and how applications can naturally scale performance across the M1 GPU family.
+00:42 And then, I'll share step-by-step "how-tos"
+00:45 and talk about what tools are available
+00:48 to maximize compute scaling for your workloads.
+00:52 Let's start by understanding what scalability is
+00:55 and why it is important for your workload.
+00:59 The Apple M1 GPU was designed from the ground up to scale
+01:02 and to let your workload achieve excellent performance across the entire SOC family.
+01:08 The same GPU supporting all Metal 3 features scales from your 8-core iPad
+01:13 all the way to your 64-core Mac Studio.
+01:17 To take advantage of the high level of scaling,
+01:20 having an app optimized for M1 is a great starting point.
+01:24 Many prominent pro apps have already been optimized for Apple M1
+01:29 and have been experiencing excellent scaling across all devices.
+01:34 For example, here we have Affinity Photo and DaVinci Resolve--
+01:39 photo and video editors from the post-production industry.
+01:44 These apps are achieving great scaling.
+01:47 Let's define what scalability really means and how you can achieve "ideal" scaling.
+01:53 GPU workload scalability is the capacity to improve performance
+01:58 with an increased number of GPU cores.
+02:01 The chart on the right shows application speed-up
+02:04 with an increasing GPU cores count.
+02:07 Linear proportion improvement is considered ideal.
+02:12 However, while working on your app, you might notice a type of scaling
+02:16 which hits a plateau and scales with diminishing returns,
+02:20 or doesn't scale at all due to gaps in the GPU timeline.
+02:25 Or you might see another type scaling where the performance improves
+02:30 but not uniformly across the stack
+02:32 where the workload is hitting some GPU limiters,
+02:37 like here, between 24 to 32 or 48 to 64 cores.
+02:44 Your goal is to get as close as possible to linear scaling,
+02:48 and I will show you the tools and techniques
+02:51 to identify bottlenecks and achieve the result you want.
+02:56 In the next section I will discuss the approaches to maximize GPU scaling.
+03:01 For every workload, you should first identify where the bottleneck is.
+03:06 Workloads can be limited either by computation or bandwidth.
+03:11 During the optimization process,
+03:14 you might end up bouncing between one and the other.
+03:16 If you are computational-bound, you might try to shift some of the load
+03:21 to leverage memory to reduce computation, or vice versa.
+03:26 Bottlenecks can shift when you scale up.
+03:29 One good solution could be using Apple frameworks
+03:32 like MPS or MPSGraph.
+03:35 if you can leverage their primitives,
+03:37 we made sure every compute kernel runs best on all the hardware.
+03:41 However, you can't replace everything with MPS,
+03:44 so it is critical to profile and understand your workload.
+03:50 I will first cover three items that can help minimize GPU gaps:
+03:54 Improve your work distribution, eliminate GPU timeline gaps,
+03:58 and atomics operation considerations.
+04:02 Then I will explain how to optimize for GPU limiters
+04:06 by first investigating the effect of compute grid shapes
+04:10 and memory layouts of your workload
+04:13 and finally by looking at a specific example in Blender Cycles.
+04:18 Start by focusing on minimizing GPU gaps.
+04:22 This kind of scaling can be the result of the GPU not being fully utilized,
+04:27 with gaps in the GPU timeline where the hardware is idle.
+04:32 Let's see if we can improve scaling by investigating work distribution.
+04:37 Small workloads usually do not saturate the whole GPU,
+04:41 and kernel synchronization has its cost,
+04:44 so both can prevent proper scaling.
+04:47 It is very important to understand how the workload gets mapped to the hardware,
+04:53 so let's talk about it.
+04:55 A workload is dispatched in the form of a 3D grid of threadgroups.
+05:00 Threadgroups are uniformly distributed to the GPU cores
+05:04 and have access to threadgroup memory, which is limited in size,
+05:09 but very fast, local to the GPU core.
+05:12 A single threadgroup is further broken down into SIMD-groups,
+05:16 which are also known as waves or warps in other compute dialects.
+05:21 Checking the "threadExecutionWidth" on the compute pipeline state object
+05:26 will return the SIMD width,
+05:28 and on all Apple GPUs, it is equal to 32.
+05:33 Threadgroups can have up to 1024 threads per threadgroup
+05:37 and threads can share up to 32K of threadgroup memory.
+05:42 To keep the GPU busy, there should be enough work to do
+05:45 on all the GPU cores.
+05:48 Here is an example of a grid to dispatch.
+05:51 Threadgroups are dispatched to GPU Clusters
+05:54 and distributed among GPU cores.
+05:59 If there are too few threadgroups,
+06:01 the workload won't fully saturate the machine.
+06:04 Here's how to fix this.
+06:08 Start by computing how many threads the workload produces
+06:11 and roughly see if the dispatch will saturate the whole machine.
+06:16 For relatively complex kernels, 1K to 2K concurrent threads per shader core
+06:22 is considered a very good occupancy,
+06:24 so take 1 to 2K threads per GPU core as a rule of thumb.
+06:30 Now you can compute if you have enough work to fully saturate the hardware.
+06:35 The table here shows the lowest recommended number of threads
+06:39 to saturate different SOCs.
+06:43 Another thing to consider would be avoiding
+06:45 using unnecessarily large threadgroup sizes.
+06:48 Making threadgroups smaller will map the load to the hardware more uniformly.
+06:54 Using larger threadgroups might prevent a more uniform distribution,
+06:58 leading to imbalance in the GPU cores.
+07:02 It's best to use the smallest multiple of the SIMD width
+07:05 that maps well to your workload.
+07:08 By using smaller threadgroups, the GPU has more opportunities
+07:12 to better balance its workload.
+07:16 Please always check your kernel runtime performance
+07:19 with Xcode or Instruments GPU Tools.
+07:23 In this GPU capture, for example, there is a kernel performing some computation.
+07:28 Occupancy is pretty low, which is unexpected.
+07:32 The compiler statistics show that max theoretical occupancy,
+07:36 which is new in Xcode 14, is 100%.
+07:40 This indicates there might not be enough threads--and indeed,
+07:44 we can see the algorithms starts to dispatch fewer and fewer threads,
+07:48 not saturating the machine anymore.
+07:51 Low occupancy might have several other causes.
+07:55 To get all the details, check the Metal Compute on MacBook Pro Tech talk.
+08:01 OK, now that workload is correctly distributed,
+08:05 it's time to make sure the GPU is always busy.
+08:09 Under-utilizing the GPU never leads to ideal scaling,
+08:13 and the worst case of under-utilizing is keeping it idle.
+08:18 The GPU can be idle because of GPU timeline gaps.
+08:23 Consider this example.
+08:26 Here is a workload using only 50% of the GPU
+08:30 due to work serialization between CPU and GPU.
+08:34 In this case, overall task duration is the sum of CPU and GPU work
+08:39 with no overlaps.
+08:42 Doubling the GPU cores makes the GPU track complete faster,
+08:46 but the CPU track is not affected.
+08:49 Overall performance increases only by 33%, far from ideal scaling.
+08:57 If the GPU cores are doubled again, the workload is even faster on the GPU,
+09:02 but overall latency is reduced by only 60% compared to the original time!
+09:08 So GPU cores scaling brings diminishing returns in such cases.
+09:13 This is far from ideal. Let's fix it!
+09:17 This Instrument trace from a M1 pro shows big GPU timeline gaps,
+09:23 and this will clearly prevent proper scaling.
+09:28 On M1 Ultra the same workload is indeed a bit faster,
+09:31 but the GPU idle time became higher
+09:34 and the workload is not scaling well.
+09:38 The big gaps are caused by CPU synchronization
+09:41 using the waitUntilCompleted on the command buffer.
+09:45 After changing the waiting logic and removing serialization,
+09:49 the GPU became fully utilized, which is great.
+09:54 Comparing the workload scaling
+09:56 before and after,
+09:57 we can state that the scaling
+09:58 became much closer to the ideal scaling.
+10:03 In the previous example, it was possible to remove
+10:06 CPU/GPU synchronization altogether,
+10:09 however this is not always the case, due to your application nature.
+10:15 There are other approaches you can take to reduce idle time.
+10:20 Use MTLSharedEvents to signal the CPU,
+10:23 pipeline more work, consider using GPU-driven encoding,
+10:27 and using concurrent dispatches.
+10:30 So let's discuss those approaches to minimize GPU timeline gaps.
+10:35 Some of them might fit your workflow.
+10:39 Waiting on the CPU for GPU completion leads to not ideal scaling.
+10:44 If your application is using WaitUntilCompleted,
+10:46 you might want to try to use MTLSharedEvents instead.
+10:51 MTLSharedEvents have lower overhead
+10:54 and can help you reduce the timeline gaps.
+10:57 The next thing to consider
+10:58 is pipelining the workload.
+11:02 If the algorithm has the data necessary
+11:04 for the next batch to work on,
+11:06 it's possible to encode one or more batches in advance
+11:09 before waiting on the MTLSharedEvents.
+11:13 By doing so, the GPU will not become drained
+11:15 and will always have work to process.
+11:19 If work can't be encoded in advance on the same queue,
+11:23 consider using a second queue to overlap work.
+11:26 Using multiple queues allows you to submit independent work,
+11:30 and they do not stall the other submission thread
+11:33 when waiting on an event.
+11:35 This way, the GPU has the chance to keep receiving and processing work.
+11:41 In some cases, an algorithm can encode work directly from the GPU.
+11:47 Using indirect command buffer,
+11:49 you can move the encoding of the next batch directly on the GPU,
+11:53 avoiding any need for synchronization.
+11:56 For more details about indirect command buffers, please check
+12:00 "Modern Rendering with Metal."
+12:02 The workload now removes or minimizes expensive synchronizations
+12:06 between CPU and GPU as much as possible.
+12:09 But even with a busy GPU timeline, scaling challenges may still exist.
+12:15 Let's investigate.
+12:17 This graph is from an image processing workload
+12:20 where images are processed 1 frame at a time.
+12:23 A lot of back-to-back compute serial dispatches can also limit scaling.
+12:29 The GPU is busy, but kernel synchronization
+12:31 has a cost and additionally, every dispatch has a small ramp up
+12:36 where the threadgroups are being distributed
+12:38 and not yet saturating the cores.
+12:41 Likewise, when threadgroups finish and retire,
+12:45 there might not be enough work to fully saturate the cores anymore.
+12:49 In this situation, the advice is to overlap independent work when possible.
+12:54 Let's see a visual example.
+12:56 Here we have a workload processing two images, one after the other.
+13:00 Normally, kernels need to synchronize between each other.
+13:04 However, this is not the only way to schedule work.
+13:07 You can interleave independent work of two images using concurrent dispatches.
+13:13 Here the driver is able to interleave different work,
+13:16 thanks to concurrent dispatches.
+13:19 We can see that the two kernels that previously were back-to-back
+13:22 are now separated by some independent work.
+13:27 However, when you use MTLDispatchTypeConcurrent,
+13:30 barriers must be put in manually.
+13:33 Concurrent dispatches enable the driver to pack the work more tightly,
+13:38 hiding most of the synchronization cost between dependent kernels,
+13:42 as well as fill the ramp up and tail end of the various kernels.
+13:47 This optimization greatly improved the workload performance
+13:50 and scaling when moving from M1 Max to M1 Ultra.
+13:55 The workload runs 30% faster with two images interleaved,
+13:59 70% faster with 3 images in parallel, compared to the previous scaling.
+14:07 It's important to carefully consider atomic operations that kernels are doing.
+14:11 Let's make sure it is made in the most efficient way.
+14:15 Atomic operation allows reading and writing data
+14:19 from multiple threads in a safe manner.
+14:22 Global atomics are coherent across the whole GPU.
+14:26 When many threads attempt to read and write the same global value,
+14:29 this leads to contention.
+14:32 Increasing numbers of GPU cores doesn't help and in fact leads to more contention.
+14:38 Let's investigate how you can improve atomics behavior
+14:41 in an algorithm with an example.
+14:45 Here is a reduction algorithm, where all of the values in a buffer
+14:49 will be summed up together.
+14:51 The simplest approach is to perform an atomic add operation
+14:54 per thread in main memory.
+14:57 However, this is not ideal because that puts a great level of pressure
+15:02 on a single value in main memory, effectively serializing each memory write.
+15:09 There are two things that the hardware offers to help with
+15:11 atomic memory contention:
+15:14 Simd-group instruction and threadgroup atomics.
+15:18 SIMD instructions like prefix_exlusive sum and simd_min and many more
+15:24 allow to do operations and exchange memory between registers
+15:28 in a SIMD-group without round trip to memory.
+15:31 Threadgroup atomics are fulfilled by the threadgroup memory.
+15:35 Each GPU core has its own threadgroup memory
+15:38 allowing to scale with the number of GPU cores.
+15:42 Let's see how these two features can help you improve your workload.
+15:48 Here we have the same reduction problem,
+15:50 but this time it start using a SIMD-group instruction,
+15:54 an inclusive memory sum.
+15:56 Such operation will leave the sum of all the numbers in the SIMD-group
+16:01 in the last thread.
+16:03 The last thread from each SIMD-group can then perform a single atomic add
+16:08 in threadgroup memory to reduce all SIMD-groups to a single value
+16:12 in threadgroup memory.
+16:14 In this way, using SIMD-group instruction and threadgroup memory,
+16:19 a whole threadgroup was reduced without touching main memory at all.
+16:24 Each group will be able to reduce independently and in parallel.
+16:29 Now that each threadgroup has been reduced to a single value,
+16:32 one thread per threadgroup can perform
+16:35 a single atomic in main memory.
+16:37 Not only this requires only
+16:39 one atomic per threadgroup,
+16:41 but since threadgroups complete
+16:43 at different times,
+16:44 it scatters atomics over time,
+16:47 reducing memory contention even further.
+16:50 To recap, to maximize atomics effectiveness,
+16:54 try to leverage memory locality, try to use SIMD-group operation,
+16:59 as well as to leverage threadgroup memory atomics.
+17:02 All this should greatly help reduce atomic operation pressure that prevents scaling.
+17:08 Now that GPU gaps are fixed, it's time to see if the scaling is closer to ideal.
+17:15 GPU Limiters in Xcode and Metal System Trace help to optimize
+17:19 any bottlenecks and inefficiencies in GPU cores execution pipeline.
+17:25 For example, inefficient memory access patterns
+17:28 always cause high Last Level Cache or Memory Management Unit,
+17:33 or MMU limiters, and pretty low utilizations.
+17:36 The first thing to address is the way to tune threadgroups and memory layout.
+17:43 The key in reducing memory span and divergence
+17:46 is to have a clear understanding of the workload memory access pattern,
+17:50 both spatially and temporally.
+17:54 Once that's understood, there are two possible tuning directions:
+17:58 Re-organize the data layout to improve data access locality,
+18:01 or tune the access pattern to better match the data layout
+18:05 and improve memory and cache locality.
+18:09 Let's see an example.
+18:12 Here it is a memory buffer where the data is laid out horizontally,
+18:16 one row after the other.
+18:18 However, when the compute kernel is dispatched,
+18:21 it is common to have a 2D like pattern
+18:24 with square threadgroups being distributed,
+18:27 which is quite spatially localized.
+18:29 This access pattern and data layout is not great for data locality.
+18:36 For example, when the first SIMD-group access the data,
+18:39 the requests are packed in a cache lines.
+18:42 Most of the cache line won't be used,
+18:45 however still occupying space in the cache.
+18:50 Re-arrange the data to fit the access pattern better,
+18:53 where, for example, instead of spanning the whole row,
+18:56 it is localized into stripes.
+19:01 With this new memory layout, a threadgroup will be able
+19:04 to utilize most of the data that will be requested
+19:07 in a cache line, reducing divergence and improving cache efficiency.
+19:12 The other option is to change how the 3D grid is dispatched
+19:16 to better fit the current data layout.
+19:19 Try to play with the threadgroup size to create groups that map better
+19:23 to your memory layout, like a more rectangular shape,
+19:27 for example.
+19:29 In this case, the access pattern is aligned with the memory layout,
+19:33 giving a much higher cache efficiency.
+19:37 You might need to experiment to find the best fit for your workload.
+19:41 Sometimes you might need to make trade-offs,
+19:44 sacrifice thread divergence for memory locality, or vice versa,
+19:49 change your data layout, grid dispatch, or a combination of them all.
+19:54 Every workload and access pattern is different.
+20:00 Now that you're aware of ways to improve memory locality,
+20:03 let's see a more concrete example in Blender Cycles.
+20:08 Cycles is Blender's physically-based path tracer for production rendering.
+20:13 It is designed to provide physically based results out-of-the-box,
+20:17 with artistic control and flexible shading nodes for production needs.
+20:24 This Instrument trace clearly shows low Read Bandwidth, high Top GPU Limiter,
+20:30 high Cache Limiter and low Last Level Cache Utilization.
+20:36 Keeping bandwidth and MMU limiters in control is important for scaling.
+20:42 If your Top limiter is the Last Level Cache or MMU,
+20:45 you need to reduce your memory span and maximize data locality.
+20:50 Let's see an example.
+20:53 Cycles use sorting of data to try to reduce divergence.
+20:57 It does that by sorting the ray hits by material type.
+21:01 This is great to reduce thread divergence,
+21:04 but it increases spatial memory divergence,
+21:07 resulting in a high MMU Limiter.
+21:11 To help with this, we experimented with partitioning the memory range
+21:14 before sorting to increase data locality.
+21:17 Let's visualize it.
+21:18 When rays are shot into the scene to simulate light traveling,
+21:24 they hit objects and data is collected into buffers.
+21:28 At the point of intersection we know many things--
+21:30 the material type that was hit, like glass, metal and so on,
+21:34 the intersection position, the ray, and more.
+21:39 For simplicity, let's focus on the material type only.
+21:43 Here are the materials in a buffer in memory.
+21:47 Since a lot of data is gathered per ray hit,
+21:49 the memory buffer can become quite large.
+21:53 To avoid moving a lot of memory around,
+21:55 populate a list of indices and sort those instead.
+22:00 After the sort, the indices for the same material type
+22:03 are now packed closed together.
+22:06 SIMD-groups can start loading the indices and process the materials.
+22:11 The SIMD-group will use the index to load the corresponding data
+22:15 in the original buffer.
+22:18 However, the SIMD-group would be reading across the whole memory span,
+22:22 putting pressure on the MMU.
+22:25 Let's investigate the new approach.
+22:28 The memory range is partitioned in an idealized partition
+22:32 that simply won't let indices from different partition mix.
+22:36 When sorting, it is apparent that the range of data accessed is contained
+22:41 inside the partition instead of spanning the full memory range like before.
+22:46 It is a trade-off and balance between thread divergence and memory divergence.
+22:52 The number of partitions and size that is ideal
+22:55 is highly dependent on the workload.
+22:58 You might have to experiment to see which one works best.
+23:02 Let's take another Metal System Trace and let see if the workload improved.
+23:07 Here we see the limiters and utilizations for the optimized version.
+23:11 The Top Performance limiter went down, as well as Last Level Cache limiter.
+23:17 As a result, bandwidth and shader runtime substantially improved.
+23:22 Let's see how much.
+23:24 Top limiter and LLC limiter reduced by around 20%.
+23:29 That means data flow is more efficient.
+23:32 GPU Read bandwidth increased significantly,
+23:35 allowing to push more data to the GPU cores.
+23:39 Overall, increasing memory locality with this experiment
+23:43 improved performance between 10 to 30%, depending on the scene.
+23:48 This was just an example of many ways you can try to improve memory access pattern.
+23:54 Keep experimenting and optimizing for the Top Performance Limiter.
+23:58 The GPU tools have more useful counters to tune for.
+24:03 Xcode has a new theoretical occupancy in the compiler statistic window.
+24:08 Both Xcode and Instruments now have several MMU related limiters and counters,
+24:15 specifically a new MMU Limiter, MMU Utilization Counter,
+24:20 and MMU TLB Miss Rate Counter.
+24:24 I have covered a lot of ground today.
+24:27 I discussed GPU scalability and how bottlenecks can shift when scaling up,
+24:32 and how the tools can help you find and fix scalability issues.
+24:36 I also discussed how you might need to experiment and make trade-offs
+24:40 to get the best result for your application.
+24:43 I am looking forward to seeing all your great apps scale amazingly well
+24:47 on Apple silicon.
+24:48 Thank you for watching.

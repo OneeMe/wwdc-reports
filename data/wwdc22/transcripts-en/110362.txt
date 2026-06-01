@@ -1,0 +1,529 @@
+00:00 ♪ ♪
+00:09 Nick Kledzik: Hi, I'm Nick Kledzik, lead Engineer on Apple's Linker team.
+00:13 Today, I'd like to share with you how to link fast.
+00:16 I'll tell you what Apple has done to improve linking,
+00:18 as well as help you understand what actually happens during linking
+00:21 so that you can improve your app's link performance.
+00:25 So what is linking?
+00:27 You've written code, but you also use code that someone else wrote
+00:31 in the form of a library or a framework.
+00:33 In order for your code to use those libraries, a linker is needed.
+00:38 Now, there are actually two types of linking.
+00:41 There is "static linking", which happens when you build your app.
+00:44 This can impact how long it takes for your app to build
+00:47 and how big your app ends up being.
+00:50 And there is "dynamic linking".
+00:52 This happens when your app is launched.
+00:54 This can impact how long your customers have to wait for your app to launch.
+00:59 In this session I'll be talking about both static and dynamic linking.
+01:04 First, I'll define what static linking is and where it came from,
+01:08 with some examples.
+01:10 Next, I'll unveil what is new in ld64, Apple's static linker.
+01:16 Then, with this background on static linking,
+01:18 I'll detail best practices for static linking.
+01:22 The second half of this talk will cover dynamic linking.
+01:26 I'll show what dynamic linking is and where it came from,
+01:29 and what happens during dynamic linking.
+01:32 Next, I'll reveal what is new in dyld this year.
+01:38 Then, I'll talk about what you can do to improve your app's
+01:41 dynamic link time performance.
+01:44 And lastly, we'll wrap up with two new tools
+01:47 that will help you peek behind the curtains.
+01:50 You'll be able to see what is in your binaries,
+01:53 and what is happening during dynamic linking.
+01:57 To understand static linking,
+01:59 let's go way back to when it all started.
+02:02 In the beginning, programs were simple and there was just one source file.
+02:06 Building was easy.
+02:08 You just ran the compiler on your one source file
+02:10 and it produced the executable program.
+02:13 But having all your source code in one file did not scale.
+02:18 How do you build with multiple source files?
+02:21 And this is not just because you don't want to edit a large text file.
+02:24 The real savings is not re-compiling every function,
+02:27 every time you build.
+02:29 What they did was to split the compiler into two parts.
+02:33 The first part compiles source code
+02:35 to a new intermediate "relocatable object" file.
+02:39 The second part reads the relocatable .o file
+02:42 and produces an executable program.
+02:45 We now call the second part 'ld', the static linker.
+02:49 So now you know where static linking came from.
+02:52 As software evolved, soon people were passing around .o files.
+02:56 But that got cumbersome.
+02:58 Someone thought, "Wouldn't it be great if we could package up
+03:01 a set of .o files into a 'library'?"
+03:04 At the time the standard way to bundle files together
+03:07 was with the archiving tool 'ar'.
+03:09 It was used for backups and distributions.
+03:12 So the workflow became this.
+03:15 You could 'ar' up multiple .o files into an archive,
+03:19 and the linker was enhanced to know how to read .o files directly
+03:22 out of an archive file.
+03:25 This was a great improvement for sharing common code.
+03:28 At the time it was just called a library or an archive.
+03:32 Today, we call it a static library.
+03:35 But now the final program was getting big because thousands of functions
+03:39 from these libraries were copied into it,
+03:41 even if only a few of those functions were used.
+03:44 So a clever optimization was added.
+03:46 Instead of having the linker use all the .o files from the static library,
+03:51 the linker would only pull .o files from a static library
+03:54 if doing so would resolve some undefined symbol.
+03:57 That meant someone could build a big libc.a static library,
+04:01 which contained all the C standard library functions.
+04:05 Every program could link with the one libc.a,
+04:08 but each program only got the parts of libc that the program actually needed.
+04:12 And we still have that model today.
+04:15 But the selective loading from static libraries is not obvious
+04:18 and trips up many programmers.
+04:20 To make the selective loading of static libraries a little clearer,
+04:24 I have a simple scenario.
+04:26 In main.c, there's a function called "main" that calls a function "foo".
+04:32 In foo.c, there is foo which calls bar.
+04:36 In bar.c, there is the implementation of bar
+04:39 but also an implementation of another function which happens to be unused.
+04:45 Lastly, in baz.c, there is a function baz which calls a function named undef.
+04:51 Now we compile each to its own .o file.
+04:56 You'll see foo, bar, and undef don't have gray boxes
+05:00 because they are undefined.
+05:02 That is, a use of a symbol and not a definition.
+05:06 Now, let's say you decide to combine bar.o and baz.o into a static library.
+05:12 Next, you link the two .o files and the static library.
+05:16 Let's step through what actually happens.
+05:20 First, the linker works through the files in command line order.
+05:23 The first it finds is main.o.
+05:26 It loads main.o and finds a definition for "main",
+05:29 shown here in the symbol table.
+05:31 But also finds that main has an undefined "foo".
+05:36 The linker then parses the next file on the command line which is foo.o.
+05:41 This file adds a definition of "foo".
+05:44 That means foo is no longer undefined.
+05:47 But loading foo.o also adds a new undefined symbol for "bar".
+05:52 Now that all the .o files on the command line have been loaded,
+05:56 the linker checks if there are any remaining undefined symbols.
+05:59 In this case "bar" remains undefined,
+06:02 so the linker starts looking at libraries on the command line
+06:06 to see if a library will satisfy that missing undefined symbol "bar".
+06:10 The linker finds that bar.o in the static library defines the symbol "bar".
+06:16 So the linker loads bar.o out of the archive.
+06:20 At that point there are no longer any undefined symbols,
+06:23 so the linker stops processing libraries.
+06:26 The linker moves on to its next phase,
+06:29 and assigns addresses to all the functions and data
+06:31 that will be in the program.
+06:33 Then it copies all the functions and data to the output file.
+06:38 Et voila! You have your output program.
+06:40 Notice that baz.o was in the static library but not loaded into the program.
+06:46 It was not loaded because the way the linker selectively loads
+06:50 from static libraries.
+06:52 This is non-obvious, but the key aspect of static libraries.
+06:56 Now you understand the basics of static linking and static libraries.
+07:00 Let's move on to recent improvements on Apple's static linker,
+07:03 known as ld64.
+07:06 By popular demand, we spent some time this year optimizing ld64.
+07:10 And this year's linker is...
+07:12 twice as fast for many projects.
+07:15 How did we do this?
+07:16 We now make better use of the cores on your development machine.
+07:21 We found a number of areas where we could use multiple cores
+07:23 to do linker work in parallel.
+07:25 That includes copying content from the input to the output file,
+07:30 building the different parts of LINKEDIT in parallel,
+07:34 and changing the UUID computation
+07:37 and codesigning hashes to be done in parallel.
+07:40 Next, we improved a number of algorithms.
+07:44 Turns out the exports-trie builder works really well
+07:47 if you switch to use C++ string_view objects
+07:49 to represent the string slices of each symbol.
+07:53 We also used the latest crypto libraries
+07:55 which take advantage of hardware acceleration
+07:58 when computing the UUID of a binary,
+08:01 and we improved other algorithms too.
+08:04 While working on improving linker performance,
+08:07 we noticed configuration issues in some apps that impacted link time.
+08:12 Next, I'll talk about what you can do in your project to improve link time.
+08:17 I'll cover five topics.
+08:19 First, whether you should use static libraries.
+08:22 And then three little known options that have a big effect on your link time.
+08:27 Finally, I'll discuss some static linking behavior that might surprise you.
+08:32 The first topic is if you are actively working on a source file
+08:35 that builds into a static library,
+08:37 you've introduced a slowdown to your build time.
+08:40 Because after the file is compiled,
+08:42 the entire static library has to be rebuilt,
+08:45 including its table of contents.
+08:47 This is just a lot of extra I/O.
+08:50 Static libraries make the most sense for stable code.
+08:53 That is, code not being actively changed.
+08:56 You should consider moving code under active development
+08:59 out of a static library to reduce build time.
+09:03 Earlier we showed the selective loading from archives.
+09:06 But a downside of that is that it slows down the linker.
+09:10 That is because to make builds reproducible
+09:13 and follow traditional static library semantics,
+09:16 the linker has to process static libraries in a fixed, serial order.
+09:21 That means some of the parallelization wins of ld64
+09:24 cannot be used with static libraries.
+09:26 But if you don't really need this historical behavior,
+09:29 you can use a linker option to speed up your build.
+09:33 That linker option is called "all load".
+09:37 It tells the linker to blindly load all .o files from all static libraries.
+09:42 This is helpful if your app is going to wind up selectively loading
+09:45 most of the content from all the static libraries anyways.
+09:49 Using -all_load will allow the linker to parse all the static libraries
+09:53 and their content in parallel.
+09:55 But if your app does clever tricks where it has multiple static libraries
+09:59 implementing the same symbols,
+10:02 and depends on the command line order of the static libraries
+10:05 to drive which implementation is used,
+10:08 then this option is not for you.
+10:10 Because the linker will load all the implementations
+10:12 and not necessarily get the symbol semantics
+10:15 that were found in regular static linking mode.
+10:18 The other downside of -all_load is that it may make your program bigger
+10:23 because "unused" code is now being added in.
+10:26 To compensate for that,
+10:28 you can use the linker option -dead_strip.
+10:31 That option will cause the linker to remove unreachable code and data.
+10:36 Now, the dead stripping algorithm is fast and usually pays for itself
+10:40 by reducing the size of the output file.
+10:42 But if you are interested in using -all_load and -dead_strip,
+10:47 you should time the linker with and without those options
+10:50 to see if it is a win for your particular case.
+10:54 The next linker option is -no_exported_symbols.
+10:58 A little background here.
+11:00 One part of the LINKEDIT segment that the linker generates
+11:03 is an exports trie, which is a prefix tree
+11:06 that encodes all the exported symbol names, addresses, and flags.
+11:10 Whereas all dylibs need to have exported symbols,
+11:13 a main app binary usually does not need any exported symbols.
+11:18 That is, usually nothing ever looks up symbols in the main executable.
+11:23 If that is the case, you can use -no_exported_symbols
+11:26 for the app target to skip the creation of the trie data structure in LINKEDIT,
+11:31 which will improve link time.
+11:33 But if your app loads plugins which link back to the main executable,
+11:37 or you use xctest with your app as the host environment to run xctest bundles,
+11:43 your app must have all its exports,
+11:46 which means you cannot use -no_exported_symbols
+11:48 for that configuration.
+11:51 Now, it only makes sense to try to suppress the exports trie if it is large.
+11:55 You can run the dyld_info command shown here
+11:58 to count the number of exported symbols.
+12:00 One large app we saw had about one million exported symbols.
+12:04 And the linker took two to three seconds to build the exports trie
+12:07 for that many symbols.
+12:09 So adding -no_exported_symbols shaved two to three seconds
+12:12 off the link time of that app.
+12:14 I'll tell you more about the dyld_info tool later in this talk.
+12:18 The next option is: -no_deduplicate.
+12:23 A few years back we added a new pass to the linker to merge functions
+12:26 that have the same instructions but different names.
+12:29 It turns out, with C++ template expansions, you can get a lot of those.
+12:33 But this is an expensive algorithm.
+12:36 The linker has to recursively hash the instructions of every function,
+12:40 to help look for duplicates.
+12:42 Because of the expense, we limited the algorithm
+12:44 so the linker only looks at weak-def symbols.
+12:48 Those are the ones the C++ compiler emits for template expansions
+12:51 that were not inlined.
+12:54 Now, de-dup is a size optimization,
+12:57 and Debug builds are about fast builds, and not about size.
+13:01 So by default, Xcode disables the de-dup optimization
+13:05 by passing -no_deduplicate to the linker for Debug configurations.
+13:11 And clang will also pass the no-dedup option to the linker
+13:15 if you run clang link line with -O0.
+13:19 In summary, if you use C++ and have a custom build,
+13:24 that is, either you use a non-standard configuration in Xcode,
+13:28 or you use some other build system,
+13:30 you should ensure your debug builds add -no_deduplicate to improve link time.
+13:36 The options I just talked about are the actual command line arguments to ld.
+13:40 When using Xcode, you need to change your product build settings.
+13:44 Inside build settings, look for "Other Linker Flags".
+13:49 Here's what you would set for -all_load.
+13:52 And notice the "Dead Code Stripping" option is here as well.
+13:56 And there's -no_exported_symbols.
+13:58 And here's -no_deduplicate.
+14:03 Now let's talk about some surprises you may experience
+14:05 when using static libraries.
+14:07 The first surprise is when you have source code that builds into a static library
+14:11 which your app links with, and that code does not end up in the final app.
+14:16 For instance, you added "attribute used" to some function,
+14:19 or you have an Objective-C category.
+14:22 Because of the selective loading the linker does,
+14:24 if those object files in the static library
+14:27 don't also define some symbol that is needed during the link,
+14:30 those object files won't get loaded by the linker.
+14:35 Another interesting interaction is static libraries and dead stripping.
+14:40 It turns out dead stripping can hide many static library issues.
+14:44 Normally, missing symbols or duplicate symbols
+14:47 will cause the linker to error out.
+14:50 But dead stripping causes the linker to run a reachability pass
+14:54 across all the code and data, starting from main,
+14:57 and if it turns out the missing symbol is from an unreachable code,
+15:02 the linker will suppress the missing symbol error.
+15:05 Similarly, if there are duplicate symbols from static libraries,
+15:09 the linker will pick the first and not error.
+15:13 The last big surprise with using static libraries,
+15:16 is when a static library is incorporated into multiple frameworks.
+15:20 Each of those frameworks runs fine in isolation,
+15:23 but then at some point, some app uses both frameworks, and boom,
+15:27 you get weird runtime issues because of the multiple definitions.
+15:32 The most common case you will see is the Objective-C runtime
+15:35 warning about multiple instances of the same class name.
+15:39 Overall, static libraries are powerful,
+15:41 but you need to understand them to avoid the pitfalls.
+15:45 That wraps up static linking.
+15:47 Now, let's move on to dynamic linking.
+15:51 First, let's look at the original diagram for static linking with a static library.
+15:56 Now think about how this will scale over time,
+15:59 as there is more and more source code.
+16:02 It should be clear that as more and more libraries are made available,
+16:06 the end program may grow in size.
+16:09 That means the static link time to build that program will also increase over time.
+16:14 Now let's look at how these libraries are made.
+16:18 What if we did this switch?
+16:21 We change 'ar' to 'ld'
+16:24 and the output library is now an executable binary.
+16:27 This was the start of dynamic libraries in the '90s.
+16:31 As a shorthand, we call dynamic libraries "dylibs".
+16:34 On other platforms they are known as DSOs or DLLs.
+16:38 So what exactly is going on here?
+16:41 And how does that help the scalability?
+16:44 The key is that the static linker treats linking
+16:47 with a dynamic library differently.
+16:49 Instead of copying code out of the library into the final program,
+16:53 the linker just records a kind of promise.
+16:56 That is, it records the symbol name used from the dynamic library
+17:00 and what the library's path will be at runtime.
+17:03 How is this an advantage?
+17:05 It means your program file size is under your control.
+17:08 It just contains your code,
+17:10 and a list of dynamic libraries it needs at runtime.
+17:13 You no longer get copies of library code in your program.
+17:16 Your program's static link time is now proportional to the size of your code,
+17:20 and independent of the number of dylibs you link with.
+17:24 Also, the Virtual Memory system can now shine.
+17:27 When it sees the same dynamic library used in multiple processes,
+17:31 the Virtual Memory system will re-use the same physical pages of RAM
+17:34 for that dylib in all processes that use that dylib.
+17:37 I've shown you how dynamic libraries started and what problem they solve.
+17:42 But what are the "costs" for those "benefits"?
+17:46 First, a benefit of using dynamic libraries
+17:48 is that we have sped up build time.
+17:51 But the cost is that launching your app is now slower.
+17:54 This is because launching is no longer just loading one program file.
+17:59 Now all the dylibs also need to be loaded and connected together.
+18:03 In other words, you just deferred some of the linking costs
+18:05 from build time to launch time.
+18:08 Second, a dynamic library based program will have more dirty pages.
+18:13 In the static library case, the linker would co-locate all globals
+18:17 from all static libraries into the same DATA pages in the main executable.
+18:22 But with dylibs, each library has its DATA page.
+18:26 Lastly, another cost of dynamic linking is that it introduces the need
+18:30 for something new: a dynamic linker!
+18:33 Remember that promise that was recorded in the executable at build time?
+18:37 Now we need something at runtime that will fulfill that promise to load our library.
+18:44 That's what dyld, the dynamic linker, is for.
+18:48 Let's dive into how dynamic linking works at runtime.
+18:52 An executable binary is divided up into segments,
+18:55 usually at least TEXT, DATA, and LINKEDIT.
+18:59 Segments are always a multiple of the page size for the OS.
+19:03 Each segment has a different permission.
+19:05 For example, the TEXT segment has "execute" permissions.
+19:09 That means the CPU may treat the bytes on the page as machine code instructions.
+19:14 At runtime, dyld has to mmap() the executables into memory
+19:19 with each segments' permissions, as show here.
+19:22 Because the segments are page sized and page aligned,
+19:25 that makes it straightforward for the virtual memory system
+19:28 to just set up the program or dylib file as backing store for a VM range.
+19:33 That means nothing is loaded into RAM
+19:36 until there is some memory access on those pages,
+19:39 which triggers a page fault, which causes the VM system
+19:42 to read the proper subrange of the file
+19:44 and fill in the needed RAM page with its content.
+19:48 But just mapping is not enough.
+19:50 Somehow the program needs to be "wired up" or bound to the dylib.
+19:55 For that we have a concept called "fix ups".
+19:58 In the diagram, we see the program got pointers set up
+20:01 that point to the parts of the dylib it uses.
+20:04 Let's dive into what fix-ups are.
+20:07 Here is our friend, the mach-o file.
+20:10 Now, TEXT is immutable.
+20:11 And in fact, it has to be in a system based on code signing.
+20:15 So what if there is a function that calls malloc()?
+20:18 How can that work?
+20:20 The relative address of _malloc can't be known when the program was built.
+20:24 Well, what happens is, the static linker saw
+20:27 that malloc was in a dylib and transformed the call site.
+20:31 The call site becomes a call to a stub synthesized by the linker
+20:35 in the same TEXT segment,
+20:37 so the relative address is known at build time,
+20:40 which means the BL instruction can be correctly formed.
+20:45 How that helps is that the stub loads a pointer from DATA
+20:49 and jumps to that location.
+20:51 Now, no changes to TEXT are needed at runtime–
+20:54 just DATA is changed by dyld.
+20:57 In fact, the secret to understanding dyld
+21:01 is that all fixups done by dyld are just dyld setting a pointer in DATA.
+21:07 So let's dig more into the fixups that dyld does.
+21:10 Somewhere in LINKEDIT is the information dyld needs to drive what fixups are done.
+21:16 There are two kinds of fixups.
+21:19 The first are called rebases,
+21:20 and they are when a dylib or app has a pointer that points within itself.
+21:25 Now there is a security feature called ASLR,
+21:29 which causes dyld to load dylibs at random addresses.
+21:33 And that means those interior pointers cannot just be set at build time.
+21:38 Instead, dyld needs to adjust or "rebase" those pointers at launch.
+21:44 On disk, those pointers contain their target address,
+21:47 if the dylib were to be loaded at address zero.
+21:51 That way, all the LINKEDIT needs to record is the location of each rebase location.
+21:56 Dyld can then just add the actual load address of the dylib
+22:01 to each of the rebase locations to correctly fix them up.
+22:06 The second kind of fixups are binds.
+22:08 Binds are symbolic references.
+22:11 That is, their target is a symbol name and not a number.
+22:15 For instance, a pointer to the function "malloc".
+22:18 The string "_malloc" is actually stored in LINKEDIT,
+22:24 and dyld uses that string to look up the actual address of malloc
+22:28 in the exports trie of libSystem.dylib.
+22:31 Then, dyld stores that value in the location specified by the bind.
+22:37 This year we are announcing a new way to encode fixups,
+22:40 that we call "chained fixups".
+22:44 The first advantage is that is makes LINKEDIT smaller.
+22:47 The LINKEDIT is smaller because instead of storing all the fixup locations,
+22:52 the new format just stores where the first fixup location is in each DATA page,
+22:57 as well as a list of the imported symbols.
+23:00 Then the rest of the information is encoded in the DATA segment itself,
+23:04 in the place where the fixups will ultimately be set.
+23:08 This new format gets its name, chained fixups,
+23:12 from the fact that the fixup locations are "chained" together.
+23:16 The LINKEDIT just says where the first fixup was,
+23:19 then in the 64-bit pointer location in DATA,
+23:23 some of the bits contain the offset to the next fixup location.
+23:28 Also packed in there is a bit that says if the fixup is a bind or a rebase.
+23:33 If it is a bind, the rest of the bits are the index of the symbol.
+23:37 If it's a rebase, the rest of the bits are the offset of the target
+23:41 within the image.
+23:44 Lastly, runtime support for chained fixups already exists in iOS 13.4 and later.
+23:49 Which means you can start using this new format today,
+23:52 as long as your deployment target is iOS 13.4 or later.
+23:57 And the chained fixup format enables a new OS feature
+24:00 we are announcing this year.
+24:02 But to understand that, I need to talk about how dyld works.
+24:08 Dyld starts with the main executable– say your app.
+24:11 Parses that mach-o to find the dependent dylibs,
+24:14 that is, what promised dynamic libraries it needs.
+24:18 It finds those dylibs and mmap()s them.
+24:21 Then for each of those, it recurses and parses their mach-o structures,
+24:25 loading any additional dylibs as needed.
+24:30 Once everything is loaded,
+24:31 dyld looks up all the bind symbols needed
+24:34 and uses those addresses when doing fixups.
+24:37 Lastly, once all the fixups are done,
+24:40 dyld runs initializers, bottom up.
+24:44 Five years ago we announced a new dyld technology.
+24:47 We realized the steps in green above were the same every time your app was launched.
+24:53 So as long as the program and dylibs did not change,
+24:56 all the steps in green could be cached on first launch
+24:59 and re-used on subsequent launches.
+25:02 This year we are announcing additional dyld performance improvements.
+25:07 We are announcing a new dyld feature called "page-in linking".
+25:12 Instead of dyld applying all the fixups to all dylibs at launch,
+25:17 the kernel can now apply fixups to your DATA pages lazily, on page-in.
+25:23 It has always been the case that the first use of some address
+25:26 in some page of an mmap()ed region triggered the kernel to read in that page.
+25:31 But now, if it is a DATA page,
+25:34 the kernel will also apply the fixup that page needs.
+25:38 We have had a special case of page-in linking for over a decade
+25:42 for OS dylibs in the dyld shared cache.
+25:45 This year we generalized it and made it available to everyone.
+25:49 This mechanism reduces dirty memory and launch time.
+25:53 It also means DATA_CONST pages are clean,
+25:56 which means they can be evicted and recreated just like TEXT pages,
+26:00 which reduces memory pressure.
+26:02 This page-in linking feature will be in the upcoming release of iOS,
+26:06 macOS, and watchOS.
+26:09 But page-in linking only works for binaries built with chained fixups.
+26:13 That is because with chained fixups,
+26:15 most of the fixup information will be encoded in the DATA segment on disk,
+26:20 which means it is available to the kernel during page-in.
+26:23 One caveat is that dyld only uses this mechanism during launch.
+26:28 Any dylibs dlopen()ed later do not get page-in linking.
+26:32 In that case, dyld takes the traditional path
+26:35 and applies the fixups during the dlopen call.
+26:38 With that in mind, let's go back to the dyld workflow diagram.
+26:43 For five years now, dyld has been optimizing the steps above in green
+26:46 by caching that work on first launch and reusing it on later launches.
+26:52 Now, dyld can optimize the "apply fixup" step
+26:57 by not actually doing the fixups,
+26:59 and letting the kernel do them lazily on page-in.
+27:03 Now that you have seen what's new in dyld,
+27:06 let's talk about best practices for dynamic linking.
+27:11 What can you do to help improve dynamic link performance?
+27:14 As I just showed, dyld has already accelerated
+27:17 most of the steps in dynamic linking.
+27:20 One thing you can control is how many dylibs you have.
+27:24 The more dylibs there are, the more work dyld has to do to load them.
+27:28 Conversely, the fewer dylibs, the less work dyld has to perform.
+27:33 The next thing you can look at are static initializers,
+27:36 which is code that always runs, pre-main.
+27:39 For instance, don't do I/O or networking in a static initializer.
+27:44 Anything that can take more than a few milliseconds
+27:46 should never be done in an initializer.
+27:49 As we know, the world is getting more complicated,
+27:52 and your users want more functionality.
+27:54 So it makes sense to use libraries to manage all that functionality.
+27:59 Your goal is to find your sweet spot between dynamic and static libraries.
+28:04 Too many static libraries
+28:06 and your iterative build/debug cycle is slowed down.
+28:09 On the other hand, too many dynamic libraries
+28:12 and your launch time is slow and your customers notice.
+28:15 But we sped up ld64 this year,
+28:18 so your sweet spot may have changed,
+28:20 as you can now use more static libraries,
+28:23 or more source files directly in your app,
+28:25 and still build in the same amount of time.
+28:28 Lastly, if it works for your installed base,
+28:31 updating to a newer deployment target
+28:34 can enable the tools to generate chained fixups,
+28:36 making your binaries smaller, and improving launch time.
+28:39 The last thing I'd like you all to be aware of
+28:42 is two new tools that will help you peek inside the linking process.
+28:47 The first tool is dyld_usage.
+28:49 You can use it to get a trace of what dyld is doing.
+28:53 The tool is only on macOS,
+28:55 but you can use it to trace your app launching in the simulator,
+28:59 or if your app built for Mac Catalyst.
+29:03 Here is an example run against TextEdit on macOS.
+29:08 As you can tell by the top few lines, the launch took 15ms overall,
+29:13 but only 1ms for fixups, thanks to page-in linking.
+29:18 The vast majority of time is now spent in static initializers.
+29:23 The next tool is dyld_info.
+29:26 You can use it to inspect binaries,
+29:28 both on disk and in the current dyld cache.
+29:31 The tool has many options, but I'll show you how to view exports and fixups.
+29:36 Here the -fixup option shows all the fixup locations dyld will process
+29:41 and their targets.
+29:43 The output is the same regardless of if the file is old style fixups
+29:47 or new chained fixups.
+29:50 Here the -exports option will show all the exported symbols in the dylib,
+29:56 and the offset of each symbol from the start of the dylib.
+30:00 In this case, it is showing information about Foundation.framework
+30:04 which is the dylib in the dyld cache.
+30:07 There is no file on disk,
+30:08 but the dyld_info tool uses the same code as dyld and can thus find it.
+30:15 Now that you understand the history and tradeoffs
+30:17 of static versus dynamic libraries,
+30:19 you should review what you app does
+30:22 and determine if you have found your sweet spot.
+30:25 Next, if you have a large app
+30:27 and have noticed the build takes a while to link,
+30:30 try out Xcode 14 which has the new faster linker.
+30:35 If you still want to speed up your static link more,
+30:38 look into the three linker options I detailed
+30:40 and see if they make sense in your build, and improve your link time.
+30:45 Lastly, you can also try building your app, and any embedded frameworks,
+30:49 for iOS 13.4 or later to enable chained fixups.
+30:54 Then see if your app is smaller and launches faster on iOS 16.
+30:58 Thanks for watching, and have a great WWDC.

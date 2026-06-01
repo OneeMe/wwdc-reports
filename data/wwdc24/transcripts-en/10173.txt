@@ -1,0 +1,659 @@
+00:07 Hello and welcome to Analyze Heap Memory!
+00:09 That’s Ben, and that’s Daniel!
+00:11 Today we're going to talk about heap memory and your app.
+00:15 Heap memory is used directly and indirectly by apps,
+00:18 and it's something as a developer, you can control and optimize.
+00:22 It's where your app's reference types are stored
+00:24 and matters because it's usually written to and dirty,
+00:26 making it count against your app's memory limits.
+00:29 That's why this session's focus will be on measuring and reducing heap memory.
+00:34 If you're interested in learning more about other types of memory
+00:36 including graphics memory or memory limits,
+00:39 there are some other excellent talks that cover those in more detail.
+00:43 So, whether your app is using too much memory
+00:45 or you're just curious like me,
+00:47 and want to take a peek under the hood, let's dive in!
+00:50 We're going to cover five topics today:
+00:52 Measuring your heap,
+00:54 dealing with transient growth,
+00:56 tracking persistent growth,
+00:58 fixing memory leaks,
+00:59 and improving runtime performance.
+01:02 So let's get started by asking the question!
+01:04 What is heap memory, and what tools can we use
+01:07 to measure how much our app is using?
+01:10 To understand the heap, we'll need to see where it fits in context
+01:13 within your app's overall virtual memory.
+01:15 When an app starts, it gets it's own empty address space of virtual memory.
+01:20 When the app launches, the system loads its main executable,
+01:23 linked libraries, and frameworks,
+01:25 and maps in regions of read-only resources from disk.
+01:29 When running, the app also uses stack areas
+01:31 for each thread's local and temporary variables,
+01:34 with dynamic and long-lived memory getting placed in memory regions
+01:37 collectively known as the heap.
+01:40 Today, we're going to focus in on this part.
+01:42 Let’s zoom in!
+01:44 The heap isn't just one block of memory
+01:46 it's made up of multiple virtual memory regions as well.
+01:50 Zooming in a bit more to the regions level,
+01:53 Each region is broken up into individual heap allocations.
+01:57 Under the hood, each of these regions
+01:59 is made up of 16KB memory pages from the operating system,
+02:02 but each allocation can be bigger or smaller.
+02:05 These memory pages can be in one of three states:
+02:08 Clean, dirty, or swapped.
+02:10 Clean pages are memory that hasn't been written to.
+02:13 This might be space allocated but unused,
+02:15 or pages that represent files mapped read-only from disk.
+02:19 These are pretty cheap as the system can discard
+02:21 and fault these pages again at any time.
+02:24 Dirty pages are memory that's been written to recently by the application.
+02:28 When dirty pages aren't used for a while, they can't be thrown away.
+02:31 If there's memory pressure, the system can swap them, either compressing
+02:35 or writing them to disk.
+02:36 That way, when they're needed
+02:37 the memory can be decompressed or faulted from disk.
+02:41 Of these three,
+02:42 only dirty and swapped count towards an application's memory footprint
+02:46 and in most applications,
+02:47 the heap will be responsible for the majority of that footprint.
+02:51 Heap regions are memory that's created with the function malloc,
+02:54 or a similar allocation primitive like calloc or realloc.
+02:58 In many cases you don’t call these functions directly,
+03:01 but compilers and runtimes use them a lot
+03:03 for example, when you create an instance of a Swift or Objective-C class.
+03:07 Malloc lets your app dynamically allocate long-lived memory.
+03:10 Allocations stay alive until they’re explicitly freed
+03:13 meaning they can live past the scope of the code that created them.
+03:17 These functions enforce a few rules,
+03:19 for example, their minimum allocation size and alignment is 16 bytes,
+03:23 which means that if you ask for 4 bytes, your request gets rounded up to 16.
+03:28 And, as a security feature, most small allocations are zeroed when they’re freed.
+03:33 Language runtimes use the heap to allocate long-lived memory.
+03:36 Swift, for example, expands this class initializer
+03:39 to call a series of Swift runtime functions,
+03:42 which end up calling malloc.
+03:45 Malloc also has a few debugging features.
+03:47 One of them is MallocStackLogging
+03:49 which records call stacks and timestamps for each allocation.
+03:53 Having MallocStackLogging enabled makes it much easier to track
+03:56 where and when memory was allocated.
+03:59 In Xcode, you can enable MallocStackLogging with a checkbox
+04:02 in the scheme diagnostics tab.
+04:05 We enabled malloc stack logging like this
+04:07 for all the demos we’ll do today.
+04:09 For tracking memory usage,
+04:10 the first tool we have available is the Xcode memory report,
+04:13 which shows an application’s footprint over time.
+04:16 An application’s footprint is made up of more than just its heap,
+04:19 but the memory report can show large memory issues and some recent history.
+04:23 Unfortunately, it can’t tell you why memory use is growing.
+04:26 We'll need other tools to help us understand that.
+04:29 Another tool we'll cover today is also a part of Xcode.
+04:32 The Memory Graph Debugger can capture memory graphs,
+04:35 which are a snapshot of all allocations and the references between them.
+04:39 With MallocStackLogging, this includes backtraces for each allocation.
+04:43 It’s a great tool if you need to focus on a specific allocation,
+04:46 and it’s accessible right from Xcode’s debug bar.
+04:50 Xcode also includes some powerful command-line tools for memory analysis.
+04:54 Leaks, heap, vmmap, and malloc_history
+04:57 can analyze macOS and Simulator processes directly,
+05:00 or investigate issues using already-captured memory graphs.
+05:04 I recommend looking at these tools’ man pages
+05:06 to learn more about their advanced functionality.
+05:09 For profiling memory use over time,
+05:11 the Instruments application has several templates available.
+05:15 The Allocations instrument records the history of all allocation
+05:18 and free events over time,
+05:20 aggregating statistics and call-trees to help track these back to your code.
+05:24 The Leaks instrument takes periodic snapshots of your app’s memory
+05:27 to detect memory leaks.
+05:29 Let's take a look at how to use Allocations to investigate an issue
+05:32 in our DestinationVideo example app.
+05:35 I’m seeing memory issues with a new feature
+05:37 Daniel and I are developing for the DestinationVideo app.
+05:40 It allows users to choose a new background image for a video.
+05:43 I opened and closed a gallery of background images a few times,
+05:46 then saw the app crash because it used too much memory.
+05:50 Each time I opened the gallery,
+05:52 the Xcode memory report shows memory use spike again, up to almost a gigabyte.
+05:56 We can analyze this using the Allocations instrument.
+05:59 And I’ll test this on my device.
+06:08 To profile in Instruments, I’ll use the Product, Profile menu item.
+06:12 This will perform a release build of my app
+06:14 and open Instruments with it selected as the target.
+06:17 When Instruments opens it asks us to choose a template for profiling.
+06:21 In this case we want to profile our app’s heap, so I’ll choose Allocations.
+06:25 The Allocations template includes two instruments, Allocations and VM Tracker.
+06:30 Allocations records heap and VM events live,
+06:33 helping us see activity in real-time.
+06:36 VM Tracker can periodically snapshot to measure all virtual memory.
+06:40 I won’t enable it today because I’m focusing specifically on the heap.
+06:43 I’ll start the trace,
+06:44 by clicking the Record button at the top left of the trace document.
+06:48 As the trace begins, data starts streaming in about our app.
+06:52 The track view shows that the app’s memory use is holding steady
+06:55 now that it’s loaded.
+06:56 I’ll open and close the gallery view
+06:58 to see what’s happening when memory use spikes.
+07:03 This is a little slower than last time, but that’s expected.
+07:06 I’m getting stack traces for every malloc and free.
+07:09 This data is going to be super useful in a minute.
+07:13 I’ll stop the trace by clicking the Stop button at the top left.
+07:17 In the Allocations track, we clearly see the spike pattern reproducing.
+07:21 Now that I’ve got a trace file,
+07:22 I can send it to my partner who loves memory bugs.
+07:25 I’ll save the trace using the menu item File, Save
+07:29 and now, it’s Daniel’s problem.
+07:32 Daniel, do you want to talk about diagnosing transient memory growth?
+07:35 Sure Ben! Let's take a deeper look at the memory spikes Ben recorded
+07:39 and see if there's something we can do about them.
+07:41 Memory spikes in your app are one type of transient memory growth,
+07:45 and this kind of growth is bad for three reasons.
+07:48 Memory spikes cause memory pressure, and the system reacts.
+07:51 Swapping and compressing dirty memory,
+07:53 discarding read-only memory,
+07:55 and even terminating background tasks.
+07:57 In the worst case, these spikes can mean termination for your app as well.
+08:01 The long-term effect of memory spikes is also bad,
+08:04 as it causes fragmentation or holes in heap memory regions.
+08:08 There are two ways to track it down.
+08:10 We can look at a specific spike to find the allocations
+08:12 Created & Still Living from the low point to the high point.
+08:16 Or, in aggregate we can select a large range
+08:18 and find all allocations that were Created & Destroyed in that range.
+08:22 Let's try it out now with the trace Ben sent me.
+08:26 I'll select one of the spike intervals in the timeline
+08:28 by clicking and dragging from the low point
+08:30 to the top of the spike in the track view,
+08:32 and the statistics detail below should show me
+08:34 some info on what's causing it.
+08:36 Let me sort these rows by total bytes and look for the top contributors.
+08:40 Even though we're focusing on heap memory in this talk,
+08:42 the top categories look like,
+08:44 IOSurface virtual memory.
+08:46 That's a pretty good hint that our temporary memory issue
+08:49 is going to be with how we're handling our background images.
+08:51 If I sort by persistent,
+08:53 in this case, objects that made it to the top of the spike
+08:56 there's one node that stands out to me:
+08:58 @autoreleasepool content.
+09:00 There were hundreds of these created which for autoreleasepools is a lot.
+09:04 I’ll come back to this in a moment.
+09:06 The other way of looking for our temporary memory problem
+09:09 is to find the code responsible for the objects created and destroyed
+09:12 in a larger range.
+09:14 At the bottom of the window, I'll change the Lifespan filter
+09:17 to Created & Destroyed.
+09:19 And in the timeline, I'll select all three spikes.
+09:23 Now I can switch the detail view to a call tree
+09:25 using the jump bar in the middle.
+09:27 Call trees are a good way of breaking down the allocations by backtrace,
+09:30 which lets me see the code allocating the most memory.
+09:33 Looking at the total, there's,
+09:35 8GB of temporary allocations?
+09:38 Wow. Where's all this coming from?
+09:40 The heaviest stack trace on the right gives me a good clue at where to look.
+09:44 Let me make this a little wider.
+09:46 The frames from my code are emphasized, and looking at this list,
+09:49 the makeThumbnail() code looks like a good place to start.
+09:53 I can click once on it to quickly disclose the call tree,
+09:56 or I can double-click to view the source.
+10:00 Oh yeah, this is the image filters we were applying,
+10:03 and one line shows a huge amount of memory,
+10:05 gigabytes, getting created and destroyed.
+10:08 This should be temporary memory, but we're seeing it grow until the top of the spike
+10:11 and then all getting freed at once.
+10:13 Let me go up a couple frames by first
+10:14 clicking back to the call tree in the jump bar.
+10:17 Looking up a few frames,
+10:18 this time I think I'll go to my ThumbnailLoader's loadThumbnails code.
+10:23 It's faulting the thumbnails in a loop,
+10:25 and the memory is growing while the loop runs,
+10:28 and then falling at the end.
+10:29 Combined with the autoreleasepool clue from earlier,
+10:32 I think I know what’s going on.
+10:34 Even though I'm using Swift which has automatic reference counting,
+10:37 autorelease pools are a common reason for temporary memory growth.
+10:41 Objective-C uses these pools to extend object lifetimes
+10:43 for return values from functions.
+10:46 Autorelease pools keep these return values alive by delaying a release until later.
+10:50 But this also means Swift can produce autoreleased objects
+10:53 when it calls into frameworks that use or expose Objective-C APIs.
+10:58 This simple example prints the current date,
+11:01 but it also creates an autoreleased string.
+11:03 This string will live on the heap until the end of current autorelease scope,
+11:06 which can be a while.
+11:09 Threads usually have a top-level autorelease pool,
+11:11 but it’s not cleaned very often.
+11:13 This can matter a lot when code fills up the pool with objects,
+11:16 which easily happens in loops.
+11:19 Every iteration objects get autoreleased into the same pool,
+11:22 and they can live longer than necessary.
+11:24 In this case, waiting until after the loop's all finished.
+11:27 Internally, autorelease pools allocate content pages to reference the objects.
+11:32 Since these are visible in the Allocations instrument,
+11:34 it can be a good way of noticing this kind of issue.
+11:37 Later when the autorelease pool is drained,
+11:39 the pool sends the delayed releases and lots of objects can get freed at once.
+11:45 The fix for this is usually to define a nested,
+11:47 local autorelease pool scope to narrow down these lifetimes.
+11:51 In this example, autoreleased objects are held by the inner, per-loop pool
+11:56 and released on each iteration.
+11:58 This means fewer objects accumulate,
+11:59 and less content pages are needed to track the references.
+12:03 Let's jump back in and see if we can fix our problem.
+12:06 From Instruments, I'll use the menu at the top right of the source view
+12:09 to open this file in Xcode.
+12:12 To fix this, let's add an autorelease pool scope in the body of the loop,
+12:15 which will drain the objects after each iteration.
+12:21 Let's see how well this works.
+12:24 Uh oh, I don't have my development phone.
+12:26 Hey Ben, can I use your phone to test out my fix?
+12:29 No! It's my phone. Why don't you use the Simulator?
+12:33 Fine, good point.
+12:34 With most profiling, it's important to run a release build
+12:36 on a real device for accurate timing.
+12:38 For heap analysis, though, the Simulator environment is a lot closer in behavior,
+12:42 and it's fine to use for memory profiling.
+12:44 I'll switch back to the memory gauge while I try out the feature Ben was showing.
+12:50 In the Simulator, I'll open the gallery once and dismiss it.
+12:54 The gauge looks better memory went up, but no huge spike this time.
+13:01 The second time is the same,
+13:02 but now I'm starting to see another pattern I don't like.
+13:06 After bringing up the sheet three times, I can confirm,
+13:09 the memory spikes are gone! We never got close to a gigabyte.
+13:12 But now our problem is that memory goes up each time in a stair step pattern.
+13:16 That's weird, because even if creating the thumbnails is expensive,
+13:19 it should only grow the first time I open the gallery.
+13:22 I’ll push my autorelease pool fix in a minute,
+13:24 but I don't want to steal all the fun.
+13:27 From Xcode's debug bar, I'm going to pause in the Memory Graph Debugger.
+13:30 This captures every single allocation in my application's heap,
+13:33 and if I already knew what type was causing the growth
+13:36 I could search for it now.
+13:37 Or on the right, I can share it.
+13:40 While I could import this memory graph right in Instruments,
+13:43 I think I’d rather just airdrop it to Ben.
+13:46 Maybe he'll have some ideas on finding what seems like a needle in a haystack.
+13:49 Good luck Ben!
+13:50 Nice try, Daniel, but I'm not getting rickrolled again!
+13:54 I'll use my own memory graph to look into this persistent growth.
+13:57 Persistent memory is memory that doesn’t get deallocated.
+14:01 Persistent growth generally looks something like this.
+14:04 With memory increasing over time.
+14:06 This growth is made up of multiple allocations.
+14:09 The Mark Generation feature in the Allocations instrument
+14:12 can break down the growth by timespan.
+14:14 When I click the Mark Generation button.
+14:16 Instruments creates a new group for allocations.
+14:19 This generation collects all allocations created prior to this point.
+14:23 That also persisted to the end of the trace.
+14:26 When I select a later time and click Mark Generation again,
+14:29 Instruments creates a new group.
+14:31 This next generation collects all persisting allocations
+14:34 made after the previous generation, and before the new timestamp.
+14:38 I generated my own memory graph in Xcode,
+14:42 and imported it in Instruments.
+14:44 Instruments shows data in the Allocations, Leaks, and VM Tracker instruments.
+14:48 I’ll focus on the Allocations track for now.
+14:51 In the track view, I can see the same step pattern Daniel noted,
+14:54 in the Xcode memory report.
+14:56 I'll use the generation marking feature
+14:57 to isolate the persistent allocations created during the growth intervals.
+15:01 I’ll select several times between periods of growth
+15:03 and press the Mark Generation button.
+15:08 Instruments now shows three generations.
+15:11 Generations B and C show persistent growth caused by opening the gallery.
+15:16 I can expand one of these generations to see its allocations,
+15:19 and order by growth size to see what types are responsible for the most growth.
+15:23 It looks like most of the growth is coming from storage for Data.
+15:27 I can expand the entry for this type,
+15:29 to see individual allocations and their addresses.
+15:32 Hah! I found the needle!
+15:35 It looks like, all of these Data storage allocations
+15:38 were created by our ThumbnailLoader code.
+15:40 So what’s holding onto the Data?
+15:42 We can take one of these addresses from Instruments
+15:45 and put it into the Memory Graph Debugger to see what references it,
+15:48 which should tell us why it still exists after the gallery was closed.
+15:51 I’ll copy the address from the extended detail view
+15:54 and put it into the Memory Graph Debugger’s filter bar,
+15:57 and select the allocation.
+16:01 To better understand what the Memory Graph Debugger is telling us,
+16:03 let’s talk a little about how it works.
+16:06 Investigating memory growth is all about asking the question,
+16:09 why does this allocation still exist? What's holding on to it?
+16:13 It's the question the Memory Graph Debugger helps to answer.
+16:16 To get the most out of this tool,
+16:18 we'll need to talk about type information and scanning for references.
+16:21 There are four main types of references:
+16:24 Strong references, which are definitely pointers,
+16:26 in ARC-managed locations with explicit ownership guarantees.
+16:30 Weak and Unowned references,
+16:31 which are also definitely pointers with explicit non-ownership guarantees.
+16:36 Unmanaged references, which are pointers in locations that the runtime knows about,
+16:40 but doesn't manage automatically.
+16:42 These might be manual owning references, but then again, maybe not.
+16:45 And Uncertain, or Conservative references.
+16:48 These are recorded when the tools don’t know
+16:50 the type of the memory they’re scanning, and just see raw memory.
+16:53 If the value looks like a pointer, maybe it is,
+16:56 but without type information there's really no way to be sure.
+16:59 When the tools scan your process' heap,
+17:01 they use the best type information available for each allocation.
+17:05 For this Swift Swallow example,
+17:06 the first two fields are standard and don't contain anything important
+17:09 for reference scanning.
+17:11 After that, we have a coconut reference to scan!
+17:14 This field does hold a pointer to a heap allocation
+17:17 it’s a strong reference to a Coconut object!
+17:20 Type information for Swift and Objective-C is great,
+17:23 but for C and C++ there's no reference ownership information,
+17:27 so you'll only see conservative references.
+17:29 The best the tools can do is look up names for C++ types with virtual methods.
+17:35 An instance of this class would be seen as a Coconut.
+17:39 For types without virtual methods, or other allocations,
+17:42 stack traces can help provide names.
+17:45 With MallocStackLogging data, an instance of this class
+17:48 might be labeled malloc in PalmTree::growCoconut(),
+17:51 which is a pretty good hint about what it might be.
+17:54 Now that we’ve talked about type information and references,
+17:57 let’s go back and look for why our data storage is persisting forever.
+18:01 In the Memory Graph Debugger we can see that our selected allocation
+18:04 is being held by a __DataStorage object.
+18:07 Which is held by a PhotoThumbnail.
+18:09 The PhotoThumbnail is in turn held by a dictionary.
+18:13 And looking all the way back,
+18:14 it looks like it’s being held by the static property,
+18:17 ThumbnailLoader.globalImageCache.
+18:20 Because I’m running with MallocStackLogging enabled
+18:22 I can see allocation backtraces in the Inspector on the right.
+18:26 I’ll use the Inspector to navigate to the source
+18:28 responsible for an allocation.
+18:30 Let’s pick the PhotoThumbnail holding the data.
+18:34 It looks like one of my code’s closures is responsible for allocating this.
+18:38 I’ll use the stack trace to jump to that code.
+18:41 It looks like this faultThumbnail method is caching thumbnails
+18:44 and creating a new one on a cache miss.
+18:47 I bet it’s storing it in that globalImageCache
+18:49 we saw just a moment ago.
+18:51 From the comment,
+18:53 it looks like we’re caching based on URL and creationDate,
+18:56 which seems reasonable.
+18:58 But there’s a bug!
+18:59 That’s clearly not the creation timestamp for the file!
+19:02 It’s the current time.
+19:03 That means we’ll never find anything in the cache,
+19:06 and we’ll always cache a new PhotoThumbnail
+19:08 each time this method is called.
+19:10 This explains why we’re seeing persistent growth of thumbnails!
+19:13 Let’s fix it by actually caching based on the file’s creation date.
+19:17 I’ll delete the code that uses the wrong timestamp,
+19:20 and now I need to get the creation timestamp of the file.
+19:24 Nice, Xcode suggested the code I wanted.
+19:26 I’ll press Tab to accept it.
+19:28 I’ll run the app again,
+19:29 to verify this fixed our issue,
+19:31 making sure the step pattern doesn’t show up in Xcode’s Memory Report.
+19:38 Let’s try that feature again.
+19:42 Okay, we’ve generated our thumbnails, now let’s try it again.
+19:49 Nice, no growth. I’ll try it one more time just to be sure.
+19:56 Let’s stop in the Memory Graph Debugger
+19:58 just to make sure there are no other problems.
+20:03 I see that some memory leaks were found,
+20:04 it’s the allocations with the yellow triangle icons next to them.
+20:08 Daniel, are you causing leaks in our code again?
+20:11 Yes I am! I guess it's a good thing Leaked memory is next on our list.
+20:16 To understand and fix leaked memory we first need to talk about reachability.
+20:21 All memory in your program should be reachable through non-weak references
+20:24 from somewhere to be used in the future.
+20:26 There are three kinds of memory on your heap.
+20:29 First, useful memory, that's reachable by your program,
+20:32 and will be used again in the future.
+20:34 Second, abandoned memory, which is reachable and could be used
+20:38 but won't actually ever be used again.
+20:40 This memory counts against your app's footprint and is just wasted.
+20:43 It's easy to do, for example caching too aggressively
+20:46 or holding expensive data on singletons.
+20:48 The third type of memory in your app is leaked,
+20:51 that is unreachable memory that can't ever be used again.
+20:54 Typically this happens when the last pointer is lost,
+20:56 either to a manually managed allocation or a reference cycle of objects.
+21:01 For most leaks, our goal will be to find and fix one reference in a cycle.
+21:05 This might be removing an accidental reference
+21:07 or changing an ownership qualifier from strong to weak or unowned.
+21:12 To make investigating these leaks easier
+21:14 I’ll use the Show only leaked allocations button in the filter bar,
+21:17 which also has the triangular icon.
+21:22 The navigator shows types grouped by the different binaries in our app.
+21:25 It’s possible for your code to leak types from system binaries,
+21:28 but leaks are usually caused directly by issues in the project.
+21:32 I'll filter down to only my project's types
+21:33 by clicking the other filter bar button.
+21:36 That’s more approachable!
+21:37 There are 3 leaks of the ThumbnailLoader class,
+21:39 and three of the ThumbnailRenderer. I’ll select one of these.
+21:43 This looks like a small reference cycle between a ThumbnailRenderer,
+21:46 a ThumbnailLoader, and a closure context.
+21:50 But what’s the closure context for?
+21:52 Let’s talk about that for a moment.
+21:54 When Swift closures need to capture values,
+21:57 they allocate memory on the heap to store the captures.
+22:00 The Memory Graph Debugger labels these allocations as closure contexts.
+22:05 Each closure context in your app's heap corresponds 1:1 with a live closure.
+22:10 Closures capture references strongly by default,
+22:12 making it possible to create reference cycles.
+22:15 You can break these cycles using weak or unowned captures instead.
+22:19 Let's say I have a Swallow object with a completion handler,
+22:22 that’s called when the swallow delivers a coconut.
+22:25 If I'm not careful,
+22:26 this will create a reference cycle by strongly capturing the Swallow itself.
+22:30 The Memory Graph Debugger would show the reference as a strong capture,
+22:34 but closure metadata doesn't include variable names.
+22:37 All references from closure contexts are simply labeled, capture.
+22:41 Let's go back and see if we can solve our leak.
+22:44 I'll open the Inspector and click on a few of these references.
+22:48 The ThumbnailRenderer has a cacheProvider reference to the loader
+22:52 The loader has a completionHandler referencing the closure context.
+22:56 And if I select the capture back to the renderer,
+22:58 the inspector shows me that the reference is strong.
+23:02 To break this reference cycle, we’ll need to find the code that created the closure.
+23:06 From the closure context’s stack trace
+23:09 I’ll jump to my code in the PhotosView.
+23:13 This code is creating a ThumbnailLoader object,
+23:16 assigning it a completion handler,
+23:18 and then telling it to begin loading.
+23:20 But the problem we just saw,
+23:22 is that the closure is strongly capturing the ThumbnailRenderer
+23:25 and this is causing a reference cycle.
+23:27 So what's the fix?
+23:29 Well, we probably should change this code to use Swift Concurrency
+23:31 instead of completion closures.
+23:33 But for now, we can specify a capture list.
+23:36 Either weak or unowned will break the cycle.
+23:39 I’ll make the renderer capture weak,
+23:42 and because we now have an optional weak reference, I've added this guard let
+23:46 to make sure the destination
+23:47 the renderer is still around when we use it.
+23:50 The fix I just made is for a 3-node cycle,
+23:52 but small changes like this can have big impacts.
+23:55 After trying out our feature again and pausing in the Memory Graph Debugger,
+24:00 now I don't see any of my types leaked.
+24:03 If I turn off the type filter, there's another nice surprise
+24:06 the other leaks were resolved too!
+24:08 Those other types were referenced by the leaks we just fixed,
+24:11 and now they're getting deallocated as well.
+24:13 In this example, finding and fixing the leak was pretty easy.
+24:16 There are a lot of different ways code can leak, though, and finding leaks
+24:19 is probably the area where the most questions come up.
+24:21 Let's talk through a few of these, starting with,
+24:24 why doesn't leaks checking find everything?
+24:26 Let's say I intentionally create a leak.
+24:29 Why don't the tools always find it?
+24:31 There's a lot of memory the tools don't have type information for,
+24:34 and languages like C permit unmanaged pointers.
+24:37 This means that tools have to allow things
+24:38 that look like they might be pointers but maybe aren’t.
+24:42 When the tools scan conservatively,
+24:44 they look for pointers byte by byte,
+24:45 looking for values that appear to be references
+24:48 and then checking them against the list of allocations.
+24:51 If values match,
+24:52 then the tools record an Uncertain, Conservative reference to the block.
+24:56 But keep in mind that the value could have been a number value,
+24:59 flags, or just random bytes that looked like a valid pointer.
+25:03 So in answer to the question,
+25:04 a real leak can be missed due to conservative references.
+25:08 If I want to create an intentional leak and see it be found,
+25:12 it doesn't hurt to drop it in a loop that does it 100 times.
+25:15 In real apps, leaking code is usually run multiple times,
+25:18 so even if tools don't find every leak, they still catch the bugs that cause them.
+25:22 Another related question,
+25:24 how can the reported number of leaks go up and down over time?
+25:28 Bugs will lead to more leaks over time,
+25:29 but the heap can be pretty noisy and random.
+25:32 This noise makes conservative references non-deterministic
+25:35 so they can appear or disappear.
+25:37 So even if your program leaks 5 objects on launch,
+25:40 the tools might find 5 of them at first,
+25:42 and only find 4 later.
+25:45 Another common question
+25:46 is why nonreturning functions sometimes appear to leak memory.
+25:49 This may be C functions with the noreturn attribute
+25:52 or Swift functions that return the Never type.
+25:54 Because these functions will never return,
+25:56 compilers can optimize away cleanup they'd normally have to do,
+25:59 including releasing local allocations or references they create.
+26:04 When these kinds of functions are used for fatal asserts, no problem
+26:07 the program's about to crash anyway!
+26:09 But sometimes they're used to park a thread forever.
+26:12 If you ever see, local state being reported as leaked from a call to a noreturn function,
+26:16 such as the Server object in this example,
+26:19 one solution is to explicitly store it into a global.
+26:22 By storing the object outside the local function scope,
+26:25 the reference ends up somewhere the tools can see.
+26:28 And because the tools can see it,
+26:29 the object will be considered reachable instead of leaked,
+26:32 even though the local variables aren't otherwise preserved by the compiler.
+26:36 Now that we've covered leaks,
+26:37 I'd like to hand it back to Ben to talk about runtime speed, and coconuts.
+26:42 Thanks Daniel!
+26:44 Reducing memory can greatly improve an app's performance,
+26:46 and there are some runtime details to keep in mind
+26:48 that can improve it even further.
+26:51 weak and unowned are two common tools you'll use in Swift
+26:54 to avoid creating strong reference cycles.
+26:57 Let’s talk about their differences and when to use them.
+27:00 Weak references are always optional types,
+27:03 and they become nil after their destinations are deinitialized.
+27:06 You’re always allowed to use a weak reference,
+27:08 regardless of source and destination lifetimes.
+27:10 Consider the case of a swallow, and a coconut.
+27:14 A coconut can be carried by a swallow, but it doesn’t own the swallow.
+27:18 If we want the coconut to reference the swallow
+27:20 we shouldn’t use a strong reference.
+27:22 We could use a weak reference instead.
+27:25 This comes with overhead, though.
+27:26 To implement the weak reference, Swift allocates a Swift weak reference storage
+27:31 for the destination object the first time it's weakly referenced.
+27:34 This allocation sits between the Swallow, and all its incoming weak references.
+27:38 It allows the weak references to be lazily nil'd out
+27:41 after the Swallow goes away.
+27:43 Unlike weak references, unowned references directly hold their destinations.
+27:47 This means they don’t use any extra memory,
+27:49 and take less time to access than weak references.
+27:52 They can even be non-optional and also constant.
+27:55 However, it's not always valid to use an unowned reference.
+27:58 Let's say we make the Coconut's 'holder' reference
+28:01 unowned instead of weak.
+28:03 What happens if the Swallow goes away before our reference?
+28:06 The Swallow will be deinitialized, but not deallocated.
+28:09 This is what makes unowned references safe.
+28:12 The unowned reference must point to something,
+28:14 so the runtime keeps the ex-parrot around, or swallow, I’m mixing metaphors here.
+28:20 At this point, if I try to access the Swallow
+28:23 using the Coconut’s unowned reference, I’d get a deterministic crash.
+28:26 In this way, unowned references are a lot like force-unwrapping weak references.
+28:31 Even if I don’t access the unowned reference,
+28:33 it’s still bad to leave it around.
+28:34 As long as the unowned reference exists,
+28:37 its destination can’t be deallocated and wastes memory.
+28:40 If you don’t know how long the destination will live
+28:42 the small overhead of a weak reference is worth it.
+28:46 If you’re not seeing weak or unowned references reported in your memory graph,
+28:50 you may need to check your project’s
+28:52 Reflection Metadata Level build setting in Xcode.
+28:55 We recommend using the default All level if possible.
+28:58 This setting includes all metadata the tools want
+29:01 and lets the tools provide much better accuracy for Swift.
+29:04 Let's look at a concrete example.
+29:07 This ByteProducer class has a generator property
+29:10 a closure that starts out assigned to its defaultAction method.
+29:14 The problem is, this creates a strong reference cycle,
+29:17 because the defaultAction method implicitly uses self.
+29:21 Be very careful when using methods as closures.
+29:24 To fix this, we can define a closure which calls defaultAction().
+29:28 It still performs a capture of self,
+29:30 but now the capture is explicit and we can use a capture list
+29:33 to keep it from being strong.
+29:35 We need to specify a reference qualifier,
+29:37 and weak certainly works here as a good default.
+29:40 Unowned is also fine in this case because the generator closure
+29:44 has the same lifetime as its destination, the ByteProducer instance.
+29:48 The closure isn’t vended to other code or being dispatched asynchronously,
+29:52 so there's no way it can outlive the captured self.
+29:55 The performance difference between these choices sometimes adds up.
+29:59 If I allocate a million of those ByteProducers,
+30:02 and export a memory graph, the heap command-line tool
+30:04 can provide a quick summary of the cost.
+30:07 There’s one weak reference storage allocation for each ByteProducer,
+30:11 and they use almost as much memory as the ByteProducers themselves!
+30:15 With unowned, this memory isn’t needed.
+30:18 The point is weak references are a good default,
+30:22 and unowned references save memory and time
+30:24 when you can guarantee a reference won't outlive its destination.
+30:29 To find areas where they introduce CPU overhead,
+30:31 profile and look for calls to runtime functions like swift_weakLoadStrong().
+30:37 You can learn more about Swift’s reference counting
+30:39 in the “Swift Programming Language” chapter on Automatic Reference Counting.
+30:44 Besides weak and unowned, sometimes automatic retain and release calls
+30:48 can show up as a profiling hotspot.
+30:51 While it might be tempting, don't circumvent ARC.
+30:54 There are better solutions than using unmanaged pointers
+30:57 or moving performance-sensitive code to a memory-unsafe language.
+31:01 Make sure -whole-module-optimization is enabled,
+31:04 as it can reduce overhead by allowing more inlining.
+31:07 Also, profile and look for generics that may need explicit specialization.
+31:12 It's also helpful to make sure your most-copied structs have simple fields.
+31:17 Profiling can help identity expensive struct copies.
+31:20 For these structs, try to minimize the use of reference types,
+31:24 copy-on-write types, and uses of any.
+31:28 For more Swift performance tips, check out "Explore Swift Performance",
+31:31 and "Consume noncopyable types in Swift".
+31:35 For Objective-C code,
+31:36 there are also a few ways to reduce retain and release overhead.
+31:41 Again, don't circumvent ARC,
+31:43 as leaks from manual reference counting can be extremely hard to debug.
+31:48 Mark methods as objc_direct to allow inlining of Objective-C method calls,
+31:52 which helps reduce retain and release traffic.
+31:56 For cases where inlining isn't possible,
+31:58 the objc_externally_retained attribute is great for letting the compiler know
+32:02 when parameter lifetimes are guaranteed, eliminating retain and release.
+32:07 Part of performance is being aware of observation cost.
+32:11 MallocStackLogging and Allocations track live data,
+32:14 which requires some memory and CPU
+32:16 to record information about every allocation.
+32:19 Leaks, VM Tracker, and Memory Graphs are snapshot-based,
+32:22 which requires the target app to be suspended during analysis.
+32:25 This can cause your app to briefly stutter or hang during the snapshot process.
+32:30 To wrap up, today we've shown how to measure the heap with Instruments,
+32:33 and look for patterns of transient and persistent growth.
+32:36 Once you find issues with individual allocations,
+32:39 use Xcode's Memory Graph Debugger and MallocStackLogging
+32:42 to find out why they still exist in your app's heap.
+32:44 But most of all, please be proactive!
+32:47 Analyze and optimize your app's heap memory.
+32:50 Finding leaks and persistent growth will let users enjoy your app for longer.
+32:54 Thanks again for joining us!

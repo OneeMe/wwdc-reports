@@ -1,0 +1,745 @@
+00:03 Hello, and welcome to WWDC.
+00:09 Hey. My name's Matthew,
+00:10 and I'm on the Security Engineering and Architecture team.
+00:13 Today, we're going to talk about the Endpoint Security Framework.
+00:16 The Endpoint Security Framework was first introduced last year in macOS Catalina.
+00:21 It is intended to be used as a replacement for the Kauth KPI,
+00:24 the unsupported Mac kernel framework, and the OpenBSM audit trail.
+00:29 Kernel extensions, or KEXTS, can be difficult to develop
+00:32 and even more difficult to debug.
+00:35 Further, KEXTS pose a maintenance nightmare,
+00:37 as kernel interfaces frequently change.
+00:40 They can also degrade overall system security and stability
+00:43 as even minor bugs often lead to kernel panics.
+00:47 With the EndpointSecurity Framework,
+00:49 you no longer need to develop a kernel extension,
+00:52 and you can instead focus on the real goals of your products.
+00:56 Products that use EndpointSecurity, or ES,
+00:59 are able to tap into a rich event stream from a normal application.
+01:03 Right now, ES supports roughly 100 event types, and we're constantly adding more.
+01:08 There are two categories of event types.
+01:11 We have NOTIFY events, which inform you of an operation taking place,
+01:14 and AUTH events, which allow you to control
+01:16 whether or not an operation should be allowed to continue.
+01:20 We'll be discussing how the EndpointSecurity subsystem works,
+01:23 how your products can best utilize the event stream,
+01:25 as well as some more advanced features available to you.
+01:29 While it's possible to distribute your ES application as a stand-alone product,
+01:33 we believe there are a lot of benefits to delivering your product
+01:36 as an EndpointSecurity based system extension.
+01:39 System extensions were also introduced last year in macOS Catalina.
+01:44 Several types of extensions are supported, including Network Extensions
+01:47 for writing applications such as VPNs and content filters,
+01:50 DriverKit for controlling hardware,
+01:52 and EndpointSecurity targeted at products like endpoint detection and response.
+01:57 We're not going to cover system extensions in detail here,
+02:00 but you should check out last year's WWDC 2019 session
+02:03 titled "System Extensions and DriverKit" for more information.
+02:08 First, when the extension is installed,
+02:10 it becomes protected by System Integrity Protection,
+02:13 preventing accidental or malicious tampering of you extension and assets.
+02:17 We're also able to provide a greater level of protection for you daemon
+02:21 similar to that of system daemons.
+02:23 This means that we prevent even root users
+02:25 from being able to unload your launchd job.
+02:29 Also, there are some EndpointSecurity features that products can only use
+02:33 if they are a system extension,
+02:35 such as during system start-up,
+02:37 the ability to execute and set up an event stream
+02:39 before other third party applications are able to execute.
+02:44 I always like starting with an example,
+02:45 so let's take a quick look at the key components needed
+02:48 to get started with EndpointSecurity.
+02:50 One thing to note, this framework is provided as a C library,
+02:53 which is a little different
+02:55 than many other Apple frameworks you might encounter.
+02:58 Using C allowed us greater control
+03:00 over some memory and performance characteristics.
+03:03 Also, our goal was to be able to provide a library
+03:06 that would be quickly adoptable by existing products.
+03:09 By using C, this library is callable from many languages
+03:12 including Swift, Objective-C and Rust.
+03:15 First off, in this example, you can see we start by initializing a new event stream
+03:19 using the ES new client API.
+03:23 This function returns an ES client T handle as an out parameter,
+03:26 but, importantly, is also defines the event handler block.
+03:30 The block passed here
+03:31 will be invoked whenever there is an event ready to be processed.
+03:36 In this example, you can see the block simply prints out the event type.
+03:40 Next, we set up the subscriptions for the event stream
+03:42 using the es_subscribe API.
+03:44 In this example, we have a single event in the array, the NOTIFY_EXEC event.
+03:50 Also in this example, we see the es_delete client API being used,
+03:53 when something went wrong setting up the subscriptions,
+03:56 and this API can be used to clean up resources
+03:58 previously obtained from a call to es_new_client.
+04:03 Finally, we call dispatch main
+04:05 which will allow the program to continue executing
+04:07 and process events via the event handler block submitted above.
+04:11 To help you all get an understanding of how EndpointSecurity works,
+04:14 let's take a look at a high-level architecture design.
+04:17 When your process connects to the EndpointSecurity subsystem
+04:20 using the es_new_client API,
+04:22 a channel is set up through which messages will be enqueued for processing.
+04:26 In this diagram here, there are two different ES-based applications.
+04:31 One has set up two event streams using multiple calls to es_new_client,
+04:35 and the second one has a single channel.
+04:37 We typically refer to these channels as ES clients.
+04:41 Each ES client is able to have its own set of subscriptions
+04:44 to control which events it receives.
+04:47 When an event is triggered in the kernel,
+04:49 and assuming our client is subscribed to that event,
+04:51 EndpointSecurity intercepts and enriches this event
+04:53 with information that is typically helpful for ES clients performing analysis.
+04:58 We'll discuss the information collected in more detail in a second,
+05:01 but once collected, this data is then wrapped in a message envelope.
+05:05 Next, that message is then sent to all appropriate ES clients,
+05:08 enqueueing the message for the event handler blocks to process.
+05:12 The message is enqueued for all clients simultaneously.
+05:16 So for those of you already familiar with EndpointSecurity,
+05:18 this is a slight change in behavior,
+05:20 where before, events were delivered to clients serially.
+05:24 Some events require a response, which we'll talk about shortly,
+05:27 in which case the original operation is held up in the kernel
+05:30 until a response is received.
+05:32 For normal notification events, or after receiving a response for AUTH events,
+05:36 the operation is immediately unblocked in the kernel and allowed to continue.
+05:41 Last thing to note in this diagram,
+05:43 is that EndpointSecurity attempts to cache as much as possible
+05:46 in order to reduce the number of messages
+05:47 that are required to be delivered for AUTH events.
+05:50 We have a lot more information about the cache later on.
+05:54 The message envelope I just mentioned refers to the es_message_t structure,
+05:58 which is the wrapper for all ES events delivered to ES clients
+06:01 via the event handler block.
+06:03 Each message contains three primary categories of information.
+06:07 First, message metadata.
+06:09 This includes things like the event type, message generation time,
+06:13 whether it's an AUTH or a NOTIFY event,
+06:15 and a message version number used for compatibility, which we'll touch on later.
+06:19 Next, all messages include information
+06:22 about the process that caused the event to be triggered in the first place.
+06:26 Process information includes information about the executable file,
+06:29 including full stat info,
+06:31 code signing information, process ID and user ID information, and a whole lot more.
+06:36 Last, each message contains information specific to the event that occurred.
+06:41 For example, the SIGNAL event includes information
+06:44 about the process being signaled and the signal number.
+06:47 The exec event includes information such as the file that will be executed
+06:50 and the executable arguments,
+06:52 and the OPEN event includes information about the file being opened
+06:55 and the open flags.
+06:58 Time-of-check time-of-use issues are extremely important
+07:01 for you to be aware of when developing your ES products.
+07:04 Quickly, for those who may not be familiar,
+07:07 this refers to a class of bugs that occur when a program makes assumptions
+07:10 about some state that were previously true but may no longer be true.
+07:15 Classic example here is first checking if a file exists
+07:17 and then opening the file as a two-step process.
+07:21 If someone on the system maybe deleted the file
+07:23 after your program checked its existence, but before your program opened it,
+07:26 and your program didn't handle open failures correctly,
+07:29 it could lead to unexpected behavior.
+07:32 The information provided in ES messages reflects a snapshot in time.
+07:37 The system continues to process multiple threads simultaneously,
+07:40 and those threads may do things that can change system state
+07:43 before your application has an opportunity to inspect a message.
+07:47 This means, in some cases, parts of the message may have different values
+07:51 than if you were to query that information on your own.
+07:55 Products need to be cautious of things like time-of-check time-of-use issues.
+07:58 This is no different than those issues faced
+08:00 by kernel extension-based products today.
+08:03 One last thing to note before diving in to a demo,
+08:06 EndpointSecurity has a handful of runtime requirements
+08:08 that programs must satisfy in order to successfully establish an ES event stream.
+08:15 First, an application must have the proper EndpointSecurity entitlement.
+08:19 This is a restricted entitlement,
+08:20 and you can request a provisioning profile via the link shown here.
+08:25 If your application is bundled as a system extension,
+08:28 there is an additional entitlement required for the containing app bundle
+08:31 in order to install the extension.
+08:34 This information can be found within the system extension documentation.
+08:38 Also, system extensions require approval from the user to complete installation.
+08:44 Once an extension begins the installation process
+08:46 by using the system extension API,
+08:48 the user must approve the installation
+08:50 from the Security and Privacy Preferences dialogue on the General pane.
+08:55 Next, in order to increase user privacy,
+08:58 we require that your applications obtain user consent
+09:00 in the form of Full Disk Access permissions,
+09:03 which is found on the Privacy pane of the Security and Privacy Preferences dialogue.
+09:08 If you deploy as a system extension,
+09:10 on installation, we pre-populate your extension in this dialogue
+09:13 to make it easier on users to enable these permissions.
+09:18 If your product is being deployed on managed devices,
+09:20 there are two MDM payloads available to aid distribution.
+09:24 First, there's payload to define extensions
+09:26 that will be automatically allowed to install without user approval.
+09:30 And second, there is a privacy preferences payload
+09:33 that can automatically enable Full Disk Access permissions.
+09:37 All right. Now, let's just into our first demo
+09:39 where we're going to look at notification messages
+09:41 and expand upon an existing ES extension.
+09:45 So over here we're looking at our main function for a NOTIFY demo,
+09:49 and we can see right away this code looks very similar
+09:51 to the example code that we saw a few slides back.
+09:54 We start by setting up our new client event stream with es_new_client,
+09:59 and our handler block here just calls our handle_event function,
+10:01 which we'll look at in a second.
+10:04 Next, we set up our subscriptions here and call es_subscribe.
+10:07 Right now we have the NOTIFY_EXEC and NOTIFY_FORK event types.
+10:11 Then, once the subscriptions are in place, we call dispatch_main
+10:14 to allow our program to continue executing and processing these events.
+10:18 So let's jump up in the handle_event.
+10:21 Up here, you can see we use a switch statement on the message event_type,
+10:25 and then we have a case for each one to just log message to the screen.
+10:29 So this extension is already installed and running and approved on the system,
+10:35 so let's go take a look at what's happening.
+10:38 So we're going to set up our log stream here first,
+10:40 and there's a predicate involved
+10:42 that allows us to just focus on the executions that I'm doing right now.
+10:46 Next, I'm gonna use the ps utility as an example.
+10:50 So now, when we execute ps, we see two messages come through.
+10:54 We first see that our Z shell is forking a new child process,
+10:58 and then from that forked process,
+11:00 it wants to execute the new executable /bin/ps.
+11:04 All right. Now let's expand upon this demo
+11:06 and add the EXIT event to get full process life cycle information.
+11:10 So here in our event array, we're going to add the ES_EVENT_TYPE_NOTIFY_EXIT
+11:15 to our list of subscriptions.
+11:19 In our handle_event function, we need to add this new case.
+11:24 So I'm gonna go ahead and add the break statement
+11:26 so I don't forget to do that later,
+11:28 and now we want to log this information.
+11:30 So I'll set up some of the boiler plate code for the OS log function here,
+11:34 and for the format string,
+11:37 let's go ahead and add the instigating process information
+11:41 like we did above, along with the pid.
+11:44 And then next, I know that the EXIT event includes some event specific information
+11:49 related to the exit status.
+11:51 So let's get that as well.
+11:57 All right.
+11:58 So now, to fill in the data for this format string,
+12:01 we need to first look for the instigating process,
+12:03 and we can do that looking at the process member of the message structure.
+12:08 From there, we can look at the executable, and then finally grab the path.
+12:14 Next, we need that pid for that process, and for processes,
+12:19 EndpointSecurity provides audit tokens for that information,
+12:23 which includes things like the user ID and the process ID.
+12:26 So you can use the lib BSM function, audit_token_to_pid, to extract that.
+12:31 So, once again, we'll dive into the-- the process field
+12:35 and pull out the audit token.
+12:38 And finally, we want the event specific information free at the EXIT event,
+12:42 which is the exit status code.
+12:44 So to do that, we'll look at the event member of the message.
+12:47 From there we can pull out the EXIT event
+12:50 and then, finally, the stat field for that status code.
+12:54 All right. So we're going to build this extension,
+12:57 and now we need to install it.
+12:58 A quick note that I've set up a system extension developer mode on this system,
+13:04 and that just allows us to more quickly deploy test extensions.
+13:10 The other thing to note here is that system extension requires
+13:13 that the containing app bundle live in /Applications
+13:16 to be able to install the extension.
+13:18 So we're gonna drag this containing app we just built over to /Applications.
+13:23 And then, once there, we can run that app and finally install the extension.
+13:28 So this is now just performing the upgrade,
+13:30 and the new extension is now running and live on the system.
+13:34 So, once again, let's use the ps utility as an example.
+13:38 Now you can see we get a third exit message,
+13:41 that includes the status code of zero,
+13:43 indicating the process exited successfully.
+13:46 As a quick example, we could pass an invalid flag to ps
+13:49 and we can see now the status code is 256
+13:52 indicating there might have been an issue with the process.
+13:56 Now that we've seen notification events in action,
+13:59 it's time to talk about AUTH events.
+14:01 A major feature of EndpointSecurity
+14:03 is the ability to authorize operations on the system.
+14:07 AUTH events are synchronous,
+14:08 which means after we enqueue the message for the ES clients,
+14:11 the operation is held up in the kernel and unable to resume
+14:14 until a response is received or a deadline expires.
+14:19 Each AUTH message received has its own deadline field
+14:22 contained inside the message structure.
+14:25 Your ES clients must inspect this value for each message
+14:28 and ensure that the work it performs is completed before the deadline expires.
+14:32 If a client fails to respond before the deadline,
+14:35 the application will be terminated.
+14:38 If your application is a system extension,
+14:40 the launchd job we submit for you will be automatically restarted.
+14:44 It's important to emphasize that each individual message has its own deadline,
+14:48 and there is no guarantee that each message
+14:51 allows for the same amount of response time.
+14:54 These values can and will change over time.
+14:58 When a deadline is missed, an implicit ALLOW is applied as the response,
+15:02 but the result will not be cached,
+15:03 allowing future operations to be reevaluated.
+15:07 There are two APIs available for responding to AUTH events.
+15:10 Most event types require a simple ALLOW or DENY response
+15:14 using the es_respond_auth_result API.
+15:18 The second response API, es_respond_flags_result
+15:22 is used when an event has a range of options that may be permitted or denied,
+15:26 such as being able to allow a file to be opened
+15:29 with read-only permissions instead of read/write.
+15:33 You should look at documentation to know which API to use for each event type,
+15:37 however as of today, only the AUTH OPEN event uses the flags result API.
+15:44 If there are multiple clients on a system that subscribe to the same AUTH event,
+15:48 the responses from all the clients are combined
+15:50 by applying the most restrictive response,
+15:53 so if you have four clients respond to an event with ALLOW
+15:56 but one wants to DENY, the overall result is to deny the operation.
+16:01 Similarly for flags responses,
+16:04 only the subset of flags set by all clients will be allowed.
+16:09 You should also be aware that ES does not send introspective AUTH events
+16:12 as this would lead to trivial deadlocks.
+16:15 The events will be implicitly allowed.
+16:18 We will, however, send NOTIFY messages for events instigated by your process.
+16:23 One quick caveat to call out with the flags result API
+16:26 is that your ES client process
+16:28 should respond with all the flags it will ever permit,
+16:30 not necessarily only the flags requested for an individual event.
+16:35 This has to do with caching, and we'll discuss this in more detail soon.
+16:39 With muting, ES clients are able to prevent receiving messages
+16:43 from processes that may not be of interest to the application.
+16:46 There are two main ways to do this.
+16:50 First, with es_mute_process,
+16:52 the ES application provides an audit token that uniquely identifies a process.
+16:57 Typically, the client will obtain the audit token from a previous message.
+17:01 The EndpointSecurity subsystem will automatically track process exits
+17:05 and remove them from your client's set of muted processes.
+17:08 There is no need to manually use the corresponding es_unmute_process API
+17:13 unless your client wants to start receiving messages again
+17:16 from a process that it previously muted.
+17:20 ES also supports muting by path literals, that is complete paths,
+17:23 with es_mute_path_literal as well as path prefixes with es_mute_path_prefix.
+17:30 As the names suggest, this mechanism will prevent messages
+17:33 from instigating processes which match the provided paths.
+17:37 We recommend that ES clients use caution with these last two APIs here.
+17:42 While we employ data structures with fast lookup operations,
+17:45 adding a large number of paths
+17:47 can potentially have an adverse affect on performance.
+17:50 Muting by process audit token is generally a better way to mute events
+17:54 without as much overhead.
+17:58 Many of the AUTH events can cache
+17:59 the combined result from the ES client responses,
+18:02 and this is stored in a single global cache shared across all ES clients.
+18:08 The cache strategy used by EndpointSecurity is best effort,
+18:11 and entries may expire at any time.
+18:14 EndpointSecurity tracks several operations,
+18:16 and will automatically invalidate cached entries,
+18:18 for example, if a file is written, truncated, deleted and many more.
+18:23 While we don't guarantee responses will be cached,
+18:26 if an ES client sets the cache flag in the response APIs to false,
+18:29 ES will guarantee not to cache that result,
+18:32 even if another client does request that it be cached.
+18:36 Some reasons that an ES client may want to deny caching
+18:39 might be for the EXEC events
+18:40 when the executable is very dependent upon the executable arguments
+18:44 or environment variables, such as interpreters
+18:46 where you may want to inspect the script that the interpreter will execute.
+18:52 ES applications are able to clear the entire cache with the es_clear_cache API,
+18:56 however we do not support invalidating individual cache entries.
+19:01 Also note that ES will automatically clear the cache
+19:04 when a new client connects or an existing client disconnects.
+19:08 This allows for various scenarios where the remaining clients
+19:11 might respond with a different result than the previously combined cache result.
+19:16 A few slides back I mentioned an important caveat
+19:19 that you need to be aware of when using the es_respond_flags_result API.
+19:24 While at first it might sound unintuitive, the response must contain all flags
+19:28 an ES client might ever allow for an operation.
+19:31 This is because the cache for flags responses
+19:33 operates the same way as AUTH responses.
+19:37 When a future event occurs, the cache is first consulted.
+19:41 If a cached entry exists, the flags from that entry
+19:43 are compared against the requested flags for the new operation,
+19:47 and the result is applied without generating an AUTH message.
+19:51 So consider the case where a process opens a file with read-only flags set,
+19:56 and suppose the file being opened isn't a concern to your application.
+19:59 That is, your application wants to allow that process
+20:01 to manipulate the file however it needs.
+20:04 When your ES client process responds with the flags result,
+20:07 it should set all appropriate flags, including the WRITE flag,
+20:09 even though it wasn't requested for this particular event.
+20:13 Because what would happen if you did not set the WRITE flag?
+20:16 Well, if the process opened the same file for writing in the future,
+20:20 and the cached result still existed,
+20:22 the operation would be automatically denied
+20:23 without generating an AUTH message,
+20:25 even though that wasn't what your product intended.
+20:29 Now that we've gone over the two, let's look at a quick comparison
+20:32 between AUTH and NOTIFY event types.
+20:35 NOTIFY events are always asynchronous.
+20:37 We enqueue the message for the client, but the operation immediately continues
+20:41 and could be completed before the ES client
+20:43 has an opportunity to see the message.
+20:46 AUTH events, as previously stated, are synchronous
+20:49 and the operation is held up until a response is received.
+20:54 Regarding delivery, NOTIFY messages are always delivered.
+20:57 However, AUTH messages are only delivered if there is no cached result
+21:01 and the message isn't being delivered
+21:03 to the same process that instigated the event.
+21:07 Neither AUTH nor NOTIFY messages are delivered
+21:09 if the instigating process is muted.
+21:13 Finally, there is a slight difference in message structure between the two.
+21:17 NOTIFY messages contain the result as applied by EndpointSecurity.
+21:21 That is, the ALLOW or DENY result from the corresponding AUTH message.
+21:25 If there were no ES clients subscribed to the AUTH variant,
+21:28 or no AUTH variant exists for the event, the result is implicitly allowed.
+21:33 For AUTH messages, no result information exists yet, obviously.
+21:36 However, a message will have a deadline value
+21:38 and also requires a response from the ES client process.
+21:42 Now, let's do another demo, this time looking at AUTH event types
+21:45 and seeing how we can write a client to handle and respond to these messages.
+21:51 So, once again, we're looking at our main function here.
+21:54 You'll notice right away it looks very similar to the previous demo setup that we had.
+21:59 One slight difference here,
+22:01 we're going to be performing some asynchronous work
+22:03 on an asynchronous dispatch queue.
+22:05 So, we're going to go ahead and set up that queue first.
+22:08 But afterwards, we'll go ahead and initialize our new client event stream
+22:11 with the es_new_client.
+22:13 And our handler block will once again call our handle_event function.
+22:18 For this demo, we're going to be looking at AUTH_EXEC and AUTH_OPEN event types.
+22:22 And after subscribing, we once again call into dispatch_main
+22:26 to allow our program to continue executing and processing these events.
+22:31 So, let's look at the handle_event function.
+22:34 Once again, we see a switch statement here
+22:36 where we call an appropriate handle function
+22:38 for each individual event type.
+22:41 Let's start with EXEC.
+22:44 First thing to note here is that we call the es_respond_auth_result
+22:49 with ES_AUTH_RESULT_ALLOW for all EXECS.
+22:52 But we've left a TODO for ourselves to deny new EXECs matching the signing ID.
+22:57 Now, we typically expect most products will want more restricted polices,
+23:01 such as matching on CD hashes,
+23:03 but for demonstration purposes,
+23:04 this is a little more clear to see what we're trying to block.
+23:08 So, how can we do this?
+23:09 Well, one way, we could just use a simple string comparison
+23:13 on the new process that we'll be executing
+23:15 then compare that signing ID to the one that we want to block.
+23:20 So, because we're looking at the event-specific data,
+23:23 we'll dive into the event union.
+23:26 And then from here, we can look at the target process
+23:29 and pull out the signing_id data.
+23:33 So, now we'll compare that to the signing_id_to_block,
+23:35 and if they're equal, we want to deny that.
+23:39 So, we can do that with the es_respond_auth_result API.
+23:42 We need to pass our client and message argument here.
+23:46 And next we need to, define our result
+23:49 which is simply the AUTH_RESULT_DENY.
+23:52 Go ahead and allow this to be cached.
+23:55 And to complete this out,
+23:57 we'll put this previous existing response here in the else statement.
+24:01 So, now, if our new executable matches the signing ID we want to block,
+24:07 we will respond with a "deny" result, and everything else will be allowed.
+24:12 So now let's look at the open case.
+24:15 So in handle_open, this may look a little less familiar,
+24:19 and there's some concepts we need to introduce
+24:21 that we haven't quite talked about yet.
+24:23 It is recommended that your ES clients perform as little work as possible
+24:27 in their event handler block.
+24:28 This typically means that you shouldn't perform a lot of I/O
+24:32 or large CPU-intensive tasks.
+24:34 And the goal here is that your event handler block
+24:37 should be as quick as possible
+24:38 so that they can return and continue dequeuing messages
+24:42 in order to keep that message queue size small,
+24:45 and that will help prevent with dropping messages.
+24:49 So in this function, you see we copy our message
+24:52 with the es_copy_message API, and we'll discuss that more later on.
+24:57 After we've copied our message,
+24:59 we asynchronously call our handle_open_worker function,
+25:02 and then once that's complete, we then go ahead and free that copied message.
+25:08 So, what does our worker function do?
+25:10 We have three cases that we're concerned about.
+25:13 Our first case is a test for an EICAR file,
+25:16 and for those not familiar, an EICAR file is a test file
+25:19 that antivirus products typically use to test their operation
+25:23 without needing to introduce real malicious code on the system.
+25:27 So, it's not important what this function does for this demo purposes.
+25:31 Just know that it needs to open and inspect the file contents,
+25:33 and it was a big driver for why we're doing this work asynchronously.
+25:38 So, assuming this is an EICAR file,
+25:40 we will use the es_respond_flags_result API.
+25:42 And you can see we've defined a mask of zero.
+25:45 And this essentially clears all bits
+25:47 and will deny all open operations for that file.
+25:52 Next, you can see we left a TODO for ourselves.
+25:56 So, what's going on here? In this if statement,
+25:59 you can see we're inspecting the open event specific data
+26:03 for the file that is being opened,
+26:05 and we compare that against the read only prefix
+26:07 here defined as /usr/local/bin.
+26:11 So we want to prevent anybody from manipulating files on these directories.
+26:17 So, to do that, we can once again use the es_respond_flags_result API.
+26:22 We'll also pass our client and message arguments.
+26:26 Now we need to define the flags.
+26:28 We know that the only operation that we want to deny here
+26:31 is the write operation.
+26:33 So we can define the mask that is first with all bits set
+26:39 and then use some bitwise operations to clear the right flag.
+26:44 One thing to note here you might notice
+26:45 is that EndpointSecurity provides flags for the open event
+26:48 that are the kernel versions of flags,
+26:50 not the oflags that you might be familiar with from the open system call.
+26:54 This is documented in the open event, and you should check that out.
+26:59 Last, we'll allow this to be cached.
+27:02 And then the final case here already written,
+27:04 is that for all other open operations, we have our mask set here with all bits set
+27:09 and will allow all those open operations to continue successfully.
+27:14 So, let's recap what we've done.
+27:17 So, the three things that our program was intending to do
+27:21 was first to deny the text edit application to open.
+27:25 We haven't installed the extension yet, so we can see all this working now.
+27:30 So text edit can successfully open.
+27:33 We also wanted to deny writing to files in /usr/local/bin.
+27:39 So, as an example here, we have set up a script called hi.sh
+27:43 that simply prints "hi" to the screen.
+27:46 And just to see that running, we can execute it.
+27:49 It does exactly what you'd expect it to do.
+27:52 Finally, in our home directory, I have an EICAR file.
+27:55 So, we'll print that out here,
+27:57 and we can see the standard EICAR test file definition.
+28:01 All right, so, now let's go over, build our extension.
+28:07 We once again need to install the system extension,
+28:12 so we're gonna drag it over to /Applications.
+28:17 Now we'll launch the containing app bundle and install that new extension,
+28:22 and now our AUTH demo is now live and running.
+28:26 So, we can first try now to open the text edit application.
+28:30 We can see the icon bounces, but nothing's able to launch anymore.
+28:34 Next we want to try and modify a file in usr/local/bin.
+28:39 So, here we can see I'm trying to modify the contents of the hi script
+28:43 to say "Bye" instead.
+28:45 However, this is now no longer allowed.
+28:48 But you can see this file is still allowed to be opened for read-only purposes,
+28:53 and the script is able to still execute.
+28:57 And finally we have the EICAR file that we want to prevent all operations on.
+29:02 So we can see even trying to read that file is no longer permitted.
+29:06 After seeing how easy it is to write in ES client to handle AUTH events,
+29:10 let's dive into some more advanced topics.
+29:12 The message structure contains a version field
+29:15 that will allow your ES-based applications to maintain compatibility
+29:18 when deployed across different operating system releases.
+29:23 New fields can be added to the various EndpointSecurity structures over time,
+29:27 allowing us to provide additional information to your ES clients.
+29:30 The version number is a single integer value,
+29:33 and all messages in an OS release will share the same version number.
+29:38 If an OS release modified structures in a way that could affect compatibility,
+29:42 the version number will be increased.
+29:44 Clients using newer fields must first check the message version
+29:47 to ensure the field is available.
+29:49 Failing to do so will result in undefined behavior.
+29:53 Please pay close attention to the header docs for the ES structures
+29:56 as they indicate in which version new fields were added.
+30:01 As a quick example, let's take a look at the acl field for the create event.
+30:05 This field didn't exist in the initial release,
+30:08 and, when it was added, we bumped the message version to 2.
+30:11 In the small example here, we have the handle_notify_create function
+30:14 that operates on NOTIFY_CREATE events.
+30:17 We see that before accessing the acl member,
+30:19 the function first checks that the message version
+30:22 is greater than or equal to two.
+30:24 The so-called early boot feature is a powerful mechanism of EndpointSecurity.
+30:29 And, as a reminder, this feature is only available
+30:31 to ES-based products that are system extensions,
+30:33 not to stand-alone ES applications.
+30:36 An extension opts into this feature
+30:38 by setting the NSEndpointSecurityEarlyBoot key
+30:41 in the extensions input/out plist.
+30:44 When there are registered early boot clients on system start-up,
+30:47 the system still comes up normally.
+30:49 However, no additional third-party applications will be allowed to execute
+30:53 until all of the early boot extensions are ready.
+30:57 To signal readiness, your extension needs to make at least one call
+31:00 to the es_subscribe API.
+31:03 Once all early boot clients have made their first subscriptions,
+31:07 the third-party applications are finally allowed to execute.
+31:11 This means that your client should be prepared to subscribe
+31:13 to all necessary events in a single call to es_subscribe.
+31:18 If you split your events across multiple calls,
+31:20 third-party applications may begin executing
+31:23 before the additional subscriptions are in place
+31:25 and your client can miss events.
+31:28 It's also important to note that there is a deadline enforced
+31:30 by EndpointSecurity subsystem
+31:32 by which all early boot clients must signal readiness.
+31:36 Once the deadline expires,
+31:37 all third-party executions are automatically allowed to continue.
+31:42 Your extensions should be careful not to perform long initialization steps
+31:45 before making a subscription to prevent missing events.
+31:50 We do not consider the deadline value to be API
+31:52 and is subject to change over time,
+31:55 but we believe the value is suitable for your products to come up and become ready
+31:58 without having a large impact on end users.
+32:02 Those of you who have already worked with the EndpointSecurity framework
+32:05 have likely noticed that we do not provide events
+32:07 related to networking operations.
+32:09 This is intentional as these are better covered
+32:11 by the NetworkExtension framework.
+32:14 There's a small exception related to UNIX domain sockets,
+32:17 and ES does provide events for these.
+32:21 You should also know that it's possible to use
+32:23 both the EndpointSecurity and NetworkExtension frameworks
+32:26 from a single combined system extension.
+32:29 For these products, you should use the system extension APIs
+32:32 and install flow as you normally would
+32:34 for extensions that are of a single extension type.
+32:37 Additionally, it is safe to combine keys in your extension's info.plist
+32:41 that are specific to either network extensions or EndpointSecurity extensions
+32:45 and the system will take care of applying those values as appropriate.
+32:50 ES provides messages to clients in the same order as they occurred on the system.
+32:54 For example, if a client subscribes to FORK and EXEC events,
+32:58 in the common scenario, when a new process is spawned,
+33:01 the client's handler block will always receive the fork event
+33:04 before the corresponding exec.
+33:07 Also note that message ordering applies to subscriptions on an individual ES client.
+33:12 If your application creates multiple ES clients
+33:15 and splits subscriptions across them, the order of the events are only sequenced
+33:19 relative to the subscriptions for each ES client.
+33:23 If desired, you can reconstruct global ordering
+33:26 by using the message generation time contained in the message struct.
+33:32 Messages are delivered to ES clients one at a time,
+33:34 and messages are delivered only when the ES client's event handler block
+33:38 returns from processing the previous message.
+33:41 The message structure received by the handler block has a lifetime
+33:44 that is only guaranteed to be valid
+33:46 as long as the invocation of the handler block for that message.
+33:51 Once you return from the block, you should not continue to access the message
+33:55 as doing so will result in undefined behavior.
+33:58 If you need to extend the lifetime of the message,
+34:01 as we needed to do in the demo,
+34:03 you can do so using the es_copy_message API.
+34:06 This will return a handle to the message
+34:08 that will live until the corresponding es_free_message API is called.
+34:13 An important feature this implies
+34:15 is that AUTH events do not necessarily need to be replied to
+34:18 before the handler block returns.
+34:21 It also means that AUTH events need not necessarily be responded to
+34:24 in the same order as presented to the ES client.
+34:28 It might be important for your application to first inspect future messages
+34:32 in order to make a decision on a previous message.
+34:35 In this case, the ES application can first copy the message
+34:39 and return from the handler block to begin inspecting additional messages,
+34:43 and then later reply to that copied message with the appropriate response.
+34:48 Don't forget to finally free the message when it's no longer needed.
+34:52 If you need to do some sort of asynchronous message processing,
+34:55 such as using an asynchronous dispatch queue,
+34:58 be sure you initialize the dispatch queue
+35:00 with a quality-of-service class appropriate for your application.
+35:04 This will likely be dependent on many factors,
+35:07 such as whether or not you subscribe to AUTH events, expected event volume
+35:11 or how much CPU or system resources you wish to consume.
+35:15 Next, we wanted to share some various tips
+35:17 that we think will help you develop great EndpointSecurity-based products.
+35:21 One field you might've noticed in the message structure
+35:23 is the is_es_client Boolean member.
+35:26 ES applications are not able to authorize their own actions
+35:29 as these introspective events are automatically allowed.
+35:33 However, there might be multiple ES clients on a system,
+35:36 and ES clients do have the ability to authorize the actions of other ES clients.
+35:41 For both AUTH and NOTIFY messages,
+35:43 the is_es_client field will be set to "true"
+35:46 if the instigating process contain the EndpointSecurity client entitlement.
+35:51 ES client should inspect this field and take appropriate action
+35:54 to ensure they don't inappropriately interfere with those clients' actions
+35:58 or perform actions that could create feedback loops.
+36:02 Path muting is a fantastic way
+36:04 to prevent your client from being inundated with messages.
+36:08 It also helps keep the overall system more performant
+36:10 by reducing the number of messages that need to be processed or authorized.
+36:15 For instance, if your client isn't concerned
+36:17 about the Spotlight service on Mac OS indexing files,
+36:20 muting the appropriate indexing processes
+36:22 can greatly reduce the number of messages received for some event types.
+36:27 Applications that take advantage of the cache
+36:30 should be aware that caching should be used for performance purposes only,
+36:33 and caching should never be used for policy.
+36:36 This is because, as stated earlier, cache entries may expire at any time.
+36:41 For example, if your application decides to deny a process from opening any files
+36:46 and allows the response to be cached, you should then not mute the process.
+36:51 Consider what happens if the cache entry is later invalidated or otherwise removed.
+36:56 If that process attempts to reopen files, no AUTH events will be generated
+37:00 because your ES client has muted the process
+37:02 and those open operations would be automatically allowed.
+37:07 The next tip is to be careful when debugging your ES application
+37:10 when subscribed to AUTH events.
+37:12 There is no way to disable or otherwise extend the response deadline.
+37:16 If an AUTH event is enqueued while your application hits a break point,
+37:19 you're still required to respond before the deadline,
+37:22 or your process will be terminated as per the normal rules.
+37:27 Finally, it is possible for EndpointSecurity to drop messages
+37:30 without delivering them to clients if the message queue is full.
+37:34 Client can determine if this has happened
+37:36 by inspecting the sequence number field in the message structure.
+37:40 This is a per-client and per-event-type sequence number
+37:43 so you can determine exactly how many of each event type may have been missed.
+37:47 Clients that see higher drop rates are encouraged to take advantage
+37:50 of more advanced EndpointSecurity API usage patterns
+37:53 such as muting, asynchronous processing
+37:55 and splitting subscriptions across multiple ES clients.
+38:00 This year we're announcing that the audit subsystem is being deprecated.
+38:04 This mainly refers to functionality related to audit events
+38:07 such as events written to audit trail files,
+38:09 typically those found in the /var/audit directory,
+38:13 as well as events sent to the Auditpipe pseudo-device
+38:15 for applications that wanted a live event stream.
+38:18 This does not apply to things like audit tokens and audit sessions,
+38:22 which will continue to be a core part of the system.
+38:25 Products that rely on audit events
+38:27 should migrate to using the EndpointSecurity framework.
+38:29 So what's new in macOS Big Sur?
+38:32 First up, there is some new event-specific API for the EXEC event.
+38:37 ES now provides the list of file descriptors and file descriptor types
+38:40 that a newly executing process will begin with.
+38:43 We also provide unique identifiers specifically for Pipe file descriptors
+38:47 that will allow you to track how multiple processes might be communicating
+38:51 via the Pipe interprocess communication mechanism.
+38:55 Due to performance limitations, not all file descriptors may be provided.
+38:59 The main focus was for standard in, standard out and standard err descriptors,
+39:03 but we also provide several more if they exist,
+39:05 and we expose to clients if there are additional descriptors
+39:08 we may not have enumerated.
+39:11 Regarding performance, we think early adopters of EndpointSecurity framework
+39:15 will have a lot to look forward to in macOS Big Sur.
+39:18 We've rewritten many of our data structures to reduce memory allocations
+39:21 and increase event throughput.
+39:23 We've tuned the caches to eliminate invalidation bottlenecks
+39:26 and improved our overall memory performance.
+39:29 Combined, these enhancements have led to better system performance
+39:32 and fewer drops.
+39:34 We think this will provide much better performance characteristics
+39:37 for your EndpointSecurity products as well.
+39:40 There were also several new event types that were added in macOS Big Sur.
+39:44 Some of these are additional AUTH variants for previously existing NOTIFY events
+39:48 and some are brand new.
+39:50 I wanted to call out a couple here.
+39:52 First, we added the trace event that was widely requested.
+39:55 This will notify your client when a process is being debugged.
+40:00 Second, we're excited to introduce the CS_INVALIDATED event.
+40:03 As many of you know, as a signed process executes,
+40:06 the kernel is constantly validating that the code it pages in
+40:09 matches the individual page hashes of that binary.
+40:12 If a mismatch is found, the process has its code signing flags updated
+40:16 to clear the CS_VALID bit.
+40:19 Previously, ES clients had to wait for future messages
+40:21 and inspect the code signing flags of the instigating process
+40:24 to determine if it went invalid.
+40:27 However, with this event, clients can get an immediate notification.
+40:32 One thing to note, binaries that use hardened run-time features,
+40:35 such as those that have the CS_KILL code signing flag set,
+40:39 will still automatically be terminated by the system
+40:42 if a hash mismatch is encountered.
+40:45 So, where do you go from here?
+40:47 First, you can use the top link shown
+40:49 to begin the process of requesting the restricted EndpointSecurity entitlement.
+40:53 Next, you can begin reviewing the official EndpointSecurity
+40:56 and System Extension API documentation on the Apple developer website.
+41:01 I want to also encourage you to carefully read the EndpointSecurity header docs in the SDK.
+41:05 We've added a lot of comments and detail that may not be on the websites
+41:08 that we think answers common questions and will help you build great products.
+41:12 Lastly, we'll be making sample code available largely based on today's demos
+41:16 to help you get started working with the EndpointSecurity framework.
+41:19 With that, thanks for joining us, and we look forward to seeing what you build.
+41:23 And enjoy WWDC 2020.

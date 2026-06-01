@@ -1,0 +1,339 @@
+00:03 ♪ ♪
+00:10 Hi.
+00:11 I’m Johannes Fortmann from the Cloud File Providers team,
+00:14 and I’m here to show you file providers on macOS.
+00:18 If you’re a cloud storage vendor syncing your users’ files
+00:21 to macOS, you’re in the right talk.
+00:23 After the introduction, we’re going to talk about
+00:26 some of the user flows involved with syncing files.
+00:31 We’ll then run through one of the flows in Xcode
+00:35 and discuss the order
+00:37 in which you will implement support for each of them.
+00:40 We’ll have a quick overview
+00:42 of additional optional integration points
+00:45 and your next steps.
+00:48 First off, let’s talk about what file providers can do for you.
+00:54 The File Provider framework allows you to integrate
+00:57 your cloud storage into the file system on macOS.
+01:01 It uses new APFS features to allow
+01:04 on-demand downloads of user files and folders.
+01:08 The API is entirely in user space.
+01:11 We’re deprecating kernel extensions on macOS,
+01:14 so this is a good alternative for you
+01:16 if you were relying on FUSE or KAUTH
+01:19 to intercept syscalls or download files on demand.
+01:24 All you have to do is handle uploads,
+01:27 downloads, and tell us what changed remotely.
+01:31 The system will tell you what changed locally
+01:34 and handle all the rest.
+01:36 All of this functionality is well integrated
+01:38 with the system and in particular in Finder.
+01:43 Your provider will show up in the sidebar.
+01:45 File status will be shown and tracked in Finder,
+01:49 and there are several customizable integration points
+01:51 with the UI.
+01:53 You implement an app extension
+01:57 that integrates with the system.
+01:59 Its life cycle is driven by user actions.
+02:03 Initially, you create a domain which represents
+02:07 the file tree that the user can access in your cloud storage.
+02:12 The system will expose that domain
+02:14 in the Finder sidebar and create a root directory
+02:17 for the domain in the file system.
+02:21 At this point, no actual data is on the device,
+02:24 but the user can already start interacting with the root.
+02:29 How does this work?
+02:31 The root is what we call a dataless directory.
+02:34 It’s a new kind of object in APFS,
+02:37 and there are APIs to recognize them and interact with them.
+02:42 But more importantly, dataless objects are
+02:44 fully transparent to processes who happen upon them unprepared.
+02:49 Reads trigger downloads,
+02:51 and files lose their dataless property
+02:53 before the reads are allowed to resume.
+02:57 In this presentation, we will see how the File Provider
+02:59 framework allows you to implement callbacks
+03:03 that get called when processes read dataless files.
+03:08 Let’s have a look at some user flows
+03:10 to get sync up and running.
+03:12 We’re going to look at four key flows that cover
+03:16 both sync down and sync up.
+03:19 In each flow, you’ll see that the system
+03:22 calls your extension whenever it needs new data.
+03:27 We’ll show you that you can talk to your cloud server
+03:30 to pull that data and, finally,
+03:32 call a completion handler to reply.
+03:36 First, we’re going to look at what happens
+03:39 when a dataless file is read.
+03:44 When the kernel detects a read access
+03:46 to a dataless file,
+03:48 that syscall is paused
+03:50 while your extension is called
+03:52 to fetch the contents of the file.
+03:55 Your extension’s fetchContents method is called.
+03:59 Typically, you will implement it to perform a download.
+04:02 When the download completes, it calls a completion handler.
+04:06 The contents of the file are handed
+04:08 to the system which fills in the formerly dataless file
+04:12 without invalidating the open file descriptor.
+04:15 The system then unpauses the read access.
+04:19 Now that the file is no longer dataless,
+04:22 subsequent reads won’t have to involve your extension.
+04:26 Enumerating a directory works very similarly.
+04:29 The kernel detects a readdir call and pauses it.
+04:33 It calls your extension to enumerate
+04:36 the items in that directory.
+04:38 You fetch the metadata for these items from your server.
+04:42 And you reply with a number of items.
+04:45 The enumeration is paginated.
+04:48 You can return less than the full set of items,
+04:51 and the system will pick up enumerating
+04:54 from where it left off.
+04:56 Once all pages have been enumerated,
+04:59 the system will allow the original call to go through.
+05:03 Like in the file case,
+05:05 once the directory has been enumerated,
+05:08 subsequent readdir calls will use the contents
+05:11 from disk and not have to involve your extension.
+05:16 But what if those contents change remotely?
+05:20 Well, you will have to inform the system of the remote change.
+05:24 Let’s look at how that works.
+05:27 If there’s a remote change,
+05:29 your server can send a push notification to the Mac.
+05:34 In response to that push notification,
+05:36 you signal the system
+05:38 that there are changes that need to be enumerated
+05:41 from a special enumerator, the .workingSet.
+05:45 The system will turn around and enumerate
+05:47 the items that have changed in the .workingSet.
+05:51 A continuation token called the syncAnchor
+05:54 is used to enumerate only the new changes.
+05:58 This token is defined by your extension.
+06:01 The system keeps track of the syncAnchor
+06:03 it last enumerated to.
+06:05 It will call your enumerator
+06:06 with the enumerateChanges(from syncAnchor:) method.
+06:09 In response, you return changed items,
+06:13 and once you’re done, give us a new syncAnchor
+06:16 that we can use next time around.
+06:19 The system will asynchronously go
+06:20 and update the user-visible files.
+06:23 We use an APFS compare-and-swap feature
+06:26 which makes sure that local changes aren’t lost
+06:29 in the process.
+06:31 Furthermore, the system integrates
+06:33 with file coordination
+06:35 and other advisory locking mechanisms
+06:37 to coordinate with applications.
+06:41 With these three mechanisms, we are able to sync files
+06:45 from the cloud and keep them in sync
+06:47 in case of remote changes.
+06:50 The last flow deals with syncing up local changes to the cloud.
+06:54 The system detects when local items have changed
+06:58 and calls a modifyItem method on your extension,
+07:02 passing in the exact set of fields that have changed.
+07:06 It aggregates low-level events into events
+07:09 that are meaningful for sync.
+07:11 For example, the kernel detects safe saves and remaps
+07:16 your item identifiers to the new file IDs transparently.
+07:20 The system will also zip package files for you if you request
+07:24 and present you with consistent package-level changes.
+07:29 In response to the modifyItem call,
+07:31 you will update the state of the item server-side.
+07:35 If the contents of the file have changed,
+07:38 the system will hand you a clone of the changed file so you can
+07:41 upload a consistent version even in the event of further changes.
+07:47 When done, you call a completion handler.
+07:51 The completion handler is used to update the version identifier
+07:54 of the item and confirms delivery
+07:56 of the change to your extension.
+07:59 The completion handler also takes the final state
+08:02 of the item as a parameter.
+08:04 Updating an item in the cloud may change its state,
+08:08 for example, if it conflicts with a remote change.
+08:11 Since you pass the final state back,
+08:14 the system is able to update the local state
+08:16 of the item to match the truth in the cloud.
+08:21 There is a fifth flow: eviction.
+08:24 The system will evict local files automatically
+08:27 and without involving your file provider extension
+08:30 when there is an urgent need for disk space.
+08:34 That might happen, for example,
+08:36 when the user is recording a video
+08:38 or downloading a software update.
+08:41 The system will evict the minimum set
+08:43 of least recently used files necessary to free up
+08:47 the disk space required to write those new files.
+08:51 Let’s review the transitions.
+08:54 Eviction turns a local file into a dataless file,
+08:57 and download turns a dataless file into a local file.
+09:02 Files can start dataless if they are created remotely
+09:06 or not if they are created locally.
+09:09 But not all files can be evicted.
+09:12 The system will only evict a file
+09:14 that you report as uploaded
+09:16 so that it can be downloaded again.
+09:19 So there really are two sorts of local files:
+09:22 uploaded and non-uploaded files.
+09:25 After a local edit, the new version of the file
+09:29 needs to be uploaded, so we’re back in a non-evictable state.
+09:33 In this presentation so far,
+09:36 we have seen how your file provider extension is invoked
+09:38 by the system to download files upon access
+09:41 and to upload files after local edits.
+09:44 While you’re not involved
+09:46 in disk-pressure triggered eviction,
+09:48 there are methods to trigger
+09:50 or prevent eviction from your extension.
+09:54 This was a lot of theory.
+09:56 Let’s have a look at one of the flows in practice.
+10:00 We’ve written an app that runs a small local file server
+10:03 and embeds a file provider extension
+10:05 that operates against that server.
+10:08 It’s called FruitBasket.
+10:10 I’ve already logged in to that server,
+10:12 so there’s an entry for the root folder here in the sidebar.
+10:16 I’ve also selected the root folder which caused the system
+10:18 to make dataless entries for the items in that folder.
+10:23 You can tell that the items are dataless
+10:25 from the cloud download icon next to the file name.
+10:31 We’re going to use ‘cat’ on the command line
+10:33 to read a file.
+10:35 Since the file is dataless,
+10:37 this will cause a content fetch in our extension.
+10:40 I’ve already attached to the extension in Xcode
+10:42 and set a breakpoint to intercept this content fetch.
+10:52 ‘cat’ is running, and our breakpoint has hit.
+10:56 Since we are blocking the completion
+10:57 of the content fetch,
+10:58 the read in our Terminal window is also blocked.
+11:02 Note how in the Finder window, the cloud icon has been replaced
+11:06 by a progress indicator.
+11:09 The system has a consistent view of the download status.
+11:13 Of course, since we are actually blocked
+11:15 in the debugger rather than busy downloading,
+11:18 the progress isn’t updating.
+11:21 Let’s continue.
+11:23 I’ve set a second breakpoint
+11:24 just before we call the completion handler.
+11:30 At this time, our provider has downloaded
+11:33 the contents of the file to a local URL on disk.
+11:36 Once we call the completion handler,
+11:38 the system will swap out the contents
+11:40 of the user-visible file with what we’ve downloaded.
+11:44 Let’s unblock the system by continuing in Xcode.
+11:47 The status in Finder updates to show the file as being local,
+11:51 and the read that the cat process was blocked on succeeds.
+11:58 I’ve still got the breakpoints set,
+12:00 but now that the file is local,
+12:02 I can run ‘cat’ again without hitting the breakpoint.
+12:05 Those reads are going against a regular local file
+12:08 and don’t involve our extension.
+12:15 Of course, this is just a small part
+12:17 of the feature set of our sample file provider.
+12:21 We’ve covered the full feature set of the API,
+12:23 and we are publishing the source code as part of this session.
+12:26 Let’s talk about how you can approach implementing
+12:29 the flows that we’ve talked about.
+12:31 First of all, we’re going to want
+12:32 to tell the system that we’re ready to sync.
+12:35 This will make an entry show up in the sidebar in Finder.
+12:39 We call these entries domains, and they usually correspond
+12:43 to a login session on your cloud server.
+12:46 Each domain has a unique identifier,
+12:48 and to make it show up, you create a new instance
+12:51 and add it via the manager object.
+12:54 You can also remove a domain.
+12:56 You’d usually do this when the user logs out,
+12:59 but it’s also going to be useful
+13:01 during your initial development and testing.
+13:05 With the domain showing up in Finder,
+13:07 the system will request enumeration of items
+13:10 as soon as you navigate to the entry.
+13:14 So let’s implement that next.
+13:16 Our first step here is to implement an item class.
+13:20 Its instances represent the individual entries
+13:23 that we’re going to enumerate.
+13:26 Then we implement an enumerator that calls the system
+13:30 with our items when the system requests it.
+13:33 At this point, we can look at directories
+13:36 by navigating to our sidebar entry.
+13:39 Of course, all the files in those directories
+13:41 will be dataless.
+13:43 Let’s change that by implementing
+13:45 content fetch.
+13:47 The fetchContents method is called by the system
+13:49 when we open one of the dataless files.
+13:52 Our job is to download the file contents to a location on disk,
+13:56 then call the completion handler with that location’s URL.
+14:00 The system will use the contents to fill the dataless file
+14:04 and then clean them up for us.
+14:07 To allow our directory structure to stay in sync,
+14:10 we’ll implement another type of enumerator.
+14:13 This one syncs remote changes.
+14:15 The system calls the currentSyncAnchor method first
+14:18 to get a sync anchor.
+14:20 You return a data object that describes
+14:23 a change cursor for your database.
+14:25 Whenever you signal that something has changed,
+14:28 the system will ask for changes
+14:30 since the last anchor you provided.
+14:32 You can then return the changes and finally a new anchor.
+14:37 The last step is to allow sync up of changes.
+14:41 If the system detects changes to the local files,
+14:44 it will call one of three methods to create,
+14:47 modify, or delete an existing item.
+14:51 We’ll have a quick look at the create method.
+14:54 The system hands you the new item that it asks you to create.
+15:00 This is a system item, although it follows
+15:02 the same protocol as your own items.
+15:06 The system will also hand you a set of fields
+15:08 that are of interest on the item.
+15:11 For example, the item may or may not
+15:13 have extended attributes attached to it,
+15:16 and there are fields to describe that.
+15:20 If the content field is set, the system will pass you
+15:23 a file URL with the contents.
+15:26 Items that describe folders or symlinks
+15:28 will not have contents.
+15:31 Your job is to upload the new local item’s data
+15:35 to the server and then call the completion handler
+15:38 with the resulting remote item.
+15:44 And that’s it.
+15:46 At this point, you have a functional
+15:48 file provider on macOS providing files on demand,
+15:52 propagating local changes to the cloud
+15:55 and remote changes to the Mac.
+15:59 There are a lot of additional optional APIs
+16:02 in the File Provider framework,
+16:04 which allow finer integration with the system.
+16:07 Let’s have a have a look.
+16:10 Icon decorations can be used to visually decorate
+16:14 items in Finder.
+16:16 You can badge a file icon,
+16:18 emboss a folder, or indicate sharing status.
+16:22 You provide custom artwork for the decorations
+16:25 via a UTType declared in your app.
+16:29 Contextual menu actions allow the user to execute
+16:33 custom actions on your files via the contextual menu.
+16:38 There are UI and non-UI variants.
+16:42 You can define which files these actions apply to
+16:45 with NSPredicates declared in your extension’s Info.plist.
+16:52 Pre-flight alerts allow you to warn the user
+16:55 before they take an action
+16:57 which may have unintended consequences.
+17:00 The alert UI and the criteria to activate the alert
+17:03 are configured in the Info.plist as well.
+17:08 So what are your next steps?
+17:10 Well, first of all, you can download
+17:12 the session’s sample code.
+17:14 It’s very comprehensive,
+17:15 and it’ll give you a lot of pointers.
+17:19 Add a target to your existing app for the new extension.
+17:23 There is an Xcode template that will help you get going.
+17:27 From there, all you have to do is implement
+17:31 the method stubs in the order we’ve discussed,
+17:33 and you’ll be up and running in no time.
+17:37 Thank you for watching this session.
+17:39 We look forward to seeing
+17:40 your file provider extensions on macOS.

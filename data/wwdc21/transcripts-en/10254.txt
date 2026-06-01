@@ -1,0 +1,765 @@
+00:01 ♪ Bass music playing ♪
+00:07 ♪
+00:09 Rokhini Prabhu: Hello, and welcome
+00:11 to "Swift Concurrency Behind the Scenes."
+00:14 My name is Rokhini, and I work on the Darwin Runtime team.
+00:18 Today, my colleague Varun and I are very excited to talk to you
+00:22 about some of the underlying nuances
+00:24 around Swift concurrency.
+00:28 This is an advanced talk which builds upon
+00:31 some of the earlier talks on Swift concurrency.
+00:35 If you are unfamiliar with the concepts of async/await,
+00:39 structured concurrency, and actors
+00:41 I encourage you to watch these others talks first.
+00:46 In the previous talks on Swift concurrency you've learned about
+00:49 the various language features available this year
+00:53 native to Swift and about how to use them.
+00:56 In this talk, we will be diving deeper to understand
+00:59 why these primitives are designed the way they are,
+01:02 not only for language safety
+01:04 but also for performance and efficiency.
+01:07 As you experiment and adopt Swift concurrency
+01:10 in your own apps, we hope this talk will give you
+01:13 a better mental model of how to reason about Swift concurrency
+01:18 as well how it interfaces with existing threading libraries
+01:22 like Grand Central Dispatch.
+01:25 We're going to discuss a few things today.
+01:28 First, we'll talk about the threading model
+01:31 behind Swift concurrency
+01:33 and contrast it with Grand Central Dispatch.
+01:36 We'll talk about how we've taken advantage
+01:38 of concurrency language features
+01:41 to build a new thread pool for Swift,
+01:43 thereby achieving better performance and efficiency.
+01:47 Lastly, in this section,
+01:49 we'll touch on considerations you need to keep in mind
+01:52 when porting your code to using Swift concurrency.
+01:56 Varun will then talk about synchronization
+01:59 in Swift concurrency via actors.
+02:02 We'll talk how actors work under the hood,
+02:05 how they compare to existing synchronization primitives
+02:08 you already may be familiar with --
+02:10 like serial dispatch queues --
+02:12 and finally, some things to keep in mind
+02:15 when writing code with actors.
+02:17 We have a lot of ground to cover today so let's dive right in.
+02:22 In our discussion today about threading models,
+02:24 we'll start by taking a look at an example app
+02:28 written with the technologies available today
+02:30 like Grand Central Dispatch.
+02:33 We will then see how the same application fares
+02:36 when rewritten with Swift concurrency.
+02:39 Suppose I wanted to write my own news feed reader app.
+02:43 Let's talk about what the high-level components
+02:46 of my application might be.
+02:48 My app will have a main thread
+02:50 that will be driving the user interface.
+02:53 I will have a database keeping track of the news feeds
+02:56 that the user is subscribed to,
+02:59 and finally, a subsystem to handle the networking logic
+03:02 to fetch the latest contents from the feeds.
+03:07 Let's consider how one might structure this app
+03:09 with Grand Central Dispatch queues.
+03:12 Let's suppose that the user has asked to see the latest news.
+03:16 On the main thread, we will handle the user event gesture.
+03:21 From here, we will dispatch async the request
+03:24 onto a serial queue that handles the database operations.
+03:28 The reason for this is twofold.
+03:30 Firstly, by dispatching the work onto a different queue,
+03:34 we ensure that the main thread
+03:36 can remain responsive to user input even while waiting
+03:40 for a potentially large amount of work to happen.
+03:43 Secondly, access to the database is protected,
+03:47 since a serial queue guarantees mutual exclusion.
+03:51 While on the database queue,
+03:53 we'll iterate through the news feeds
+03:55 the user has subscribed to and for each of them,
+03:59 schedule a networking request to our URLSession
+04:02 to download the contents of that feed.
+04:06 As the results of the networking requests come in,
+04:09 the URLSession callback will be called on our delegate queue
+04:13 which is a concurrent queue.
+04:16 In the completion handler for each of the results,
+04:19 we will synchronously update the database
+04:21 with the latest requests from each of these feeds,
+04:25 so as to cache it for future use.
+04:27 And finally, we'll wake up the main thread
+04:30 to refresh the UI.
+04:33 This seems like a perfectly reasonable way
+04:35 to structure such an application.
+04:38 We've made sure not to block the main thread
+04:40 while working on requests.
+04:42 And by handling the network requests concurrently,
+04:45 we've taken advantage of the inherent parallelism
+04:47 in our program.
+04:49 Let's take a closer look at a code snippet
+04:52 that shows how we process the results
+04:54 of our networking requests.
+04:58 First, we have created a URLSession
+05:01 for performing downloads from our news feeds.
+05:04 As you can see here, we've set the delegate queue
+05:06 of this URLSession to be a concurrent queue.
+05:10 We then iterate over all the news feeds
+05:13 that need to be updated and for each of them,
+05:16 schedule a data task in the URLSession.
+05:20 In the completion handler of the data task --
+05:22 which will be invoked on the delegate queue --
+05:25 we deserialize the results of our download
+05:28 and format them into articles.
+05:31 We then dispatch sync against our database queue
+05:34 before updating the results for the feed.
+05:38 So here you can see that we've written
+05:40 some straight-line code to do something fairly straightforward
+05:44 but this code has some hidden performance pitfalls.
+05:49 To understand more about these performance problems,
+05:52 we need to first dig into how threads are brought up
+05:55 to handle work on GCD queues.
+05:58 In Grand Central Dispatch,
+06:00 when work is enqueued onto a queue,
+06:02 the system will bring up a thread
+06:04 to service that work item.
+06:08 Since a concurrent queue
+06:10 can handle multiple work items at once,
+06:12 the system will bring up several threads
+06:15 until we have saturated all the CPU cores.
+06:19 However, if a thread blocks --
+06:21 as seen on the first CPU core here --
+06:24 and there is more work to be done on the concurrent queue,
+06:27 GCD will bring up more threads
+06:29 to drain the remaining work items.
+06:33 The reason for this is twofold.
+06:36 Firstly, by giving your process another thread,
+06:39 we are able to ensure that each core
+06:41 continues to have a thread that executes work
+06:44 at any given time.
+06:47 This gives your applications
+06:49 a good, continuing level of concurrency.
+06:53 Secondly the blocked thread may be waiting on a resource
+06:56 like a semaphore, before it can make further progress.
+07:00 The new thread that is brought up
+07:02 to continue working on the queue
+07:04 may be able to help unblock the resource
+07:07 that is being waited on by the first thread.
+07:10 So now that we understand a bit more
+07:13 about thread bringups in GCD, let's go back
+07:16 and look at the CPU execution of the code
+07:19 from our news app.
+07:22 On a two-core device like the Apple Watch,
+07:25 GCD will first bring up two threads
+07:27 to process the feed update results.
+07:30 As the threads block on accessing the database queue,
+07:34 more threads are created to continue working
+07:37 on the networking queue.
+07:39 The CPU then has to context switch between different threads
+07:43 processing the networking results
+07:45 as indicated by the white vertical lines
+07:48 between the various threads.
+07:51 This means that in our news application,
+07:54 we could easily end up with a very large number of threads.
+07:58 If the user has a hundred feeds that need to be updated,
+08:02 then each of those URL data tasks
+08:05 will have a completion block on the concurrent queue
+08:07 when the network requests complete.
+08:10 GCD will bring up more threads when each of the callbacks
+08:14 block on the database queue,
+08:16 resulting in the application having lots of threads.
+08:20 Now you might ask,
+08:21 what's so bad about having a lot of threads in our application?
+08:26 Having a lot of threads in our applications
+08:28 means that the system is overcommitted
+08:31 with more threads than we have CPU cores.
+08:34 Consider an iPhone with six CPU cores.
+08:37 If our news application has a hundred feed updates
+08:40 that need to be processed,
+08:42 this means that we have overcommitted the iPhone
+08:45 with 16 times more threads than cores.
+08:48 This is the phenomenon we call thread explosion.
+08:52 Some of our previous WWDC talks have gone into further detail
+08:56 on the risks associated with this,
+08:59 including the possibility of deadlocks in your application.
+09:03 Thread explosion also comes with memory
+09:06 and scheduling overhead that may not be immediately obvious,
+09:09 so let's look into this further.
+09:13 Looking back at our news application,
+09:16 each of the blocked threads is holding onto valuable memory
+09:20 and resources while waiting to run again.
+09:23 Each blocked thread has a stack
+09:25 and associated kernel data structures to track the thread.
+09:29 Some of these threads may be holding onto locks
+09:32 which other threads that are running might need.
+09:35 This is a large number of resources and memory
+09:39 to be holding onto for threads which are not making progress.
+09:43 There is also greater scheduling overhead
+09:46 as a result of thread explosion.
+09:48 As new threads are brought up,
+09:50 the CPU need to perform a full thread context switch
+09:54 in order to switch away from the old thread
+09:56 to start executing the new thread.
+10:00 As the blocked threads become runnable again,
+10:03 the scheduler will have to timeshare the threads on the CPU
+10:06 so that they are all able to make forward progress.
+10:10 Now, timesharing of threads
+10:12 is fine if that happens a few times --
+10:15 that is the power of concurrency.
+10:17 But when there is thread explosion,
+10:20 having to timeshare hundreds of threads on a device
+10:23 with limited cores can lead to excessive context switching.
+10:28 The scheduling latencies of these threads
+10:30 outweigh the amount of useful work they would do,
+10:33 therefore, resulting in the CPU
+10:35 running less efficiently as well.
+10:38 As we've seen so far, it is easy to miss
+10:41 some of these nuances about the threading hygiene
+10:44 when writing applications with GCD queues
+10:47 thereby resulting in poor performance
+10:50 and greater overhead.
+10:52 Building on this experience,
+10:53 Swift has taken a different approach
+10:55 when designing concurrency into the language.
+10:59 We've built Swift concurrency with performance
+11:02 and efficiency in mind as well so that your apps
+11:05 can enjoy controlled, structured,
+11:07 and safe concurrency.
+11:11 With Swift, we want to change the execution model of apps
+11:15 from the following model,
+11:16 which has lots of threads and context switches, to this.
+11:24 Here you see that we have just two threads
+11:26 executing on our two-core system
+11:28 and there are no thread context switches.
+11:31 All of our blocked threads go away and instead
+11:34 we have a lightweight object known as a continuation
+11:38 to track resumption of work.
+11:41 When threads execute work under Swift concurrency
+11:44 they switch between continuations
+11:46 instead of performing a full thread context switch.
+11:49 This means that we now only pay
+11:52 the cost of a function call instead.
+11:56 So the runtime behavior that we want for Swift concurrency
+11:59 is to create only as many threads as there are CPU cores,
+12:03 and for threads to be able to cheaply and efficiently
+12:07 switch between work items when they are blocked.
+12:10 We want you to be able to write straight-line code
+12:13 that is easy to reason about
+12:15 and also gives you safe, controlled concurrency.
+12:20 In order to achieve this behavior that we are after,
+12:23 the operating system needs a runtime contract
+12:26 that threads will not block, and that is only possible
+12:30 if the language is able to provide us with that.
+12:33 Swift's concurrency model and the semantics around it
+12:37 have therefore been designed with this goal in mind.
+12:42 To that end, I'd like to dive into two
+12:44 of Swift's language-level features that enable us
+12:47 to maintain a contract with the runtime.
+12:50 The first comes from the semantics of await
+12:53 and the second, from the tracking of task dependencies
+12:56 in the Swift runtime.
+12:59 Let's consider these language features
+13:01 in the context of our example news application.
+13:05 This is the code snippet we walked through earlier
+13:08 that handles the results of our news feed updates.
+13:11 Let's see what this logic looks like
+13:13 when written with Swift concurrency primitives instead.
+13:18 We'd first start with creating an async implementation
+13:22 of our helper function.
+13:23 Then, instead of handling the results
+13:26 of our networking requests on a concurrent dispatch queue,
+13:29 here we are using a task group instead
+13:32 to manage our concurrency.
+13:35 In the task group, we will create child tasks
+13:38 for each feed that needs to be updated.
+13:41 Each child task will perform a download from the feed's URL
+13:45 using the shared URLSession.
+13:47 It will then deserialize the results of the download,
+13:51 format them into articles and finally,
+13:53 we will call an async function to update our database.
+13:58 Here, when calling any async functions,
+14:01 we annotate it with an await keyword.
+14:04 From the "Meet async/await in Swift" talk,
+14:07 we learned that an await is an asynchronous wait.
+14:11 That is, it does not block the current thread
+14:14 while waiting for results from the async function.
+14:17 Instead, the function may be suspended
+14:20 and the thread will be freed up to execute other tasks.
+14:25 How does this happen?
+14:26 How does one give up a thread?
+14:28 My colleague Varun will now shed light
+14:30 on what is done under the hood in the Swift runtime
+14:33 to make this possible.
+14:37 Varun Gandhi: Thanks, Rokhini.
+14:38 Before jumping into how async functions are implemented,
+14:41 let's do a quick refresher on how nonasync functions work.
+14:46 Every thread in a running program has one stack,
+14:49 which it uses to store state for function calls.
+14:52 Let's focus on one thread for now.
+14:55 When the thread executes a function call,
+14:57 a new frame is pushed onto its stack.
+15:00 This newly created stack frame can be used by the function
+15:03 to store local variables, the return address,
+15:06 and any other information that is needed.
+15:09 Once the function finishes executing and returns,
+15:12 its stack frame is popped.
+15:16 Now let's consider async functions.
+15:19 Suppose that a thread called an add(_:) method on the Feed type
+15:22 from the updateDatabase function.
+15:24 At this stage, the most recent stack frame will be for add(_:).
+15:29 The stack frame stores local variables
+15:31 that do not need to be available across a suspension point.
+15:35 The body of add(_:) has one suspension point,
+15:37 marked by await.
+15:39 The local variables, id and article, are immediately
+15:42 used in the body of the for loop after being defined,
+15:46 without any suspension points in-between.
+15:49 So they will be stored in the stack frame.
+15:53 Additionally, there will be two async frames on the heap,
+15:57 one for updateDatabase and one for add.
+16:00 Async frames store information that does need to be available
+16:03 across suspension points.
+16:06 Notice that the newArticles argument is defined
+16:09 before await but needs to be available after the await.
+16:13 This means that the async frame for add
+16:16 will keep track of newArticles.
+16:19 Suppose the thread continues executing.
+16:22 When the save function starts executing,
+16:25 the stack frame for add is replaced
+16:27 by a stack frame for save.
+16:30 Instead of adding new stack frames,
+16:32 the top most stack frame is replaced
+16:34 since any variables that will be needed in the future
+16:37 will already have been stored in the list of async frames.
+16:42 The save function also gains an async frame for its use.
+16:48 While the articles are being saved to the database,
+16:50 it would be better if the thread could do some useful work
+16:53 instead of being blocked.
+16:55 Suppose the execution of the save function is suspended.
+17:00 And the thread is reused to do some other useful work
+17:03 instead of being blocked.
+17:08 Since all information that is maintained
+17:10 across a suspension point is stored on the heap,
+17:14 it can be used to continue execution at a later stage.
+17:18 This list of async frames is the runtime representation
+17:22 of a continuation.
+17:25 Say after a little while,
+17:27 the database request is complete,
+17:29 and suppose some thread is freed up.
+17:32 This could be the same thread as before,
+17:34 or it could be a different thread.
+17:38 Suppose the save function resumes executing
+17:40 on this thread.
+17:42 Once it finishes executing
+17:45 and returns some IDs, then the stack frame for save
+17:48 will again be replaced by a stack frame for add.
+17:52 After that, the thread can start executing zip.
+17:56 Zipping two arrays is a nonasync operation,
+17:59 so it will create a new stack frame.
+18:03 Since Swift continues to use the operating system stack,
+18:05 both async and nonasync Swift code
+18:08 can efficiently call into C and Objective-C.
+18:12 Moreover, C and Objective-C code can continue
+18:15 efficiently calling nonasync Swift code.
+18:18 Once the zip function finishes, its stack frame will be popped
+18:22 and execution will continue.
+18:27 So far, I've described how await is designed to ensure
+18:30 efficient suspension and resumption,
+18:33 while freeing up a thread's resources to do other work.
+18:37 Next, Rokhini will describe the second language feature,
+18:40 which is the runtime's tracking of dependencies between tasks.
+18:44 Rokhini: Thanks, Varun.
+18:46 As described earlier, a function can be broken up
+18:49 into continuations at an await,
+18:51 also known as a potential suspension point.
+18:55 In this case,
+18:56 the URLSession data task is the async function
+19:00 and the remaining work after it is the continuation.
+19:03 The continuation can only be executed
+19:06 after the async function is completed.
+19:09 This is a dependency tracked by the Swift concurrency runtime.
+19:14 Similarly, within the task group,
+19:17 a parent task may create several child tasks
+19:20 and each of those child tasks needs to complete
+19:23 before a parent task can proceed.
+19:26 This is a dependency that is expressed in your code
+19:30 by the scope of the task group and therefore explicitly known
+19:34 to the Swift compiler and runtime.
+19:38 In Swift, tasks can only await other tasks that are known
+19:42 to the Swift runtime --
+19:43 be it continuations or child tasks.
+19:46 Therefore, code when structured
+19:48 with Swift's concurrency primitives
+19:50 provide the runtime with a clear understanding
+19:53 of the dependency chain between the tasks.
+19:58 So far, you've learned how Swift's language features
+20:01 allow a task to be suspended during an await.
+20:05 Instead, the executing thread is able to reason
+20:08 about task dependencies
+20:10 and pick up a different task instead.
+20:13 This means that code written with Swift concurrency
+20:16 can maintain a runtime contract
+20:19 that threads are always able to make forward progress.
+20:23 We have taken advantage of this runtime contract
+20:26 to build integrated OS support for Swift concurrency.
+20:31 This is in the form of a new cooperative thread pool
+20:35 to back Swift concurrency as the default executor.
+20:39 The new thread pool will only spawn as many threads
+20:42 as there are CPU cores,
+20:44 thereby making sure not to overcommit the system.
+20:48 Unlike GCD's concurrent queues, which will spawn more threads
+20:52 when work items block,
+20:54 with Swift threads can always make forward progress.
+20:58 Therefore, the default runtime can be judicious
+21:02 about controlling how many threads are spawned.
+21:05 This lets us give your applications
+21:07 the concurrency you need while making sure to avoid
+21:11 the known pitfalls of excessive concurrency.
+21:15 In previous WWDC talks about concurrency
+21:19 with Grand Central Dispatch, we've recommended that
+21:22 you structure your applications into distinct subsystems
+21:26 and maintain one serial dispatch queue per subsystem
+21:30 to control the concurrency of your application.
+21:33 This meant that it was difficult for you to get concurrency
+21:37 greater than one within a subsystem
+21:39 without running the risk of thread explosion.
+21:43 With Swift, the language gives us strong invariants
+21:47 which the runtime has leveraged,
+21:49 thereby being able to transparently provide you
+21:52 with better-controlled concurrency
+21:54 in the default runtime.
+21:59 Now that you understand a bit more about the threading model
+22:02 for Swift concurrency,
+22:03 let's go through some considerations to keep in mind
+22:06 while adopting these exciting new features in your code.
+22:12 The first consideration that you need to keep in mind
+22:15 has to do with performance when converting synchronous code
+22:18 into asynchronous code.
+22:20 Earlier, we talked through some of the costs
+22:23 associated with concurrency such as additional memory allocations
+22:27 and logic in the Swift runtime.
+22:29 As such, you need to be careful to only write new code
+22:34 with Swift concurrency when the cost
+22:36 of introducing concurrency into your code
+22:39 outweighs the cost of managing it.
+22:43 The code snippet here might not actually benefit
+22:46 from the additional concurrency of spawning a child task
+22:50 simply to read a value from the user's defaults.
+22:53 This is because the useful work done by the child task
+22:57 is diminished by the cost of creating and managing the task.
+23:02 We therefore recommend profiling your code
+23:04 with Instruments system trace
+23:06 to understand it's performance characteristics
+23:09 as you adopt Swift concurrency.
+23:12 The second thing to be careful about
+23:14 is the notion of atomicity around an await.
+23:18 Swift makes no guarantee that the thread
+23:21 which executed the code before the await is the same thread
+23:25 which will pick up the continuation as well.
+23:28 In fact, await is an explicit point in your code
+23:32 which indicates that atomicity is broken
+23:35 since the task may be voluntarily descheduled.
+23:39 As such, you should be careful not to hold locks
+23:42 across an await.
+23:44 Similarly, thread-specific data will not be preserved
+23:47 across an await either.
+23:50 Any assumptions in your code which expect thread locality
+23:54 should be revisited to account for the suspending behavior
+23:57 of await.
+24:00 And lastly, the final consideration
+24:02 has to do with the runtime contract that is foundational
+24:06 to the efficient threading model in Swift.
+24:10 Recall that with Swift, the language allows us
+24:13 to uphold a runtime contract
+24:15 that threads will always be able to make forward progress.
+24:20 It is based on this contract
+24:21 that we have built a cooperative thread pool
+24:24 to be the default executor for Swift.
+24:28 As you adopt Swift concurrency,
+24:30 it is important to ensure that you continue to maintain
+24:33 this contract in your code as well
+24:35 so that the cooperative thread pool can function optimally.
+24:40 It is possible to maintain this contract
+24:43 within the cooperative thread pool by using safe primitives
+24:47 that make the dependencies in your code explicit and known.
+24:51 With Swift concurrency primitives
+24:53 like await, actors, and task groups,
+24:56 these dependencies are made known at compile time.
+25:00 Therefore, the Swift compiler enforces this
+25:03 and helps you preserve the runtime contract.
+25:07 Primitives like os_unfair_locks and NSLocks are also safe
+25:12 but caution is required when using them.
+25:16 Using a lock in synchronous code is safe
+25:19 when used for data synchronization
+25:21 around a tight, well-known critical section.
+25:25 This is because the thread holding the lock
+25:28 is always able to make forward progress
+25:30 towards releasing the lock.
+25:33 As such, while the primitive may block a thread
+25:36 for a short period of time under contention,
+25:39 it does not violate the runtime contract
+25:42 of forward progress.
+25:44 It is worth noting that unlike Swift concurrency primitives,
+25:48 there is no compiler support to aid in correct usage of locks,
+25:53 so it is your responsibility to use this primitive correctly.
+25:58 On the other hand, primitives like semaphores
+26:01 and condition variables are unsafe to use
+26:04 with Swift concurrency.
+26:06 This is because they hide dependency information
+26:09 from the Swift runtime,
+26:11 but introduce a dependency in execution in your code.
+26:15 Since the runtime is unaware of this dependency,
+26:18 it cannot make the right scheduling decisions
+26:21 and resolve them.
+26:23 In particular, do not use primitives that create
+26:26 unstructured tasks and then retroactively
+26:29 introduce a dependency across task boundaries
+26:33 by using a semaphore or an unsafe primitive.
+26:36 Such a code pattern means that a thread can block indefinitely
+26:40 against the semaphore until another thread
+26:43 is able to unblock it.
+26:45 This violates the runtime contract
+26:48 of forward progress for threads.
+26:51 To help you identify uses of such unsafe primitives
+26:55 in your codebase, we recommend testing your apps
+26:58 with the following environment variable.
+27:01 This runs your app under a modified debug runtime,
+27:05 which enforces the invariant of forward progress.
+27:11 This environment variable can be set in Xcode
+27:14 on the Run Arguments pane of your project scheme
+27:17 as shown here.
+27:21 When running your apps with this environment variable,
+27:24 if you see a thread from the cooperative thread pool
+27:27 that appears to be hung
+27:28 it indicates the use of an unsafe blocking primitive.
+27:33 Now, having learned about how the threading model
+27:36 has been designed for Swift concurrency,
+27:38 let's discover a little bit more about the primitives
+27:41 that are available to us to synchronize state
+27:44 in this new world.
+27:47 Varun: In the Swift concurrency talk on actors
+27:49 you've seen how actors can be used
+27:51 to protect mutable state from concurrent access.
+27:54 Put differently, actors provide a powerful new synchronization
+27:58 primitive that you can use.
+28:01 Recall that actors guarantee mutual exclusion:
+28:04 an actor may be executing at most one method call at a time.
+28:08 Mutual exclusion means that the actor's state
+28:11 is not accessed concurrently, preventing data races.
+28:15 Let's see how actors compare
+28:17 to other forms of mutual exclusion.
+28:21 Consider the earlier example
+28:23 of updating the database with some articles
+28:25 by syncing to a serial queue.
+28:28 If the queue is not already running
+28:30 we say that there is no contention.
+28:32 In this case, the calling thread is reused to execute
+28:35 the new work item on the queue without any context switch.
+28:39 Instead, if the serial queue is already running
+28:43 the queue is said to be under contention.
+28:45 In this situation, the calling thread is blocked.
+28:49 This blocking behavior is what triggered thread explosion
+28:52 as Rokhini described earlier in the talk.
+28:55 Locks have this same behavior.
+28:58 Because of the problems associated with blocking,
+29:00 we have generally advised
+29:02 that you prefer using dispatch async.
+29:05 The primary benefit of dispatch async is that it is nonblocking.
+29:10 So even under contention,
+29:12 it will not lead to thread explosion.
+29:14 The downside of using dispatch async with a serial queue
+29:18 is that when there is no contention
+29:20 Dispatch needs to request a new thread
+29:22 to do the async work
+29:24 while the calling thread continues to do something else.
+29:27 Hence, frequent use of dispatch async can lead
+29:30 to excess thread wakeups and context switches.
+29:34 This brings us to actors.
+29:37 Swift's actors combine the best of both worlds
+29:40 by taking advantage of the cooperative thread pool
+29:42 for efficient scheduling.
+29:45 When you call a method on an actor that is not running,
+29:48 the calling thread can be reused to execute the method call.
+29:52 In the case where the called actor is already running,
+29:55 the calling thread can suspend the function it is executing
+29:58 and pick up other work.
+30:00 Let's look at how these two properties
+30:02 work in the context of the example news app.
+30:07 Let's focus on the database and networking subsystems.
+30:11 When updating the application to use Swift concurrency,
+30:14 the serial queue for the database
+30:16 would be replaced by a database actor.
+30:19 The concurrent queue for networking
+30:21 could be replaced by one actor for each news feed.
+30:25 For simplicity, I've only shown three feed actors here --
+30:28 for the sports feed, the weather feed
+30:30 and the health feed --
+30:31 but in practice, there will be many more.
+30:34 These actors would run on the cooperative thread pool.
+30:39 The feed actors interact with the database
+30:41 to save articles and perform other actions.
+30:45 This interaction involves execution switching
+30:47 from one actor to another.
+30:49 We call this process actor hopping.
+30:52 Let's discuss how actor hopping works.
+30:55 Suppose that the actor for the sports feed
+30:58 is running on a thread from the cooperative pool,
+31:00 and it decides to save some articles into the database.
+31:04 For now, let's consider that the database is not being used.
+31:08 This is the uncontended case.
+31:10 The thread can directly hop from the sports feed actor
+31:13 to the database actor.
+31:15 There are two things to notice here.
+31:18 First, the thread did not block while hopping actors.
+31:22 Second, hopping did not require a different thread;
+31:25 the runtime can directly suspend
+31:27 the work item for the sports feed actor
+31:29 and create a new work item for the database actor.
+31:34 Say the database actor runs for a while
+31:36 but it has not completed the first work item.
+31:39 At this moment, suppose that the weather feed actor
+31:42 tries to save some articles in the database.
+31:46 This creates a new work item for the database actor.
+31:51 An actor ensures safety by guaranteeing mutual exclusion;
+31:54 at most, one work item may be active at a given time.
+31:58 Since there is already one active work item, D1,
+32:01 the new work item, D2, will be kept pending.
+32:05 Actors are also nonblocking.
+32:07 In this situation, the weather feed actor will be suspended
+32:12 and the thread it was executing on is now freed up
+32:14 to do other work.
+32:17 After a little while,
+32:18 the initial database request is completed,
+32:21 so the active work item for the database actor is removed.
+32:26 At this point, the runtime may choose to start executing
+32:29 the pending work item for the database actor.
+32:31 Or it may choose to resume one of the feed actors.
+32:34 Or it could do some other work on the freed-up thread.
+32:39 When there is a lot of asynchronous work,
+32:41 and especially a lot of contention,
+32:43 the system needs to make trade-offs
+32:44 based on what work is more important.
+32:47 Ideally, high-priority work such as that
+32:50 involving user interaction, would take precedence
+32:52 over background work, such as saving backups.
+32:55 Actors are designed to allow the system to prioritize work well
+32:59 due to the notion of reentrancy.
+33:01 But to understand why reentrancy is important here,
+33:04 let's first take a look at how GCD handles priorities.
+33:09 Consider the original news application
+33:12 with the serial database queue.
+33:14 Suppose the database receives some high-priority work,
+33:16 such as for fetching the latest data
+33:18 to update the UI.
+33:19 It also receives low-priority work,
+33:21 such as for backing up the database to iCloud.
+33:24 This needs to be done at some point,
+33:26 but not necessarily immediately.
+33:29 As the code runs, new work items are created
+33:32 and added to the database queue in some interleaved order.
+33:36 Dispatch queues execute the items received
+33:38 in a strict first-in, first-out order.
+33:42 Unfortunately, this means that after item A has executed
+33:46 five low-priority items need to execute
+33:48 before getting to the next high-priority item.
+33:51 This is called a priority inversion.
+33:54 Serial queues work around priority inversion
+33:57 by boosting the priority of all of the work in the queue
+34:00 that's ahead of the high-priority work.
+34:02 In practice, this means that the work in the queue
+34:05 will be done sooner.
+34:08 However, it does not resolve the main issue,
+34:11 which is that items 1 through 5 still needed to complete
+34:14 before item B could start executing.
+34:17 Solving this issue requires changing the semantic model
+34:20 away from strict first-in, first-out.
+34:24 This brings us to actor reentrancy.
+34:27 Let's explore how reentrancy is connected to ordering
+34:30 with an example.
+34:34 Consider the database actor executing on a thread.
+34:37 Suppose that it is suspended, awaiting some work,
+34:41 and the sports feed actor starts executing on that thread.
+34:46 Suppose after a while,
+34:47 the sports feed actor calls the database actor
+34:50 to save some articles.
+34:53 Since the database actor is uncontended,
+34:56 the thread can hop to the database actor
+34:58 even though it has one pending work item.
+35:03 To perform the save operation,
+35:05 a new work item will be created for the database actor.
+35:09 This is what actor reentrancy means;
+35:12 new work items on an actor can make progress
+35:14 while one or more older work items on it are suspended.
+35:18 The actor still maintains mutual exclusion:
+35:20 at most one work item can be executing at a given time.
+35:25 After some time, item D2 will finish executing.
+35:29 Notice that D2 finished executing before D1,
+35:32 even though it was created after D1.
+35:35 Hence, support for actor reentrancy means
+35:38 that actors can execute items in an order
+35:40 that is not strictly first-in, first-out.
+35:45 Let's revisit the example from before
+35:47 but with a database actor instead of a serial queue.
+35:51 First, work item A will execute, as it has high priority.
+35:55 Once that's done,
+35:56 there is the same priority inversion as before.
+36:00 Since actors are designed for reentrancy,
+36:02 the runtime may choose to move the higher-priority item
+36:05 to the front of the queue,
+36:06 ahead of the lower-priority items.
+36:10 This way, higher-priority work could be executed first,
+36:14 with lower-priority work following later.
+36:17 This directly addresses the problem of priority inversion,
+36:20 allowing for more effective scheduling
+36:23 and resource utilization.
+36:26 I've talked a bit
+36:27 about how actors using the cooperative pool
+36:30 are designed to maintain mutual exclusion
+36:32 and support effective prioritization of work.
+36:35 There is another kind of actor, the main actor,
+36:38 and its characteristics are somewhat different
+36:41 since it abstracts over an existing notion in the system:
+36:44 the main thread.
+36:47 Consider the example news app using actors.
+36:50 When updating the user interface,
+36:52 you will need to make calls to and from MainActor.
+36:56 Since the main thread is disjoint from the threads
+36:58 in the cooperative pool, this requires a context switch.
+37:02 Let's look at the performance implications
+37:04 of this with a code example.
+37:08 Consider the following code
+37:09 where we have a function updateArticles on MainActor,
+37:13 which loads articles out of the database
+37:15 and updates the UI for each article.
+37:19 Each iteration of the loop
+37:21 requires at least two context switches:
+37:23 one to hop from the main actor to the database actor
+37:25 and one to hop back.
+37:27 Let's see how the CPU usage for such a loop would look like.
+37:33 Since each loop iteration requires two context switches,
+37:37 there is a repeating pattern where two threads
+37:39 run one after another for a short span of time.
+37:43 If the number of loop iterations is low,
+37:45 and substantial work is being done in each iteration,
+37:48 that is probably all right.
+37:51 However, if execution hops on and off
+37:53 the main actor frequently,
+37:55 the overhead of switching threads can start to add up.
+38:01 If your application spends a large fraction of time
+38:03 in context switching, you should restructure your code
+38:07 so that work for the main actor is batched up.
+38:12 You can batch work by pushing the loop into the loadArticles
+38:15 and updateUI method calls,
+38:17 making sure they process arrays instead of one value at a time.
+38:21 Batching up work reduces the number of context switches.
+38:25 While hopping between actors on the cooperative pool is fast,
+38:29 you still need to be mindful of hops to and from the main actor
+38:33 when writing your app.
+38:35 Looking back, in this talk
+38:38 you've learned how we've worked on making the system
+38:40 the most efficient it can be,
+38:42 from the design of the cooperative thread pool --
+38:44 the mechanism for nonblocking suspension --
+38:46 to how actors are implemented.
+38:48 At each step, we're using some aspect of the runtime contract
+38:52 to improve the performance of your applications.
+38:55 We are excited to see how you use
+38:57 these incredible new language features to write clear,
+39:00 efficient, and delightful Swift code.
+39:03 Thank you for watching and have a great WWDC.
+39:06 ♪

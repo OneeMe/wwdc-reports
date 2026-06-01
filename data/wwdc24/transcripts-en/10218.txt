@@ -1,0 +1,436 @@
+00:06 Hello!
+00:07 My name is Kamal Ramamoorthy
+00:09 and I'm a software engineer from the GPU, Graphics and Display team.
+00:13 In this video, my colleague Sam and I
+00:15 will present how you can accelerate your machine learning models using Metal.
+00:20 Training is the first step of deploying models on Apple's platforms.
+00:24 The second step is to prepare the model for deployment on device.
+00:29 Finally, the model is ready to be integrated into your application,
+00:33 which is what I will focus on in this video.
+00:36 If you are using Core ML to deploy your models,
+00:39 MPSGraph provides GPU acceleration using Metal.
+00:43 To learn more about Core ML,
+00:44 watch the “Explore Machine Learning on Apple Platforms” video.
+00:49 You may also want to watch
+00:50 the “Deploy Machine Learning Models On-Device With Core ML” video.
+00:54 You can also train your models
+00:56 using frameworks like PyTorch, TensorFlow and JAX.
+01:00 Check out the “Train Your ML Models With Apple Silicon GPUs” video to learn more.
+01:05 All these frameworks build on top of Metal Performance Shaders Graph,
+01:09 which is a framework for constructing and running general purpose compute graphs
+01:13 using Metal.
+01:15 MPSGraph provides low level control over GPU synchronization and memory,
+01:20 so in some cases you may want to use MPSGraph directly.
+01:24 For example, if your application uses Metal,
+01:27 you can use MPSGraph to sequence ML tasks with other GPU work.
+01:32 You can also share low level Metal resources such as buffers.
+01:36 If you’re new to accelerating machine learning using Metal,
+01:39 check out our videos from previous years’ WWDCs.
+01:43 Sam and I will talk about three things in this video.
+01:46 First, improvements to MPS and MPS Graph.
+01:49 Many of these are focused on improving the efficiency of transformer models,
+01:53 so I will use those models as an example.
+01:56 Second, new features which accelerate FFT-based ML models.
+02:01 Finally, Sam will introduce MPSGraph Viewer,
+02:04 which allows you to visualize your ML models.
+02:08 Let’s start with the new features
+02:09 focused on improving the performance of transformer models.
+02:13 Transformers are commonly used in language models
+02:15 to translate, predict and generate text.
+02:19 The input is a sequence of tokens.
+02:21 For example, a simple sentence like “The quick brown” is a 3 token input.
+02:26 The language model responds by predicting the next token, “fox”.
+02:30 This new sentence is repeatedly fed back into the model to generate new tokens.
+02:36 MPS and MPSGraph have new features
+02:39 which enable you to improve your transformer models.
+02:42 These improvements fall into three categories.
+02:45 First, improved compute performance.
+02:48 Next, memory bandwidth savings.
+02:50 And finally, quality improvements for transformer models.
+02:54 I’ll start with compute performance.
+02:56 Transformer-based models are made of layers of transformer blocks.
+03:01 Focusing further on the internals of a transformer block,
+03:04 it consists of multihead attention, normalization and feed forward blocks.
+03:09 The multihead attention block
+03:10 is one of the most compute intensive blocks.
+03:13 This block computes large multidimensional matrix multiplications,
+03:17 which are compute heavy operations.
+03:20 The input matrix is projected through a matrix multiplication layer
+03:23 to produce a query matrix called Q,
+03:26 a key matrix K and a value matrix V,
+03:30 which are then fed to the Scaled Dot-Product attention block.
+03:34 This is the heart of the transformer model.
+03:37 There are two ways you can optimize the performance of this attention block.
+03:41 If you look inside the attention block, it is made of several operations.
+03:46 MPSGraph now has an operation
+03:49 which combines this sequence of operations into a single kernel
+03:53 which executes more efficiently.
+03:56 To use this operation, call the scaledDotProductAttention method
+04:00 on an MPSGraph object.
+04:02 This method takes query, key, and value tensors as arguments.
+04:07 Using the fused SDPA operation should enable you
+04:11 to improve the performance of your transformer models.
+04:14 Let’s revisit the multi head attention block
+04:16 so I can show you another opportunity
+04:19 to improve compute performance using these tensors.
+04:22 Here you can see how the Query, Key and Value projections
+04:26 work for the first token.
+04:27 A matrix multiplication operation
+04:29 projects the embedding vector for query, key and value.
+04:35 To generate the next output token,
+04:36 we have to feed all the previously generated tokens
+04:39 into the matrix multiplication.
+04:41 This results in recomputing the K and V projections
+04:44 that were already calculated in previous iterations.
+04:48 This cost adds up the longer the sequence length gets.
+04:53 To mitigate this problem, you can cache these projections
+04:56 as they are generated so they can be reused in future iterations.
+05:00 The first thing you need to do is:
+05:02 create K and V tensors which will store the cached K and V values.
+05:07 These tensors are called the KV cache.
+05:10 In the first iteration, the K and V values are computed for the first token
+05:14 and inserted into the KV cache.
+05:20 You can now reuse the cached values, so that in the second iteration,
+05:24 you only need to compute the K and V values for the second token.
+05:28 This simplifies the matrix-matrix multiplication
+05:31 into a matrix-vector multiplication.
+05:35 You could append the K and V projections to the end of the KV cache
+05:38 by creating a new tensor for every iteration,
+05:41 but this would use a lot of memory.
+05:44 Instead, you can update the existing tensor in-place
+05:47 using the slice update operation.
+05:52 You can then use the slice operation
+05:54 to extract just the portion of the KV cache which has been computed.
+05:59 Let’s look at how to do this in code.
+06:02 First, create a placeholder representing the cache.
+06:06 The dimensions of this tensor depend on the details of your model.
+06:09 For this example, I will focus on just the key portion of the cache,
+06:14 but the value portion works the same way.
+06:17 To be able to to update the KV cache in-place,
+06:19 you will need to create a variable
+06:22 which represents the current state of the cache.
+06:24 Unlike the results of a normal graph operation,
+06:26 you can update this variable to refer to a different value later.
+06:32 For every token, you’ll need to insert the key projection into the cache.
+06:36 You can do this using the sliceUpdateDataTensor method
+06:40 on the MPSGraph object.
+06:43 The start and end arrays indicate where to put the new value.
+06:47 This example appends it to the end of the valid portion of the cache.
+06:51 In this case, the stride is uniform.
+06:54 You can now assign the updated cache back to the original variable.
+06:58 MPSGraph will optimize this to update the cache allocation in-place.
+07:03 Finally, you can use the slice operation to extract
+07:06 just the portion of the KV cache which has been computed.
+07:10 This is the portion from the beginning of the cache
+07:12 up to the most recently inserted key projection.
+07:16 You can then pass the updated key cache to the SDPA operation.
+07:21 Once you’ve made these compute improvements,
+07:24 the memory bandwidth becomes the new bottleneck.
+07:28 The memory required to store the weights for large language models
+07:31 can be in the order of tens of gigabytes.
+07:34 These weights are usually represented using 16-bit floating point.
+07:38 However, MPS supports quantizing these weights to 8-bit integers
+07:43 to reduce the memory foot print by half.
+07:46 New this year, MPS also supports a 4-bit integer format.
+07:51 This allows you to reduce the size of the weights even further.
+07:55 MPS supports several techniques
+07:57 to map your weights to these quantized formats.
+08:00 Here is an example tensor
+08:02 where the elements are distributed on a number line.
+08:05 For 8-bit quantization, there are 256 possible quantization points
+08:09 linearly distributed along the number line.
+08:12 For 4-bit quantization there are 16 points.
+08:15 During quantization,
+08:17 the points are adjusted to the closest quantized value.
+08:20 The quantization scale factor
+08:22 can be determined by using the formula on the right.
+08:25 This accrues a slight error
+08:27 but we end up saving 2x or 4x the memory space and bandwidth.
+08:32 Use the dequantize method on the MPSGraph object
+08:35 to dequantize the values.
+08:39 Another quantization technique uses a lookup table.
+08:42 This technique is useful when your weights
+08:44 are clustered around different areas on the number line.
+08:47 With affine quantization,
+08:49 the quantized values are uniformly distributed,
+08:52 but the input values are not.
+08:53 This causes most of the quantized bits to go unused
+08:57 as most input values cluster around only a few quantized points.
+09:01 You can use the quantized bits better by using a lookup table.
+09:06 In this technique, you choose your own quantized points
+09:08 based on the distribution of your data.
+09:11 You store these quantized values in a lookup table.
+09:14 Then, you assign each weight a 4 or 8-bit index into this table.
+09:20 This way, you get a lot more flexibility
+09:23 while sacrificing only a small amount of performance
+09:26 to look up the values in the table.
+09:29 Use the dequantize method to convert these quantized values
+09:32 back into 32-bit floating point values.
+09:34 Simply pass in your quantized weights in the 32-bit lookup table.
+09:39 You can then reuse the dequantized tensor as usual.
+09:42 For example, as an input to a matrix multiplication.
+09:46 In fact, in cases like this, MPSGraph goes one step further.
+09:52 If your graph contains a dequantize operation
+09:55 on the weights preceding a matrix multiplication,
+09:59 MPSGraph will replace the two operations
+10:02 with a single quantized matrix multiplication operation.
+10:05 This operation will dequantize weights on the fly
+10:08 as needed rather than storing
+10:10 a temporary copy of the dequantized weights.
+10:14 Quantization can save memory and memory bandwidth,
+10:17 but it can also introduce numerical inaccuracies.
+10:20 Now, let me show you 2 ways to improve the quality of your transformer models.
+10:26 When you quantize your weights,
+10:27 each weight is mapped to a lower precision value.
+10:30 You also choose a scale and, optionally,
+10:32 and, optionally, an offset to apply to the quantized values when dequantizing.
+10:37 However, applying a single scale and offset value to all of the weights
+10:41 will limit how accurate the reconstructed values can be.
+10:45 Instead, you can quantize blocks of elements individually,
+10:49 each with their own scale and offset values.
+10:52 This allows you to match the scale and offset values
+10:56 more precisely for each block.
+10:59 The code to do this is similar to the earlier example,
+11:02 except, instead of passing in a single scale and zero point value,
+11:06 you pass in a tensor containing the scale and zero point for each block.
+11:11 So, that’s it for quantization.
+11:14 Next, I’ll show you a different way
+11:16 you can improve the quality of your transformer models using adapters.
+11:21 Adapters are small layers that you can insert into your model
+11:24 consisting of just a few operations and parameters.
+11:28 When you fine-tune the model,
+11:30 only the parameters inside the adapter are updated.
+11:33 This can be used to adapt a pre-trained base model to new tasks,
+11:37 but it can also be used to compensate for error introduced by quantization.
+11:42 You can add adapters to your model using MPSGraph callables.
+11:48 The way this works is each adapter is a separate MPSGraph
+11:51 that can be called from the main graph.
+11:53 First, insert calls to your adapters from your base graph
+11:57 by specifying a unique name for each adapter.
+12:01 To do this in code,
+12:02 you will need to define the shape and type of the output
+12:05 the call to your adapter will produce.
+12:08 Then, use the call method on your main MPSGraph object
+12:11 to add the call to your adapter.
+12:14 This is where you provide the name, inputs,
+12:17 and output types for your callable.
+12:20 Next, create the MPSGraph for each adapter.
+12:24 In this example,
+12:25 I’ll create a placeholder representing the "input" as an unranked tensor.
+12:29 Next, I’ll create the "output" tensor by multiplying the "input" by 2.
+12:35 Finally, compile the graphs for each adapter into graph executables.
+12:40 These are compiled like any other MPS graph.
+12:44 First, define the input types to the graph by providing the exact shape.
+12:49 Then, call the compile method on the graph object,
+12:52 providing the Metal device, input types, and outputTensor.
+12:56 Now that you’ve added the calls to your adapters from the main graph
+12:59 and compiled the graph executables for each adapter,
+13:04 the last thing you need to do is map the adapter names
+13:06 to the actual graph executables in the main graph.
+13:09 This is done when compiling your main MPSGraph
+13:12 for your network using a GraphCompilationDescriptor.
+13:16 First, create a dictionary mapping the name of each adapter
+13:19 to its graph executable and set it on the descriptor.
+13:23 Then simply provide the compilation descriptor
+13:25 when compiling the main graph.
+13:28 And that’s all you need to do to set up adapters!
+13:31 To summarize, adapters and callables let you customize your models
+13:35 to perform new tasks and improve the quality
+13:38 because you can use them to fine-tune your model output.
+13:42 Next I’ll tell you about what’s new
+13:45 for Fourier Transforms in MPS and MPSGraph this year.
+13:49 Fast Fourier transforms, or FFTs for short,
+13:51 convert data like signals or images
+13:54 from the temporal or spatial domains to the frequency domain.
+13:58 They are a common pre-processing step in machine learning models
+14:02 that process audio, such as speech-to-text models,
+14:05 and models that separate different audio sources from a single track.
+14:09 They can also be used to accelerate certain convolution layers,
+14:13 and they’re used in many image processing and scientific computing applications.
+14:17 For example, to extract text from an audio signal,
+14:21 the input waveform is first run through a Short-Time Fourier Transform, or STFT.
+14:27 The frequency spectrum is then analyzed by a Transformer model
+14:30 to extract the text.
+14:32 I’ve already described how you can use MPSGraph
+14:35 to execute ML models efficiently on the GPU.
+14:39 But you can also use MPSGraph’s support
+14:42 for Fast Fourier Transforms to move this entire pipeline to the GPU.
+14:47 The first step is to implement the Short-Time Fourier Transform.
+14:52 This works by dividing the input waveform into multiple shorter views,
+14:56 or windows, which may overlap each other.
+14:58 Each window is effectively an independent signal.
+15:02 In order to reduce spectral leakage
+15:04 the individual windows are multiplied by a window function.
+15:07 Finally, you can use a normal batched one-dimensional FFT operation
+15:12 to compute the STFT for each window.
+15:15 In order to divide the waveform into shorter windows,
+15:17 you can create a strided view.
+15:20 First, set up the shape of the windowed view.
+15:23 In this case the width of the window will be 512 elements.
+15:27 Next, set up the stride for each dimension.
+15:30 This example uses 256,
+15:32 meaning we skip 256 elements in the underlying 1D array
+15:37 for each step in the second dimension.
+15:39 The final batch dimension is set to 1, but you can use larger batch sizes.
+15:45 Finally you can create the strided view by calling the arrayView method
+15:49 on the input tensor.
+15:50 The best part is that the view operation works without performing any copies
+15:56 by aliasing the memory of the input array, saving memory and GPU time.
+16:02 Now you can compute the FFTs over all the windows.
+16:05 First, create a placeholder for the strided view data.
+16:09 You will need to load the data out of the strided view NDArray
+16:12 and provide it when running the graph later.
+16:15 Next, multiply by the window function.
+16:18 This is typically the Hann window or a Gaussian window.
+16:22 You can use an MPSGraphConstant tensor for this, for example.
+16:26 Finally, you can create the FFTTensor operation.
+16:30 So that’s it for Fast Fourier Transforms.
+16:32 Next, I’ll hand the presentation over to Sam,
+16:35 who has some great news for you if you want to get a better understanding
+16:39 of your MPSGraph structures.
+16:42 Thanks Kamal!
+16:43 Hi everyone, I’m Sam Colbran, and I'm also a software engineer
+16:46 from the GPU, Graphics and Display team.
+16:50 Now, if you’re not familiar, Metal includes advanced tools
+16:53 in Xcode and Instruments, to help you take full advantage of Apple GPUs.
+16:58 With so much power at your fingertips:
+17:01 Your Metal pipelines, and AI models that run on-device,
+17:04 can be bigger, and more complex.
+17:07 However, while you can visualize your Metal pipelines
+17:10 with the dependency viewer in Xcode,
+17:12 it hasn’t been possible to visualize MPSGraph until now!
+17:17 Today, I’m excited to introduce the newest addition to the Metal tools,
+17:21 coming in Xcode 16, the MPSGraph Viewer!
+17:25 It’s a brand new tool, specifically designed for machine learning and AI.
+17:30 Now, you can directly open MPSGraph packages in Xcode,
+17:34 and visualize how your operations are connected.
+17:37 Before I jump into a demo, let’s first recap
+17:40 how to actually create an MPSGraph package,
+17:43 whether you’re using MPSGraph directly,
+17:45 or have been developing your ML models in another framework.
+17:49 If you’ve created your model directly with MPSGraph,
+17:53 first, compile your graph into an MPSGraph executable.
+17:58 Then, use the serialize API on the executable, to create the package.
+18:05 New this year, you can now also create an MPSGraph executable
+18:10 directly from a CoreML package.
+18:13 As before, you can then serialize the executable to an MPSGraph package.
+18:20 Alternatively, if you’re coming from another framework,
+18:22 like one that exports to ONNX,
+18:24 you can use mpsgraphtool to convert your model.
+18:27 Let’s go through an example together.
+18:30 I’m using Mistral’s model with 7 billion parameters,
+18:34 that was converted to CoreML during this years
+18:37 “Bring your machine learning and AI models to Apple silicon” video.
+18:41 Now, mpsgraphtool, can be accessed through the command line.
+18:45 So open up your favorite Terminal,
+18:47 and run mpsgraphtool with the convert argument.
+18:51 And that’s it!
+18:52 Your freshly created mpsgraph package is ready to go.
+18:56 And now, viewing it is easy, with the new MPSGraph Viewer.
+19:02 I’ve already opened the converted Mistral package in Xcode 16,
+19:06 so let me describe what’s on my screen.
+19:08 Starting at the top left, are the compilation options.
+19:12 By default, the viewer is showing the graph as-is.
+19:15 That is, it’s not optimized for any particular device.
+19:19 So the operations should appear the same, regardless of the device you’re using.
+19:24 Beneath that, is the operations navigator,
+19:27 which shows you a list of all of the operations used in your graph.
+19:32 In the middle, is the graph itself.
+19:34 And finally, on the right, there’s the operation inspector,
+19:38 which I’ll come back to later.
+19:41 At this level, it’s a bit hard to see anything, so I’ll zoom in.
+19:47 And now, I can see high level structures
+19:49 and the further in I go, even more detail!
+19:53 Here, I can scroll around and see all of the inputs and outputs
+19:56 for each operation and how they’re connected.
+20:00 This makes it easy to visualize and understand,
+20:03 the structure of your graph.
+20:05 Now, Mistral is a transformer model, and, as Kamal explained earlier,
+20:09 these are made of layers of transformer blocks.
+20:13 Let’s try to find them.
+20:15 I’ll start, by looking for the new, Scaled Dot Product Attention operator,
+20:19 which should be part of the multihead attention
+20:21 in each transformer block.
+20:23 I could search for it,
+20:25 but I can already see in the operation navigator on the left
+20:28 that there are 32 of them.
+20:30 I’ll expand this group, and click on the first one,
+20:33 to jump to it in the graph.
+20:36 It looks like this operation has 5 inputs,
+20:38 and, hopefully, you recognize the Query, Key and Value,
+20:42 which Kamal went through earlier.
+20:45 I’ll zoom out a little bit
+20:47 to get a better view of the whole transformer block.
+20:52 And, following the connections,
+20:54 I can see the blocks that make up the query,
+20:57 the key, and the value.
+21:00 And even at this level,
+21:01 I can see variables in both the key and the value.
+21:06 I’ll zoom-in on the ones in the key.
+21:08 And, since this model was exported from CoreML with states,
+21:12 it’s using a KV-cache and taking advantage of the new assign-to-variable
+21:16 and read-from-variable operations in MPS,
+21:19 which, as Kamal showed, will improve compute performance.
+21:23 Now, to simplify the graph,
+21:24 the viewer might show some operations and variables like this one,
+21:28 in multiple places.
+21:30 And, once I’ve selected the variable in the inspector on the right,
+21:34 I can see where it’s first created, and all of the places that it’s used.
+21:39 Okay, so that was one transformer block.
+21:42 How about the rest?
+21:43 Well, just like the inspector,
+21:45 I can actually select multiple operations
+21:48 at the same time in the operation navigator.
+21:51 And just like that, the high level structure is clear,
+21:54 and I can see all of the layers repeated over, and over again.
+21:59 Pretty cool.
+22:00 Now, let’s talk about constants.
+22:03 You might’ve already noticed the green previews
+22:05 shown directly inside the graph,
+22:08 but I can also find them, sorted by size,
+22:11 in the constants navigator tab on the left.
+22:14 I’ll select the biggest one.
+22:16 Then, double click to open the constant viewer.
+22:19 Here, you can inspect the trained weights and gain insights
+22:22 into what your model has learned.
+22:25 This can help you to uncover opportunities to optimize your model
+22:28 for better integration on-device.
+22:32 However, remember: the viewer is showing the graph as-is,
+22:36 it’s not optimized for any particular device.
+22:40 In reality, the graph that’s executed might be different.
+22:45 For example, MPSGraph might automatically optimize operations
+22:49 by stitching them together into a single Metal kernel.
+22:53 You can use the viewer to visualize this.
+22:56 Let me show you how.
+22:58 I’ve opened up an MPSGraph package containing ResNet50,
+23:01 and, like before, I can zoom in to see all of the operations and constants.
+23:06 But now, let’s see what the graph looks like for my device.
+23:11 In the compilation options at the top left, I’ll select my device.
+23:15 Now, zooming in,
+23:17 I can see that the operations have been grouped inside these
+23:20 Metal Stitched Shader regions, which I can expand to see inside.
+23:25 Because these operations are fused into a single optimized Metal shader,
+23:30 internally, they have no memory overhead, which dramatically improves performance.
+23:36 In general, knowing how your graph ultimately gets executed on hardware
+23:41 can be useful to truly understanding it’s runtime performance characteristics.
+23:45 And that’s it for the new MPSGraph Viewer!
+23:49 Now, let’s recap what was shown today.
+23:52 As Kamal explained earlier,
+23:53 you can accelerate your machine learning with Metal,
+23:56 using Metal Performance Shaders Graph.
+23:58 It’s already used under-the-hood in popular frameworks,
+24:01 such as CoreML, to give you the best performance on Apple Silicon.
+24:06 This year, new features for transformers can help you improve compute,
+24:11 with the new Scaled Dot Product Attention operation,
+24:14 combined with kv-cache.
+24:16 Memory bandwidth, with quantization,
+24:18 and quality, with adaptors, through callables.
+24:22 Fourier Transforms can now be computered even faster in MPSGraph,
+24:26 with the new strided NDArray API
+24:30 and lastly, the new MPSGraph Viewer makes it easy to understand
+24:34 and gain insights into how your model is executed on Apple Silicon.
+24:39 Make sure to checkout the documentation and sample code for MPSGraph
+24:43 and, of course, model integration is the last piece of the puzzle.
+24:48 So, if you haven’t already, make sure to check out these other great videos
+24:52 to learn more about training and deployment.
+24:56 Thanks for watching, and have a great WWDC!

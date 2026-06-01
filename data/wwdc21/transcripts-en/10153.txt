@@ -1,0 +1,672 @@
+00:02 ♪ Bass music playing ♪
+00:07 ♪
+00:09 Eugene Zhidkov: Hi and welcome to WWDC.
+00:11 My name is Eugene Zhidkov. I am from GPU software.
+00:14 And together, with Harsh Patil from Mac system architecture,
+00:18 we'll show you how to create image-processing applications
+00:21 powered by Metal on Apple silicon.
+00:24 First, I will focus
+00:25 on the best practices and lessons learned,
+00:28 optimizing image-processing applications for M1
+00:31 based on developer engagements we have had over the last year.
+00:35 And then Harsh will give you a step-by-step guide
+00:38 to how you can redesign your image-processing pipeline
+00:41 for optimal performance on Apple silicon.
+00:44 So let’s jump right in!
+00:46 To start, let’s briefly revisit Apple system
+00:49 on-the-chip architecture and its benefits.
+00:52 Many image-processing and video-editing apps
+00:54 are designed with discrete GPUs in mind.
+00:57 So it’s important to highlight what’s so different
+01:00 about Apple GPUs.
+01:02 First, all Apple chips use Unified Memory Architecture.
+01:06 All blocks --
+01:07 such as CPU, GPU, Neural and Media engines --
+01:10 have access to the same system memory
+01:12 using unified memory interface.
+01:15 And second, our GPUs are Tile Based Deferred Renderers,
+01:19 or TBDRs.
+01:21 TBDRs have two main phases: tiling,
+01:24 where whole render surfaces split into tiles
+01:27 and processed geometry is then handled independently;
+01:30 and rendering,
+01:31 where all of the pixels will be processed for each tile.
+01:35 So in order to be most efficient on Apple silicon,
+01:38 your image-processing app
+01:40 should start leveraging unified memory --
+01:43 to avoid any copies your pipeline used to have --
+01:45 and TBDR architecture by exploiting tile memory
+01:49 and local image block.
+01:51 To learn more about how Apple TBDR works at low level
+01:55 and how to target our shader core,
+01:57 please watch these sessions from the last year.
+02:00 And now, let’s talk about
+02:02 the exact things we are going to do to optimize
+02:05 image-processing compute workloads
+02:06 for Apple silicon.
+02:08 Last year,
+02:09 we’ve been working closely with many great developers
+02:12 on their image pipeline transitions.
+02:14 We picked the six most rewarding tips to share.
+02:17 First, we’ll discuss how to avoid
+02:20 unnecessary memory copies or blits.
+02:22 This is really important
+02:23 given we are now working with images up to 8K.
+02:27 Then, we wanted to highlight the benefits of using
+02:29 render pipeline and textures
+02:31 instead of using compute on buffers
+02:33 and how you could do that
+02:35 in your own image-processing pipeline.
+02:38 Once we have the render and textures paths
+02:40 up and running,
+02:41 we wanted to show you the importance of proper
+02:43 load/store actions and memoryless attachments.
+02:46 This will help you getting the most out of the tile memory.
+02:50 Then, we’ll talk how to best approach Uber-shaders
+02:53 with its dynamic control flow
+02:56 and also how to leverage smaller data types --
+02:59 such as short and half --
+03:00 to improve performance and efficiency.
+03:03 And we’ll finish with important advice
+03:05 about texture formats to get the best throughput.
+03:08 All right.
+03:09 So let’s get started with one of the most rewarding tips:
+03:12 avoiding unneeded blits on Apple silicon.
+03:15 Most image-processing apps are designed around discrete GPUs.
+03:20 With discrete GPUs,
+03:22 you have separate system memory and video memory.
+03:25 To make the frame image visible or resident to the GPU,
+03:28 explicit copy is required.
+03:31 Moreover, it is usually required twice;
+03:33 to upload the data for the GPU to process it,
+03:35 and to pull it back.
+03:37 Let’s consider we are decoding an 8K video, processing it,
+03:41 and saving it to disk.
+03:43 So this is a CPU thread, decoding, in this case.
+03:48 That’s where we need to copy the decoded frame to GPU VRAM.
+03:53 And here is GPU timeline,
+03:54 where all the effects and filters are applied.
+03:58 Let’s take it one step further and let’s recall
+04:01 we need to save the results to disk, right?
+04:03 So we must also consider bringing the processed frame
+04:07 back to system memory
+04:09 and the actual encoding of the frame.
+04:12 So, these are known as "copy" or "blit gaps",
+04:15 and advanced image-processing applications
+04:17 had to do deep pipelining and other smart things
+04:20 to fill them in.
+04:21 Well, the good news is that on Apple GPUs,
+04:24 blitting for the sake of residence
+04:26 is no longer needed.
+04:28 Since memory is shared,
+04:29 both the CPU and GPU can access it directly.
+04:33 So please add a simple check to detect if you are running
+04:36 on unified memory system and avoid unnecessary copies.
+04:40 It will save you memory, time,
+04:42 and is an absolute first step to do.
+04:45 So this is where we land on Unified Memory Architecture
+04:48 with the blits removed.
+04:51 By removing the blits, we completely avoid copy gaps
+04:54 and can start processing immediately.
+04:58 This also gives better CPU and GPU pipelining
+05:01 with less hassle.
+05:03 Let’s make sure you implement unified memory path
+05:05 with no copies involved.
+05:07 If you just leave blit copies exactly as it was
+05:10 on the discrete GPU,
+05:12 you’ll pay with system memory bandwidth,
+05:14 less GPU time for actual processing,
+05:16 and potential scheduling overhead.
+05:18 Not to mention we no longer need separate VRAM image allocated.
+05:24 GPU frame capture can help you with spotting large blits.
+05:28 Please inspect your application blits
+05:30 and make sure you only do the copies required.
+05:34 Now, let’s talk about how exactly we should start
+05:36 leveraging Apple GPU TBDR architecture
+05:38 for image processing.
+05:40 Most image-processing applications operate
+05:42 on image buffers by dispatching series of compute kernels.
+05:47 When you dispatch a compute kernel
+05:48 in default serial mode,
+05:50 Metal guarantees that all subsequent dispatches
+05:53 see all the memory writes.
+05:55 This guarantee implies memory coherency for all shader cores,
+06:00 so every memory write is made visible to all other cores
+06:03 by the time the next dispatch starts.
+06:06 This also means memory traffic could be really high;
+06:09 the whole image has to be read and written to.
+06:12 With M1, Apple GPUs enable tile dispatches on MacOS.
+06:17 In contrast to regular compute, they operate in tile memory
+06:21 with tile-only sync points.
+06:23 Some filters -- like convolutions --
+06:25 cannot be mapped to the tile paradigm,
+06:27 but many other filters can!
+06:29 Deferring system memory flush until the encoder end point
+06:33 provides solid efficiency gains.
+06:35 You can execute more useful GPU work
+06:38 when not limited by system memory bandwidth.
+06:41 To take it even further,
+06:43 let’s notice that many per-pixel operations
+06:46 don’t require access to neighboring pixels,
+06:48 so tile sync point is not necessary.
+06:52 This maps really well to fragment functions.
+06:55 Fragment functions can be executed
+06:57 without implicit tile sync,
+06:58 requiring sync only at the encoder boundary
+07:01 or when tile kernels are dispatched serially
+07:03 after the fragment kernels.
+07:05 We now learned that Apple GPUs enable fragment functions
+07:08 and tile kernels for more efficient image processing.
+07:11 Let’s see how we could use that.
+07:14 We do that by converting regular compute dispatches
+07:17 on buffers to render command encoder on textures.
+07:21 As we just discussed, rule of thumb is the following.
+07:25 Per-pixel operations with no interpixel dependency
+07:28 should be implemented using fragment functions.
+07:31 Any filter with threadgroup scoped operations
+07:33 should be implemented with tile shading,
+07:35 since neighbor pixels access within a tile is required.
+07:39 Scatter-gather and convolution filters
+07:41 cannot be mapped to tile paradigm
+07:43 since they require random access,
+07:45 so these should still remain compute dispatches.
+07:49 Render command encoder also enables
+07:51 a unique Apple GPU feature:
+07:53 lossless bandwidth compression for textures and render targets.
+07:56 This is a really great bandwidth saver,
+07:58 especially for an image-processing pipeline,
+08:01 so let’s see how we should use it.
+08:04 Well, speaking of enabling lossless compression,
+08:06 it’s actually easier to say what you should not do.
+08:10 First, already-compressed texture formats
+08:12 cannot benefit from lossless.
+08:15 Second, there are three particular texture flags
+08:18 which cannot work with this compression,
+08:20 so make sure you don’t set them just by an accident.
+08:24 And third, linear textures -- or backed by an MTLBuffer --
+08:28 are not allowed as well.
+08:31 Some special treatment is also required
+08:33 for nonprivate textures;
+08:35 make sure to call optimizeContentsForGPUAccess
+08:38 to stay on the fastest path.
+08:41 GPU frame capture Summary pane now shows you
+08:44 lossless compression warnings
+08:46 and highlights the reasons why the texture has opted out.
+08:49 In this example, PixelFormatView flag was set.
+08:54 In many cases,
+08:55 developers are setting these flags unintentionally.
+08:58 Don’t set PixelFormatView
+08:59 if all you need is components swizzle or sRGB conversion.
+09:05 All right, we have the render and textures path
+09:07 up and running.
+09:08 Now, let’s make sure we properly use tile memory.
+09:11 Tile memory TBDR concepts --
+09:14 such as load/store actions and memoryless attachments --
+09:17 are totally new to the desktop world.
+09:19 So let’s make sure we use them properly.
+09:22 Let’s start with load/store actions!
+09:25 As we already know,
+09:26 the whole render target is split into the tiles.
+09:29 Load/store are per-tile bulk actions
+09:32 guaranteed to take the most optimal path
+09:34 through memory hierarchy.
+09:36 They are executed at the beginning of the render pass --
+09:39 where we tell the GPU how to initialize the tile memory --
+09:43 and at the end of the pass to inform the GPU
+09:45 what attachments need to be written back.
+09:48 The key thing here is to avoid loading what we don’t need.
+09:52 If we are overwriting the whole image,
+09:54 or the resource is temporary,
+09:56 set load action to LoadActionDontCare.
+09:59 With render encoder,
+10:00 you no longer need to clear your output or temporary data,
+10:04 as you probably did before with dedicated compute pass
+10:07 or fillBuffer call.
+10:09 By setting LoadActionClear,
+10:11 you can efficiently specify the clear value.
+10:14 And the same goes for the store action.
+10:16 Make sure to only store the data you will later need --
+10:19 like the main attachment --
+10:20 and don’t store anything temporary.
+10:23 Besides explicit load and store actions,
+10:26 Apple GPUs saves your memory footprint
+10:28 with memoryless attachments.
+10:30 We can explicitly define an attachment
+10:33 as having memoryless storage mode.
+10:35 This enables tile-only memory allocation,
+10:38 meaning that your resource will persist
+10:40 for each and every tile only within encoder lifetime.
+10:43 This can greatly reduce your memory footprint,
+10:45 especially for 6K/8K images,
+10:48 where every frame takes hundreds of megabytes.
+10:51 Let’s see how this all can be done in code.
+10:54 We start by creating the textureDescriptor
+10:57 and then create the outputTexture.
+11:00 We then create a temporary texture.
+11:02 Notice that I’ve marked it memoryless,
+11:04 as we don’t want any storage here.
+11:07 Then we create the render pass
+11:09 by first describing what the attachments are
+11:12 and then what are the load/store actions.
+11:14 We don’t care about loading the output
+11:16 since it is fully overwritten, but we need to store it.
+11:20 As for the temporary texture, we don’t load but clear it,
+11:23 and we don’t need to store it either.
+11:26 Finally, we create our renderPass from the descriptor.
+11:31 That’s it.
+11:32 So we are using unified memory,
+11:35 moved our image-processing pipeline
+11:37 to render command encoder,
+11:38 and are properly leveraging tile memory.
+11:41 Now, let’s talk about uber-shaders.
+11:44 Uber-shaders, or uber-kernels,
+11:46 is a pretty popular way to make developers' life easier.
+11:50 Host code sets up the control structure,
+11:53 and shader just loops through a series of if/else statements,
+11:57 for example, if tone mapping is enabled
+11:59 or if the input is in HDR or SDR formats.
+12:03 This approach is also known as "ubers-shader"
+12:06 and is really good at bringing
+12:08 total number of pipeline state objects down.
+12:11 However, it has drawbacks.
+12:14 The main one is increased register pressure
+12:17 to keep up with more complex control flow.
+12:19 Using more registers can easily limit maximum occupancy
+12:23 your shader is running at.
+12:25 Consider a simple kernel where we pass in the control struct.
+12:29 We use flags inside the struct to control what we do.
+12:33 We have two features here:
+12:35 if the input is in HDR and if tonemapping is enabled.
+12:38 All look good, right?
+12:40 Well, here is what happens on the GPU.
+12:44 Since we cannot deduce anything at compile time,
+12:46 we have to assume we could take both paths --
+12:49 HDR and non-HDR --
+12:51 and then combine based on the flag.
+12:54 Same goes for tone mapping.
+12:56 We evaluate it and then mask it in or out,
+12:59 based on the input flag.
+13:02 The problem here is registers.
+13:04 Every control flow path needs live registers.
+13:07 This is where uber-shaders are not so good.
+13:10 As you recall, registers used by the kernel
+13:14 define maximum occupancy the shader could run.
+13:17 That happens because registers file is shared by all simdlanes
+13:20 on the shader core.
+13:22 If we could only run what’s only needed,
+13:24 that would enable higher simdgroup concurrency
+13:27 and GPU utilization.
+13:30 Let’s talk how to fix this.
+13:32 Metal API has the right tool for the job,
+13:34 and it's called "function_constants".
+13:37 We define both control parameters
+13:39 as function_constants,
+13:41 and we modify the code accordingly.
+13:43 Here, we are showing the modified kernel code.
+13:46 Host side must be also updated to provide
+13:49 function_constant value at pipeline creation time.
+13:52 Another great way to reduce register pressure
+13:56 is using 16-bit types in your shaders.
+13:59 Apple GPUs have native 16-bit type support.
+14:03 So, when using smaller data types,
+14:05 your shaders will require less registers,
+14:08 increasing occupancy.
+14:10 Half and short types also require less energy
+14:13 and might achieve higher peak rates.
+14:16 So, please use half and short types
+14:18 instead of float and int when possible,
+14:20 since type conversions are usually free.
+14:24 In this example,
+14:25 consider a kernel using the thread_position
+14:28 in threadgroup for some computations.
+14:32 We are using unsigned int,
+14:33 but the maximum threadgroup size supported by Metal
+14:37 can easily fit in unsigned short.
+14:40 threadgroup_position_in_grid, however,
+14:42 could potentially require a larger data type.
+14:46 But for the grid sizes we’re using in image processing --
+14:49 up to 8K or 16K -- unsigned short is also enough.
+14:54 If we use 16-bit types instead, the resulting code
+14:57 will use a smaller number of registers,
+14:59 potentially increasing the occupancy.
+15:02 Now, let me show you where you can have
+15:04 all the details on registers.
+15:07 GPU frame debugger in Xcode13
+15:10 now has advanced pipeline state object view for render,
+15:13 tile, and compute PSOs.
+15:15 You can inspect detailed pipeline statistics --
+15:18 now with registers usage -- and fine-tune all your shaders.
+15:22 With register concerns covered,
+15:25 let’s talk about texture formats.
+15:28 First, we want to note that different pixel formats
+15:30 might have different sampling rates.
+15:33 Depending on hardware generation and number of channels,
+15:36 wider floating-point types might have
+15:38 reduced point sampling rate.
+15:40 Especially floating-point formats such as RGBA32F
+15:44 will be slower than FP16 variants
+15:46 when sampling filtered values.
+15:49 Smaller types reduce memory storage,
+15:51 bandwidth, and cache footprint as well.
+15:53 So we encourage, again,
+15:54 to use the smallest type possible,
+15:56 but in this case, for the textures storage.
+15:59 This was actually a common case for 3D LUTs in image processing;
+16:03 most applications we worked with were using float RGBA
+16:07 for a 3D LUT application phase with bilinear filtering enabled.
+16:12 Please consider if your app can instead use halfs
+16:14 and the precision will be enough.
+16:17 If that’s the case,
+16:18 switch to FP16 right away to get peak sampling rates.
+16:22 If half precision is not enough,
+16:24 we found out that fixed-point unsigned short
+16:26 provides great uniform range of values,
+16:29 so encoding your LUTs in unit scale
+16:31 and providing LUT range to the shader
+16:33 was a great way to get both peak sampling rate
+16:36 and sufficient numerical accuracy.
+16:39 All right, so we just went over
+16:41 how we should leverage Apple GPU architecture to make
+16:44 your image-processing pipeline run as efficient as possible.
+16:48 To apply it all right away, please meet Harsh!
+16:50 Harsh Patil: Thanks, Eugene.
+16:52 Now let’s walk through redesigning
+16:54 an image-processing pipeline for Apple silicon
+16:56 based on all the best practices we have learned so far.
+16:59 To be specific,
+17:00 we are going to tailor the image-processing phase
+17:02 of the video-processing pipeline for Apple GPUs.
+17:05 Real-time image processing is very GPU compute
+17:08 and memory bandwidth intensive.
+17:10 We will first understand how it is usually designed
+17:13 and then how we can optimize it for Apple silicon.
+17:16 We are not going to go into the details
+17:18 of video-editing workflow in this section,
+17:20 so please refer to our talk from two years ago.
+17:22 We will solely focus on transitioning
+17:24 the compute part of image processing to render path.
+17:27 Before we start,
+17:28 let's begin quickly take a look at where image-processing phase
+17:30 stands in a typical video-processing pipeline.
+17:33 We'll take ProRes-encoded input file as an example.
+17:37 We first read the ProRes-encoded frame from the disk
+17:40 or external storage.
+17:41 We then decode the frame on CPU,
+17:44 and now the image-processing phase
+17:45 executes on this decoded frame on the GPU
+17:48 and renders the final output frame.
+17:50 Finally, we display this output frame.
+17:53 We could additionally also encode the final rendered frame
+17:56 for delivery.
+17:57 Next, let’s take a look at what comprises
+17:59 an image-processing pipeline.
+18:02 Image processing starts with unpacking different channels
+18:04 of the source image RGB in alpha
+18:07 into separate buffers in the beginning.
+18:09 We will process each of these channels
+18:11 in our image-processing pipeline,
+18:12 either together or separately.
+18:15 Next, there might be color space conversions
+18:17 to operate in the desired color-managed environment.
+18:21 We then apply a 3D LUT; perform color corrections;
+18:26 and then apply spatial-temporal noise reduction, convolutions,
+18:29 blurs, and other effects.
+18:31 And finally,
+18:32 we pack the individually processed channels together
+18:34 for final output.
+18:36 What do these selected steps have in common?
+18:39 They are all point filters,
+18:40 operating only on a single pixel with no interpixel dependency.
+18:43 These map well to fragment shader implementation.
+18:47 Spatial and convolution-style operations
+18:49 require access to large radius of pixels,
+18:51 and we have scattered
+18:52 read-write access patterns as well.
+18:54 These are well-suited for compute kernels.
+18:57 We’ll use this knowledge later.
+18:58 For now, let’s see how these operations are executed.
+19:02 Applications represent chain of effects
+19:03 applied to an image as a filter graph.
+19:06 Every filter is its own kernel,
+19:08 processing the inputs from the previous stage
+19:10 and producing outputs for the next stage.
+19:12 Every arrow here means a buffer being written
+19:15 to/from output of one stage
+19:16 and read as the input in the next stage.
+19:20 Since memory is limited,
+19:22 applications usually linearize the graph
+19:24 by doing a topological sort.
+19:26 This is done to keep the total number of intermediate resources
+19:29 as low as possible while also avoiding race conditions.
+19:33 This simple filter graph in that example
+19:35 would need two intermediate buffers to be able to operate
+19:38 without race conditions and produce the final output.
+19:41 The linearized graph here roughly represents
+19:43 the GPU command buffer encoding as well.
+19:46 Let’s look deeper on why this filter graph
+19:49 is very device memory bandwidth intensive.
+19:52 Every filter operation has to load whole image
+19:55 from device memory into the registers
+19:58 and write the result back to the device memory.
+20:01 And that’s quite a bit of memory traffic.
+20:03 Let’s estimate the memory footprint
+20:05 for a 4K-frame image processing
+20:07 based on our example image-processing graph.
+20:11 A 4K decoded frame itself takes 67 megabytes of memory
+20:15 for floating-point 16 precision
+20:17 or 135 megabytes of memory for floating-point 32 precision,
+20:21 and professional workflows
+20:22 absolutely need floating-point 32 precision.
+20:25 For processing one 4K frame in floating-point 32 precision
+20:29 through this image-processing graph, we are talking more than
+20:32 two gigabytes of read-write traffic to device memory.
+20:36 Also, writes to buffers holding the intermediate output
+20:39 thrashes the cache hierarchy
+20:40 and impacts other blocks on the chip as well.
+20:43 Regular compute kernels
+20:45 don’t benefit from the on-chip tile memory implicitly.
+20:48 Kernels can explicitly allocate threadgroup-scoped memory,
+20:51 which will be backed by the on-chip tile memory.
+20:54 However, that tile memory is not persistent
+20:56 across dispatches within a compute encoder.
+21:00 In contrast, the tile memory is actually persistent
+21:02 across draw passes within one render command encoder.
+21:06 Let’s see how we can redesign this representative
+21:08 image-processing pipeline to leverage the tile memory.
+21:12 We are going to address this by following three steps.
+21:15 We first change the compute pass to render pass
+21:18 and all the intermediate output buffers to textures.
+21:21 We then encode per-pixel operations
+21:23 with no interpixel dependency as fragment shader invocations
+21:27 within one render command encoder,
+21:28 making sure to account for all the intermediate results
+21:31 and setting appropriate load/store actions.
+21:34 And finally, we discuss what do we do in more complex situation
+21:38 than just point filters.
+21:40 Our first step is to use separate
+21:42 MTLRenderCommandEncoder to encode eligible shaders.
+21:45 In this filter graph, unpack, color space conversion, LUT,
+21:49 and color-correction filters are all point per-pixel filters
+21:53 that we can convert to fragment shader
+21:55 and encode them using one render command encoder.
+21:59 Similarly, mixer and pack shaders --
+22:02 which are towards the end
+22:03 of this image-processing pipeline --
+22:05 can also be converted to fragment shaders
+22:07 and encoded using another MTLRenderCommandEncoder.
+22:11 Then we can invoke these shaders
+22:12 within their respective render passes.
+22:15 When you create the render pass,
+22:17 all the resources attached to the color attachments
+22:19 in that render pass are implicitly tiled for you.
+22:22 A fragment shader can only update the image block data
+22:26 associated with fragment’s position in the tile.
+22:29 Next shader in the same render pass
+22:31 can pick up the output of the previous shader
+22:33 directly from the tile memory.
+22:35 In the next section, we will take a look
+22:37 at how we can structure the fragment shaders
+22:39 which map to these filters.
+22:41 We will also take a look at what constructs
+22:43 we need to define and use to enable access
+22:46 to the underlying tile memory
+22:48 from within these fragment shaders.
+22:50 And finally, we will take a look
+22:52 at how the output generated in the tile memory
+22:54 by one fragment shader can be consumed
+22:56 directly from the tile memory by the next fragment shader
+22:59 within the same render command encoder.
+23:02 This is what you have to do in your code.
+23:05 Here I have attached output image as a texture
+23:07 attached to color attachment 0 of the render pass descriptor.
+23:11 I have attached texture holding intermediate result
+23:14 to color attachment 1 of the render pass descriptor.
+23:17 Both of these will be implicitly tiled for you.
+23:21 Please set the appropriate load/store properties
+23:23 as discussed earlier in the talk.
+23:26 Now, set up a structure to access these textures
+23:29 in your fragment shader.
+23:30 In the coming examples,
+23:31 we will show how to use this structure
+23:33 within your fragment shaders.
+23:35 You simply access the output and the intermediate textures
+23:38 within your fragment shader as highlighted
+23:40 by using the structure we defined earlier.
+23:43 Writes to these textures are done
+23:45 to appropriate tile memory location
+23:47 corresponding to the fragment.
+23:49 Output produced by the unpack shader is consumed as input
+23:53 by color space conversion shader
+23:54 using the same structure that we defined earlier.
+23:57 This fragment shader can do its own processing
+24:00 and update the output and intermediate textures
+24:02 which will, once again,
+24:03 update the corresponding tile memory location.
+24:06 You are to continue the same steps
+24:08 for all the other fragment shaders
+24:09 within the same render encoder pass.
+24:12 Next, let's visualize
+24:13 how this sequence of operations looks now with these changes.
+24:17 As you can see, now you have unpack,
+24:20 color space conversion, application of 3D LUT,
+24:23 and color-correction steps, all executed on the tile memory
+24:26 using one render pass
+24:27 with no device memory passes in between.
+24:30 At the end of the render pass,
+24:32 render targets that are not memoryless
+24:34 are flushed to the device memory.
+24:36 You can then execute the next class of filters.
+24:39 Let’s talk a bit about filters
+24:41 that have scatter-gather access patterns.
+24:43 Kernels representing such filters
+24:45 can directly operate on the data in the device memory.
+24:49 Convolution filters are very well-suited
+24:51 for tile-based operations in compute kernels.
+24:54 Here, you can express intent to use tile memory
+24:57 by declaring a threadgroup-scoped memory.
+25:00 Now, you bring in the block of pixels into the tile memory
+25:03 along with all the necessary halo pixels,
+25:05 depending upon the filter radius,
+25:07 and perform the convolution operation
+25:09 directly on the tile memory.
+25:11 Remember, tile memory is not persistent
+25:14 across compute dispatches within a compute encoder.
+25:17 So after executing Filter1,
+25:19 you have to explicitly flush the tile memory contents
+25:21 to device memory.
+25:23 That way, Filter2 can consume the output of Filter1.
+25:27 So where do we land once we make all of these changes?
+25:30 For processing one 4K frame in floating-point 32 precision
+25:34 through our example restructured image-processing graph,
+25:37 here’s what we have now.
+25:39 Bandwidth goes down from 2.16 gigabytes
+25:42 to just load and store worth 810 megabytes,
+25:45 and that’s 62 percent reduction in memory traffic
+25:47 to the device memory.
+25:48 We don't need two intermediate device buffers
+25:51 saving 270 megabytes of memory per frame.
+25:54 And finally, we have reduced cache thrashing,
+25:56 and that's because all the fragment shaders
+25:59 within that render pass are operating
+26:00 directly on the tile memory.
+26:02 One of the key features of Apple silicon
+26:05 is its Unified Memory Architecture.
+26:07 Let’s see an example of how to leverage
+26:09 this Unified Memory Architecture for interaction
+26:11 between different blocks on the Apple silicon.
+26:15 We will take HEVC encoding of the final video frame
+26:18 rendered by GPU as a case study.
+26:21 This encoding is done using dedicated hardware media engines
+26:24 on Apple silicon.
+26:27 The final output frame rendered by the GPU
+26:29 can be consumed directly by our media engines
+26:31 with no extra memory copies.
+26:33 In the coming section,
+26:35 we will walk through an example on how to set up a pipeline
+26:38 for HEVC encoding of the final output frame
+26:41 produced by the GPU in the most efficient way.
+26:43 For that, first we will leverage CoreVideo API
+26:47 to create a pool of pixel buffers
+26:49 backed by IOSurfaces.
+26:51 Then, using the Metal API,
+26:53 we render the final frames into Metal textures
+26:55 backed by IOSurfaces from the pool we just created.
+26:59 And finally, we dispatch these pixel buffers
+27:01 directly to the media engine for encode
+27:03 without any additional copies of the output frames
+27:06 produced by the GPU,
+27:07 thus leveraging the Unified Memory Architecture.
+27:09 Let’s walk through on how to do this step by step
+27:11 and covering all the constructs we need to enable this flow.
+27:15 First, we create a CVPixelBufferPool
+27:17 backed by IOSurface in the desired pixel format.
+27:21 Here, we will use the biplanar
+27:23 chroma-subsampled pixel format for HEVC encode.
+27:28 Now, you get a CVPixelBuffer from this CVPixelBufferPool.
+27:32 Pass this CVPixelBuffer to the MetalTextureCache
+27:35 with the right plane index
+27:36 to get the CVMetalTextureReference.
+27:39 Since we are using biplanar pixel format,
+27:41 you need to perform this step
+27:42 for both planes of the biplanar pixel buffer.
+27:45 Next, get the underlying Metal texture from the
+27:48 CVMetalTextureReference object.
+27:50 Perform this step for both luma and chroma planes.
+27:53 Remember that these Metal textures
+27:55 are backed by the same IOSurfaces
+27:57 which are also backing the CVPixelBuffer planes.
+28:00 Using Metal API, render into the textures
+28:03 corresponding to luma and chroma planes.
+28:06 This will update the IOSurface
+28:07 which backs these Metal textures as well.
+28:10 We highly recommend doing the chroma subsampling step
+28:12 on the chroma planes on the GPU itself
+28:14 as a shader pass within your image-processing pipeline.
+28:18 An important thing to note
+28:19 is that both CVPixelBuffer and the Metal textures --
+28:22 which we just rendered into --
+28:24 are backed by the same underlying IOSurface copy
+28:26 in the system memory.
+28:29 You can now send this CVPixelBuffer
+28:30 directly to the media engine for encode.
+28:33 As you can see,
+28:34 due to the Unified Memory Architecture,
+28:36 we can seamlessly move data between GPU
+28:38 and media engine block with no memory copies.
+28:41 And finally, remember to release the CVPixelBuffer
+28:44 and CVMetalTexture reference after every frame.
+28:48 Releasing the CVPixelBuffer
+28:49 enables recycling of this buffer for future frames.
+28:53 To wrap up, we encourage you again to do the following:
+28:56 leverage Unified Memory Architecture,
+28:58 use MTLRenderCommandEncoder instead of compute
+29:00 when applicable,
+29:02 merge all your eligible render passes
+29:04 within single render command encoder,
+29:06 set appropriate load/store actions,
+29:08 use memoryless for transient resources,
+29:11 leverage tile shading when applicable,
+29:13 and use buffer pools with other APIs for zero-copy.
+29:16 We want to thank you for joining this session today.
+29:19 Enjoy the rest of WWDC 2021!
+29:28 ♪

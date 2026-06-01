@@ -1,0 +1,415 @@
+00:03 Hello and welcome to WWDC.
+00:08 Hi everyone, I’m Ben. I’m in the Languages and Runtimes team,
+00:11 and I’m going to talk to you about changes we’ve made this year
+00:13 in the Objective-C runtime in iOS and mac OS
+00:17 that significantly improve memory use.
+00:19 This talk is a little bit different to most.
+00:21 You shouldn’t need to change any of your code.
+00:23 I’m not going to talk about any new APIs to learn this year
+00:26 or deprecation warnings to squash.
+00:28 With any luck, you won’t need to do anything
+00:29 and your apps will just get faster.
+00:32 Why are we telling you about these improvements?
+00:34 Well, partly because we think they’re cool and interesting,
+00:37 but also because these kind of improvements in the runtime
+00:39 are only possible because our internal data structures are hidden behind APIs.
+00:44 When apps access these data structures directly, things get a little crashy.
+00:49 In this talk you’ll learn a few things to watch out for
+00:51 that might happen when someone else working on your codebase,
+00:54 not you obviously, access things that they shouldn’t.
+00:58 We’re gonna cover three changes in this session.
+01:01 First, there’s a change in the data structures
+01:03 that the Objective-C runtime uses to track classes.
+01:07 Then we’ll take a look at changes to Objective-C method lists.
+01:11 Finally, we’ll look at a change in how tagged pointers are represented.
+01:16 So, let’s start off with changes to the runtime data for classes.
+01:20 On disk, in your application binary, classes look like this.
+01:25 First, there’s the class object itself,
+01:27 which contains the information that's most frequently accessed:
+01:30 pointers to the metaclass, superclass, and the method cache.
+01:35 It also has a pointer to more data
+01:37 where additional information is stored, called the class_ro_t.
+01:41 "Ro" stands for read only.
+01:43 And this includes things like the class's name
+01:46 and information about methods, protocols, and instance variables.
+01:51 Swift classes and Objective-C classes share this infrastructure,
+01:54 so each Swift class has these data structures as well.
+01:58 When classes are first loaded from disk into memory,
+02:01 they start off like this too, but they change once they're used.
+02:04 Now, to understand what happens then,
+02:06 it’s useful to know about the difference between clean memory and dirty memory.
+02:12 Clean memory is memory that isn’t changed once it’s loaded.
+02:16 The class_ro_t is clean because it’s read only.
+02:21 Dirty memory is memory that’s changed while the process is running.
+02:26 The class structure is dirtied once the class gets used
+02:29 because the runtime writes new data into it.
+02:31 For example, it creates a fresh method cache and points to it from the class.
+02:36 Dirty memory is much more expensive than clean memory.
+02:40 It has to be kept around for as long as the process is running.
+02:44 Clean memory, on the other hand, can be evicted to make room for other things
+02:48 because you if you need it, the system can always just reload it from disk.
+02:53 macOS has the option to swap out dirty memory,
+02:55 but dirty memory is especially costly in iOS because it doesn’t use swap.
+03:01 Dirty memory is the reason why this class data is split into two pieces.
+03:07 The more data that can be kept clean, the better.
+03:10 By separating out data that never changes,
+03:12 that allows for most of the class data to be kept as clean memory.
+03:17 This data is enough to get us started,
+03:19 but the runtime needs to track more information about each class.
+03:22 So, when a class first gets used,
+03:24 the runtime allocates additional storage for it.
+03:29 This runtime allocated storage is the class_rw_t, for read/write data.
+03:34 In this data structure, we store new information only generated at runtime.
+03:39 For example, all classes get linked into a tree structure
+03:42 using these First Subclass and Next Sibling Class pointers,
+03:45 and this allows the runtime to traverse all the classes currently in use,
+03:49 which is useful for invalidating method caches.
+03:53 But why do we have methods and properties here
+03:56 when they're in the read only data too?
+03:58 Well, because they can be changed at runtime.
+04:01 When a category is loaded, it can add new methods to the class,
+04:05 and the programmer can add them dynamically using runtime APIs.
+04:10 Since the class_ro_t is read only,
+04:13 we need to track these things in the class_rw_t.
+04:17 Now, it turns out that this takes up quite a bit of memory.
+04:20 There are a lot of classes in use in any given device.
+04:23 We measured about 30 megabytes of these class_rw_t structures
+04:27 across the system on an iPhone.
+04:30 So, how could we shrink these down?
+04:32 Remember we need these things in the read/write part
+04:35 because they can be changed at runtime.
+04:39 But examining usage on real devices,
+04:40 we found that only around 10% of classes ever actually have their methods changed.
+04:47 And this demangled name field is only used by Swift classes,
+04:50 and isn't even needed for Swift classes
+04:52 unless something asks for their Objective-C name.
+04:56 So, we can split off the parts that aren't usually used,
+04:59 and this cuts the size of the class_rw_t in half.
+05:03 For the classes that do need the additional information,
+05:06 we can allocate one of these extended records
+05:08 and slide it in for the class to use.
+05:12 Approximately 90% of classes never need this extended data,
+05:16 saving around 14 megabytes system wide.
+05:19 This is memory that’s now available for more productive uses,
+05:22 like storing your app’s data.
+05:24 So, you can actually see the impact of this change yourself on your Mac
+05:28 by running some simple commands in the terminal.
+05:30 Let’s take a look at that now.
+05:32 I'm gonna go into the terminal on my MacBook here,
+05:34 and I'm gonna run a command that's available on any Mac, called heap.
+05:38 And it lets you inspect the heap memory in use by a running process.
+05:43 So, I'm gonna run it against the Mail app on my Mac.
+05:46 Now, if I just ran this, it would output thousands of lines
+05:49 showing every heap allocation made by Mail.
+05:52 So, instead I'm just gonna grep it
+05:55 for the types we've been talking about today.
+05:58 The class_rw_t types.
+06:00 And I'm also gonna search for the header.
+06:07 And from the results that come back,
+06:08 we can see that we're using about 9000 of these class_rw_t types in the Mail app,
+06:15 but only about a tenth of them, a little over 900,
+06:18 actually needed this extended information.
+06:21 So, we can easily calculate the savings we've made by this change.
+06:26 This is the type that's halved in size.
+06:28 So, if we subtract from this number
+06:31 the amount of memory we've had to allocate to the extended types,
+06:34 we can see that we've saved about a quarter of a meg of data
+06:38 just for the Mail app.
+06:40 If we extend that system wide,
+06:42 that's a real savings in terms of dirty memory.
+06:46 Now, a lot of code that fetches data out of the class
+06:48 now has to deal with classes that both do and don't have this extended data.
+06:53 Of course, the runtime handles all of that for you,
+06:55 and from the outside, everything just keeps working like it always did,
+06:58 just using less memory.
+07:01 This works because the code that reads these structures
+07:04 is all within the runtime, and it's updated at the same time.
+07:09 Sticking to these APIs is really important
+07:11 because any code that tried to access these data structures directly
+07:15 is going to stop working in this year's OS release
+07:17 since things have moved around, and that code won't know about the new layout.
+07:22 We saw some real code that broke due to these changes,
+07:25 and, in addition to your own code,
+07:27 watch out for external dependencies you might be bringing into your app
+07:30 that might be digging into these data structures without you realizing.
+07:35 All of the information in these structures is available through official APIs.
+07:39 There are functions like class_getName and class_getSuperclass.
+07:43 When you use these APIs to access this information,
+07:45 you know they'll keep working no matter what we change behind the scenes.
+07:50 All of these APIs can be found in the Objective-C runtime documentation
+07:54 on developer.apple.com.
+07:56 Next, let's dive a little deeper into these class data structures
+07:59 and take a look at another change, relative method lists.
+08:04 Every class has a list of methods attached to it.
+08:07 When you write a new method on a class, it gets added to the list.
+08:10 The runtime uses these lists to resolve message sends.
+08:14 Each method contains three pieces of information.
+08:18 First is the method's name or selector.
+08:21 Selectors are strings,
+08:22 but they're unique so they can be compared using pointer equality.
+08:26 Next is the method's type encoding.
+08:28 This is a string that represents the parameter and return types,
+08:31 and it isn't used for sending messages,
+08:33 but it's needed for things like runtime introspection and message forwarding.
+08:38 Finally, there's a pointer to the method's implementation.
+08:41 The actual code for the method.
+08:42 When you write a method, it gets compiled into a C function
+08:45 with your implementation in it,
+08:47 and then the entry in the method list points to that function.
+08:51 Let's look at a single method.
+08:53 I've chosen the init method.
+08:55 It contains entries for the method name, types, and implementation.
+09:01 Each piece of data in the method list is a pointer.
+09:04 On our 64-bit systems,
+09:06 that means that each method table entry occupies 24 bytes.
+09:10 Now this is clean memory, but clean memory isn't free.
+09:14 It still has to be loaded from disk and occupies memory when it's in use.
+09:19 Now here's a zoomed out view of the memory within a process.
+09:23 Note that it's not to scale.
+09:25 There's this big address space that requires 64 bits to address.
+09:30 Within that address space,
+09:31 various pieces are carved out for the stack, the heap,
+09:34 and the executables and libraries or binary images
+09:37 loaded into the process,
+09:39 shown here in blue.
+09:41 Let's zoom in and look at one of these binary images.
+09:46 Here, we show the three method table entries
+09:48 pointing into locations in their binary.
+09:51 This shows us another cost.
+09:53 A binary image can be loaded anywhere in memory
+09:56 depending on where the dynamic linker decides to place it.
+09:59 That means that the linker needs to resolve the pointers into the image
+10:04 and fix them up to point to their actual location in memory at load time,
+10:09 and that also has a cost.
+10:11 Now note that a class method entry from a binary
+10:14 only ever points to method implementations within that binary.
+10:18 There's no way to make a method that has its metadata in one binary
+10:22 and the code implementing it in another.
+10:25 That means that method list entries
+10:27 don't actually need to be able to refer to the entire 64-bit address space.
+10:33 They only ever need to be able to refer to functions within their own binary,
+10:36 and those will always be nearby.
+10:40 So, instead of an absolute 64-bit address,
+10:43 they can use a 32-bit relative offset within the binary.
+10:48 And that's a change that we've made this year.
+10:51 This has several advantages.
+10:53 Firstly, the offsets are always the same
+10:55 no matter where the image is loaded into memory,
+10:58 so they don't have to be fixed up after they're loaded from disk.
+11:02 And because they don't need to be fixed up,
+11:05 they can be held in true read only memory, which is more secure.
+11:09 And, of course, 32-bit offsets
+11:11 mean that we've halved the amount of memory needed on 64-bit platforms.
+11:15 We've measured about 80MB of these methods system wide on a typical iPhone.
+11:20 Since they're half the size, we save 40 megabytes.
+11:24 That's more memory your app can use to delight your users.
+11:30 But what about swizzling?
+11:31 The method lists in a binary can't now refer to the full address space,
+11:36 but if you swizzle a method, that can be implemented anywhere.
+11:39 And besides, we just said that we want to keep these method lists read only.
+11:44 To handle this, we also have a global table
+11:47 mapping methods to their swizzled implementations.
+11:51 Swizzling is rare.
+11:52 The vast majority of methods never actually get swizzled,
+11:55 so this table doesn't end up getting very big.
+11:58 Even better, the table is compact.
+12:00 Memory is dirtied a page at a time.
+12:03 With the old style of method lists,
+12:05 swizzling a method would dirty the entire page it was on,
+12:08 resulting in many kilobytes of dirty memory for a single swizzle.
+12:13 With the table, we just pay the cost for an extra table entry.
+12:17 As always, these changes are invisible to you,
+12:20 and everything keeps working just like it always has.
+12:23 These relative method lists are supported on the new OS versions
+12:26 coming out later this year.
+12:29 When you build with the corresponding minimum deployment target,
+12:32 the tools will automatically generate relative method lists in your binaries.
+12:37 If you need to target older OS versions still, not to worry.
+12:41 Xcode will generate the old style method list format as well,
+12:44 which is still fully supported.
+12:46 You still get the benefit from the OS itself
+12:49 being built with the new relative method lists,
+12:51 and the system has no problem with both formats in use
+12:54 in the same app at the same time.
+12:57 If you can target this year's OS releases though,
+12:59 you'll get smaller binaries and less memory usage.
+13:03 This is a generally good tip in Objective-C or Swift.
+13:07 Minimum deployment targets
+13:09 aren't just about which SDK APIs are available to you.
+13:13 When Xcode knows that it doesn't need to support older OS versions,
+13:17 it can often emit better optimized code or data.
+13:21 We understand that many of you need to support older OS versions,
+13:25 but this is a reason why it's a good idea to increase your deployment target
+13:29 whenever you can.
+13:31 Now, one thing to watch out for is building with a deployment target
+13:34 that's newer than the one you intend it to target
+13:38 Xcode usually prevents this, but it can slip through,
+13:40 especially if you're building your own libraries or frameworks elsewhere
+13:44 and then bringing them in.
+13:46 When running on an older OS,
+13:48 that older runtime will see these relative methods,
+13:51 but it doesn't know anything about them,
+13:53 so it will try to interpret them like the old style pointer-based methods.
+13:58 That means it will try to read a pair of 32-bit fields
+14:02 as a 64-bit pointer.
+14:05 The result is two integers being glued together as a pointer,
+14:08 which is a nonsense value that is certain to crash if it's actually used.
+14:13 You can recognize when this happens
+14:14 by a crash in the runtime reading method information,
+14:18 where the bad pointer looks like two 32-bit values smooshed together
+14:22 as in this example.
+14:24 And if you're running code that digs through these structures
+14:27 to read out the values,
+14:28 that code will have the same problem as these older runtimes,
+14:32 and the app would crash when users upgraded their devices.
+14:36 So again, don't do that. Use the APIs.
+14:40 Those APIs keep working regardless of how things change underneath.
+14:44 For example, there are functions that, given a method pointer,
+14:47 return the values for its fields.
+14:51 Let's explore one more change coming this year.
+14:53 A change to the tagged pointer format on arm64.
+14:57 First, we need to know what tagged pointers are.
+15:01 We're gonna get really low-level here, but don't worry.
+15:03 Like everything else we've talked about, you don't need to know this.
+15:06 It's just interesting,
+15:08 and maybe helps you understand your memory usage a little better.
+15:12 Let's start by looking at the structure of a normal object pointer.
+15:15 Typically when we see these,
+15:17 they're printed as these big hexadecimal numbers.
+15:19 We saw some of these earlier.
+15:22 Let's break it out into the binary representation.
+15:26 We have 64 bits, however, we don't really use all of these bits.
+15:31 only these bits here in the middle are ever set in a real object pointer.
+15:37 The low bits are always zero because of alignment requirements.
+15:40 objects must always be located at an address
+15:43 that's a multiple of the pointer size.
+15:46 The high bits are always zero because the address space is limited.
+15:49 we don't actually go all the way up to two to the 64.
+15:54 These high and low bits are always zero.
+15:57 So, let's pick one of these bits that's always zero and make it a one.
+16:02 That can immediately tell us that this is not a real object pointer,
+16:06 and then we can assign some other meaning to all of the other bits.
+16:10 We call this a tagged pointer.
+16:14 For example, we might stuff a numeric value into the other bits.
+16:18 As long as we were to teach NSNumber how to read those bits,
+16:22 and teach the runtime to handle the tagged pointers appropriately,
+16:25 the rest of the system can treat these things like object pointers
+16:29 and never know the difference.
+16:32 And this saves us the overhead of allocating a tiny number object
+16:36 for every case like this,
+16:38 which can be a significant win.
+16:41 Just a quick aside,
+16:42 these values are actually obfuscated by combining them
+16:46 with a randomized value that's initialized at process startup.
+16:50 This is a security measure that makes it difficult to forge a tagged pointer.
+16:54 We'll ignore this for the rest of the discussion,
+16:56 since it's just an extra layer on top.
+16:58 Just be aware that if you actually try and look at these values in memory,
+17:01 they'll be scrambled.
+17:03 So, this is the full format of a tagged pointer on Intel
+17:07 The low bit is set to one to indicate that this is a tagged pointer.
+17:11 As we discussed, this bit must always be zero for a real pointer,
+17:15 so this allows us to tell them apart.
+17:18 The next three bits are the tag number.
+17:21 This indicates the type of the tagged pointer.
+17:24 For example, a three means it's an NSNumber,
+17:26 a six, that it's an NSDate.
+17:29 Since we have three tag bits, there are eight possible tag types.
+17:34 The rest of the bits are the payload.
+17:36 This is data that the particular type can use however it likes.
+17:40 For a tagged NSNumber, this is the actual number.
+17:45 Now, there's a special case for tag seven.
+17:47 This indicates an extended tag.
+17:50 An extended tag uses the next eight bits to encode the type,
+17:54 allowing for 256 more tag types
+17:57 at the cost of a smaller payload.
+18:00 This allows us to use tagged pointers for more types,
+18:03 as long as they can fit their data into a smaller space.
+18:07 This gets used for things like tagged UI colors or NSIndexSets.
+18:13 Now, if this seems really handy to you,
+18:15 you might be disappointed to hear that only the runtime maintainer,
+18:18 that is Apple,
+18:19 can add tagged pointer types.
+18:21 But if you're a Swift programmer,
+18:23 you'll be happy to know that you can create your own kinds of tagged pointers.
+18:27 If you've ever used an enum with an associated value that's a class,
+18:31 that's like a tagged pointer.
+18:33 The Swift runtime stores the enum discriminator
+18:36 in the spare bits of the associated value payload.
+18:40 What's more, Swift's use of value types
+18:42 actually makes tagged pointers less important,
+18:45 because values no longer need to be exactly pointer sized.
+18:49 For example, a Swift UUID type can be two words and held inline
+18:54 instead of allocating a separate object because it doesn't fit inside a pointer.
+18:59 Now that's tagged pointers on Intel. Let's have a look at ARM.
+19:03 On arm64, we've flipped things around.
+19:06 Instead of the bottom bit, the top bit is set to one
+19:09 to indicate a tagged pointer.
+19:12 Then the tag number comes in the next three bits,
+19:15 and then the payload uses the remaining bits.
+19:18 Why do we use the top bit to indicate a tagged pointer on ARM,
+19:21 instead of the bottom bit like we do on Intel?
+19:24 Well, it's actually a tiny optimization for objc_msgSend.
+19:28 We want the most common path in msgSend to be as fast as possible,
+19:32 and the most common path is for a normal pointer.
+19:36 We have two less common cases:
+19:38 tagged pointers and nil.
+19:42 It turns out that when we use the top bit,
+19:44 we can check for both of those with a single comparison,
+19:47 and this saves a conditional branch for the common case in msgSend
+19:51 compared to checking for nil and tagged pointers separately.
+19:55 Just like in Intel, we have a special case for tag seven,
+19:58 where the next eight bits are used as an extended tag,
+20:01 and then the remaining bits are used for the payload.
+20:05 Or that was actually the old format used in iOS 13.
+20:08 In this year's release, we're moving things around a bit.
+20:11 The tag bit stays at the top,
+20:12 because that msgSend optimization is still really useful.
+20:17 The tag number now moves to the bottom three bits.
+20:20 The extended tag, if in use, occupies the high eight bits following the tag bit.
+20:26 Why did we do this?
+20:27 Well, let's consider a normal pointer again.
+20:31 Our existing tools, like the dynamic linker,
+20:34 ignore the top eight bits of a pointer due to an ARM feature called Top Byte Ignore,
+20:40 and we'll put the extended tag in the Top Byte Ignore bits.
+20:44 For an aligned pointer, the bottom three bits are always zero,
+20:49 but we can fiddle with that just by adding a small number to the pointer.
+20:53 We'll add seven to set the low bits to one.
+20:56 Remember, seven is the indication that this is an extended tag.
+21:00 And that means we can actually fit this pointer above
+21:04 into an extended tag pointer payload.
+21:08 The result is a tagged pointer with a normal pointer in its payload.
+21:13 Why is that useful?
+21:14 Well, it opens up the ability for a tagged pointer
+21:17 to refer to constant data in your binary such as strings or other data structures
+21:21 that would otherwise have to occupy dirty memory.
+21:24 Now, of course, these changes mean that code, which accesses these bits directly,
+21:28 will no longer work when iOS 14 is released later this year.
+21:33 A bitwise check like this would've worked in the past,
+21:37 but it'll give you the wrong answer on future OSs,
+21:39 and your app will start mysteriously corrupting user data.
+21:43 So, don't use code that relies on anything we've just talked about.
+21:47 Instead, you can probably guess what I'm gonna say,
+21:49 which is use the APIs.
+21:52 Type checks like isKindOfClass worked on the old tagged pointer format,
+21:55 and they'll continue to work on the new tagged pointer format.
+21:58 All NSString or NSNumber methods just keep on working.
+22:02 All of the information in these tagged pointers
+22:05 can be retrieved through the standard APIs.
+22:09 It's worth noting this also applies to CF types as well.
+22:12 We don't want to hide anything
+22:14 and we definitely don't want to break anybody's apps.
+22:16 When these details aren't exposed,
+22:17 it's just because we need to maintain the flexibility to make changes like this,
+22:21 and your apps will keep working just fine,
+22:23 as long as they don't rely on these internal details.
+22:27 So, let's wrap up.
+22:29 In this talk, we've seen a few of the behind-the-scenes improvements
+22:32 that have shrunk the overhead of our runtime,
+22:34 leaving more memory available to you and your users.
+22:38 You get these improvements without having to do anything
+22:41 except, maybe, consider raising your deployment target.
+22:45 To help us make these improvements each year,
+22:47 just follow a simple rule.
+22:49 Don't read internal bits directly. Use the APIs.
+22:53 Thanks for watching, and enjoy your faster devices.

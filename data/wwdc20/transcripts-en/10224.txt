@@ -1,0 +1,185 @@
+00:03 Hello, and welcome to WWDC.
+00:09 Hello. I'm Doug Wyatt from the Core Audio team,
+00:12 and today I'd like to introduce you to audio workgroups.
+00:15 If you develop an audio application or plug-in that creates realtime threads,
+00:19 then this talk is for you.
+00:22 You're probably using realtime threads for very low-latency audio synthesis
+00:26 or signal processing.
+00:28 It's important that you adopt new API audio workgroups.
+00:32 And these new APIs are available in the fall 2020 releases of macOS and iOS.
+00:41 Now, if you're wondering if you should create your own realtime threads,
+00:44 the answer is probably no.
+00:46 If you do go down this path, though,
+00:48 then follow the first rule of performance tuning: measure everything.
+00:53 Okay, let's dive in with some background.
+00:56 Modern CPUs have performance controllers,
+00:59 which make trade-offs between power consumption and computing power.
+01:04 The performance controller helps assign threads to CPUs.
+01:07 The CPUs themselves may have differing power and speed characteristics.
+01:12 The performance controller
+01:13 can also dynamically change the clock frequency of the CPUs.
+01:19 Up until now, the main input into the performance controller's decision-making
+01:23 has been observations about the running applications and daemons:
+01:27 how many threads are they using and how much work they are doing?
+01:31 Now, because of the time-critical nature of audio,
+01:34 we've given it a new input into the performance controller:
+01:37 the new workgroup APIs.
+01:40 Let's look now at audio workgroups.
+01:42 Later, we'll see how to use them in your apps and Audio Unit plug-ins.
+01:47 First, a workgroup consists of one or more threads.
+01:50 There is a master thread which wakes up periodically.
+01:54 It tells the kernel when it begins a work cycle,
+01:57 and what the deadline for that work is.
+02:00 The master thread might signal and wait for other threads
+02:04 that are part of the workgroup
+02:05 and those threads might be in other processes.
+02:09 At the end of each work cycle, the workgroup, again, notifies the kernel.
+02:15 This diagram illustrates how Core Audio runs an I/O thread in the audio server.
+02:20 This thread wakes up at regular intervals and has a deadline for each cycle.
+02:25 Each time it wakes up, it calls the client to produce output.
+02:30 When the client is done,
+02:31 then the output data is written to the hardware and the I/O thread sleeps.
+02:37 This is the master thread of a device workgroup.
+02:40 It informs the kernel of the beginning and end of each work cycle.
+02:46 If the client takes too long to produce output data,
+02:49 then the thread misses its deadline and we get an overload.
+02:53 The user hears this as a discontinuity, or a glitch, in the audio.
+02:58 So, it's important that the performance controller be aware of the threads
+03:01 that are producing audio with that deadline.
+03:04 For every audio server I/O thread,
+03:06 there is a second thread in the client application.
+03:09 We see here that the audio server
+03:11 wakes and waits for this thread on each I/O cycle.
+03:15 Both threads are colored in green here.
+03:18 This illustrates that the audio frameworks
+03:20 join the client-side thread to the device's workgroup.
+03:24 So, the kernel knows that both threads
+03:26 are working together towards a common deadline.
+03:29 Here's a more complex situation:
+03:31 the app is hosting two Audio Units which are running in other processes.
+03:36 In each render cycle,
+03:37 the app renders the two Audio Units serially, using two inter-process calls.
+03:43 Here too, all of the realtime rendering threads are owned by the audio frameworks,
+03:48 so they are colored in green
+03:50 to indicate that they are all part of the device's workgroup.
+03:53 What we've just seen is the good news.
+03:55 The audio system's realtime threads are automatically joined to workgroups.
+04:00 Now, let's look at apps which have their own realtime audio threads.
+04:04 Here we have an app
+04:06 that's running two auxiliary threads in parallel with the I/O thread.
+04:10 For example, it might be rendering three complex tracks.
+04:14 It splits the work between the auxiliary threads and the I/O thread,
+04:17 and the I/O thread waits for the worker threads and mixes the final result.
+04:22 These threads are in shown in gray to illustrate a problem:
+04:25 they're not part of the workgroup.
+04:28 They're running with the same deadline as the threads in the workgroup,
+04:31 but the scheduler doesn't know this.
+04:34 So, the solution is to join these threads to the workgroup.
+04:37 And we can see how.
+04:40 First, obtain the device's os_workgroup object.
+04:44 On macOS, you can obtain it directly from the audio device with the HAL API.
+04:49 On any platform,
+04:50 you can obtain it from the input/output audio unit, AUHAL, or AURemoteIO,
+04:56 using these properties.
+04:58 Once you've obtained the device's workgroup,
+05:00 then in your realtime thread, call os_workgroup_join.
+05:04 This joins the thread to the workgroup and only has to be done once.
+05:09 You'll also need to call os_workgroup_leave
+05:12 before your thread ends.
+05:14 The details are in these header files.
+05:17 After you've done this, then your app's parallel realtime threads
+05:20 are part of the device's workgroup.
+05:22 All the threads are in green.
+05:25 Let's look at a more complex app.
+05:27 It is also running two auxiliary threads, but they are running asynchronously
+05:31 to the I/O threads, with different deadlines.
+05:35 Since they have different deadlines from the device I/O threads,
+05:38 these auxiliary threads need to be in two additional workgroups.
+05:42 Let's see how.
+05:43 First, instead of obtaining the device's workgroup as we saw before,
+05:47 create your own workgroup using AudioWorkIntervalCreate.
+05:52 As before, you need to join the realtime threads to the workgroup,
+05:56 using os_workgroup_join. And again, this only has to be done once.
+06:02 You might have multiple threads in your group,
+06:04 but one is controlling the others. It's the "master."
+06:08 In this thread, on each work cycle, call os_workgroup_interval_start.
+06:13 The startTime parameter can be "now," as reported by mach_absolute_time.
+06:18 Or it can be in the past,
+06:20 if you know exactly when your work cycle was scheduled to start,
+06:23 presumably in the recent past.
+06:26 The deadline has to be greater than the start time.
+06:30 The units are mach_absolute_time.
+06:32 Here, be sure not to assume that mach_absolute_time are nanoseconds
+06:36 or anything else.
+06:37 Be sure to use mach_timebase_info to get the clock frequency of mach_absolute_time.
+06:44 Then at the end of each work cycle, call os_workgroup_interval_finish.
+06:49 After you have joined your asynchronous auxiliary threads to workgroups,
+06:52 things look like this.
+06:54 There are three independent workgroups
+06:56 working on separate cadences with separate deadlines
+07:00 that cover apps which create realtime threads.
+07:03 Now, let's look at Audio Units which create realtime threads.
+07:07 The vast majority of Audio Units don't do this,
+07:10 but there are a few large and powerful ones
+07:12 that do create their own extra rendering threads.
+07:15 Here's an example.
+07:16 This Audio Unit is dividing its work between four threads,
+07:20 three that it has created, plus one from the host.
+07:24 You can see the problem here:
+07:25 the Audio Unit has realtime threads that are not part of a workgroup.
+07:29 It's being called by the host in some unknown thread context.
+07:33 That context could be the device's I/O thread,
+07:36 or it could be a non-realtime worker thread.
+07:39 The Audio Unit doesn't know.
+07:41 To solve this, we're introducing the AURenderContextObserver.
+07:45 This is a block in the audio unit that gets called before each render request.
+07:51 As the audio unit developer,
+07:53 you implement this render context observer property
+07:56 to return a block that receives a context struct.
+08:00 This struct contains an os_workgroup.
+08:06 So, at render time, when you see that the context's workgroup has changed,
+08:10 you can join your auxiliary realtime threads to that workgroup,
+08:13 as we saw earlier, using os_workgroup_join.
+08:18 It's important to be aware here
+08:19 that the workgroup may change from one render call to the next.
+08:24 After you implement the render context observer,
+08:27 and you join your realtime threads to the workgroup it observes,
+08:31 then here too we have all realtime threads joined to workgroups.
+08:35 It's very important to note here:
+08:36 the system informs Audio Units of the workgroup
+08:39 using the render context observer.
+08:42 This happens automatically when the host renders.
+08:44 So, the host should not try to call the render context observer.
+08:49 Again, the system handles this automatically.
+08:52 That brings me to the main point of this talk:
+08:55 all audio threads should be joined to workgroups.
+08:58 And now we've seen the APIs you can use to do this.
+09:02 You might be wondering about non-realtime audio rendering threads.
+09:06 They don't have deadlines, so they can't be joined to workgroups.
+09:10 If your non-realtime threads do have deadlines,
+09:13 that might be a reason to convert them to realtime.
+09:16 But again, measure performance if you start down this path.
+09:21 If you're creating parallel worker threads,
+09:23 there is a new API which will recommend how many threads to create:
+09:27 and that's os_workgroup_max_parallel_threads.
+09:31 You can't call this until you know your workgroup,
+09:34 which, if you're an Audio Unit,
+09:35 might not be until you're rendering in realtime.
+09:40 In that case, when your Audio Unit is initialized,
+09:43 then you create as many threads as there are CPU cores,
+09:47 but make a render-time decision to use only the recommended number of threads.
+09:53 To summarize, here are all the different kinds of realtime threads we looked at,
+09:57 and how to make sure they are joined to workgroups.
+10:00 The system frameworks take care of all the threads they manage.
+10:05 For app threads that are parallel to the device thread,
+10:08 join them to the device's workgroup.
+10:12 For app threads that are asynchronous to the device thread,
+10:15 create and manage a workgroup of your own and join those threads to that workgroup.
+10:21 For Audio Unit threads that are parallel to the host's render requests,
+10:25 implement a render context observer,
+10:27 and join threads to the workgroup it observes.
+10:31 We've seen how to improve the performance
+10:33 of your app or plug-in's audio realtime threads
+10:36 by joining them to audio workgroups.
+10:38 Thank you for your time and attention,
+10:40 and I look forward to seeing your great music and audio apps.

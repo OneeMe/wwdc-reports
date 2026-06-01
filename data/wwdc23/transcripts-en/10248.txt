@@ -1,0 +1,757 @@
+00:00 ♪ ♪
+00:10 Joachim Kurz: Welcome to "Analyze Hangs with Instruments."
+00:13 My name is Joachim,
+00:14 and I am an engineer working on the Instruments team.
+00:17 Today, we want to take a closer look at Hangs.
+00:20 First, I'll give you an overview of what a hang is,
+00:23 and to do so, we'll need to talk about human perception.
+00:26 Then, I'll briefly talk about the event handling
+00:29 and rendering loop, as it forms the basis to understand how a hang is caused.
+00:34 Armed with this theoretical knowledge,
+00:36 we'll jump into Instruments and look at three different hang examples:
+00:40 a busy main thread hang, an asynchronous hang,
+00:43 and a blocked main thread hang.
+00:46 For each of these, I'll show you how to recognize them,
+00:49 what to look for when analyzing them,
+00:51 and how to know when to add other instruments to your document
+00:53 to learn more.
+00:55 Before we start: for part of this session,
+00:58 it's helpful to be somewhat familiar with Instruments.
+01:01 If you have ever profiled an application with Instruments,
+01:03 you should be good to go.
+01:05 Otherwise, check out our 2019 session, "Getting Started with Instruments.”
+01:11 When dealing with hangs: there are usually three steps.
+01:14 You find a hang,
+01:16 you then analyze a hang to understand how it happens,
+01:19 and then you fix it,
+01:20 (and verify it is actually fixed).
+01:24 Today we will assume you've already found a hang
+01:27 and focus on the analyzing part,
+01:29 as well as discussing some fixes.
+01:32 If you want to know more about finding hangs,
+01:34 take a look at our session,
+01:35 "Track down hangs with Xcode and on-device detection" from WWDC22.
+01:40 It covers all our tools for finding hangs, including: Instruments,
+01:44 On-device Hang Detection,
+01:46 which you can enable in the iOS Developer settings,
+01:48 and Xcode Organizer.
+01:52 Today, we'll use Instruments to analyze a hang we've already found.
+01:56 To better understand hangs,
+01:58 let's talk about human perception and turn on the light.
+02:03 We need a light bulb and a cable.
+02:06 Ah, much better.
+02:08 Like a lamp should, it turned on when I plugged in the cable.
+02:12 And when I pull it out again, it shuts off. Instantly.
+02:17 But what if there was a delay?
+02:19 I plug it in.
+02:22 And here it took a moment to turn on.
+02:24 Even weirder, the same thing happens when I pull the cable out again.
+02:29 The delay between the cable being plugged in
+02:31 and the light turning on was only 500 milliseconds.
+02:35 But it already makes you wonder what's going on inside this box.
+02:39 It doesn't feel quite right that the lamp doesn't turn on and off directly.
+02:43 However, in some other circumstances, a 500 millisecond delay might be OK.
+02:48 What kind of delay is acceptable depends on the circumstances.
+02:52 Let's say you overhear a conversation like this:
+02:55 "How do turtles communicate?"
+02:58 "Shell-phones."
+03:00 Here, we had a delay of one second between question and answer.
+03:06 And that felt totally natural.
+03:08 But this doesn’t:
+03:12 Why is that?
+03:15 The conversation between the turtle and the unicorn
+03:17 is a request-response style interaction,
+03:20 but plugging in a lamp is directly manipulating a real object.
+03:24 Real objects react instantly.
+03:26 If we simulate a real thing, it also needs to react instantly.
+03:30 If it doesn't, it breaks the illusion.
+03:34 You had no issue with me claiming that I've got an actual lamp here
+03:37 when there was no delay between the cable being plugged in
+03:40 and the light turning on.
+03:42 But when there's a significant delay,
+03:46 your brain suddenly says, "Wait a moment, that's not how this stuff works."
+03:51 But how fast is instant?
+03:54 What delay is small enough for us not to notice?
+03:58 Here's our baseline with no delay.
+04:03 How about 100 ms?
+04:08 To me, it felt like I noticed a tiny delay on turning it on,
+04:11 but not when turning it off, and only when I look closely.
+04:15 Your experience might be different.
+04:18 100 ms is somewhat of a threshold.
+04:21 Significantly smaller delays aren't really perceivable anymore.
+04:25 Let's try 250 ms.
+04:31 250 ms doesn't feel instant anymore.
+04:34 It's not slow, but the delay is definitely noticeable.
+04:40 These kind of perception thresholds also inform our hang reporting.
+04:44 A delay below roughly 100 ms for a discrete interaction,
+04:48 like tapping a button, will usually feel instant.
+04:51 There are some special cases where you might want to go even below that,
+04:55 but it's a good goal to aim for.
+04:57 Above that, it depends on the circumstances.
+05:01 Until 250 ms, you might get away with it.
+05:05 Longer than that and it becomes noticeable,
+05:07 at least subconsciously.
+05:09 It's a continuous scale, but above 250 ms,
+05:12 it certainly doesn't feel instant anymore.
+05:15 So most of our tools start reporting hangs by default starting at 250 ms,
+05:21 but we call these "micro hangs" as they are easy to ignore.
+05:25 Depending on the context, those might be OK, but often they are not.
+05:30 Everything above 500 ms we consider a proper hang.
+05:34 Based on this, we can roughly use these thresholds:
+05:38 If you want something to feel instant, aim for 100 ms or less in delay.
+05:43 If you have a request-response style interaction,
+05:45 500 ms without any additional feedback might be OK.
+05:50 But actually, we often have both in an interaction.
+05:53 Let's look at an example.
+05:56 I just finished writing this email to all the colleagues who helped
+05:58 in preparing this session and I'm ready to send it.
+06:02 I move my mouse over to the Send button and click it
+06:05 and a moment later, the email window animates out
+06:08 to indicate it is being sent.
+06:11 What happened here is that you actually saw two things happening.
+06:15 First, the button highlighted,
+06:17 then there was small delay of 500 ms,
+06:21 then the email window animated out.
+06:24 But this delay felt fine because we already knew our request was received
+06:28 due to the button highlighting.
+06:29 We treat the button as a "real" thing
+06:32 and we expect it to update in "real" time, instantly.
+06:37 So for the actual UI elements in our interface,
+06:40 we usually want to aim for this “instant” update.
+06:44 To enable our UI elements to react “instantly”
+06:47 it is vital to keep the main thread free from non-UI work.
+06:50 To see why that is, let's take a closer look at
+06:53 the event handling and rendering loop
+06:55 to see how events are processed on Apple platforms
+06:57 and how user input leads to a screen update.
+07:02 At some point, someone will interact with the device.
+07:05 We have no control over when that happens.
+07:08 First, there's usually some hardware involved,
+07:11 like a mouse or a touchscreen.
+07:14 It detects the interaction, creates an event,
+07:16 and sends it to the operating system.
+07:18 The operating system figures out which process needs to handle the event
+07:22 and forwards it to that process, for example, your app.
+07:26 In the app, it's the responsibility of the app's main thread to handle events.
+07:31 This is where most of your UI code runs.
+07:34 It makes a decision how to update the UI.
+07:36 Then this UI update gets sent to the render server,
+07:39 which is a separate process responsible for compositing the individual UI layers
+07:43 and rendering the next frame.
+07:45 Lastly, the display driver picks up the bitmap prepared by the render server
+07:50 and updates the pixels on screen accordingly.
+07:53 If you want to know more about how this works,
+07:54 we cover this in the documentation under "Improving app responsiveness.”
+07:58 For us, this rough overview is enough to understand what's going on.
+08:03 Now, when another event comes in during this time,
+08:06 it can usually be processed in parallel.
+08:10 But, if we look at how a single event travels through the pipeline,
+08:14 we still need to look at all the steps in sequence.
+08:17 The event processing steps before we get to the main thread
+08:20 and the render and update display steps AFTER
+08:23 are usually fairly predictable in their duration.
+08:26 When we encounter a significant delay in interaction,
+08:28 it is almost always because the portion on the main thread took too long
+08:32 or because something else is still executing on the main thread
+08:35 when the event comes in
+08:37 so we need to wait for it to finish before the event can be handled.
+08:40 Given that every update to a UI element needs some time on the main thread,
+08:44 and we want these updates to happen within 100 ms to feel real,
+08:48 ideally, no work on the main thread should take longer than 100 ms.
+08:53 If you can be faster, even better.
+08:56 Note that long-running work on the main thread can also cause hitches,
+09:01 and lower thresholds apply to avoid hitches.
+09:04 You can find more details about hitches
+09:05 in our Tech Talk "Explore UI animation hitches and the render loop"
+09:09 and our documentation about "Improving app responsiveness".
+09:12 Today, we focus on hangs.
+09:15 One of my colleagues just found a hang in one of our apps, Backyard Birds,
+09:19 while working on a new feature.
+09:21 Let's profile the app with Instruments.
+09:31 I have the Xcode project with the app here.
+09:34 All I need to do to profile the app in Instruments
+09:36 is click on the Product menu and then Profile
+09:40 and then Xcode will build the app and install it on the device,
+09:43 but not launch it.
+09:47 Xcode will also open Instruments
+09:50 and configure to target the same app and device that were configured in Xcode.
+09:55 In Instruments' template chooser, I will choose the Time Profiler template,
+09:59 which is often a good starting point if you don't yet know
+10:01 what you are looking for and want to get a better understanding of
+10:04 what your app is doing.
+10:07 This creates a new Instruments document from the Time Profiler template.
+10:11 Among others, this new document contains the Time Profiler instrument
+10:15 and the Hangs instrument, both of which will be useful for our analysis.
+10:20 I click the Record button in the top left of the toolbar to start the recording.
+10:24 Instruments launches the configured application and starts capturing data.
+10:30 So here I have the Backyard Birds app.
+10:32 I tap on the first garden to go to the detail view.
+10:36 When I tap the "Choose Background" button in a moment,
+10:39 a bottom sheet should come up,
+10:41 showing me a selection of background pictures to choose from.
+10:44 Let me do that now.
+10:48 The button is pressed but seems stuck.
+10:50 It took quite a while for the sheet to appear.
+10:53 A severe hang.
+10:57 Instruments has been recording all this.
+10:59 I'm going to stop the recording by clicking on the Stop button
+11:02 in the toolbar.
+11:04 Instruments has also detected the hang.
+11:06 It measures the hang duration
+11:08 and labels the corresponding intervals according to the severity.
+11:11 In this case, Instruments shows us a “Severe Hang” has happened.
+11:15 This fits what we are experiencing while using the app as well.
+11:20 Instruments detected an unresponsive main thread
+11:22 and marks the corresponding interval as a potential hang.
+11:26 In our case, a hang did indeed occur.
+11:29 There are two main cases for an unresponsive main thread.
+11:32 The most simple case is that the main thread is simply
+11:34 still busy doing other work.
+11:37 In this case, the main thread will show a bunch of CPU activity.
+11:41 The other case is that the main thread is blocked.
+11:44 This is usually because the main thread is waiting for some other work
+11:47 to be done elsewhere.
+11:49 When the thread is blocked
+11:50 there will be little to no CPU activity on the main thread.
+11:54 Which case you have determines which steps you should take next
+11:56 to determine what's going on.
+11:59 Back in Instruments, we'll need to find the Main Thread.
+12:02 The last track in the document shows the track for our target process.
+12:07 It has a small disclosure indicator on the left
+12:10 to indicate that there are subtracks.
+12:12 I click it to reveal a separate track for each thread in the process.
+12:17 Then, I'll select the Main Thread track here.
+12:20 This also updates the detail area to show the Profile view,
+12:24 which shows us a call tree of all functions
+12:26 which executed on the main thread during the whole recording time.
+12:31 But we are only interested in what happened during the hang,
+12:34 so I secondary-click on the Hang-interval in the timeline to display a context menu.
+12:40 I could choose Set Inspection Range here,
+12:43 but I'm going to hold down the option key as well
+12:46 to get Set Inspection Range and Zoom instead.
+12:51 This zooms in to the interval's range
+12:53 and filters the data displayed in the detail view to the selected time range.
+12:57 While the CPU usage isn't 100% during the whole hang interval,
+13:02 it is still fairly high, with 60% to 90% CPU usage most of the time.
+13:08 This is clearly a case of a busy main thread.
+13:11 Let's find out what all this CPU work is.
+13:15 We could take a closer look at all the different nodes in the call tree now.
+13:18 But there's a great summary on the right side:
+13:21 the heaviest stack trace view.
+13:24 When I click on a frame in the heaviest stack trace view,
+13:27 the call tree view updates to reveal this node.
+13:31 This also shows us that this method call is already pretty deep in the call tree.
+13:38 The heaviest stack trace by default hides subsequent function calls
+13:42 that don't originate from your source code
+13:43 to make it easier to see where your source code is involved.
+13:48 We can apply a similar filter to the call tree view
+13:50 by clicking on the Call Tree button in the bottom bar
+13:53 and enabling the Hide System Libraries checkbox.
+13:58 This will filter out all functions from the system libraries
+14:00 and makes it easier to focus on our code.
+14:04 The call tree view shows us that almost all our backtraces contain
+14:07 the "BackgroundThumbnailView.body.getter" call.
+14:12 It looks as if we should make our body getter faster, right?
+14:16 Not quite!
+14:18 So we know we have a busy main thread case,
+14:20 meaning the CPU is doing a lot of work.
+14:22 We also have found a method where a lot of CPU time is spent.
+14:26 But there are two different cases now.
+14:28 We might be spending a lot of CPU time in this method
+14:31 because the method itself runs for a long time.
+14:34 But it could also be that it is just called a lot of times,
+14:38 which is why it shows up here.
+14:40 How we should reduce the work on the main thread depends on which case we have.
+14:46 A typical call stack is structured like this.
+14:49 There's a call from the main function,
+14:51 which calls out to some UI frameworks and a bunch of other stuff,
+14:55 and then, at some point, your code is called.
+14:58 If this function is only called once
+15:00 and that one call takes a long time, like our Turtle function here,
+15:05 then we want to look at what it calls.
+15:08 Maybe it does a lot of work. Then we can maybe do less of it.
+15:14 But it could also be that
+15:15 the method we are investigating is called a lot of times,
+15:19 like Unicorn here.
+15:21 And then, of course, the work it does is done over and over again as well.
+15:26 This is usually because there is some caller
+15:28 that calls the function, Unicorn, a lot of times--
+15:32 for example, from a loop.
+15:36 Rather than optimizing what the focused function, Unicorn here, does,
+15:40 it might be more beneficial to investigate how we can call it less often.
+15:47 That means the direction we need to look at next
+15:50 depends on the case we have.
+15:51 For a long-running function, like our Turtle case,
+15:54 we want to look at its implementation and its callees.
+15:57 We need to look further down.
+15:59 However, if a function is called a lot of times, like Unicorn,
+16:03 it is more beneficial to look at what is calling it
+16:06 and determine whether we can do so less often.
+16:10 We need to look further up.
+16:12 But Time Profiler cannot tell us which case we have.
+16:16 Let's assume the calls to Unicorn and Turtle happened right after another.
+16:20 Time Profiler gathers data by checking what's running on the CPU
+16:24 in regular intervals.
+16:26 And for each sample, it checks which function is currently running on the CPU.
+16:31 For this example, we would get both Turtle and Unicorn four times.
+16:37 But it could also be that this is a very fast Turtle,
+16:40 and Unicorn takes much longer,
+16:43 or other combinations.
+16:45 All of these scenarios would create the same data in Time Profiler.
+16:50 To measure the execution time of a specific function, use os_signposts.
+16:55 We talked about how to do so in our 2019 session,
+16:58 "Getting Started with Instruments".
+17:01 There are also specialized instruments for various technologies
+17:04 that can tell you precisely what's going on.
+17:06 One of which is the SwiftUI View body instrument.
+17:10 To add the SwiftUI body instrument,
+17:12 I click the plus button in the top right of the toolbar.
+17:15 This shows the Instruments library.
+17:17 This is the list of all the instruments, the Instruments application has to offer.
+17:21 There are a lot.
+17:22 You can even write your own custom instruments.
+17:25 I'll enter "SwiftUI" in the filter field, and two instruments show up.
+17:30 I'll pick the "View body" instrument
+17:32 and drag it into the document window to add it.
+17:36 Now, because this instrument wasn't in the document when we last recorded,
+17:40 it has no data to display.
+17:43 But no problem. We'll just record again.
+17:47 To save some time, I've done that already.
+17:50 After I recorded with the SwiftUI View Body instrument in the document,
+17:54 the View Body track also shows some data now.
+17:58 There are a lot of intervals in the SwiftUI view bodies track.
+18:01 It's a little cramped, so I press Ctrl+Plus to increase its height.
+18:06 The SwiftUI View Body track groups the intervals
+18:09 by the library they are implemented in.
+18:11 Each interval is one view body execution.
+18:14 Let's zoom into our hang again.
+18:20 In the second lane, there are a lot of orange intervals
+18:23 all labeled "BackgroundThumbnailView".
+18:27 This tells us precisely how many body executions there were
+18:30 and how long each one took.
+18:32 The orange color indicates that the runtime of that specific body execution
+18:36 took a little longer than what we are aiming for with SwiftUI.
+18:39 But the bigger problem seems to be how many intervals there are.
+18:42 In the detail view, there's a summary of all the body intervals.
+18:47 By clicking on the disclosure indicator next to Backyard Birds,
+18:50 I can reveal the individual view types in Backyard Birds.
+18:54 This shows me that BackgroundThumbnailView's body
+18:57 was executed 70 times with an average duration
+19:01 of about 50 milliseconds,
+19:03 leading to a total duration of over three seconds.
+19:07 This explains almost all of our hang duration.
+19:10 But 70 times seems excessive
+19:12 when we only need to show six images up front.
+19:16 This is a case where the body should be called less often,
+19:19 so we need to look at the callers of our body getter
+19:22 to find out why it's called this often and look at how to reduce it.
+19:26 To easily navigate to the relevant code, I select the main thread track again,
+19:31 secondary-click on the BackgroundThumbnailView.body.getter node
+19:34 in the call tree to show a context menu, and select "Reveal in Xcode".
+19:40 This opens our body implementation right in Xcode.
+19:44 Let's find out how this view is used by secondary-clicking the type
+19:48 and choosing "Find", "Find Selected Symbol in Workspace".
+19:55 The first result in the Find navigator is already what we're looking for.
+20:04 Here, our "BackgroundThumbnailView" is used inside a ForEach inside a GridRow
+20:10 inside another ForEach inside a Grid.
+20:14 Grid eagerly computes its whole content when it's created,
+20:18 so it will compute all background thumbnails
+20:20 even though we only need the first few.
+20:23 But there's an alternative: LazyVGrid.
+20:27 It only computes as many views as necessary to fill one screen.
+20:32 Lots of views in SwiftUI have lazy variants,
+20:35 which only compute as many views as necessary,
+20:38 and this can often be an easy way to do less work.
+20:42 However, the eager variants use much less memory
+20:44 when they need to render the same contents.
+20:47 Use the regular eager variants by default and switch to lazy variants
+20:51 when you find a performance issue related to doing too much work upfront.
+20:56 Our WWDC session from WWDC 2020 about "Stacks, Grids, and Outlines in SwiftUI"
+21:03 introduces these lazy variants and describes them in more detail.
+21:07 Let's profile this updated code.
+21:10 I start recording
+21:12 and reproduce our hang by tapping the Choose Background button again.
+21:18 Now, this is much better.
+21:20 There was still a small delay, but not nearly as bad as before.
+21:23 Instruments confirms this.
+21:25 The hang we recorded now took less than 400 milliseconds.
+21:29 It's a micro hang.
+21:33 The "View Body" track also shows us
+21:36 that we now only got eight BackgroundThumbnail body executions,
+21:40 which fits our expectation.
+21:42 Maybe this is good enough.
+21:44 The microhang is not very noticeable.
+21:46 Let's make sure it also works well on other device types
+21:49 by profiling Backyard Birds on an iPad.
+21:57 Here, I'm running Backyard Birds on an iPad.
+22:00 I'm already in the detail view.
+22:03 I tap the "Choose Background" button
+22:06 and it takes a long time for the sheet to appear.
+22:09 Once it appears, we can see why.
+22:12 There are a lot more thumbnails now because our screen is bigger
+22:15 and has more space.
+22:17 Instruments also recorded this hang.
+22:22 Focusing the inspection range on our hang interval,
+22:25 we see more BackgroundThumbnailView bodies again.
+22:30 It makes sense.
+22:31 Now we need to render about 40 of them for a full screen
+22:34 as many more fit on screen.
+22:37 So the same code performed mostly OK on an iPhone
+22:40 but was slow on an iPad, simply because the screen was bigger.
+22:45 This is one of the reasons why you should also fix micro hangs.
+22:48 What you might see as a micro hang during testing at your desk
+22:51 might be a major hang for some of your users under different conditions.
+22:55 We now only render as many views as we need to fill the screen,
+22:58 so we exhausted our optimization potential in terms of calling this less often.
+23:03 Let's find out what we can do to make each individual execution faster.
+23:08 I'll set the inspection range to a single BackgroundThumbnailView interval
+23:13 and switch back to the "Main Thread" track.
+23:16 Instruments shows our view body getter in the heaviest backtrace view
+23:20 and shows that it calls a "BackyardBackground.thumbnail"
+23:23 property getter.
+23:26 This is the model object which provides the thumbnail image
+23:29 to display in our view.
+23:31 This thumbnail getter calls "UIImage imageByPreparingThumbnailOfSize:".
+23:38 So we seem to be computing a thumbnail on the fly here.
+23:41 That can take some time. In this case, about 150 milliseconds.
+23:46 This is work we should rather be doing in the background
+23:49 and not keep the main thread busy with.
+23:51 To better understand what change we can make,
+23:54 I want to look at the context how the thumbnail getter is called.
+23:58 I secondary click on the "BackgroundThumbnailView.body.getter"
+24:01 frame in the heaviest stack trace view
+24:04 and choose "Open in Source Viewer".
+24:07 This replaces the call tree view with a source viewer
+24:09 that shows the implementation of our body getter
+24:12 and annotates the lines of the implementation
+24:16 with the Time Profiler samples to show where our code spent how much time.
+24:21 Our body implementation is really simple here;
+24:24 it just makes a new Image view with the thumbnail returned by the background.
+24:28 But this thumbnail call takes a long time.
+24:32 I have an idea how to write it differently.
+24:34 To jump to Xcode, I click on the menu button in the top right
+24:38 and choose "Open file in Xcode".
+24:42 As before, this shows our source code in Xcode, ready to make changes.
+24:46 What I want to do now is to load the thumbnail in the background,
+24:50 and while the loading is happening, display a progress indicator.
+24:53 First, we need a state variable to hold the loaded thumbnail.
+25:00 Then, in the body,
+25:03 if we have the loaded image already, we are going to use it in the Image view.
+25:09 Otherwise, we show a progress view.
+25:14 Now all that's left is loading the actual thumbnail.
+25:18 We want to start loading it once our view appears.
+25:21 That's what the ".task" modifier is for.
+25:27 On appear, SwiftUI will start a task for us
+25:30 that will call the "thumbnail" getter and assign the result to our "image",
+25:34 which will update our view.
+25:36 Let's try it out!
+25:38 So here, with Instruments recording, I tap the "Choose Background" button
+25:42 and the sheet comes right up!
+25:44 Great!
+25:45 We saw our progress indicators, and a few seconds later,
+25:48 our thumbnails were displayed.
+25:49 This worked. Nice!
+25:53 But wait, Instruments is still showing a hang of almost two seconds.
+25:58 What happened here is that the hang happens slightly later now.
+26:01 Let me show you where it happens in the Backyard Birds app.
+26:05 I'm in the detail view already.
+26:06 In a moment, I'll tap the "Choose Background" button again
+26:09 and then I'll attempt to dismiss the sheet directly afterwards
+26:12 by tapping the done button.
+26:14 OK, "Choose Background" and "Done".
+26:19 I tapped multiple times,
+26:20 but while the loading was happening, my taps were ignored.
+26:24 This is the hang that Instruments told us about.
+26:27 It happens after the sheet is displayed.
+26:30 This is a slightly different type of hang.
+26:33 We already talked about the difference between the main thread being busy
+26:37 or being blocked.
+26:38 There is another way to look at hangs;
+26:40 what they are caused by and when they occur.
+26:44 We call these synchronous and asynchronous hangs.
+26:50 Here, we have the main thread doing some work.
+26:52 If, when an event comes in, it takes a long time to process that event,
+26:57 then that's a hang.
+26:59 Let's say we get that under control
+27:03 and make sure our events are handled quickly.
+27:06 But maybe we just delayed some work to be done later on the main thread,
+27:10 or some other main thread work happens, and then an event comes in.
+27:14 Then that event has to wait for the previous work to be done
+27:17 before it can be handled.
+27:19 Then this still causes a hang,
+27:21 even though the code for each individual event handling finishes quickly.
+27:26 The way hang detection works on our platforms is that
+27:29 it looks at all work items on the main thread
+27:31 and checks whether they are too long.
+27:34 If so, it marks them as a potential hang.
+27:38 And it does that irrespective of whether there was user input
+27:43 because user input could come in at any time
+27:46 and then we would have an actual hang.
+27:49 This means hang detection also detects these asynchronous or delayed cases,
+27:54 but it only measures the potential delay, not the actually experienced delay.
+28:00 We call asynchronous hangs asynchronous because they are often caused
+28:03 by "dispatch_async"ing work on the main queue
+28:07 or by a Swift Concurrency task that runs asynchronously on the main actor.
+28:12 But they could be caused by anything that causes work on the main thread.
+28:16 The first hang we saw was a synchronous hang.
+28:18 We tapped a button, that button tap causes long-running work,
+28:22 so the result is displayed late.
+28:26 This most recent hang is an asynchronous or delayed hang.
+28:30 Tapping the Done button doesn't actually cause any expensive work by itself.
+28:35 But there was still work on the main thread
+28:37 preventing the tap from being handled.
+28:40 So while someone using the app might not even notice
+28:42 if they don't interact with the app during this time,
+28:44 we should still fix these cases, in case they do.
+28:49 Let's do that now.
+28:50 So here I'm back in Instruments
+28:52 and I've already set the selection range to our async hang and zoomed in.
+28:56 In the summary view of the view body track,
+28:58 Instruments shows us that there were now 75 calls
+29:01 to our BackgroundThumbnailView's body getter.
+29:04 This is because most thumbnail body getters are executed twice.
+29:09 SwiftUI creates 40 views with progress indicators to fill the grid.
+29:14 But then only 35 actually end up being displayed,
+29:17 and for those 35, we start loading the image,
+29:19 and once the image is loaded, the view updates and the body is called again,
+29:23 giving us a total of 75 body getter executions.
+29:28 Even all 75 body getters in total took much less than one millisecond.
+29:34 So our body getters are fast now. That part worked.
+29:37 But we still have a hang.
+29:39 I'm going to select the "Main Thread" track again
+29:42 and in the heaviest stacktrace view,
+29:44 Instruments shows us that it's still the thumbnail getter
+29:46 that takes a long time on the main thread.
+29:49 This time, it's called by a closure
+29:52 inside our "BackgroundThumbnailView.body.getter",
+29:55 not the body getter directly.
+29:57 I double-click it, which is a shortcut to open the source viewer.
+30:02 Now this is exactly the code we expected to execute in the background
+30:06 due to being in the task modifier closure.
+30:08 This code should run at this time, but it should not run on the main thread.
+30:14 For issues like this, where Swift Concurrency tasks
+30:17 don't execute the way you expect them to,
+30:19 we have another useful instrument:
+30:21 the Swift Concurrency Tasks instrument.
+30:23 I've already recorded the same behavior with
+30:25 the Swift Concurrency task instrument added.
+30:28 The Swift Tasks instrument adds a summary track to the document
+30:32 but what's more interesting for our case
+30:34 is the data it contributes to each thread track.
+30:38 Here, in the main thread track,
+30:40 there's a new graph from the Swift Tasks instrument.
+30:44 A single track can show multiple graphs.
+30:47 By clicking on the little downward arrow in the thread track header,
+30:51 I can configure which graphs to show.
+30:53 I can either choose another graph,
+30:56 like the Time Profiler's CPU Usage graph
+30:59 or hold down the Command key while clicking to select multiple.
+31:03 So now Instruments is showing both the CPU Usage
+31:06 and the Swift Tasks graph for this thread together.
+31:10 I'm gonna zoom in to our hang interval again.
+31:14 The "Swift Tasks" lane now clearly displays that
+31:18 there are a bunch of task executions on the main thread.
+31:22 Setting the inspection range to one of them
+31:25 and checking the heaviest stack trace in the Profile view
+31:28 confirms that this task is wrapping our thumbnail computation work.
+31:34 So this work is correctly wrapped in a task like we wanted.
+31:37 But the task is executing on the main thread, which is unexpected.
+31:42 Let me explain what's going on here.
+31:44 First, the body getter inherits the @MainActor annotation
+31:48 from SwiftUI's View protocol.
+31:50 Because "body" is annotated as "@MainActor" in the "View" protocol,
+31:55 when we implement it, the body getter is also implicitly annotated as @MainActor.
+32:00 Second, the ".task" modifier's closure
+32:03 is annotated to inherit the actor isolation of the surrounding context.
+32:08 So because the body getter is isolated to the MainActor,
+32:11 the task closure will be as well.
+32:14 So all the code running in this closure
+32:16 will be running on the main actor by default,
+32:19 and because the "thumbnail" getter is synchronous,
+32:22 it now synchronously runs on the main thread.
+32:28 Swift Concurrency Tasks, by default, inherit the actor isolation
+32:32 of the surrounding context.
+32:34 The same behavior is true for SwiftUI's .task modifier.
+32:38 There are two ways to get off of the main actor.
+32:41 asynchronously calling an function that's not bound to the main actor
+32:45 allows the task to go off of the main actor.
+32:49 There may be cases where this is not feasible.
+32:52 Then, you can explicitly detach the task from the surrounding actor context
+32:56 by using "Task.detached",
+32:59 but it is a heavy handed approach
+33:01 and creating a separate task is more expensive
+33:03 than simply suspending an existing one.
+33:07 SwiftUI will also automatically cancel the task created via the task modifier
+33:12 when the corresponding view disappears,
+33:14 but this cancellation will not propagate to a new unstructured task,
+33:18 like Task.detached.
+33:20 To learn more, check out "Visualize and optimize Swift concurrency"
+33:24 from WWDC22 and our documentation on improving app responsiveness.
+33:30 Because in our case we are already in an asynchronous context,
+33:33 and it's easy to make the thumbnail function nonisolated and asynchronous,
+33:37 we are going to pick option one.
+33:40 Here, we have our thumbnail loading code.
+33:43 The issue is that this task will execute on the main actor
+33:47 due to inheriting the main actor isolation of the body getter
+33:50 and as the thumbnail getter is synchronous,
+33:53 it will also stay on the main actor.
+33:56 The fix is simple.
+33:57 We jump to the definition of the thumbnail getter,
+34:01 we make the getter async,
+34:05 then we go back to our view struct...
+34:10 And because our getter is now async, we need to add await in front of it.
+34:16 This should allow the "thumbnail" getter to execute on
+34:19 Swift Concurrency's concurrent thread pool instead of the main thread.
+34:22 Let's try it.
+34:24 I'm in the detail view again, and tap "Choose Background".
+34:28 Wow. That was fast!
+34:30 Not only was there no hang,
+34:32 but it also seemed like the overall loading was faster.
+34:34 I barely saw the progress views.
+34:37 Instruments confirms there was no hang now.
+34:40 There is some high CPU usage right here.
+34:43 Let me zoom into that.
+34:46 This is where the thumbnail loading now happens.
+34:49 Checking the main thread, we can confirm that all task intervals
+34:52 on the main thread are now very short.
+34:56 Scrolling down to the other thread tracks reveals that our Swift tasks
+34:59 are now executing on other threads in parallel instead of sequentially
+35:04 which makes much better use of our multi-core CPUs.
+35:08 This allows us to compute all the thumbnails in a few hundred milliseconds
+35:13 instead of almost 1.5 seconds.
+35:15 And during all this time, the main thread remains responsive,
+35:18 so we've fixed this one for good now.
+35:21 We've now investigated, and fixed, an unresponsive main thread
+35:25 that was caused by the main thread being busy,
+35:27 which we could identify by the main thread using a lot of CPU during the hang.
+35:31 We've also experienced how a hang can be synchronous
+35:34 when it happens directly as part of the user interaction
+35:37 or asynchronous, where work that was scheduled on the main thread earlier
+35:41 causes an incoming event to be processed late
+35:44 and how Instruments can detect both cases.
+35:47 And we've fixed a hang by both doing less work
+35:50 and by doing other work we can't do less of in the background
+35:53 and only coming back to the main thread to update the UI.
+35:57 But there's one case we haven't yet looked at,
+36:00 a blocked main thread,
+36:01 in which case the main thread will use very little CPU.
+36:05 The other dimensions apply to a blocked main thread the same way,
+36:08 but other Instruments are necessary to analyze such a case.
+36:12 Let's look at an example now.
+36:15 Here I have a trace file from another hang.
+36:18 I already zoomed into the hang. It's a long one; several seconds.
+36:23 In the "Main Thread" track, the CPU Usage graph shows us that
+36:27 there is some initial CPU usage, but then, nothing.
+36:32 This is a clear case of a blocked main thread.
+36:35 We talked about how Time Profiler gathers its data
+36:37 by sampling what's running on the CPU.
+36:41 When we zoom in, the CPU Usage graph even shows the individual samples.
+36:48 So each of these markers here is a sample that Time Profiler took.
+36:53 There are a few more samples to the right, but then nothing.
+36:59 But when I select a time range without samples,
+37:02 Time Profiler cannot tell us what's going on,
+37:04 as it didn't record any data during this time.
+37:07 So we need a different tool: the Thread States instrument.
+37:12 Like the other instruments before,
+37:13 you can add it from the Instruments library.
+37:16 I've already recorded the same hang again,
+37:19 this time with the "Thread State Trace" instrument added.
+37:22 There's a new track for this instrument now.
+37:24 But like the "Swift Concurrency" instrument,
+37:27 the data that's interesting to us is actually in the "thread" tracks.
+37:31 So there is this really long "blocked" interval here in the main thread,
+37:35 over six seconds, which explains most of our hang duration.
+37:39 When I click in the middle of it, Instruments' time cursor moves there,
+37:43 which also updates the Narrative view in the detail area
+37:47 to show the entry for this blocked state.
+37:49 The Narrative view tells us the story of the thread;
+37:52 what it was doing, when, and why.
+37:57 For the selected time, it tells us that the thread was blocked for 6.64 seconds
+38:03 and it was blocked because it was calling mach_msg2_trap, a syscall.
+38:08 On the right, there's a backtrace view again.
+38:11 But this backtrace is not a heaviest backtrace--
+38:13 it's not some aggregation.
+38:15 It is the precise backtrace of the mach_msg2_trap syscall
+38:19 that caused the thread to be blocked.
+38:22 The function call is displayed as the leaf node at the bottom
+38:25 and its call stack is displayed above.
+38:28 The call stack tells us that the syscall happened as a result of
+38:31 allocating an MLModel, which in turn happened due to
+38:34 allocating an object of type "ColorizingService",
+38:38 which was called as part of a singleton property called "shared"
+38:42 on that colorizing service,
+38:44 which, in turn, was called by a closure in a body getter.
+38:48 If we double-click that closure, we jump to the Source Viewer again
+38:52 and can find the code where this was called.
+38:55 This line looks harmless, right?
+38:57 Let's take a closer look.
+39:01 We are accessing the shared property of ColorizingService
+39:04 and storing it in a local variable.
+39:07 Except it's not harmless because the shared property creates
+39:10 the shared ColorizingService instance the first time it's accessed
+39:14 and that, in turn, kicks off the whole model loading machinery,
+39:17 which blocks the thread.
+39:19 So you might be tempted to say,
+39:21 "Let's just move this inside the async part after 'await'."
+39:26 However, counterintuitively, this does not solve the problem.
+39:30 The "await" keyword only applies to asynchronous function calls
+39:33 in the subsequent code.
+39:35 In our example the "colorize" function is "async".
+39:40 But the "shared" property is not.
+39:43 Because it's a static let property,
+39:45 it will be initialized lazily the first time it is accessed
+39:48 and that happens synchronously.
+39:51 The await keyword doesn't change that,
+39:53 so the synchronous call would still happen on the main thread.
+39:57 We can just fix this the same way as we did in our previous example,
+40:00 by making the shared property "async" as well
+40:03 to get off of the main actor.
+40:06 This is generally OK when you are waiting for work on your thread's behalf elsewhere
+40:10 where forward progress is made.
+40:13 However, another common reason for blocked threads are locks or semaphores.
+40:18 For best practices to keep in mind
+40:20 and what to avoid when using locks and semaphores with Swift concurrency,
+40:24 watch our session "Swift concurrency: Behind the scenes" from WWDC 21.
+40:30 Before we wrap up, I want to talk about
+40:32 one other case related to blocked main threads.
+40:35 Here is the trace we looked at a moment ago.
+40:38 On the right is the hang we just investigated
+40:40 with the blocked main thread.
+40:42 But to the left of it, there are some other cases
+40:45 where the main thread is blocked for multiple seconds,
+40:48 but Instruments doesn't flag this as a potential hang.
+40:51 Here, the main thread is just asleep because there was no user input.
+40:55 From the operating system's perspective, it is blocked,
+40:59 but it's just saving resources by not running when there is nothing to do.
+41:04 As soon as input comes in, it will wake up and handle it.
+41:08 So to determine whether a blocked thread is a responsiveness issue or not,
+41:12 look to the Hangs instrument, not the thread states instrument.
+41:17 So a blocked main thread does not imply an unresponsive main thread.
+41:20 Similarly, High CPU Usage also doesn't imply
+41:24 that the main thread is unresponsive.
+41:26 But if the main thread is unresponsive,
+41:29 that means it was either blocked or the main thread was busy.
+41:33 Our hang detection takes all these details into account
+41:36 and will only label intervals where the main thread was actually unresponsive
+41:39 and show them as potential hangs.
+41:42 If you remember only one thing from this session, let it be this:
+41:46 whatever work you are doing on the main thread,
+41:48 it should be done in less than 100 milliseconds
+41:50 to free the main thread for event handling again.
+41:53 The shorter, the better.
+41:56 To analyze hangs in detail, Instruments is your best friend.
+42:00 Remember the distinction between a busy and a blocked main thread
+42:03 and remember that hangs can also be caused by asynchronous work on the main thread.
+42:09 To fix hangs, you want to do less work or move work to the background.
+42:14 Sometimes, even both.
+42:17 And doing less work often just means using the right API for the job.
+42:22 In general, measure first
+42:24 and check whether there is actually a hang before optimizing.
+42:27 There are certainly some best practices,
+42:29 but concurrent and asynchronous code is also much harder to debug.
+42:33 You'll often be surprised by all the things
+42:35 that are actually very fast
+42:37 and what actually ends up being slow.
+42:40 Have fun finding, analyzing, and fixing all your hangs.
+42:43 Thank you for watching.
+42:45 ♪ ♪

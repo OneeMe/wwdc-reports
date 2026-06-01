@@ -1,0 +1,470 @@
+00:00 ♪ ♪
+00:09 Hello, and welcome to WWDC 2022.
+00:12 My name is Ben, and I'm an engineer on the Xcode build system team.
+00:15 Hi, my name is Artem, and I'm an engineer on the Swift Compiler team.
+00:19 In this talk we're gonna give you a deep dive into Xcode's build process
+00:22 to demystify parallelization inside builds.
+00:25 Ben is going to start with an introduction of the core concepts about builds
+00:29 and look at the available tools that Xcode offers
+00:31 to help investigate build performance issues.
+00:34 He will then explain how Xcode increases parallelization while building a target.
+00:39 Building on top of that,
+00:40 I will explain how Xcode parallelizes a build holistically
+00:43 while building projects consisting of many targets
+00:46 and summarize the takeaways in the end.
+00:48 Ben?
+00:50 Let's re-iterate on what happens when pressing CMD+B in Xcode to build an app.
+00:55 The build system, as part of Xcode,
+00:57 gets invoked with a representation of the whole project,
+01:00 including all source files, assets,
+01:03 build settings, and other configurations like the run destination.
+01:07 The build system is the single source of truth about how an app should be built.
+01:11 It knows which tools to invoke using which settings
+01:14 and which intermediate files to produce to eventually create an app.
+01:18 In the next step, the build system invokes the tools
+01:20 to process the project's input files, for example, the compilers.
+01:26 Both compilers, Clang and Swift, will produce object files
+01:29 that the linker needs to link the executable program
+01:32 that represents the app.
+01:34 While this order makes sense, it's not obvious where it comes from.
+01:37 So let's take a look at one example of that process
+01:40 and how the build system decides in which order to execute all tasks.
+01:46 Using the input source-files, the Swift compiler captures
+01:49 the programmer's intent and translates it into a machine-executable binary,
+01:53 checking the source code for errors along the way.
+01:55 This process can fail, which would cancel the build,
+01:58 but if it succeeds, it creates an object file for each input.
+02:02 Those object files are used to invoke the linker
+02:05 which combines them and adds references to externally linked libraries
+02:08 to produce the executable.
+02:11 The two tasks have a dependency based on what they consume and produce.
+02:15 The object files produced by the compiler get consumed by the linker.
+02:19 This creates a dependency on the build system graph.
+02:22 The file contents itself are not of interest to the build system,
+02:25 but the dependency between the tasks is.
+02:28 While executing the build, it needs to make sure
+02:30 that a task that produces another task's input finishes before said task can start.
+02:35 And since this core concept is valid for all kind of tasks,
+02:39 let's switch to a more generic visualization
+02:41 that shows a dependency between Task A and Task B.
+02:44 In this case, A produces some or all of B's inputs.
+02:49 Compiling and Linking are only a few of many different task types
+02:53 that need to be executed to build a whole target,
+02:56 so let's add some more generic tasks to the graph
+02:58 that represent other types like compiling assets,
+03:00 copying files or codesigning.
+03:03 Together, they represent building a Framework target.
+03:07 Again, those tasks have defined dependencies
+03:10 based on their inputs and outputs.
+03:12 So completing executing task A unblocks running task B and C,
+03:16 while finishing task B unblocks task D and E.
+03:21 Tasks that get unblocked are called 'downstream'
+03:24 and tasks that block 'upstream'.
+03:27 Many projects contain more than one framework target,
+03:30 so let's add two more targets representing an app and an app extension.
+03:34 Targets define dependencies between each other in the project
+03:37 via explicit or implicit dependencies.
+03:39 For example, by getting added to the 'Link Binary with Libraries' build phase.
+03:45 In this case, the app embeds the app extension
+03:48 and links against the Framework.
+03:50 The app extension is not using the Framework,
+03:52 so they don't have a dependency relationship.
+03:56 When executing the build graph, different tasks take a different amount of time.
+04:00 This comes down to the level of complexity that is necessary to complete the work,
+04:05 depending on the computation that's needed as well as the size of the input.
+04:10 Compiling many files takes usually much more time than copying a few header files,
+04:15 and taking this into consideration will end up with something like this.
+04:19 When the build system executes this build,
+04:21 it starts by running tasks that don't have dependencies.
+04:25 And once those completed, they unblock downstream tasks and so on,
+04:29 following this process until all planned tasks finished.
+04:35 On following builds, the build system is able to skip tasks
+04:38 for which inputs haven't changed while the output is still up to date.
+04:43 If a task needs to re-run due to a changed input,
+04:46 like B of the App target in this case,
+04:48 downstream tasks have to re-run too if its output changed.
+04:52 Skipping all other tasks allows for very fast turnaround times
+04:55 when iteratively working on the project.
+04:58 This is called an incremental build, but let's stick to full builds for now.
+05:03 The dependencies and duration of the task execution
+05:06 defines the first possible time a downstream task can start.
+05:10 With this information it's possible to calculate the critical path
+05:13 which is the shortest time the build needs to run
+05:16 with theoretical unlimited resources.
+05:18 A common pattern throughout this talk will be to shorten this path
+05:22 to create a highly parallelizable and scalable build graph.
+05:25 A shorter critical path does not necessarily result
+05:29 in a shorter overall build time,
+05:30 but it ensures that the build scales with the hardware.
+05:34 The critical build path defines the limiting factor
+05:36 of how fast a build can be–
+05:38 it cannot complete faster, even if the hardware would allow it.
+05:43 Shortening the critical path is done by breaking up dependencies within it.
+05:47 When looking at how a build performed and to understand more about its execution,
+05:51 the data needs to be plotted based on the time they executed.
+05:55 The width still indicates the length of tasks.
+05:58 Wide elements like these two indicate a long running task
+06:01 while narrow elements like these represent fast finishing tasks.
+06:07 The height of the graph shows the number of parallel executing tasks
+06:11 at a given time.
+06:12 Be aware that this does not directly map to CPU or memory utilization.
+06:18 Empty space originates by tasks blocking its downstream tasks
+06:22 like in those two scenarios.
+06:24 And finally, the color of the elements represent their associated target.
+06:29 I'm very excited to announce that this visualization is new in Xcode 14
+06:33 and will help understand a build's performance after it finished.
+06:37 The Xcode Build Timeline is a great new addition to the build log.
+06:40 It visualizes based on parallelization,
+06:42 rather than hierarchy to understand the build's performance.
+06:46 The number of rows at given time represents the level of parallelism
+06:49 during that time.
+06:51 The horizontal length of individual tasks
+06:54 represent the duration they needed to finish their work.
+06:57 Empty space in the graph shows where unfinished tasks
+07:00 blocked downstream tasks from starting to execute.
+07:04 Different colors applied to the timeline elements
+07:06 help distinguish the different targets that were part of the build.
+07:10 And on incremental builds, the timeline will only contain tasks
+07:13 that got actually executed,
+07:15 allowing to spot long-running tasks,
+07:17 especially ones which might not have been expected to run during this build.
+07:22 Here's a demo of the Build Timeline in Xcode 14.
+07:25 In this window I opened a copy of the swift-docc project from Github
+07:29 which builds the documentation compiler.
+07:31 To get an overview about the targets that are built for the scheme,
+07:34 let's check out the scheme editor.
+07:36 To open that I click on the scheme and select "Edit scheme".
+07:40 The 'build' tab contains a list of all targets.
+07:43 Targets can explicitly get added to the scheme
+07:45 or implicitly by being a dependency of a target
+07:48 that is already part of the scheme.
+07:50 In this case I'm using a Swift package with an automatically generated scheme
+07:54 for the package, so all targets from the manifest are explicitly defined.
+08:00 This log represents a build of that scheme that I executed earlier.
+08:04 In contains entries for all tasks that the build system executed.
+08:08 The entries are organized in a hierarchy
+08:10 based on the targets they belong to, like the 'docc' target here.
+08:14 To successfully build the executable of that target,
+08:17 Xcode ran all tasks that are represented by the children of this node.
+08:21 Since the build log is currently in its 'All' state,
+08:23 it also shows tasks from previous builds
+08:26 that didn't need to re-run in an incremental build.
+08:28 Selecting 'Recent' only shows tasks that got actually executed,
+08:32 hiding all skipped tasks.
+08:34 In addition to that, the build log also supports filters
+08:37 to only show tasks that had issues or even failed.
+08:43 To open the build timeline for this build,
+08:45 I go to the editor options and open the assistant.
+08:49 The build timeline opens next to the build log.
+08:52 Like usual, the editor options provide settings to show the assistant
+08:55 on the right or bottom.
+08:57 I'll stay with bottom for now.
+08:59 The timeline visualizes the same data as the 'recent' build log
+09:02 based on the parallelization of the build.
+09:05 Selecting an element in one also selects it in the other.
+09:08 This enables to see a task's execution in context.
+09:12 The timeline here gives a sense about the tasks
+09:15 that executed in parallel to the selected task.
+09:18 I'm using a pinch gesture on the trackpad to zoom out again.
+09:26 Selecting an element in the timeline shows it in the build log.
+09:30 And since the build log visualizes based on the hierarchical structure,
+09:34 it enables to view which files were compiled
+09:36 as part of this compiler invocation.
+09:38 It also enables to view the whole command line of that invocation.
+09:46 Holding down Option while selecting an area in the build timeline
+09:49 adjusts the view port to fit this timeframe.
+09:52 Here we can verify that linking of the target ArgumentParser
+09:56 is in fact waiting for compilation of the same target.
+09:59 Holding Option while scrolling up allows me to zoom out quickly.
+10:03 The number of rows in the timeline represents the number of tasks
+10:06 that ran in parallel at that time.
+10:08 An empty space like this indicates tasks waiting for un-produced inputs.
+10:14 Ideally, the timeline is vertically filled and has as little empty space as possible.
+10:18 This scales the build graph the best and makes builds faster,
+10:21 the faster the hardware.
+10:23 To achieve this, Xcode comes with many improvements this year
+10:26 to shorten the critical path.
+10:28 Next, let's check out how Xcode defines and builds individual targets
+10:32 as well as how it can increase parallelization.
+10:35 When configuring a target, build phases describe the work
+10:38 that needs to be done to produce that target's product.
+10:41 They are defined in the project editor and can contain a set of source code files
+10:45 and assets to compile,
+10:46 files that need to be copied like headers or resources,
+10:49 as well as libraries that should be linked or scripts that should be executed.
+10:54 Many build phases describe tasks with inputs or outputs
+10:57 from other build phases, creating dependencies between them.
+11:00 For example, a target's source files must be compiled before it is linked.
+11:04 However, this doesn't apply to all build phases.
+11:08 Instead of running tasks from each build phase in a linear order,
+11:11 the build system will consider the inputs and outputs of build phases
+11:15 to determine if they can run in parallel.
+11:17 For example, Compilation and Resource copying can run in parallel
+11:21 because neither depends on any outputs of the other.
+11:24 However, linking must still follow compilation
+11:27 because it depends on the object files produced by that phase.
+11:30 Now, let's consider a different target which contains 'Run Script' build phases.
+11:35 Unlike other build phases, the inputs and outputs of script phases
+11:38 must be manually configured in the target editor.
+11:41 As a result, the build system will run consecutive script phases
+11:45 one at a time to avoid introducing a data race in the build process.
+11:49 If the scripts in a target are configured to run
+11:51 based on dependency analysis
+11:53 and specify their complete list of inputs and outputs,
+11:56 then the build setting FUSE_BUILD_SCRIPT_PHASES
+11:58 can be set to YES
+11:59 to indicate the build system should attempt to run them in parallel.
+12:03 However, when running script phases in parallel,
+12:06 the build system has to rely on the specified inputs and outputs.
+12:09 So be aware that an incomplete list of the inputs or outputs of a script phase
+12:14 can lead to data races which are very hard to debug.
+12:17 To mitigate this, Xcode supports user script sandboxing
+12:20 to precisely declare the dependencies of each script phase.
+12:24 Sandboxing is an opt-in feature that blocks shell scripts
+12:27 from accidentally accessing source files and intermediate build objects,
+12:30 unless those are explicitly declared as an input or output for the phase.
+12:35 In this example, neither input nor output.txt
+12:38 are declared as a dependency for that script phase.
+12:41 The sandbox will block the script from reading and writing
+12:43 to both files when building the project.
+12:46 When the script violates the sandbox,
+12:48 it will fail with a non-zero exit code causing the build to fail.
+12:52 In addition to that, Xcode will list all the paths
+12:55 that the script phase was trying to access without properly declaring them.
+13:00 Adding both files as dependency information to this script phase
+13:03 fixes this issue.
+13:04 This way the sandbox ensures that the script is not mistakenly
+13:08 accessing any file other than its declared inputs and outputs.
+13:12 Now, let's explore an example with more than one script phase
+13:15 and see how sandboxing prevents data races and incorrect builds.
+13:19 There are two script phases.
+13:21 The first one reads a text file, calculates a checksum of its content,
+13:25 and writes that value to an intermediate file in DERIVED_FILE_DIR.
+13:30 The other script reads the same text file
+13:32 as well as the produced checksum
+13:34 and injects them into an html file for later display in the app.
+13:38 If the precise set of input and output dependencies for these phases
+13:42 is not declared, Xcode will run the two scripts in parallel
+13:45 when FUSE_BUILD_SCRIPT_PHASES is on.
+13:48 Let's inspect this problematic scenario in detail.
+13:51 Let's assume "Generate HTML" is missing the input declaration
+13:55 of "checksum.txt", but all other inputs and outputs of both scripts
+13:59 have been correctly declared.
+14:01 Without sandboxing, this misconfiguration might stay unnoticed,
+14:04 causing problems in the build.
+14:07 It means Xcode will fail to infer the dependency relation
+14:10 between both phases, and schedule to run them in parallel
+14:13 when FUSE_BUILD_SCRIPT_PHASES is switched on.
+14:16 There are a few hazards here.
+14:18 Since checksum.txt is not listed as an input dependency for "Generate HTML"
+14:23 during a clean build the script will attempt to read the file
+14:26 without it being available on the filesystem.
+14:29 The other hazard is if checksum.txt is available on disk
+14:32 because of previous runs of "Calculate Checksum",
+14:34 "Generate HTML" may pick up the outdated file
+14:37 when the two scripts run in parallel.
+14:40 This is a user error, and executing the scripts in a sandbox
+14:43 helps preventing this issue.
+14:45 With sandboxing switched on, "Generate HTML" will fail immediately
+14:49 when it attempts to read "checksum.txt".
+14:51 The error message will guide adding the missing input for that build phase.
+14:56 Having the inputs and outputs correctly defined
+14:58 guides Xcode to respect the dependency relation between both phases
+15:02 so that "calculate checksum" runs before "Generate HTML".
+15:05 While unrelated build phases can still execute in parallel.
+15:09 To enable Sandboxed Shell Scripts for a target,
+15:12 set ENABLE_USER_SCRIPT_SANDBOXING to YES in the build settings editor
+15:15 or an xcconfig file.
+15:17 In summary, sandboxed shell scripts allow having correct dependency information
+15:22 to enable faster and more robust incremental builds
+15:25 since the build system has the confidence to skip script phases
+15:28 if the inputs haven't changed and the outputs are still valid,
+15:31 while re-running the script otherwise.
+15:34 Enabling the build setting for a script's target blocks access to files
+15:37 inside the source root of the project as well as the derived data directory
+15:41 if they are not explicitly defined as inputs or outputs of the script
+15:44 in the project.
+15:46 The sandbox will not prevent unauthorized access to any other directory,
+15:49 so don't consider this a security feature.
+15:52 Using this feature helps to debug missing inputs or outputs
+15:55 of existing script phases to ensure a valid configuration
+15:59 And in combination with the previously explained build setting
+16:02 FUSE_BUILD_SCRIPT_PHASES,
+16:03 script phases with correctly defined dependency edges through sandboxing
+16:07 can execute in parallel to reduce the critical path of the build.
+16:11 That's it for parallelizing the steps of building a target.
+16:14 Now Artem is going to demystify parallelization
+16:17 hen building many targets.
+16:18 Artem: Thanks, Ben.
+16:20 Now that we've covered the basics of build system tasks
+16:22 and phases that may go into building a target in your project,
+16:25 let's take a more global view
+16:27 and explore how Xcode uses dependencies between Swift targets
+16:30 to extract the maximum amount of parallelism out of your builds
+16:33 and how the structure and organization of your project can affect build times.
+16:38 There are likely to be several levels of hierarchy composing your project.
+16:41 For example, an App target depending on a collection of local libraries
+16:45 broken up into targets along semantic boundaries,
+16:48 and in several frameworks.
+16:49 Each target containing many different build phases and steps,
+16:52 producing and consuming file dependencies
+16:55 to and from build phases in other targets.
+16:57 As the size of your project grows,
+16:59 these task graphs tend to increase in size and complexity.
+17:04 While the Xcode Build System flattens these hierarchies,
+17:06 breaking down the build into a sea of tasks
+17:08 that correspond to build phases of all targets.
+17:11 One kind of task that is special for a Swift target is compilation.
+17:15 Building a Swift target's source code into binary product's
+17:18 is a complex operation that typically consists of many sub-tasks
+17:22 for build planning, compilation, and linking.
+17:26 Coordination of these tasks is delegated to a specialized tool
+17:29 in the Xcode toolchain– the Swift Driver.
+17:32 The Driver has specialized knowledge on when and how to construct
+17:35 the required compiler and linker invocations for the target's source code.
+17:39 Any target that includes Swift code
+17:41 also corresponds to a unit of code distribution: a module.
+17:45 A binary module file capturing the public interface of this target
+17:48 is a build product that is required for downstream targets to begin a compilation.
+17:52 Let's take a closer look at an example of what Swift Driver does
+17:55 to build one of the targets.
+17:58 Your target probably consists of a collection of several source files.
+18:02 In release or optimized builds the driver will schedule one compiler task
+18:05 including all source files to maximize opportunities for optimization.
+18:10 This single compile task will also produce the target's Swift module.
+18:15 In debug or incremental compilation modes,
+18:17 the Swift Driver breaks down the required compilation effort
+18:20 into smaller sub-tasks which can run in parallel,
+18:23 some of which may not need to re-run on an incremental build.
+18:26 Producing a Swift module then requires an additional step
+18:29 to merge together partial intermediate products of each compile task.
+18:33 If, like in this example,
+18:35 the number of source files in your target is high,
+18:38 individual files may also be assigned to batch compilation sub-tasks,
+18:42 according to the build-system's heuristics.
+18:45 The build log highlights which source files get assigned
+18:47 to batch compilation jobs,
+18:49 with a separate entry for each file's diagnostics.
+18:52 Being able to parallelize a target's build across different source files is crucial
+18:56 for both faster and smaller incremental builds,
+18:59 so make sure your Debug builds are using the Incremental Compilation Mode setting.
+19:04 Before Xcode 14, because of the boundary
+19:06 between the Xcode Build System and Swift Driver,
+19:09 orchestration of target build phases,
+19:11 and compilation sub-tasks spawned by each target's instance of the Driver
+19:15 happened independently of each other,
+19:17 with each component doing its best
+19:19 to make the most of available system resources.
+19:22 Let's take this example build graph and dive deeper
+19:25 into what goes into scheduling its compilation phases
+19:27 with respect to each other.
+19:30 As we've learned earlier, Swift target dependencies are resolved
+19:33 by having their dependents provide a binary module file
+19:36 that captures the dependent's public interface.
+19:39 Resolving these dependency relationships leads us to the following ordering,
+19:43 captured in a timeline showing the top-level Swift Driver tasks
+19:46 for each target, as well as their individual sub-tasks.
+19:50 With Xcode 14, thanks to an entirely new implementation of Swift Driver–
+19:53 itself now written in Swift–
+19:55 the build system and the compiler are fully integrated.
+19:58 The Xcode Build System acts as the central scheduler
+20:01 for all tasks that must be performed to compile your code.
+20:05 This central planning mechanism allows Xcode
+20:07 to make fine-grained scheduling decisions
+20:09 providing better guarantees that building your project
+20:12 will use only as much resources as available,
+20:15 without oversubscribing your CPU and reducing overall system performance.
+20:20 And what was previously a collection of islands of sub-tasks
+20:23 outside of Xcode Build System's purview
+20:25 are now fully in a domain of the build-system's scheduler.
+20:30 With all the individual sub-tasks in a central task pool,
+20:33 it is important to consider the trade-offs made by the build scheduler.
+20:37 For example, on an 8-core machine
+20:40 the scheduler's default is to assign available tasks–
+20:43 those tasks whose dependencies have been satisfied and are ready to go–
+20:46 to one of eight available execution slots.
+20:49 As soon as one of the slots frees up,
+20:51 the Build System attempts to fill it with more outstanding work.
+20:55 On a higher-core-count machine,
+20:57 we're able to perform more concurrent work.
+20:59 But that means we're also more likely to have idle cores
+21:02 which are available to perform more work,
+21:04 but all of the outstanding tasks are still awaiting their inputs,
+21:08 as produced by other tasks that are currently in-flight or waiting.
+21:11 The new integrated build system allows the scheduler
+21:14 to significantly reduce this idle time.
+21:17 To see how, let's revisit how a target's dependencies for compilation,
+21:20 binary module files, are resolved.
+21:25 As we've covered earlier,
+21:26 the partial results of compilation sub-tasks
+21:29 are merged into a target's final module product.
+21:32 Once this product is available, downstream targets may begin compilation.
+21:36 New in Xcode 14 and Swift 5.7, construction of a target's module
+21:41 is done in a separate emit-module task
+21:43 directly from all program source files.
+21:46 This means a target's dependencies can begin compilation
+21:48 as soon as the emit-module task is complete
+21:50 without waiting for all of the other compiler tasks of the dependency target.
+21:55 Being able to unblock downstream target compilation this much sooner
+21:59 cuts down on the time spent waiting for available work with idle CPU cores–
+22:03 that empty space in between spurs of activity in the build timeline.
+22:08 Extending this to the rest of our project
+22:10 shows that although we are performing a similar amount of overall work,
+22:14 the build system is able to use the computer's resources more efficiently,
+22:18 often completing the build significantly faster.
+22:22 Now, let's take a look at a second cross-target optimization
+22:24 the build system can perform when building Swift–
+22:27 Eager Linking.
+22:28 Building on the previous example,
+22:30 we've added the linker tasks for each target,
+22:32 which are both on the build's critical path.
+22:34 In this case, because Target B links Target A,
+22:38 Target B's link task must wait for Target A's linked output to be produced
+22:42 and its own compilation tasks to complete before it can run.
+22:46 However, with eager linking,
+22:48 Target B's link task can depend on Target A's emit-module task instead.
+22:53 As a result, Target B can begin linking earlier in the build,
+22:57 running in parallel with linking Target A and shortening the critical path.
+23:01 How does this work?
+23:03 Normally, the dependency graph of two targets
+23:05 with a linked product dependency looks something like this.
+23:09 Linking the dependent target requires the linked product of its dependencies
+23:13 in addition to the target's own compilation outputs.
+23:16 When linking eagerly, this dependency is broken,
+23:19 allowing the dependent target to start linking earlier.
+23:23 Instead of depending on a linked product of the dependency,
+23:26 it now depends on a text-based dynamic library stub
+23:29 produced earlier in the build process by the emit-module task.
+23:33 This stub contains a list of symbols which will appear
+23:35 in the linked product for use by dependents.
+23:38 You can enable this optimization using the Xcode build setting shown on screen.
+23:42 Eager Linking applies to all pure Swift targets
+23:44 that are dynamically linked by their dependents.
+23:47 To summarize, the Xcode Build System is a sophisticated scheduling engine
+23:52 that seeks to extract as much parallelism as possible
+23:54 by running build phases in parallel.
+23:57 And features like Script Sandboxing allow you to ensure your builds
+23:59 are both maximally parallel and reliable.
+24:03 Xcode and Swift are more integrated than ever.
+24:06 And project structure: its modularization, the overall shape of the graph
+24:10 made up of dependencies between target products
+24:12 and the number and complexity of build phases within them,
+24:15 combined with the available computational resources of your machine–
+24:19 all these are contributing factors to the degree Xcode is able to parallelize
+24:23 and speed up your builds.
+24:25 With this knowledge, and powerful new tools like the build timeline,
+24:29 you are well equipped to examine your project and gain insight into your builds.
+24:33 And if you're curious to learn even more
+24:34 of the behind-the-scenes technical details,
+24:36 many of the technologies we described that are used by Xcode
+24:39 are developed in the open-source.
+24:41 You can find the repository for Swift Driver on GitHub at the link below.
+24:46 For more great sessions about Xcode,
+24:47 check out all new features and improvements from this year
+24:50 in "What's new in Xcode".
+24:51 And learn how Xcode 14's linker improves link times up to two times
+24:55 in the session "Link fast: Improve build and launch times".
+24:59 Thanks for following along.
+25:00 We hope you learned some new insights about Xcode builds.
+25:03 We can't wait to see what you're going to create.
+25:06 Have a great rest of the conference.

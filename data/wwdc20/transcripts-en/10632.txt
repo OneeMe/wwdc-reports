@@ -1,0 +1,575 @@
+00:03 Hello and welcome to WWDC.
+00:08 Hi, my name is Mike Imbrogno from GPU Software and welcome to "Optimize Metal
+00:13 Performance for Apple Silicon Macs." As you know by now, Apple GPUs are
+00:18 coming to the Mac for the first time and we're really excited for you to
+00:21 see what they can do. Apple GPUs are faster and more power efficient.
+00:25 Your apps are going to perform great out of the box. They support all the
+00:29 features of Intel-based Macs and support all the Metal features unique
+00:33 to Apple GPUs. This talk will show you how to optimize for the Apple
+00:37 GPU architecture. If you previously developed for iOS then some of the
+00:41 advice here today may already be familiar to you. But if you're new
+00:44 to Apple GPUs and want your app to stand out on Apple Silicon Macs,
+00:48 then this is the session for you. Before we get started, let's take a look
+00:53 at where this session fits in your transition to Apple Silicon Macs. On
+00:57 Intel-based Macs, your app runs natively. On Apple Silicon Macs, your app will
+01:03 run out of the box under Rosetta's highly optimized translation layer.
+01:08 Under translation, your app will also be automatically opted into several
+01:12 Metal consistency features to ensure that they look great too. But translation
+01:17 and consistency features will cost you some performance, so your next step
+01:22 will be to re-compile your app with a new macOS SDK. To learn more about
+01:27 Metal consistency and translation behavior differences, please see the
+01:31 earlier session from my colleagues Gokhan and Sam. Once consistency issues
+01:36 are fixed, you're ready to focus on performance optimizations and the focus
+01:40 of this talk. Let's look at today's agenda. In the first section, I'll describe
+01:45 how to fix the top performance issues we've observed in your apps that
+01:49 come from not taking into account Apple's tile-based deferred rendering architecture.
+01:53 You'll learn how to schedule work efficiently, optimize pass management
+01:58 and minimize overdraw. In the next section, my colleague Dom will explain
+02:03 how to use Metal's explicit TBDR features to take your optimizations to the
+02:08 next level. You'll learn how to manage tile memory and use tile shaders
+02:13 to optimize the rendering techniques that you already use. And finally,
+02:18 in the last section, Dom will also show you how to optimize for the Apple
+02:22 GPU shader core. Let's jump in. Now this section requires a good
+02:28 understanding of the Apple GPU architecture, so let's start with a recap
+02:31 from our earlier talks. Apple-designed GPUs have a tile-based, deferred
+02:36 rendering architecture designed for both high performance and low power.
+02:41 It uses a high bandwidth, low latency tile memory to eliminate overdraw and
+02:46 reduce system memory traffic. The Apple GPU first processes all the geometry
+02:51 of a render pass in the vertex stage. It transforms and bins your geometry
+02:56 into screen-aligned, tiled vertex buffers that are then passed to the fragment stage.
+03:02 Each tiled vertex buffer is then processed entirely on-chip as part of the
+03:05 fragment stage. The GPU rasterizes all primitives in a tile before shading
+03:10 any pixels using fast, on-chip, tile memory. Metal is designed to directly
+03:16 take advantage of this architecture. For example, load and store actions make
+03:21 explicit how render pass attachments move in and out of this tile memory.
+03:25 Keep this in mind as we dive into our top performance best practices.
+03:29 I have three optimization categories to share with you today. The first category
+03:34 is workload scheduling. Apple GPUs execute different workloads concurrently
+03:38 to maximize utilization and minimize latency. But unnecessary dependencies
+03:43 across render passes can create serialization. So in this section, I'll
+03:48 teach you how to identify and eliminate those dependencies. The next category
+03:53 is minimizing system bandwidth. Apple GPUs achieve maximum performance
+03:58 when system memory bandwidth is minimized. So in this section, I'm also
+04:02 going to show you how to structure your render passes to reduce load and
+04:06 store traffic. And finally, I'll teach you how to minimize overdraw by maximizing
+04:12 the hidden surface removal capabilities of Apple GPUs. Let's start with
+04:17 workload scheduling. Apple GPUs process vertex, fragment and even compute
+04:22 workloads in parallel using independent hardware channels.
+04:27 Overlapping these workloads maximizes GPU utilization and minimizes execution time.
+04:32 So your goal is to overlap wherever possible. Metal automatically overlaps
+04:36 your workloads whenever there are no data dependencies between them.
+04:41 But data dependencies are a natural result of producing and consuming Metal
+04:44 resources between passes. So what we're focusing on here are the unnecessary
+04:49 dependencies that don't need to be there. Let's take a closer look.
+04:54 Apple GPUs process all vertices of a render pass before any fragments, so stages
+04:59 from the same pass must execute serially. But vertex processing of the next
+05:03 pass should overlap with fragment processing of the current pass.
+05:08 This even occurs across frame boundaries so often times the vertex cost is almost
+05:12 entirely hidden by fragment processing. But now let's take a look at what
+05:17 happens when you make vertex work dependent on fragment work of a previous pass.
+05:22 In this example, the fragment stage of each pass is producing data into
+05:26 a Metal buffer or texture that is read by the next vertex stage. This will
+05:31 reduce your overlap and extend execution time by creating a bubble of inactivity
+05:35 in the vertex stage. If you see this pattern in your app, then you really
+05:39 want to fix it. But sometimes the pattern won't be so simple or obvious.
+05:45 Unnecessary dependencies often involve multiple chains of vertex, fragment
+05:49 and compute. In this example, the vertex stage of Render Pass 1 depends on
+05:54 Compute Pass 1. And Compute Pass 1 in turn depends on the fragment stage
+05:58 of Render Pass 0. All these holes in your GPU activity will again hurt your performance.
+06:05 So now that you know what to look out for, let's talk about how false dependencies
+06:08 come up in practice. False dependencies are caused by sharing the same
+06:13 Metal resources between adjacent passes but not the data inside those resources.
+06:18 In this example, Render Pass 0 produces data for some later passes into the
+06:22 same resource that Render Pass 1 consumes, but the data is unrelated.
+06:27 Metal only tracks dependencies at the resource level and not the data itself.
+06:32 So one way to fix this is to use separate resources. In this example, I've
+06:38 separated the resources into two. So now Metal understands that there is
+06:42 no dependency and will schedule your work optimally. But if separating
+06:47 your data into different resources isn't an option, then you can also ask
+06:50 Metal to not track the resource at all. In this example, we're back to only
+06:56 one resource but it's now marked as untracked so that Metal will schedule
+07:00 it optimally. Untracked resources let you control if and when synchronization
+07:04 is required. You'll be responsible for inserting any necessary synchronization
+07:09 using Metal fences or events. Metal fences and events are powerful synchronization
+07:15 primitives that give you fine control over the scheduling of your work.
+07:19 To learn more about them, please see the previous Metal WWDC talks
+07:23 listed here. Now, the last tip for optimal workload scheduling is pass re-ordering.
+07:30 You should always encode independent work as early as possible. Let's consider
+07:35 this example again. If Compute Pass 2 is not dependent on Compute Pass
+07:39 1, then encode it ahead of Compute Pass 1 to fill in the execution gap.
+07:46 Likewise, if Render Pass 2 is independent of Render Pass 1, then it should also be
+07:50 encoded ahead of Render Pass 1. Now you might not always observe a performance
+07:57 improvement after reordering your passes because Metal will also reorder
+08:00 independent passes when it can. But Metal's visibility is limited, so it's
+08:05 always better to reorder explicitly. Okay, so now you know what patterns
+08:10 to look out for and how to fix them. But how do you actually find these bubbles?
+08:15 The answer is to use Metal System Trace. Metal System Trace will clearly
+08:20 highlight missed overlap opportunities in your apps. In this example, you
+08:26 can see that the vertex, fragment and compute stages do not overlap at all.
+08:31 This is because there are unnecessary dependencies inserted between each stage.
+08:37 Here's the exact same frame at the exact same scale, but with all the unnecessary
+08:41 dependencies removed. Notice that there is now significantly better overlap
+08:46 between stages, particularly between the vertex and compute stages. Be sure
+08:52 to use Metal System Trace while tuning your workloads to verify that you're
+08:55 taking advantage of overlap between stages. So that's it for workflow scheduling.
+09:02 Now let's explore how to minimize the system memory bandwidth.
+09:08 Apple GPUs process render pass attachments in tile storage and those attachments
+09:12 are moved in and out of tile memory using load and store actions.
+09:17 These actions consume the majority of your app's system bandwidth. Apple GPUs
+09:22 achieve peak performance when they are not system memory bandwidth bound,
+09:26 so it's important to minimize load and store traffic. Load and store actions
+09:31 are executed for each render pass so you can minimize load and store
+09:35 traffic by reducing the number of render passes used. We sometimes see
+09:39 apps with more render passes than necessary. Let me show you some of those
+09:44 common cases and how to fix them. Some apps split updates to the exact same
+09:49 set of attachments into separate yet adjacent passes. In this example, we
+09:54 have three render passes drawing to the same attachments incrementally,
+09:58 so that each attachment is loaded and stored multiple times. That uses a
+10:03 lot of system memory bandwidth. This often happens when you parallelize encoding
+10:07 using multiple command buffers. Metal lets you encode different passes
+10:12 to different command buffers in parallel to minimize CPU latency,
+10:16 so it's not surprising that you might be using it in this way. You might even
+10:20 think it's the only way to achieve encoding parallelism in Metal
+10:24 based on experience with other graphics APIs. In this example, the app is encoding
+10:30 (on the CPU timeline) the three parts of the G-Buffer into three separate
+10:34 command buffers. But the G-Buffer is logically a single render pass,
+10:40 so should be encoded that way to avoid the execution overhead of repeatedly
+10:44 loading and storing the same attachments. To fix this, we should instead
+10:49 use Metal's parallel render command encoder. With parallel render command
+10:54 encoders, you still achieve your goal of multi-threaded encoding but without
+10:58 the execution cost. In this example, I've replaced the separate command
+11:03 buffers with parallel sub encoders. Metal will combine those sub-encoders
+11:08 into a single render pass before execution, saving most of the system memory
+11:12 bandwidth along the way. Let's take a quick look at how the API is used.
+11:20 You start by creating a parallel render command encoder. The descriptor
+11:23 is setup exactly how you would for a regular render pass encoder. All sub-encoders
+11:29 will share the exact same render pass configuration. You then create your
+11:34 sub-encoders. In this case, I'm creating two sub-encoders. The order in
+11:39 which sub-encoder commands execute is implied by the creation order. So
+11:42 it's important to create those up front to match your intended order.
+11:47 You then hand off the sub-encoders to your worker threads for async encoding.
+11:51 In this case, I'm dispatching asynchronously to the global queue. And once
+11:57 encoding is complete, you'll need to finalize the parallel encoder. In this
+12:01 example, I first wait for completion using my dispatch group before finalizing.
+12:07 Now let's look at another common case where rendered passes are split unnecessarily.
+12:12 In this example, we have a forward renderer drawing opaque geometry in the
+12:15 first pass and translucent objects in the second. The set of attachments are
+12:20 the same but the load and store actions are different. In the first pass, color
+12:26 and depth are written. And in the second pass, color is accumulated but depth
+12:30 is only loaded. We often see this pattern in apps that choose to abstract
+12:34 their graphics API usage and that abstraction decides when to start a new
+12:38 pass based on the attachments used and the actions needed. Now you don't
+12:43 have to change your abstraction layer to fix this. You only need to update
+12:46 your app logic to avoid splitting passes when only the actions change.
+12:51 Here I've merged the two passes by drawing the translucent objects immediately
+12:55 after the opaque objects. I can do this because render passes don't need
+12:59 to be split when only load and store actions change. This eliminates the
+13:04 intermediate loads and stores and the associated system memory bandwidth. Merging
+13:09 also lets you store only the final color just once. We also don't need
+13:15 the depth attachment outside of this pass, so I set its store action
+13:18 to Don't Care. And in this case, the depth buffer isn't used outside the
+13:23 pass either, so I mark it memoryless to save on footprint too. Now let's
+13:29 look at another common pattern we call Attachment Ping-ponging. Apps often
+13:34 need to perform some intermediate rendering that is then composited onto
+13:38 the main scene and often have to do so repeatedly. This looks like a game
+13:43 of ping-pong where the app switches back and forth between two sets of attachments.
+13:48 In this example, we're lighting a scene with a series of lights. Each light
+13:52 needs its screen space attenuation texture generated before lighting the scene.
+13:58 Each light therefore creates a separate render pass, forcing the main scene attachments
+14:02 to load and store repeatedly. This, of course, is not great for performance.
+14:08 To fix this, let's use multiple render targets. Metal lets you reference
+14:12 up to eight color attachments in each pass. So here I just reference both
+14:17 the main scene texture and the light attenuation texture together. Draws
+14:22 for the main scene will target the main scene texture and attenuation draws
+14:26 will target only its texture. This optimization avoids all the intermediate
+14:30 memory traffic. Only the main scene attachment is stored. The attenuation
+14:35 attachment is set to the Don't Care store action. The attenuation attachment
+14:40 isn't referenced outside this pass either so I've marked it memoryless too.
+14:44 Now let's take a quick look at how to set up the pass for this example.
+14:49 You start by creating the main scene attachment then create the attenuation
+14:53 attachment of the same size. Notice that I've marked it memoryless here. Then you
+14:59 create the render pass by first describing the attachment configuration.
+15:04 We want to clear both the scene and attenuation textures but only store
+15:07 the scene texture. And finally we create Our render pass from our descriptor.
+15:13 That's it. Now let's look at an example of how not to clear attachments
+15:17 in Metal. Here's another common pattern we see for apps ported from other
+15:22 graphics APIs is that have a standalone clear operation. In this example,
+15:26 the standalone clear is translated into a separate render pass that only
+15:30 exists to clear that attachment. This again generates wasted system memory traffic.
+15:37 The solution is to fold the clear operation into the render pass that needs
+15:40 it. With Apple GPUs, the clear load action only operates on tile memory
+15:47 and draws will also target tile memory either occluding or overwriting
+15:50 the cleared pixel so you don't waste bandwidth storing cleared pixels that
+15:55 are later over drawn. So that's a simple load action improvement. For our
+15:59 last tip, let's look at a similar store action improvement that you can
+16:03 make to your multi-sampled apps. Multi-sampling anti-aliasing is a great
+16:08 way to improve the image quality of your app, and on Apple GPUs
+16:11 it's really efficient when used correctly. Some apps however are choosing to
+16:16 first store the multi-sampled attachment data, and then reload it just to
+16:20 perform the resolve operation. In this example we store the sample data
+16:24 for both color and depth in the first pass and then resolve both in the
+16:28 second pass. Like the separate clear example, we often observe this pattern
+16:33 in apps ported from other graphics APIs that don't support load actions.
+16:38 But sample data is rarely needed off chip, so the resolve operation should
+16:42 really be performed as part of the previous pass. That way, we only consume
+16:47 system memory bandwidth for the pixels that matter and not the samples.
+16:52 Also notice in this example, that I've made the MSA textures memoryless.
+16:57 MSA samples are often only ever needed within a pass, so it's a great opportunity
+17:01 to save a lot of memory. So that's our advice for minimizing system memory
+17:05 bandwidth your apps. Now let's learn how to maximize hidden surface removal
+17:09 efficiency to minimize overdraw. Remember that Apple GPUs support hidden
+17:15 surface removal in hardware. The goal of HSR is to shade only visible
+17:20 pixels and not pixels occluded by later draws. To do this HSR categorizes
+17:26 fragments based on their visibility. First, we have opaque fragments which
+17:32 always occlude or hide everything beneath them. Then we have feedback fragments,
+17:38 which are generated by fragment functions containing a discard statement
+17:42 or that return of depth value. Alpha tested foliage falls into this category.
+17:48 And finally we have translucent fragments, which blend with their background
+17:52 like a smoke effect would. To maximize HSR efficiency draw, each type of
+17:56 fragment together and then the order shown. First opaque, then feedback,
+18:02 and finally translucent objects. Draw ordering within each category
+18:07 only matters for feedback and translucent fragments. Opaque draws can be in
+18:11 any order but are usually sorted by your app's material system. Let's focus
+18:17 more on opaque fragments. Opaque fragments allow HSR to eliminate the most
+18:21 work because any pixel beneath them can be rejected before shading.
+18:25 For example when rendering the opaque triangles on the right, hidden surface
+18:29 removal reject all fragments belonging to the yellow and green triangles
+18:33 that are covered by the blue triangle. Not all opaque geometry is treated
+18:38 equally though. We already know that some Metal features will make your
+18:42 fragments non-opaque, like alpha blending and alpha testing. But some Metal
+18:46 features will also reduce hidden surface removal efficiency. It's OK to
+18:51 use those features when needed but you should be aware their performance and
+18:55 how to minimize the efficiency impact. Let's review them now. Metal supports
+19:01 writing to buffers and textures from fragment functions. These resources
+19:05 are not your render pass attachments. By default Metal is required to execute
+19:10 all such fragments even if they're occluded by later fragments. Metal does
+19:15 this to ensure that memory rights are deterministic at the expense of hidden
+19:19 surface removal. But you often don't need resource writes to occur for
+19:23 rejected fragments. And when that is true, Metal provides the early fragment
+19:28 test attribute to recover some of that efficiency. That attribute tells
+19:32 Metal that it's ok to not shade the fragment if it fails the depth test.
+19:36 You should add the early fragment test attribute to these fragment functions
+19:40 wherever possible. Another feature that reduces HSR efficiency is write
+19:45 masking. Write masks allow you to restrict which color channels of a render pass
+19:51 attachment are written, even when the shader writes all the channels.
+19:56 In this example color attachment will only have its red and green channels
+20:00 written by the fragment function bound to this pipeline. The blue and alpha
+20:04 channels will not be updated. Metal must preserve the untouched channels
+20:09 for correctness and on Apple GPUs, that means shading underlapping fragments
+20:13 to first generate those values. All the channels of the underlapping fragment
+20:17 are shaded even though only some channel values are actually needed.
+20:21 So some computation is wasted. Now if you need write masking to express your
+20:26 rendering technique, then by all means use it. And you probably intended
+20:29 to use write masking when you set it up through the Metal API. But now let
+20:34 me show you an example we found where write masking was not intentional.
+20:38 Write masks can be setup in fragment functions too. And fragment functions
+20:42 that don't write any channels of an attachment are also write masking.
+20:47 Consider this on-chip deferred rendering example. The G-Buffer consists
+20:50 of three render pass attachments: albedo normals and the light accumulation texture.
+20:57 The fragment function of the G-Buffer generation phase only writes to two
+21:01 of those three attachments because the last attachment isn't used in this phase.
+21:05 This form of write masking was unintentional. You didn't intend to reduce
+21:09 HSR efficiency here. To fix this, we just need to write all of the attachments.
+21:16 And in this case we can just initialize the lighting attachment to zeros.
+21:20 So remember that unless you really need to preserve the previous values of an
+21:24 attachment, you should write to all render pass attachments to improve HSR
+21:28 efficiency. To close our discussion on hidden surface removal best practices,
+21:32 let's look at the role of depth pre-passes on Apple GPUs.
+21:38 Depth pre-pass is a commonly-used technique in existing Mac games to minimize overdraw.
+21:43 You first render the scene into your depth attachment only to determine visibility.
+21:49 You then render the scene again into your color attachments; testing against
+21:53 that visibility but without updating it. This ensures that only fragments
+21:57 matching the depth test are shaded in the second pass. Now if you need
+22:01 visibility information before your main scene renders for a particular
+22:05 technique, then you don't have to change your app. But if you only perform
+22:09 a depth pre-pass for performance, then hidden surface removal serves the
+22:13 same purpose on Apple GPUs. When HSR is maximized, it can reject hidden
+22:19 fragments as well as depth pre-passes can, but without any additional costs.
+22:24 With HSR, geometry is only processed once. An HSR doesn't require the depth
+22:30 attachment to be stored or even have memory backing at all. It also avoids
+22:35 a correctness artifact called z-fighting where the depth calculation
+22:39 of both passes slightly mismatch. For more information on z-fighting, please
+22:44 see this year's Apple Silicon Mac porting session. So that concludes our
+22:48 discussion on how to minimize overdraw with hidden surface removal.
+22:53 Now my colleague Don will introduce you to even more advanced optimization techniques.
+22:57 Hey, thanks Mike. In the first part of this video we've seen some performance
+23:02 optimization techniques for Apple GPUs that require some relatively small
+23:06 changes in your use of the Metal API. In this section, instead, we're going
+23:11 to discuss further optimization opportunities based on Metal features
+23:15 that are specific to Apple GPUs, such as tile shaders and programmable blending.
+23:22 Let's start talking about how to optimize deferred shading on Apple GPUs.
+23:26 Deferred shading is a lighting solution commonly used in several game
+23:30 engines. As a quick recap, in deferred shading, rendering is split in two passes.
+23:36 First, we draw all the scene geometry to compute some per-pixel material properties.
+23:42 In this case, albedo, normals,and surface roughness are stored in three
+23:47 different attachments. That's what we call G-Buffer. Then in the second
+23:52 pass, the G-Buffer data is used to compute the final per-pixel lighting output.
+23:59 The main idea is that de-coupling geometry from lighting can keep the shading
+24:03 costs under control. A common issue of deferred shading is that G-buffers
+24:08 can have a large memory footprint and bandwidth costs, especially in cases
+24:13 where multiple G-buffers are used to shade unique materials such as hair
+24:17 or skin. However, Apple GPUs support features designed to reduce the
+24:23 number of render passes for deferred shading. Programmable blending can
+24:27 reduce the bandwidth cost and when combined with memoryless render targets
+24:32 the memory footprint can be reduced to a small fraction. Here you have
+24:36 a basic example of a deferred renderer ported from Intel-based Macs.
+24:42 The G-buffer attachments are rendered and stored to system memory by the first
+24:46 command encoder. The attachments are read back immediately afterwards in the
+24:51 lighting pass, consuming a significant amount of memory bandwidth.
+24:56 Metal on macOS supports the concept of memory barrier and some developers
+25:00 use this construct in their deferred renderers. A memory barrier is a synchronization
+25:05 object that ensures that all writes to a given set of resources have completed
+25:10 before further commands can be processed. So in this case, a memory barrier
+25:16 on the fragment stage could be used to combine the G-buffer and lighting
+25:19 passes together. However, memory barriers within the fragment stage are a very
+25:25 expensive operation on Apple GPUs. That's because they're required to flush the
+25:29 tile memory to system memory, which is what we want to avoid in the first place.
+25:35 Fortunately, you can use programmable blending to optimize this deferred
+25:39 rendered into a single pass. Programmable blending allows your shader to access
+25:44 the current pixel's value for all color attachments. The results are accessible
+25:48 in the on-chip tile memory without needing to go through system memory.
+25:53 One important detail to highlight is that the tile memory stores color
+25:57 and depth attachments separately, so the depth is not directly accessible
+26:02 to a fragment shader. To work around this limitation, you can maintain the
+26:06 current fragment's depth in a dedicated color attachment to keep it available
+26:10 to all your fragment shaders. Now that we know the basics of on-chip
+26:14 deferred shading, let's see some more complex examples. Game engines can
+26:21 have multiple lighting pipelines with unique G-buffer layouts. For instance,
+26:25 hair or skin shading often add additional material properties and need
+26:30 custom lighting. Such configuration would consume a lot of memory bandwidth
+26:34 on Apple GPUs. Fortunately, Metal offers a number of techniques to optimize
+26:39 these kind of pipelines. Remember that Metal supports up to 8 core
+26:43 attachments per render pass. If your G-buffer layout is similar among all
+26:48 logical passes of your deferred renderer and you use only a few unique attachments
+26:53 to store all the intermediate lighting results, then you can keep everything
+26:57 in one pass using programmable blending. In this example, besides the G-buffer
+27:01 attachments, you have one attachment for regular lighting and one
+27:05 attachment for the specialized hair lighting before compositing them together.
+27:11 And of course, if you don't need to reference G-buffer data outside the render
+27:15 pass, then you can even make those attachments memoryless, reducing the memory
+27:20 footprint of your workload. To summarize, we now know that programmable
+27:24 blending is a simple yet powerful feature to maximize the use of tile memory.
+27:29 However, there are cases where you need to repurpose more drastically the
+27:33 structure of your tile memory. Later in this video, we'll focus again on
+27:37 this topic but before, we need to talk about how to mix render and compute
+27:41 together. Modern renderers often implement more sophisticated lighting pipelines
+27:46 than what we've seen so far. In many cases, those pipelines use both render-
+27:52 based techniques as well as compute dispatches. A typical example is tile-based
+27:57 light culling which is a rendering technique where the rendered target
+28:01 is split into small tiles and a compute shader builds a list of all lights
+28:06 that affect each tile. The final lighting pass uses the per-tile light
+28:11 list to shade only the lights affecting a given tile, reducing the shading
+28:15 costs dramatically. Now that we are throwing compute into the mix, keeping
+28:19 data on-chip might require some additional work. Metal supports render
+28:25 command encoders for drawing and compute command encoders for dispatches.
+28:29 But starting with A11 Bionic, Apple GPUs also support tile-based compute dispatches.
+28:35 With tile shaders, you can dispatch threadgroups that operate on a per-tile
+28:39 basis within a render command encoder. Tile dispatches introduce implicit
+28:44 barriers against the fragment shading stage of the earlier and later draws.
+28:48 For this reason, a tile dispatch can use the fragment shading results of
+28:52 all earlier draws in the tile and finish executing before any subsequent draws
+28:56 start their fragment shading. Tile shaders are deeply integrated in the architecture
+29:01 of modern Apple GPUs, so they can access imageblocks. threadgroup memory and
+29:06 device memory as well. With this in mind let's go back to our tile deferred renderer.
+29:11 Here is a pipeline that has a G-buffer pass followed by a light culling
+29:15 compute pass. To determine whether a light affects a given tile, the light
+29:20 culling pass uses the depth attachment produced by the G-buffer pass.
+29:26 Finally the culled light list is used in the last compute pass to accumulate the
+29:30 lighting contribution of all lights in a given tile. Without tile shading
+29:36 dispatching thread groups without a compute command encoder would break rendering
+29:40 into three passes, forcing several flashes of the tile memory to system memory.
+29:45 Using tile shaders instead, you can access the whole image block data in a
+29:50 tile dispatch, so you can generate per-tile light lists in the middle of
+29:54 a render command encoder. In this configuration, the light list is stored in
+29:59 a threadgroup memory buffer which can be read by the fragment shaders that calculate
+30:03 lighting later on. And once again, because most of the intermediate data
+30:08 stays in the on-chip tile memory you could use memoryless attachments
+30:11 to reduce the memory footprint. Let's look at how to setup the render pass
+30:16 descriptor for this configuration. Let's define the dimension of the on-chip
+30:22 tiles, so that they match with the light culling scheme. In this case, I'm
+30:26 using 32 by 32 pixels for each tile. One detail to keep in mind is that
+30:32 Apple GPUs only support a few different tile dimensions. Then, I allocate
+30:37 the threadgroup memory buffer used to store the per-tile light list.
+30:41 I'm assuming that each tile will contain up to eight unique lights.
+30:46 Now it's time to set up the G-buffer attachments. Notice that I'm using the
+30:50 .dontCare storeAction as I don't want to store the G-buffers back to system memory.
+30:56 And as discussed, we can use memory- less textures for those attachments.
+31:00 The last three lines configure the lighting attachment to be cleared at
+31:04 the beginning of the render pass and stored out to system memory at the
+31:08 end of the render pass and that's it: our render pass descriptor is now
+31:12 ready to be used. Tiles shaders are a powerful and flexible tool. And over
+31:17 the last few years, we at Apple prepared a lot of material about it.
+31:22 If you're looking for a deep dive into tile shading, please see our Metal 2
+31:26 on A11 Tech Talk on tile shading. And if you want to know more about tile-
+31:30 based light culling, please check out our Modern Rendering with Metal talk
+31:34 at WWDC 19. Now that we know about tile shaders, let's go back to our discussion
+31:40 about how to repurpose tile memory. One more reason to have tile shaders
+31:44 in your tool box is when you need to change the layout of your image block
+31:47 or threadgroup memory. When you're looking for opportunities to merge passes,
+31:52 sometimes you have data, stored in color attachments or image block fields
+31:56 that are no longer needed. A good example would be transitioning an image
+32:00 block from a G-buffer layout to a layout suitable to sort and accumulate multiple
+32:05 layers of translucent geometry. To implement this transition, you need a
+32:09 fragment-based tile pipeline, which is a tile shader dispatch with a fragment
+32:14 function bound. Let's look at the source code. Here is the image block
+32:20 layout used for deferred shading. I want to transition to a layout that
+32:25 is useful for storing multiple layers of translucent fragments per pixel.
+32:29 This struct will serve as the fragment shader output. It has a single field
+32:35 marked with the imageblock_data attribute. The fragment function will read a
+32:40 DeferredShadingFragment input and return a FragmentOutput structure,
+32:45 which will initialize the image block for multilayer alpha blending.
+32:49 The fragment shader will read any values that need to be processed or preserved
+32:53 from the input image block and return the correct value to repurpose the
+32:57 image block itself. So this concludes our discussion about repurposing
+33:02 tile memory. For further details. Please see our Metal 2 on A11 Tech Talk
+33:08 on Image Blocks. In the final section of this video, we'll have a brief
+33:12 architectural overview of the Apple Shader Core which is a key component
+33:16 of our GPUs. Then we'll focus on some optimization techniques for
+33:20 your shaders. The Apple shader core uses a modern scalar architecture
+33:24 that is closely aligned to the Metal shading language programming model.
+33:28 And even if its math units are scalar, the Apple Shader core prefers to load
+33:33 and store vector types directly. The shader core can hoist execution
+33:38 of a constant code ahead of time and prefetch constant data, once per
+33:42 draw or dispatch. This allows each parallel thread to focus on its
+33:47 own unique work. The operator core contains both a 16-bit and a 32-bit
+33:53 ALU so it can perform math at different precisions to reduce power
+33:57 usage and increase performance. You get most of these benefits for free
+34:02 but optimal performance may require some tweaking of your shaders.
+34:06 The next sections will focus on three important topics. Let's start talking
+34:11 about memory address spaces and how to use them effectively. GPUs have
+34:15 multiple paths to memory that are designed for different access patterns.
+34:20 For this reason the Metal Shading language implements the concept of
+34:23 address space. Every time you declare a buffer binding in your shaders,
+34:28 the Metal shading language requires you to tag your data with a specific
+34:32 address space. Choosing the right address space is an important decision
+34:36 that will directly impact the performance of your shaders. We're going
+34:41 to focus our attention on the device and constant address bases. The device
+34:47 adress space is a read-write memory space with virtually no size restrictions.
+34:52 On the other hand the constant address space is read-only and can fit only
+34:57 a limited amount of data. Keep in mind that this address space is optimized
+35:02 for the use of data that is constant across all threads in the same draw
+35:06 or dispatch. Picking the correct address space is usually a matter of asking
+35:12 yourself two simple questions: first, how much data are we dealing with?
+35:18 If the amount of data is not known at compile time and each thread in your
+35:22 draws or dispatches reads a different number of items, then the data should
+35:25 be placed in the device address space. Second if the size is fixed, how
+35:31 many times is each item read? If it's a few, then use the device address
+35:36 space. Otherwise, if the same item is reused several times by different
+35:40 threads, use the constant address space. For instance if your indexing some
+35:45 data of your vertex ID or fragment coordinates, then each thread will
+35:48 likely access a different item. In such case, use the device address space.
+35:54 Choosing the right address space can be critical for achieving the best performance.
+35:58 Next let's discuss about one particular optimization related to the constant
+36:03 address space. In some cases, the shader compiler can preload your buffers
+36:08 into special registers dedicated to constant data. Let's call those registers "uniforms."
+36:16 The preloading happens before your shaders run. So it's a helpful mechanism
+36:20 to reduce latency. Buffers tagged with the constant address space can likely
+36:25 be pre-loaded into uniforms. Preloading is more likely to happen if the
+36:29 offset of the data within your buffer can be determined at compile time.
+36:35 And if you're indexing into an array, its size needs to be known at compile
+36:39 time as well. Let's see an example. The fragment shader on the left reads
+36:44 an array of light structures from system memory. In this example, constant
+36:49 preloading will not happen. That's because even if we specify the const
+36:53 qualifier, we're actually reading the light array from the device address
+36:57 space. But also, the size of the light array is not determined at compile time.
+37:04 To help the shader compiler to preload your constant buffers, make sure
+37:07 to provide your constants as a single struct, passed by reference. And for
+37:12 your constant arrays, provide a size known at compile time. The resulting
+37:18 code would look like this. The light array is now encapsulated in a struct
+37:23 loaded by reference from constant address space. And the maximum number
+37:28 of lights is known at compile time with the MAX_LIGHTS constant. The shader
+37:33 compiler is now able to preload the lights array into a uniform registers.
+37:38 Let's now talk about ALU data types and how they can significantly affect
+37:43 the performance of your shaders. First, some definitions. By data types,
+37:48 we mean whatever types you use throughout your shader code. Apple GPUs
+37:53 are optimized for 16-bit data types. So when you use a type bigger than 16-bits,
+37:59 you will allocate more registers accordingly and if you use a smaller type
+38:03 you will still consume a full 16-bit register. Using 16-bit data types
+38:08 instead of 32-bit data types, your shaders will require less registers
+38:12 leading to an increase in shader core occupancy. Higher occupancy means
+38:17 that more GPU threads can be in flight at the same time which is great
+38:21 to improve the latency hiding capabilities of the shader core. But also
+38:25 in most cases, 16-bit data types use faster arithmetic instructions than
+38:30 the equivalent 32-bit data types, leading to a significantly better ALU utilization.
+38:36 For all those reasons use half and short instead of float and int when possible.
+38:41 Don't worry about type conversions. Those are typically free, even between
+38:46 single precision and half precision floating point values. Let's see
+38:50 some examples. In this example, consider a kernel using the thread position
+38:56 within a thread group for some computation. I'm using 32-bits but the maximum
+39:01 threadgroup size supported by Metal can easily fit in a 16-bit value.
+39:06 The threadgroup position within the dispatch grid, however, could potentially require
+39:10 a larger datatype depending on the grid size. In this case, for the grid
+39:15 size I'm going to use, a 16-bit value is enough. The resulting code would use a
+39:20 smaller number of registers to compute local and global positions within
+39:24 the dispatch, potentially increasing the shader core occupancy. Next let's
+39:29 talk about another case where it is possible to use more registers than
+39:32 expected, this time through floating point literals. The Metal shading
+39:37 language specifies that operations have to happen at the highest precision
+39:42 among all operands. So even if the A and B arguments are using half precision,
+39:47 the compiler has to promote the whole expression to single precision.
+39:52 that's because of the -2 and 5 literals. So when you're writing half precision
+39:57 code make sure to use half procedure literals using the H letter suffix.
+40:04 Finally let's talk about how to avoid some common pitfalls in the memory
+40:08 accesses of your shaders. In general, try to avoid stack-allocated arrays
+40:14 as sometimes the force the compiler to generate suboptimal code. For instance,
+40:20 the compiler cannot easily optimize away dynamically indexed arrays initialized
+40:25 at runtime. In this case, if the value of the index argument is not known
+40:31 at compile time, the compiler would likely spill to memory A B and C and
+40:36 read back the correct value based on the index argument. In this other
+40:41 example, the loop will likely get unrolled so the compiler will
+40:45 be able to know the value of the index variable at compile time optimizing
+40:49 away any spilling. The best way to know if you have stack accesses getting
+40:54 spilled to memory is to use the GPU frame debugger in Xcode. If you
+40:59 see a warning sign next to one of your draws, click on the Pipeline Statistics section.
+41:06 This will open a remarks panel containing a message similar to this
+41:09 if you hit any spilling due to stack accesses. Another thing to look
+41:13 out for is the type of the indices used in memory accesses. The best practice
+41:18 is to use signed types wherever you can. Let's consider the following example.
+41:25 Here you have a simple loop accessing a buffer. The loop index variable
+41:30 uses an unsigned type. Unsigned types have a well-defined wrapping semantic
+41:36 in the Metal Shading language. So if the index overflows, the compiler
+41:41 needs to make sure that it wraps around correctly and such behavior comes
+41:45 at a cost. Let's take a look at the memory access pattern involving wrapping.
+41:51 In this case, "start" has a value larger than "end." In the Metal Shading
+41:56 language, this is perfectly valid. And what will happen is that the index
+42:00 will wrap around when reaching UINT_MAX. To implement its behavior,
+42:05 the shader compiler cannot vectorize the loads together, potentially affecting
+42:08 the performance of this shader. If you need the wrapping behavior, of course
+42:12 use an unsigned type. However most of the times this is not necessary.
+42:17 Replacing the index with a signed type will tell the compiler you don't need
+42:21 the wrapping semantic, as overflow of signed values is undefined behavior
+42:25 in the Metal Shading language. With this change, the shader compiler is
+42:29 now able to vectorize the four loads together, likely leading to a performance improvement.
+42:34 And once again batching your memory accesses together is generally a good
+42:38 thing for performance. The compiler will try to do it for you, but sometimes
+42:43 it needs your help. Let's consider the following example. The main loop
+42:48 is accessing fields A and C of the foo struct at the same time. The problem
+42:54 here is that those fields are not adjacent as B is sitting between them,
+42:59 therefore the compiler will not be able to load them together. To fix that,
+43:05 you can merge the fields manually like this using a vector datatype directly,
+43:10 forces the compiler to emit a vectorized load in this case. You can achieve
+43:15 the same behavior by simply modifying your structure so that the fields
+43:18 are next to each other. And this concludes our discussion about the Apple
+43:23 Shader core. OK, let's review what we learned today in this video. Mike and
+43:28 I showed you many different optimization techniques for the Apple GPU architecture.
+43:34 We discussed about eliminating unnecessary dependencies to maximize vertex,
+43:38 fragment, and compute overlap. Next, we discussed avoiding unnecessary
+43:44 pass changes through pass re-ordering and merging. We also talked about
+43:49 how to minimize memory bandwidth through proper use of load and store actions.
+43:55 We then discussed how to maximize the efficiency of the hidden
+43:58 surface removal hardware by ordering draws properly and paying attention to
+44:02 the uses of Metal that can affect the opaqueness of your fragments.
+44:07 We also showed you how to use Metal's TBDR-specific features to optimize
+44:11 your apps for Apple GPUs even further. We showed you how to optimize
+44:16 for the Apple shader core by using 16-bit data types where possible
+44:21 and using the right address space to enable constant data prefetch.
+44:25 And then we discussed about how to avoid common pitfalls in the memory accesses
+44:30 of your shaders. We are now at the end of this road that started with porting
+44:35 your native x86 apps to the new Apple silicon Macs. So what are the next steps?
+44:41 If you want to profile your apps, the Metal System Trace instrument is the
+44:45 best tool at your disposal. And remember that we at Apple prepared a lot
+44:50 of material to help you squeeze every bit of performance out of your apps.
+44:55 In particular, check out our new talk about Metal App Profiling in Xcode 12
+45:00 from my colleague Sam. And don't forget to check last year's WWDC talks
+45:05 about Delivering Optimized Metal Apps and Games as well as the Modern Rendering
+45:10 with Metal talk. Thank you.

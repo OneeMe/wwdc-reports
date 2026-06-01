@@ -1,0 +1,287 @@
+00:00 ♪ ♪
+00:09 Ahmed: Hi, my name is Ahmed, and I work on the Clang and Swift compilers.
+00:13 In this session we're going to dive deep into changes we've made
+00:17 to make common Swift and Objective-C operations faster and more efficient,
+00:21 so that we can improve your app's size and runtime performance.
+00:25 When you write code in Swift or Objective-C,
+00:27 you're always really interacting with two major components.
+00:30 First, you build using Xcode,
+00:32 and that uses the Swift and Clang compilers.
+00:35 But when you run your app, a lot of the heavy lifting is done
+00:38 in the Swift and Objective-C Runtime.
+00:41 The runtime is embedded in the operating systems for all of our platforms.
+00:45 What the compiler cannot do at build time, the runtime does, well, at run time.
+00:50 We're going to look at several improvements we've made
+00:52 in both compilers and runtimes.
+00:54 Now, this session is a bit unusual; there are no new APIs,
+00:58 language changes, or new build settings.
+01:00 You don't have to change your code, so all these improvements are transparent
+01:03 to you, the developer.
+01:05 Let's dive in.
+01:06 We're going to look at four improvements.
+01:08 We've made protocol checks in Swift more efficient,
+01:11 we've also made Objective-C message send calls smaller,
+01:14 as we did retain and release calls,
+01:16 and finally, we've made autorelease elision faster and smaller.
+01:21 Let's take a closer look.
+01:23 Let's start with protocol checks in Swift.
+01:27 Here we have a CustomLoggable protocol.
+01:30 It has a read-only computed property customLogString,
+01:33 and we can use it in our log function,
+01:35 that has special handling for CustomLoggable objects.
+01:38 Later, we're defining an Event type with name and date fields.
+01:42 And we're conforming to the CustomLoggable protocol,
+01:45 by defining the getter for the customLogString property.
+01:49 And this lets us pass Event objects to our 'log' function.
+01:53 When we execute this code, the 'log' function needs to check
+01:56 whether the value we passed conforms to the protocol.
+01:59 And it does that using the 'as' operator. You may also have seen the 'is' operator.
+02:05 Whenever possible, this check is optimized away at build time, in the compiler.
+02:09 However, we don't always have enough information yet.
+02:13 So this often needs to happen in the runtime,
+02:15 with the help of protocol check metadata we compute earlier.
+02:20 With this metadata, the runtime knows whether this particular object
+02:23 really does conform to the protocol,
+02:25 and the check succeeds.
+02:29 Part of the metadata is built at compile time,
+02:31 but a lot can only be built at launch time,
+02:33 particularly when using Generics.
+02:36 When you use a lot of protocols, this can add up to hundreds of milliseconds.
+02:40 On real-world apps, we've seen this take up to half of the launch time.
+02:45 With the new Swift runtime, we now precompute these ahead of time,
+02:48 as part of the dyld closure for the app executable
+02:51 and any dylib it uses at launch.
+02:54 Best of all, this is enabled even for existing apps
+02:56 when running on iOS 16, tvOS 16, or watchOS 9.
+03:01 If you'd like to learn more about dyld and launch closures,
+03:03 watch the talk "App Startup Time: Past, Present, and Future."
+03:07 That was protocol checks in Swift.
+03:10 Let's move on to message send.
+03:14 With the new compilers and linker in Xcode 14,
+03:17 we've made message send calls up to 8 bytes smaller,
+03:19 down from 12, on ARM64.
+03:22 As we'll see in just a moment, message send is really everywhere,
+03:25 so this adds up,
+03:26 and we've seen up to 2% code size improvements on binaries.
+03:30 This is enabled automatically when building with Xcode 14,
+03:33 even if you use an older OS release as deployment target.
+03:38 It defaults to a balance of size win and performance,
+03:40 but you can opt into optimizing for size only,
+03:43 using the objc_stubs_small linker flag.
+03:46 Now let's look into what changed.
+03:49 So let's start with an example.
+03:50 Here we're trying to make an NSDate for the start day of the conference.
+03:54 We start by making an NSCalendar,
+03:56 then we fill out NSDateComponents,
+03:58 make a date out of that, and finally return it.
+04:01 Now let's look at the assembly the compiler generates.
+04:05 Now, the details of the assembly aren't super important.
+04:07 Us compiler folks stare at it all day so that you don't have to.
+04:11 What's important is that almost every line here
+04:13 ends up needing an instruction to call objc_msgSend,
+04:16 even when doing property accesses like we do for the date components.
+04:21 This is because at compile time, we don't know which method to call,
+04:24 and it's only the objc runtime that does.
+04:26 So we call into the runtime using objc_msgSend
+04:29 to ask it to find the right method.
+04:32 Let's focus on one of these calls.
+04:34 We already mentioned the instruction to call objc_msgSend.
+04:37 But there's more.
+04:38 To tell the runtime which method to call,
+04:40 we have to pass a selector to these objc_msgSend calls.
+04:44 That needs a couple more instructions to prepare the selector.
+04:48 When we look at the binary, each of these instructions takes a little bit of space.
+04:52 On ARM64, that's 4 bytes each.
+04:55 So for each of these objc_msgSend calls, we're using 12 bytes,
+04:59 and we need that for every single one of these calls;
+05:01 that really adds up.
+05:04 Let's see what we can do to improve that.
+05:08 Now, as we've seen before,
+05:09 8 of those bytes are dedicated to preparing the selector.
+05:13 Interesting thing is, for any given selector, it's always the same code.
+05:17 And this is where our optimization comes in.
+05:21 Since this is always the same code, we can share it
+05:23 and only emit it once per selector
+05:25 instead of every time we do a message send.
+05:27 We can take it out and put it into a little helper function,
+05:30 and call that function instead.
+05:33 Over many calls using the same selector,
+05:35 we can save all these instruction bytes.
+05:38 We call this helper function a "selector stub."
+05:42 We still need to call the real objc_msgSend function, though,
+05:45 so we continue onto that.
+05:47 And again, that has another, different, indirection to load the address
+05:51 of the function itself and call it.
+05:53 The details aren't important, but what's important is that we need
+05:56 another several bytes of code to do that.
+05:59 And this is where you can choose which mode you want,
+06:01 as I mentioned earlier.
+06:03 We can either keep these two little stub functions separate, like we've done here.
+06:07 We get to share the most code, and make these functions
+06:09 as small as possible.
+06:11 But unfortunately, this would do two calls back to back,
+06:14 which is not ideal for performance.
+06:17 So we can further improve this with an alternative version.
+06:20 We can take these two stub functions we've created, combine them into one.
+06:25 That way, we keep the code closer together and we don't need as many calls.
+06:29 And that's on the right here.
+06:32 So these are the two options.
+06:33 You can choose whether to optimize for size alone,
+06:36 and get the maximum size savings available.
+06:38 You can enable that using the -objc_stubs_small linker flag,
+06:42 or you can use the code generation that provides size benefits
+06:45 while keeping the best performance.
+06:48 And unless you're severely size-constrained, we recommend using this,
+06:51 and that's why it's the default.
+06:54 And that was smaller message send using stubs.
+06:57 Another improvement we've made is making retain/release cheaper.
+07:01 With the new compilers in Xcode 14,
+07:03 retain/release calls are now up to 4 bytes smaller,
+07:05 down from 8 on ARM64.
+07:08 As we'll see in just a moment, just like message send,
+07:11 retain/release is also everywhere.
+07:13 So this adds up, and we've seen up to 2% more code size improvements on binaries.
+07:18 Now, unlike message send stubs, this does need runtime support,
+07:21 so you'll get this automatically as you migrate to a deployment target
+07:24 of iOS 16, tvOS 16, or watchOS 9.
+07:28 Now let's look into what changed.
+07:31 Let's go back to our example.
+07:32 We talked about msgSend calls,
+07:35 but with automatic reference counting, or ARC,
+07:37 we also end up with a lot of retain/release calls
+07:39 inserted by the compiler.
+07:42 At a very high level, whenever we make a copy of a pointer to an object,
+07:46 we need to increment its retain count to keep it live.
+07:49 And here, this happens with our variables cal, dateComponent, and theDate.
+07:53 We do that by calling into the runtime, using objc_retain.
+07:57 When the variables go out of scope,
+07:59 we then need to decrement the retain count using objc_release.
+08:03 Of course, part of the benefit of ARC is all the compiler magic
+08:06 that eliminates a lot of these calls, to keep them to a minimum.
+08:10 And we're going to go into one of these magic tricks a little bit later.
+08:13 But even with all the magic, we still often need these calls.
+08:17 In this example, we end up needing to release our local copies of calendar
+08:21 and dateComponents.
+08:24 Under the hood, these objc_retain/release functions
+08:27 are just plain C functions;
+08:29 take a single argument, the object to be released.
+08:32 So with ARC, the compiler inserts calls to these C functions,
+08:36 passing the appropriate object pointers.
+08:38 Because of that, these calls have to respect the C calling convention,
+08:42 defined by our platform Application Binary Interface, or ABI.
+08:46 Concretely, what that means is that we need even more code
+08:49 to do these calls, to pass the pointer in the right register.
+08:53 So we end up with a few additional 'move' instructions just for that.
+08:57 And that's where our new optimization comes in.
+09:00 By specializing retain/release with a custom calling convention,
+09:03 we can opportunistically use the right variant
+09:06 depending on where the object pointer already is,
+09:09 so that we don't need to move it.
+09:11 Concretely, what this means is, we get rid of a bunch of redundant code
+09:15 for all these calls.
+09:17 And again, while this may not seem like much
+09:18 for these puny little instructions,
+09:20 over an entire app, it really adds up.
+09:23 That's how we made retain/release operations cheaper.
+09:26 Finally, let's talk about autorelease elision.
+09:29 Now this one is even more interesting.
+09:32 With objc runtime changes, we've made autorelease elision faster.
+09:36 That happens automatically for existing apps
+09:38 when you run them on the new OS releases.
+09:41 Building on top of that, with additional compiler changes,
+09:44 we also made the code smaller.
+09:47 And you'll get this size benefit automatically
+09:49 as you migrate to a deployment target of iOS 16, tvOS 16, or watchOS 9.
+09:55 Now this is all great, but what's autorelease elision in the first place?
+09:59 Let's go back to our example.
+10:02 I mentioned earlier that ARC already gives us a lot of compiler magic
+10:05 to optimize retains and releases.
+10:07 So let's focus on one case here:
+10:08 autoreleased return values.
+10:11 In this example, we made a temporary object,
+10:13 and we're returning it to our caller.
+10:15 So let's look at how that works.
+10:17 So we have our temporary theDate,
+10:19 we return it, the call completes,
+10:21 and the caller saves it to its own variable.
+10:24 So let's see how that works with ARC.
+10:28 ARC inserts a retain in the caller, and a release in the called function.
+10:32 Here, when we return our temporary object, we need to release it first
+10:36 in the function, because it's going out of scope.
+10:39 But we can't do that just yet, because it doesn't have any other references yet.
+10:43 If we did release it, it would be destroyed before we even return,
+10:46 and that's no good.
+10:48 So a special convention is used to be able to return the temporary.
+10:51 We autorelease it before the return so that the caller can then retain it.
+10:56 You've likely seen autorelease and autoreleasepools before:
+10:59 it's simply a way to defer a release until some later point.
+11:02 Runtime doesn't really make any guarantees as to when the release happens,
+11:05 but as long as it's not right here, right now, it's convenient,
+11:09 because it lets us return this temporary object.
+11:12 Now, this isn't free.
+11:13 There is some overhead to doing an autorelease.
+11:16 This is where autorelease elision comes in.
+11:19 So to understand how that works,
+11:21 let's look at the assembly and retrace this return.
+11:24 When we call autorelease, that goes into the objc runtime,
+11:27 and that's where the fun begins.
+11:30 The runtime tries to recognize what's happening:
+11:33 that we're returning an autoreleased value.
+11:35 To help it out, the compiler emits a special marker
+11:38 that we never use otherwise.
+11:40 It's there to tell the runtime that this is eligible for autorelease elision.
+11:45 And it's followed by the retain, that we will execute later.
+11:48 But right now, we're still in the autorelease,
+11:50 and when we do it, the runtime loads the special marker instruction, as data,
+11:54 and compares it to see if it is the special marker value it expects.
+11:59 If it is, that means the compiler told the runtime
+12:02 that we're returning a temporary that will immediately be retained.
+12:05 And this lets us elide, or remove, the matching autorelease and retain calls.
+12:09 And that's autorelease elision.
+12:12 However, this is not free either:
+12:15 loading code as data isn't something that's super common otherwise,
+12:18 so it's not optimal on the CPUs.
+12:20 We can do better.
+12:21 So let's retrace the return sequence again,
+12:24 this time using the new way.
+12:26 We started at the autorelease.
+12:28 That still goes into the Objective-C runtime.
+12:30 At this point, we actually already have valuable information: the return address.
+12:35 It tells us where we need to return to after this function completes execution.
+12:41 So we can keep track of that.
+12:42 Thankfully, getting the return address is very cheap.
+12:45 It's just a pointer, and we can store it on the side.
+12:48 We then leave the runtime autorelease call.
+12:51 We return to the caller,
+12:53 and we re-enter the runtime when doing the retain.
+12:56 And this is where the new bit of magic happens.
+12:59 At that point, we can look at where we are
+13:02 and get a pointer to our current return address.
+13:04 In the runtime, we can compare this pointer we just got
+13:07 while doing the retain with the one we saved earlier
+13:10 when we were doing the autorelease.
+13:12 And since we're just comparing two pointers,
+13:13 this is super cheap.
+13:14 We don't need to do expensive memory accesses.
+13:17 If the comparison succeeds, we know we can elide
+13:20 the autorelease/retain pair,
+13:21 and we get to improve some performance.
+13:25 And on top of that, now that we don't need to compare
+13:27 this special marker instruction as data anymore,
+13:29 we don't need it, so we can remove it.
+13:32 And that lets us save some code size as well.
+13:34 That's how we made autorelease elision faster and smaller.
+13:38 We went through several Swift and Objective-C runtime improvements.
+13:42 Let's wrap up.
+13:43 When your app is run on the new OS,
+13:45 thanks to the improvements in the runtimes,
+13:47 Swift protocol checks are more efficient.
+13:50 Every time we try to do autorelease elision, that's faster too.
+13:55 Thanks to the new compilers and linker in Xcode 14 and message send stubs,
+13:58 you can save up to 2% of code size by rebuilding your app.
+14:02 And finally, when you update your deployment target to iOS 16, tvOS 16,
+14:06 or watchOS 9, you can further save another 2%
+14:10 by making retain/release calls smaller.
+14:12 Even more, thanks to the smaller autorelease elision sequence.
+14:16 I hope you enjoyed this deep dive into the Swift and Objective-C runtimes,
+14:19 and thanks for watching.
