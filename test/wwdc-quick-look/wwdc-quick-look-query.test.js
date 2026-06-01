@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { describe, it } from 'node:test';
 
 const execFileAsync = promisify(execFile);
-const SCRIPT = path.resolve('.agents/skills/wwdc-quick-look/scripts/query.mjs');
+const SCRIPT = path.resolve('skills/wwdc-quick-look/scripts/query.mjs');
 
 const RAW_DATA = {
   events: {
@@ -87,10 +87,9 @@ async function runQuery(baseUrl, args) {
 }
 
 describe('wwdc-quick-look query script', () => {
-  it('defaults to the versionless jsDelivr URL because @main can serve stale branch cache', async () => {
+  it('defaults to the renamed GitHub repository on the main branch', async () => {
     const source = await fs.readFile(SCRIPT, 'utf8');
-    assert.match(source, /https:\/\/cdn\.jsdelivr\.net\/gh\/OneeMe\/wwdc-reports\/data/);
-    assert.doesNotMatch(source, /cdn\.jsdelivr\.net\/gh\/OneeMe\/wwdc-reports@main\/data/);
+    assert.match(source, /https:\/\/cdn\.jsdelivr\.net\/gh\/OneeMe\/wwdc-quick-look@main\/data/);
   });
 
   it('shows resources and code snippet counts in session details', async () => {

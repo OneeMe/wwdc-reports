@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { createEventConfig } from '../../src/wwdc-reports/event-config.js';
-import { fetchRawData } from '../../src/wwdc-reports/ingest.js';
+import { createEventConfig } from '../../src/wwdc-quick-look/event-config.js';
+import { fetchRawData } from '../../src/wwdc-quick-look/ingest.js';
 
 async function withMockFetchRouter(handler, fn) {
   const originalFetch = globalThis.fetch;

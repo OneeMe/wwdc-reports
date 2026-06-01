@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { sessionSupplementMetadataFromHtml } from '../../src/wwdc-reports/session-metadata.js';
+import { sessionSupplementMetadataFromHtml } from '../../src/wwdc-quick-look/session-metadata.js';
 
 const SESSION_HTML = `
 <h2>Resources</h2>

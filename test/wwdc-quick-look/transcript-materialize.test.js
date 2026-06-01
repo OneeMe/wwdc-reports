@@ -5,10 +5,10 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import rawData from '../fixtures/raw_data_minimal.json' with { type: 'json' };
-import { createEventConfig } from '../../src/wwdc-reports/event-config.js';
-import { writeJson } from '../../src/wwdc-reports/fs-utils.js';
-import { materializeIndex, materializeSessions, renderSessionMarkdown, sessionFilename } from '../../src/wwdc-reports/materialize.js';
-import { parseTranscriptText, renderTranscriptLines } from '../../src/wwdc-reports/transcript.js';
+import { createEventConfig } from '../../src/wwdc-quick-look/event-config.js';
+import { writeJson } from '../../src/wwdc-quick-look/fs-utils.js';
+import { materializeIndex, materializeSessions, renderSessionMarkdown, sessionFilename } from '../../src/wwdc-quick-look/materialize.js';
+import { parseTranscriptText, renderTranscriptLines } from '../../src/wwdc-quick-look/transcript.js';
 
 const session = rawData.videos['wwdc2026-101'];
 
@@ -50,7 +50,7 @@ describe('materialize markdown', () => {
   });
 
   it('writes session files and index in a temporary yearly workspace', async () => {
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-reports-'));
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-quick-look-'));
     const config = createEventConfig({ year: 2026, dataRoot: tmp });
     await writeJson(config.rawDataPath, rawData);
     await writeJson(path.join(config.videoJsonDir, 'wwdc2026-101.json'), session);

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { formatDuration, formatTimestamp, parseTimestamp, sanitizeFilename, sessionCodeFromId } from '../../src/wwdc-reports/format.js';
+import { formatDuration, formatTimestamp, parseTimestamp, sanitizeFilename, sessionCodeFromId } from '../../src/wwdc-quick-look/format.js';
 
 describe('format utilities', () => {
   it('sanitizes filenames without dropping unicode titles', () => {

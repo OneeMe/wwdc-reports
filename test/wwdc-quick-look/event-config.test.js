@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { createEventConfig, timestampUrl, videoUrl } from '../../src/wwdc-reports/event-config.js';
+import { createEventConfig, timestampUrl, videoUrl } from '../../src/wwdc-quick-look/event-config.js';
 
 describe('event config', () => {
   it('derives yearly defaults', () => {

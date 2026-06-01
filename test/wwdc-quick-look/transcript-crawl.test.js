@@ -5,14 +5,14 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import rawData from '../fixtures/raw_data_minimal.json' with { type: 'json' };
-import { main } from '../../src/wwdc-reports/cli.js';
-import { createEventConfig } from '../../src/wwdc-reports/event-config.js';
+import { main } from '../../src/wwdc-quick-look/cli.js';
+import { createEventConfig } from '../../src/wwdc-quick-look/event-config.js';
 import {
   crawlTranscripts,
   extractTranscriptLinesFromHtml,
   renderTranscriptText,
   videoEntriesFromRawData
-} from '../../src/wwdc-reports/transcript-crawl.js';
+} from '../../src/wwdc-quick-look/transcript-crawl.js';
 
 const TRANSCRIPT_HTML = `<!doctype html>
 <section id="transcript-content">

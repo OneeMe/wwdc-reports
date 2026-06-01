@@ -5,8 +5,8 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import rawData from '../fixtures/raw_data_minimal.json' with { type: 'json' };
-import { main, parseArgs } from '../../src/wwdc-reports/cli.js';
-import { listJsonFiles, pathExists, readJson, writeJson } from '../../src/wwdc-reports/fs-utils.js';
+import { main, parseArgs } from '../../src/wwdc-quick-look/cli.js';
+import { listJsonFiles, pathExists, readJson, writeJson } from '../../src/wwdc-quick-look/fs-utils.js';
 
 function makeIo() {
   let output = '';
@@ -64,7 +64,7 @@ describe('cli', () => {
   it('prints help', async () => {
     const io = makeIo();
     assert.equal(await main(['help'], io), 0);
-    assert.match(io.output, /No-key WWDC raw metadata and transcript archiver/);
+    assert.match(io.output, /WWDC Quick Look skill and no-key session archive/);
   });
 
   it('runs crawl as one command: fetch metadata then crawl transcripts', async () => {

@@ -8,7 +8,7 @@ import { sessionSupplementMetadataFromHtml } from './session-metadata.js';
 export async function fetchHtml(url, options = {}) {
   const response = await fetch(url, {
     headers: {
-      'user-agent': options.userAgent ?? 'wwdc-reports/0.1 no-key local pipeline',
+      'user-agent': options.userAgent ?? 'wwdc-quick-look/0.1 no-key local pipeline',
       'accept': 'text/html,application/xhtml+xml'
     }
   });

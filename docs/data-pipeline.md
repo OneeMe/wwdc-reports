@@ -7,7 +7,7 @@ The Node.js rewrite treats existing Python scripts as legacy references and defi
 Run `crawl` from the directory where you want the raw archive stored:
 
 ```sh
-node ./bin/wwdc-reports.js crawl --year 2025 --locale en
+node ./bin/wwdc-quick-look.js crawl --year 2025 --locale en
 ```
 
 This command:
@@ -27,7 +27,7 @@ This command:
 For WWDC25, this shortcut is equivalent to `crawl --year 2025 --locale en`:
 
 ```sh
-node ./bin/wwdc-reports.js wwdc25
+node ./bin/wwdc-quick-look.js wwdc25
 ```
 
 No `.env` file, API key, cookie, browser session, Selenium driver, or LLM provider is involved.
@@ -54,11 +54,11 @@ No `.env` file, API key, or LLM provider is involved.
 Example for WWDC25:
 
 ```sh
-node ./bin/wwdc-reports.js crawl --year 2025 --locale en
+node ./bin/wwdc-quick-look.js crawl --year 2025 --locale en
 
 # Or the manual equivalent:
-node ./bin/wwdc-reports.js archive --year 2025 --locale en
-node ./bin/wwdc-reports.js transcripts --year 2025 --raw-data raw_data.json
+node ./bin/wwdc-quick-look.js archive --year 2025 --locale en
+node ./bin/wwdc-quick-look.js transcripts --year 2025 --raw-data raw_data.json
 ```
 
 Existing non-empty transcript files are skipped unless `--force` is passed. Sessions whose pages have no timestamped transcript lines are reported as missing, recorded in `_manifest.json`, and do not fail the whole crawl. Use `--concurrency <n>` to tune fetch concurrency and `--limit <n>` for smoke tests.

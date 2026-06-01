@@ -4,7 +4,7 @@ import path from 'node:path';
 import { videoUrl } from './event-config.js';
 import { formatTimestamp, sessionCodeFromId } from './format.js';
 
-const DEFAULT_USER_AGENT = 'wwdc-reports/0.1 no-key transcript crawler';
+const DEFAULT_USER_AGENT = 'wwdc-quick-look/0.1 no-key transcript crawler';
 
 function decodeHtmlEntities(value) {
   return String(value ?? '')

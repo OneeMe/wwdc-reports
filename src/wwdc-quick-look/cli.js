@@ -11,23 +11,23 @@ import { crawlTranscripts } from './transcript-crawl.js';
 
 const VERSION = '0.1.0';
 
-const HELP = `wwdc-reports ${VERSION}
+const HELP = `wwdc-quick-look ${VERSION}
 
-No-key WWDC raw metadata and transcript archiver.
+WWDC Quick Look skill and no-key session archive.
 
 Usage:
-  wwdc-reports --year 2026 [--locale en]
-  wwdc-reports help
-  wwdc-reports version
-  wwdc-reports crawl --year 2026 [--locale en]
-  wwdc-reports wwdc25 [--locale en]
-  wwdc-reports archive --year 2026 [--locale en]
-  wwdc-reports transcripts --year 2026 --raw-data raw_data.json [--out-dir transcripts-en]
-  wwdc-reports init-year --year 2026
-  wwdc-reports split --year 2026 [--raw-data years/2026/raw/raw_data.json]
-  wwdc-reports topics --year 2026 [--raw-data years/2026/raw/raw_data.json]
-  wwdc-reports query-topic --year 2026 --topic Swift [--with-description]
-  wwdc-reports materialize --year 2026 [--include-transcript]
+  wwdc-quick-look --year 2026 [--locale en]
+  wwdc-quick-look help
+  wwdc-quick-look version
+  wwdc-quick-look crawl --year 2026 [--locale en]
+  wwdc-quick-look wwdc25 [--locale en]
+  wwdc-quick-look archive --year 2026 [--locale en]
+  wwdc-quick-look transcripts --year 2026 --raw-data raw_data.json [--out-dir transcripts-en]
+  wwdc-quick-look init-year --year 2026
+  wwdc-quick-look split --year 2026 [--raw-data years/2026/raw/raw_data.json]
+  wwdc-quick-look topics --year 2026 [--raw-data years/2026/raw/raw_data.json]
+  wwdc-quick-look query-topic --year 2026 --topic Swift [--with-description]
+  wwdc-quick-look materialize --year 2026 [--include-transcript]
 
 Global options:
   --project-root <path>   Project root, default: current working directory

@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import rawData from '../fixtures/raw_data_minimal.json' with { type: 'json' };
-import { splitRawData } from '../../src/wwdc-reports/split.js';
-import { findTopics, getTopicList, sessionsForTopics, topicsAndVideos } from '../../src/wwdc-reports/topics.js';
+import { splitRawData } from '../../src/wwdc-quick-look/split.js';
+import { findTopics, getTopicList, sessionsForTopics, topicsAndVideos } from '../../src/wwdc-quick-look/topics.js';
 
 describe('split raw data', () => {
   it('splits videos into per-session files and keeps other top-level keys', () => {

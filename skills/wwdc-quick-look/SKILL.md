@@ -17,7 +17,7 @@ description: |
 
 ## 数据来源
 
-所有数据来自 `https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports/data/`，
+所有数据来自 `https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/`，
 由 GitHub Actions 每日自动刷新：
 
 - `index.json` — 可用年份目录
@@ -35,31 +35,31 @@ description: |
 
 ```bash
 # 列出所有可用年份
-node .agents/skills/wwdc-quick-look/scripts/query.mjs list-years
+node skills/wwdc-quick-look/scripts/query.mjs list-years
 
 # 列出某年的所有主题分类
-node .agents/skills/wwdc-quick-look/scripts/query.mjs list-topics --year 2025
+node skills/wwdc-quick-look/scripts/query.mjs list-topics --year 2025
 
 # 列出某年的所有 session
-node .agents/skills/wwdc-quick-look/scripts/query.mjs list-sessions --year 2025
+node skills/wwdc-quick-look/scripts/query.mjs list-sessions --year 2025
 
 # 按主题过滤 session
-node .agents/skills/wwdc-quick-look/scripts/query.mjs filter-topic --year 2025 --topic "Swift"
+node skills/wwdc-quick-look/scripts/query.mjs filter-topic --year 2025 --topic "Swift"
 
 # 关键词搜索（匹配标题、描述、资源标题/URL、代码片段标题/内容）
-node .agents/skills/wwdc-quick-look/scripts/query.mjs search --year 2025 --keyword "privacy"
+node skills/wwdc-quick-look/scripts/query.mjs search --year 2025 --keyword "privacy"
 
 # 查看单个 session 详情
-node .agents/skills/wwdc-quick-look/scripts/query.mjs show-session --year 2025 --code 238
+node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2025 --code 238
 
 # 查看单个 session 的 Resources 链接
-node .agents/skills/wwdc-quick-look/scripts/query.mjs resources --year 2025 --code 238
+node skills/wwdc-quick-look/scripts/query.mjs resources --year 2025 --code 238
 
 # 查看单个 session 的 Code tab 代码片段（可加 --limit N 限制片段数）
-node .agents/skills/wwdc-quick-look/scripts/query.mjs code --year 2025 --code 238 --limit 3
+node skills/wwdc-quick-look/scripts/query.mjs code --year 2025 --code 238 --limit 3
 
 # 读取逐字稿（可加 --limit N 限制行数）
-node .agents/skills/wwdc-quick-look/scripts/query.mjs transcript --year 2025 --code 238 --limit 20
+node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2025 --code 238 --limit 20
 ```
 
 ## 交互策略

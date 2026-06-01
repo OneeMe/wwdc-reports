@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { createEventConfig } from '../../src/wwdc-reports/event-config.js';
-import { rawDataFromCollectionHtml } from '../../src/wwdc-reports/html-metadata.js';
+import { createEventConfig } from '../../src/wwdc-quick-look/event-config.js';
+import { rawDataFromCollectionHtml } from '../../src/wwdc-quick-look/html-metadata.js';
 
 const COLLECTION_HTML = `
 <a href="/videos/play/wwdc2025/238/" class="vc-card tile">
