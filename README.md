@@ -133,20 +133,20 @@ so the stable URLs are:
 
 ```text
 # Catalog of every published year (schemaVersion, sessionCount, locales, …)
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/index.json
+https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports/data/index.json
 
 # Per-year session metadata (title, description, topics, webPermalink, resources, codeSnippets, …)
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/wwdc25/raw_data.json
+https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports/data/wwdc25/raw_data.json
 
 # Transcript manifest (per-session status, line count, source URL)
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/wwdc25/transcripts-en/_manifest.json
+https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports/data/wwdc25/transcripts-en/_manifest.json
 
 # Single session transcript (timestamped lines, `MM:SS text` per line)
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/wwdc25/transcripts-en/238.txt
+https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports/data/wwdc25/transcripts-en/238.txt
 ```
 
 jsDelivr caches each path for ~12 hours by default. Pin a specific commit
-SHA instead of `@main` when you need byte-stable output for archival.
+SHA when you need byte-stable output for archival.
 
 ## Open the dataset for a new year
 

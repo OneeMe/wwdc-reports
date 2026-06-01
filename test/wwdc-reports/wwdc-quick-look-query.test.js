@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -86,6 +87,12 @@ async function runQuery(baseUrl, args) {
 }
 
 describe('wwdc-quick-look query script', () => {
+  it('defaults to the versionless jsDelivr URL because @main can serve stale branch cache', async () => {
+    const source = await fs.readFile(SCRIPT, 'utf8');
+    assert.match(source, /https:\/\/cdn\.jsdelivr\.net\/gh\/OneeMe\/wwdc-reports\/data/);
+    assert.doesNotMatch(source, /cdn\.jsdelivr\.net\/gh\/OneeMe\/wwdc-reports@main\/data/);
+  });
+
   it('shows resources and code snippet counts in session details', async () => {
     await withFixtureServer(async (baseUrl) => {
       const out = await runQuery(baseUrl, ['show-session', '--year', '2099', '--code', '101']);

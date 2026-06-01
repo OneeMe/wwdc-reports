@@ -1,6 +1,6 @@
 # WWDC Dataset Schema
 
-Published at `https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/`.
+Published at `https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports/data/`.
 
 ## index.json
 

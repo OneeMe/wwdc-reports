@@ -14,7 +14,7 @@
  *   node query.mjs transcript --year 2025 --code 238 [--limit 20]
  */
 
-const BASE = process.env.WWDC_QUICK_LOOK_BASE_URL ?? 'https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data';
+const BASE = process.env.WWDC_QUICK_LOOK_BASE_URL ?? 'https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports/data';
 
 async function fetchJson(url) {
   const r = await fetch(url);

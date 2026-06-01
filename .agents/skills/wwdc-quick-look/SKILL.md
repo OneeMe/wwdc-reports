@@ -17,7 +17,7 @@ description: |
 
 ## 数据来源
 
-所有数据来自 `https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports@main/data/`，
+所有数据来自 `https://cdn.jsdelivr.net/gh/OneeMe/wwdc-reports/data/`，
 由 GitHub Actions 每日自动刷新：
 
 - `index.json` — 可用年份目录
