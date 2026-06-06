@@ -62,7 +62,7 @@ node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2025 --code 290 
 查询脚本默认读取公开 CDN 数据：
 
 ```text
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/
 ```
 
 本地测试时可以覆盖数据源：
@@ -105,16 +105,16 @@ node scripts/build-index.mjs
 
 ```text
 # 所有已发布年份目录
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/index.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/index.json
 
 # 单年 session 元数据
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/wwdc25/raw_data.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/raw_data.json
 
 # Transcript manifest
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/wwdc25/transcripts-en/_manifest.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/_manifest.json
 
 # 单个 transcript
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/wwdc25/transcripts-en/290.txt
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/290.txt
 ```
 
 jsDelivr 会缓存路径。需要字节级稳定归档时，请使用绑定 commit 的 URL。

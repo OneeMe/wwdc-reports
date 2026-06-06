@@ -89,7 +89,7 @@ async function runQuery(baseUrl, args) {
 describe('wwdc-quick-look query script', () => {
   it('defaults to the renamed GitHub repository on the main branch', async () => {
     const source = await fs.readFile(SCRIPT, 'utf8');
-    assert.match(source, /https:\/\/cdn\.jsdelivr\.net\/gh\/OneeMe\/wwdc-quick-look@main\/data/);
+    assert.match(source, /https:\/\/cdn\.jsdelivr\.net\/gh\/SwiftGGTeam\/wwdc-quick-look@main\/data/);
   });
 
   it('shows resources and code snippet counts in session details', async () => {

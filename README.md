@@ -62,7 +62,7 @@ node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2025 --code 290 
 By default the query script reads the published CDN dataset:
 
 ```text
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/
 ```
 
 For local testing, point it at another base URL:
@@ -105,16 +105,16 @@ The combined crawl fetches public Apple Developer collection cards, enriches eac
 
 ```text
 # Catalog of every published year
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/index.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/index.json
 
 # Per-year session metadata
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/wwdc25/raw_data.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/raw_data.json
 
 # Transcript manifest
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/wwdc25/transcripts-en/_manifest.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/_manifest.json
 
 # Single transcript
-https://cdn.jsdelivr.net/gh/OneeMe/wwdc-quick-look@main/data/wwdc25/transcripts-en/290.txt
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/290.txt
 ```
 
 jsDelivr caches paths. Use a commit-pinned URL when byte-stable archival output matters.
