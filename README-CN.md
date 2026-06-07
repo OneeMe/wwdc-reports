@@ -3,10 +3,20 @@
 # WWDC Quick Look Skill
 
 [English README](README.md)
+[![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look)](https://www.skills.sh/swiftggteam/wwdc-quick-look)
+[落地页](https://wwdc-quick-look.swiftgg.team)
 
 WWDC Quick Look 是一个面向 Agent 的本地 skill，用来快速查询 Apple WWDC session 的元数据、视频逐字稿、Code tab 代码片段和 Resources 链接。
 
-这个仓库也包含支撑该 skill 的爬取脚本和发布数据。默认工作流是 local-first、no-key：从公开 Apple Developer 页面读取内容，写成结构化 JSON 和 transcript 文本，并通过 jsDelivr 提供最新归档。
+推荐通过 skills.sh 一条命令分发和安装，然后让 Agent 在遇到 WWDC 问题时直接调用 `wwdc-quick-look`。这个仓库也包含支撑该 skill 的爬取脚本和发布数据。默认工作流是 local-first、no-key：从公开 Apple Developer 页面读取内容，写成结构化 JSON 和 transcript 文本，并通过 jsDelivr 提供最新归档。
+
+## 通过 skills.sh 安装
+
+```sh
+npx skills add SwiftGGTeam/wwdc-quick-look
+```
+
+skills CLI 会自动发现本仓库中的 `skills/wwdc-quick-look/SKILL.md`，并把它安装到本机 Agent 的 skill 目录中。这是推荐的分发方式，适用于 skills.sh 支持的 Codex、Claude Code、Cursor 等 Agent 运行时。
 
 ## 这个 Skill 能做什么
 
@@ -46,9 +56,9 @@ data/
 
 `skills/` 是唯一真源。`playground` 下的两个软链接让需要 `.agents/skills` 或 `.claude/skills` 的 Agent 运行时都能加载同一份 skill。仓库根目录不再保留 `.agents/skills` 副本。
 
-## 本地使用
+## 直接运行查询脚本
 
-在仓库根目录运行：
+安装 skill 后，Agent 会按需调用这个脚本。调试或本地验证时，也可以在仓库根目录直接运行：
 
 ```sh
 node skills/wwdc-quick-look/scripts/query.mjs list-years
