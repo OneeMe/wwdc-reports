@@ -26,6 +26,39 @@ function textFromHtml(fragment) {
     .trim());
 }
 
+function textFromWebVtt(fragment) {
+  return decodeHtmlEntities(String(fragment ?? '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim());
+}
+
+function attributeValue(attributes, name) {
+  const pattern = new RegExp(`\\b${name}\\s*=\\s*(["'])(?<value>[\\s\\S]*?)\\1`, 'i');
+  return decodeHtmlEntities(String(attributes ?? '').match(pattern)?.groups?.value ?? '');
+}
+
+function hlsAttributeValue(attributeList, name) {
+  const pattern = new RegExp(`(?:^|,)${name}=((?<quoted>"(?:[^"\\\\]|\\\\.)*")|(?<bare>[^,]*))`, 'i');
+  const match = String(attributeList ?? '').match(pattern);
+  const value = match?.groups?.quoted ? match.groups.quoted.slice(1, -1).replace(/\\"/g, '"') : match?.groups?.bare;
+  return decodeHtmlEntities(value ?? '');
+}
+
+function absoluteUrl(href, baseUrl) {
+  if (!href) return '';
+  try {
+    return new URL(href, baseUrl || 'https://developer.apple.com').toString();
+  } catch {
+    return '';
+  }
+}
+
 function transcriptSection(html) {
   const start = String(html ?? '').search(/<section\b[^>]*id=["']transcript-content["'][^>]*>/i);
   if (start < 0) return '';
@@ -54,6 +87,103 @@ export function extractTranscriptLinesFromHtml(html) {
     lines.push({ seconds, timestamp: formatTimestamp(seconds), text });
   }
   return lines;
+}
+
+function parseWebVttTimestamp(value) {
+  const match = String(value ?? '').trim().match(/^(?:(?<hours>\d{1,2}):)?(?<minutes>\d{2}):(?<seconds>\d{2})(?:\.(?<millis>\d{1,3}))?$/);
+  if (!match) return Number.NaN;
+  const hours = Number(match.groups.hours ?? 0);
+  const minutes = Number(match.groups.minutes);
+  const seconds = Number(match.groups.seconds);
+  const millis = Number((match.groups.millis ?? '').padEnd(3, '0') || 0);
+  return hours * 3600 + minutes * 60 + seconds + millis / 1000;
+}
+
+export function extractTranscriptLinesFromWebVtt(vtt) {
+  const blocks = String(vtt ?? '').replace(/\r\n?/g, '\n').split(/\n{2,}/);
+  const lines = [];
+  const seen = new Set();
+
+  for (const block of blocks) {
+    const blockLines = block.split('\n').map((line) => line.trim()).filter(Boolean);
+    if (blockLines.length === 0 || /^WEBVTT\b/i.test(blockLines[0]) || /^NOTE\b/i.test(blockLines[0])) continue;
+
+    const timingIndex = blockLines.findIndex((line) => line.includes('-->'));
+    if (timingIndex < 0) continue;
+
+    const [startText] = blockLines[timingIndex].split(/\s+-->\s+/, 1);
+    const startSeconds = parseWebVttTimestamp(startText);
+    if (!Number.isFinite(startSeconds)) continue;
+
+    const seconds = Math.max(0, Math.floor(startSeconds));
+    const text = textFromWebVtt(blockLines.slice(timingIndex + 1).join('\n'));
+    if (!text) continue;
+
+    const key = `${seconds}\0${text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push({ seconds, timestamp: formatTimestamp(seconds), text });
+  }
+
+  return lines;
+}
+
+export function videoPlaylistUrlsFromHtml(html, pageUrl = 'https://developer.apple.com') {
+  const source = String(html ?? '');
+  const urls = [];
+  const seen = new Set();
+  const addUrl = (href) => {
+    const url = absoluteUrl(href, pageUrl);
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    urls.push(url);
+  };
+
+  for (const match of source.matchAll(/<meta\b(?<attributes>[^>]*\bproperty=["']og:video(?:_secure_url)?["'][^>]*)>/gi)) {
+    addUrl(attributeValue(match.groups.attributes, 'content'));
+  }
+  for (const match of source.matchAll(/<video\b(?<attributes>[^>]*)>/gi)) {
+    addUrl(attributeValue(match.groups.attributes, 'src'));
+  }
+  for (const match of source.matchAll(/https:\/\/[^"'\s<>]+\.m3u8/gi)) {
+    addUrl(match[0]);
+  }
+
+  return urls.filter((url) => /\.m3u8(?:[?#]|$)/i.test(url));
+}
+
+export function subtitlePlaylistUrlFromMasterPlaylist(masterPlaylist, masterUrl, options = {}) {
+  const locale = String(options.locale ?? 'en').toLowerCase();
+  const mediaLines = String(masterPlaylist ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^#EXT-X-MEDIA:/i.test(line) && /TYPE=SUBTITLES/i.test(line));
+
+  const subtitleTracks = mediaLines.map((line) => {
+    const attributes = line.slice(line.indexOf(':') + 1);
+    return {
+      language: hlsAttributeValue(attributes, 'LANGUAGE').toLowerCase(),
+      name: hlsAttributeValue(attributes, 'NAME'),
+      uri: hlsAttributeValue(attributes, 'URI'),
+      defaultTrack: /^YES$/i.test(hlsAttributeValue(attributes, 'DEFAULT'))
+    };
+  }).filter((track) => track.uri);
+
+  const matched = subtitleTracks.find((track) => track.language === locale)
+    ?? subtitleTracks.find((track) => track.language.split('-')[0] === locale.split('-')[0])
+    ?? subtitleTracks.find((track) => track.defaultTrack)
+    ?? subtitleTracks[0];
+
+  return matched ? absoluteUrl(matched.uri, masterUrl) : '';
+}
+
+export function mediaPlaylistSegmentUrls(mediaPlaylist, playlistUrl) {
+  return String(mediaPlaylist ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+    .map((line) => absoluteUrl(line, playlistUrl))
+    .filter(Boolean);
 }
 
 export function renderTranscriptText(lines) {
@@ -89,25 +219,87 @@ async function isNonEmptyFile(filePath) {
   }
 }
 
+async function countTextLines(filePath) {
+  const text = await fs.readFile(filePath, 'utf8');
+  return text.split('\n').filter((line) => line.trim()).length;
+}
+
 export async function fetchTranscriptHtml(url, options = {}) {
-  const response = await fetch(url, {
-    headers: {
-      'user-agent': options.userAgent ?? DEFAULT_USER_AGENT,
-      'accept': 'text/html,application/xhtml+xml'
+  const attempts = Math.max(1, Math.floor(Number(options.fetchAttempts ?? 3) || 3));
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          'user-agent': options.userAgent ?? DEFAULT_USER_AGENT,
+          'accept': options.accept ?? 'text/html,application/xhtml+xml'
+        }
+      });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      return response.text();
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
     }
-  });
-  if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
-  return response.text();
+  }
+
+  const cause = lastError?.cause?.code ?? lastError?.cause?.message ?? lastError?.message ?? 'unknown error';
+  throw new Error(`Failed to fetch ${url}: ${cause}`);
+}
+
+async function fetchText(url, options = {}) {
+  return fetchTranscriptHtml(url, options);
+}
+
+async function mapConcurrent(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+  return results;
+}
+
+async function transcriptLinesFromHls(html, pageUrl, options = {}) {
+  const playlistUrls = videoPlaylistUrlsFromHtml(html, pageUrl);
+  for (const playlistUrl of playlistUrls) {
+    const masterPlaylist = await fetchText(playlistUrl, { ...options, accept: 'application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*' });
+    const subtitlePlaylistUrl = subtitlePlaylistUrlFromMasterPlaylist(masterPlaylist, playlistUrl, { locale: options.locale });
+    if (!subtitlePlaylistUrl) continue;
+
+    const subtitlePlaylist = await fetchText(subtitlePlaylistUrl, { ...options, accept: 'application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*' });
+    const segmentUrls = mediaPlaylistSegmentUrls(subtitlePlaylist, subtitlePlaylistUrl);
+    const segmentConcurrency = Math.max(1, Math.floor(Number(options.segmentConcurrency ?? 8) || 8));
+    const segments = await mapConcurrent(segmentUrls, segmentConcurrency, (segmentUrl) => (
+      fetchText(segmentUrl, { ...options, accept: 'text/vtt,text/plain,*/*' })
+    ));
+
+    const lines = extractTranscriptLinesFromWebVtt(segments.join('\n\n'));
+    if (lines.length > 0) return lines;
+  }
+
+  return [];
 }
 
 async function crawlOneTranscript(entry, options) {
   const outputPath = path.join(options.outputDir, `${entry.sessionCode}.txt`);
   if (!options.force && await isNonEmptyFile(outputPath)) {
-    return { status: 'skipped', entry, outputPath };
+    return { status: 'skipped', entry, outputPath, lineCount: await countTextLines(outputPath) };
   }
 
   const html = await fetchTranscriptHtml(entry.url, options);
-  const lines = extractTranscriptLinesFromHtml(html);
+  let lines = extractTranscriptLinesFromHtml(html);
+  if (lines.length === 0) {
+    lines = await transcriptLinesFromHls(html, entry.url, options);
+  }
   if (lines.length === 0) return { status: 'missing', entry, outputPath, message: `No timestamped transcript lines found at ${entry.url}` };
 
   await fs.mkdir(path.dirname(outputPath), { recursive: true });

@@ -1,0 +1,255 @@
+00:08 Hello, my name is Shiyao. I'm a GPU Software Engineer.
+00:11 Today, I am pleased to guide you through an exploration of Metal tensors,
+00:16 and show you how to write optimized custom ML kernels with TensorOps.
+00:21 Apple platforms provide first-class support
+00:24 for running ML models at every layer of the software stack.
+00:28 High-level frameworks like Core AI and MLX
+00:31 make it easy to deploy your models with minimal code,
+00:35 while lower-level APIs like Metal Performance Shaders
+00:38 provide access to high-performance Metal kernels.
+00:42 These layers all build on the low-level acceleration
+00:45 provided by Metal Performance Primitives and the TensorOps library.
+00:49 There are a few reasons why you might want to work at the Metal level.
+00:53 ML research moves quickly,
+00:56 so you might want to implement custom operations
+00:58 which can plug into a higher level frameworks such as Core AI.
+01:02 You may also need to write Metal kernels if you're contributing to an ML framework
+01:07 such as MLX or llama.cpp
+01:10 or if you're working on a Metal-based application.
+01:14 The easiest way to get started is using the TensorOps library.
+01:19 TensorOps is a Metal Shading Language API
+01:22 which accelerates tensor operations on the GPU,
+01:25 including matrix multiplication and convolution.
+01:29 It automatically uses any available hardware acceleration
+01:33 across all Apple Silicon GPU generations,
+01:36 so you don't need to worry about the differences
+01:38 between hardware generations.
+01:40 In particular, it takes full advantage of the neural accelerator
+01:44 in the M5 chip family.
+01:47 The neural accelerator is a new hardware block in M5,
+01:51 located directly in each shader core.
+01:54 It sits alongside the other GPU pipelines and is designed to accelerate dense
+01:58 compute-bound work such as the prefill stage of an LLM.
+02:05 You can check out the related sessions
+02:07 to learn the basics of getting started with TensorOps.
+02:11 In this session, I'll build on those basics,
+02:14 starting with best practices for working with quantized data.
+02:18 Then, I'll show you how to build advanced custom operations
+02:22 such as FlashAttention.
+02:25 Let's dive into the first topic — working with quantized data.
+02:30 As we know, state-of-the-art machine learning models are getting larger.
+02:34 The inference stage is typically memory bandwidth bound,
+02:38 so compressing the weights becomes necessary
+02:42 both to better fit models into memory and to save memory bandwidth.
+02:47 The standard approach for compressing weights is quantization.
+02:51 The idea is simple — take higher-precision weights
+02:55 and reduce them into lower-precision data types.
+02:58 For example, 16-bit half-precision weights could be compressed down to just 4-bits.
+03:05 These quantized weights are paired with scale factors,
+03:08 which let us scale the quantized values
+03:11 back into the original range when it's time to compute.
+03:16 In addition to 16- and 32-bit floating point types,
+03:20 TensorOps now natively supports quantized data types.
+03:24 We added a support for 4- and 8-bit integer types
+03:27 in an update to macOS and iOS 26,
+03:31 and we're extending support to even more data types in macOS and iOS 27.
+03:37 This includes 4- and 8-bit floating point types
+03:40 and 2-bit integer types.
+03:42 You can simply create and pass your app's quantized tensors to TensorOps
+03:47 and it will automatically take advantage of any available hardware acceleration.
+03:53 Creating a tensor with a quantized data type
+03:56 is very similar to creating a regular tensor.
+03:59 You fill in your descriptor's properties like any other tensor,
+04:03 but simply specify a quantized dataType.
+04:06 Then create the tensor by calling newTensorWithDescriptor
+04:10 on your Metal device.
+04:14 So that's how you can store your quantized element data.
+04:18 Next, let's talk about the scale factors.
+04:21 In macOS and iOS 27,
+04:23 a single MTLTensor object can now represent your scales
+04:28 alongside your tensor's quantized data as an additional scale plane.
+04:33 This plane supports the popular FP8 E8M0 block-wise scale factor format.
+04:38 Each element of the scale plane applies to a block of elements in the data plane.
+04:44 Declaring the scale plane is similar to declaring a tensor.
+04:49 First, create a descriptor object for the scale plane.
+04:53 Then fill in the dataType and blockFactors.
+04:56 Finally, create an auxiliary plane map to specify that this plane is for scales.
+05:04 Then simply attach the auxiliary planes map to your original tensorDescriptor.
+05:09 The quantized data, scales,
+05:12 and metadata will all be packed into a single tensor object.
+05:17 Now let's put this into practice
+05:19 by extending a basic matrix multiplication kernel
+05:22 to support quantization.
+05:25 Matrix multiplication is the core operation
+05:27 in machine learning workloads.
+05:29 For instance, LLMs perform millions of matrix multiplications during inference.
+05:36 We covered the basics
+05:38 of how to write a high performance matrix multiplication kernel
+05:41 with TensorOps in the M5 machine learning talk.
+05:44 The basic approach
+05:46 is to slice the input matrices into smaller tiles,
+05:49 and then perform tile-wise matrix multiplications using TensorOps.
+05:54 This maximizes parallelism and keeps data in the cache.
+06:00 We can use quantization to further reduce memory traffic
+06:04 and fit larger models in memory.
+06:07 In the kernel, it helps to define type aliases up front
+06:10 before binding the tensors.
+06:12 Here we declare a scales factor plane with fp8_e8m0_ data type,
+06:17 and a block size of 32 by 1.
+06:20 That means every 32 elements in the data plane
+06:23 share a single element in the scales_plane.
+06:26 Then we declare a full tensor type, specifying an FP8 data type
+06:32 along with the scales_plane.
+06:34 You can simply bind these tensors to buffer binding points.
+06:38 The kernel will then have access to the tensors
+06:40 you've allocated on the host side.
+06:43 Alternatively, if you don't want to create a full MTLTensor on the host,
+06:47 you can create a temporary tensor right on the shader's stack.
+06:51 The syntax is almost identical,
+06:54 just swap the tag tensor_handle with tensor_inline.
+06:58 Then pass your buffer pointers and other metadata
+07:01 to the tensor constructor to create a tensor on the stack.
+07:06 As I mentioned earlier, we'll divide the problem
+07:08 over many threadgroups for better parallelism.
+07:12 First, we'll slice out the tile for each threadgroup
+07:15 and then perform the multiplication with TensorOps.
+07:19 To do this, simply call slice on your input and output tensors
+07:24 using the threadgroup ID.
+07:26 The data and scales plane will both be sliced simultaneously
+07:30 according to the block size.
+07:32 Setting up the matrix multiplication with quantized tensors
+07:36 is identical to normal tensors.
+07:38 First, set up the matmul2d_descriptor,
+07:41 specifying the tile sizes and other parameters.
+07:45 Then create a matmul2d op,
+07:47 specifying the number of simdgroups in the threadgroup.
+07:51 Then simply pass in your quantized tensors
+07:54 and TensorOps will handle dequantization for you.
+07:59 In most cases, you should feed your quantized data straight into TensorOps
+08:04 so that it can automatically utilize any available hardware acceleration.
+08:08 However, if you need to dequantize a custom format,
+08:12 TensorOps still have you covered.
+08:14 The simplest approach
+08:16 is to have each thread load a chunk of quantized data from device memory
+08:21 and dequantize it to f16 values in threadgroup memory.
+08:26 You can then pass it as an inline threadgroup tensor to TensorOps.
+08:30 However, this approach requires extra loads and stores
+08:34 through threadgroup memory.
+08:36 Ideally, we would keep all this data in thread registers instead.
+08:41 You can do this by dequantizing the data into a cooperative tensor,
+08:46 which can now be passed as an input to the matmul2d op.
+08:50 Cooperative tensors distribute their storage
+08:53 across the thread private memory
+08:55 of the threads participating in the matmul operation.
+08:58 So if you can't use quantized tensors directly,
+09:02 you can still skip the round trip through threadgroup memory.
+09:06 To recap — Metal tensors natively support a wide range of quantized data types,
+09:12 including the new MX scaling formats
+09:14 and E8M0 scale factors coming in iOS and macOS 27.
+09:20 Note that these new data types have additional alignment requirements
+09:24 compared to the larger data types,
+09:26 so be sure to check the Metal documentation for details.
+09:31 Now let's take it up a notch —
+09:33 building a full, more complex custom operation with TensorOps.
+09:39 Attention is at the core of every transformer network,
+09:42 including LLMs.
+09:44 To compute attention,
+09:46 you first multiply two matrices together called Q and K.
+09:51 Next, you compute SoftMax using reductions on the rows of the intermediate matrix.
+09:57 Finally, you multiply by a third matrix called V.
+10:01 The popular FlashAttention algorithm fuses all of these operations together
+10:06 into a single kernel.
+10:09 To implement this with TensorOps,
+10:12 you'll first need to set up a custom simd group mapping
+10:15 so that each simd group owns complete rows of the intermediate matrix.
+10:21 This allows you to compute the SoftMax
+10:23 without exchanging data between simd groups.
+10:27 You can do this using the execution_simdgroup operation scope.
+10:32 This means that each simd group
+10:34 will perform an independent matrix multiplication in parallel.
+10:39 You can use the simd group ID to slice your input tiles.
+10:43 We'll use a cooperative tensor to store the intermediate matrix
+10:46 so that we can use it as an input
+10:49 to the next step without writing it to the memory.
+10:52 We'll compute SoftMax on the result.
+10:56 To do this, we'll need to compute a couple of reductions
+10:59 on the cooperative tensor.
+11:00 TensorOps includes a reduce_rows function to help with this.
+11:05 Threads will exchange data amongst themselves
+11:08 to calculate the max for each row.
+11:11 The result is returned in another cooperative tensor.
+11:16 Let's set it up.
+11:18 First, create a cooperative tensor to store the reduction output.
+11:23 Then pass the source and destination to the reduce_rows function.
+11:28 Here we'll use the max reduction_operation with an initial value of negative INFINITY.
+11:36 These two cooperative tensors have different shapes,
+11:39 so to help map between them,
+11:41 TensorOps also includes a map_iterator function.
+11:45 Given an iterator pointing to an element in the 2D tensor,
+11:49 it returns an iterator pointing to the corresponding element
+11:53 in the reduction destination.
+11:55 First, set up a loop over the 2D cooperative tensor using iterators.
+12:00 Then call map_iterator to map each element to its corresponding row max.
+12:07 Finally, dereference these iterators to compute SoftMax
+12:11 and store the result back into the cooperative tensor.
+12:15 Now we're ready to multiply this cooperative tensor by V.
+12:20 In macOS 26, you would have had to first store it to threadgroup memory.
+12:25 But it's now possible to use cooperative tensors
+12:28 directly as inputs to matmul operations.
+12:33 To do this, call get_left_input_cooperative_tensor method,
+12:37 passing the source cooperative tensor as an argument.
+12:41 You can then pass the result as an input to the second matmul operation.
+12:47 One thing to watch out for:
+12:49 not every cooperative tensor can be reused as an input.
+12:53 The layouts may different depending on the data types and other factors.
+12:58 So before you do this,
+12:59 call the is_compatible_as_left or right _input method
+13:03 to check for compatibility.
+13:06 If it returns true, you're good to go.
+13:08 If not, you'll need to store and reload the data
+13:12 through threadgroup memory to convert it to the correct layout.
+13:16 Either way, the call to op.run is the same.
+13:20 Those are the key TensorOps features you'll need to build an advanced operation
+13:25 like FlashAttention using TensorOps.
+13:28 Now that we've walked through how to build this operation,
+13:31 let's see how it runs in a real model using Core AI.
+13:35 Core AI provides tools for Python developers
+13:38 to convert Pytorch models to Core AI models,
+13:41 including support for custom Metal kernels.
+13:45 Check out the "Deep Dive into Core AI Model authoring and Optimization" session
+13:49 for the details of how to integrate a Metal kernel into a Core AI model.
+13:56 I've followed the steps outlined in that session
+13:59 to integrate our custom FlashAttention kernel
+14:01 into a Sam3 image segmentation model.
+14:05 We define the body of our custom attention kernel
+14:08 as a string in Python and register the TorchMetalKernel object, shown here.
+14:14 Then, we replace the default huggingface attention implementation
+14:18 with one that calls our kernel, shown here.
+14:25 Finally, we load the model from huggingface
+14:28 and export it from PyTorch as an optimized Core AI asset.
+14:33 The export will take a moment to finish.
+14:40 Now we're ready to do inference.
+14:43 Sam3 performs promptable concept segmentation,
+14:47 so we provide the model with an image and text,
+14:50 and then it responds with a segmentation mask
+14:53 indicating where objects are located in the image.
+14:57 Here, I'm prompting the model to label all pixels
+15:00 containing a car in this image.
+15:04 Ok, now, I'll run the segmentation.
+15:11 Looking at the final result,
+15:13 we can see the model correctly segmented the image.
+15:16 The car is highlighted in blue,
+15:19 so our attention kernel is fully integrated
+15:21 into the model as expected.
+15:25 Today, I've covered all the tools you can use
+15:28 to build optimized custom ML kernels on Apple Silicon.
+15:32 From quantized data types, to advanced TensorOps features
+15:36 like cooperative tensors and reductions, to integrating with Core AI.
+15:42 To go further,
+15:43 explore the Metal Performance Primitives documentation for the full API reference,
+15:48 and the programming guide for more performance optimization guidelines.
+15:53 You can also download the TensorOps sample code
+15:56 to see the details that I couldn't cover here.
+15:58 And be sure to check out the related sessions
+16:01 to learn more about Core AI and Metal.
+16:04 Thank you!

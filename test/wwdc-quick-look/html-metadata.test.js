@@ -38,4 +38,20 @@ describe('Apple collection HTML metadata', () => {
       title: 'Accessibility & Inclusion'
     });
   });
+
+  it('keeps apostrophes inside double-quoted metadata attributes', () => {
+    const config = createEventConfig({ year: '2026' });
+    const html = `
+      <a href="/videos/play/wwdc2026/101/" class="vc-card tile">
+        <h5 class="vc-card__title">Keynote</h5>
+        <span class="vc-card__keywords hidden"
+          data-filter-description="don't miss what's new."
+          data-filter-collectionid="wwdc26"
+          data-filter-topics="Essentials"></span>
+      </a>`;
+
+    const rawData = rawDataFromCollectionHtml(html, config);
+
+    assert.equal(rawData.videos['wwdc2026-101'].description, "don't miss what's new.");
+  });
 });

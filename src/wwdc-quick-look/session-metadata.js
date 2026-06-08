@@ -29,7 +29,7 @@ function codeFromHtml(fragment) {
 }
 
 function attributeValue(attributes, name) {
-  const pattern = new RegExp(`\\b${name}=["'](?<value>[\\s\\S]*?)["']`, 'i');
+  const pattern = new RegExp(`\\b${name}\\s*=\\s*(["'])(?<value>[\\s\\S]*?)\\1`, 'i');
   return decodeHtmlEntities(String(attributes ?? '').match(pattern)?.groups?.value ?? '');
 }
 

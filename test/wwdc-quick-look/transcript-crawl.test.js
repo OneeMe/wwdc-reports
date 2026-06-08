@@ -10,7 +10,11 @@ import { createEventConfig } from '../../src/wwdc-quick-look/event-config.js';
 import {
   crawlTranscripts,
   extractTranscriptLinesFromHtml,
+  extractTranscriptLinesFromWebVtt,
+  mediaPlaylistSegmentUrls,
   renderTranscriptText,
+  subtitlePlaylistUrlFromMasterPlaylist,
+  videoPlaylistUrlsFromHtml,
   videoEntriesFromRawData
 } from '../../src/wwdc-quick-look/transcript-crawl.js';
 
@@ -50,12 +54,71 @@ async function withMockHtmlFetch(html, fn) {
   }
 }
 
+async function withMockFetchRouter(handler, fn) {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return handler(String(url), options);
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 describe('transcript crawler', () => {
   it('extracts timestamped transcript lines from Apple video HTML', () => {
     assert.deepEqual(extractTranscriptLinesFromHtml(TRANSCRIPT_HTML), [
       { seconds: 7, timestamp: '00:07', text: 'Hello & welcome,' },
       { seconds: 9, timestamp: '00:09', text: 'to WWDC.' }
     ]);
+  });
+
+  it('extracts timestamped transcript lines from WebVTT', () => {
+    const vtt = `WEBVTT
+
+00:00:56.524 --> 00:01:00.320
+The primitives that we're introducing
+are designed to be flexible,
+
+00:01:00.345 --> 00:01:04.399
+ensuring it's possible to build today's
+abstractions, and tomorrow's.
+`;
+
+    assert.deepEqual(extractTranscriptLinesFromWebVtt(vtt), [
+      { seconds: 56, timestamp: '00:56', text: "The primitives that we're introducing are designed to be flexible," },
+      { seconds: 60, timestamp: '01:00', text: "ensuring it's possible to build today's abstractions, and tomorrow's." }
+    ]);
+  });
+
+  it('finds English WebVTT segment URLs from HLS playlists', () => {
+    const pageHtml = '<video src="https://example.com/videos/wwdc/2026/242/cmaf.m3u8"></video>';
+    const master = `#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="zh",NAME="简体中文",DEFAULT=NO,URI="subtitles/zh/prog_index.m3u8",FORCED=NO
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="en",NAME="English",DEFAULT=YES,URI="subtitles/en/prog_index.m3u8",FORCED=NO`;
+    const media = `#EXTM3U
+#EXTINF:6.0
+sequence_0.webvtt
+#EXTINF:6.0
+sequence_1.webvtt`;
+
+    assert.deepEqual(videoPlaylistUrlsFromHtml(pageHtml, 'https://developer.apple.com/videos/play/wwdc2026/242/'), [
+      'https://example.com/videos/wwdc/2026/242/cmaf.m3u8'
+    ]);
+    assert.equal(
+      subtitlePlaylistUrlFromMasterPlaylist(master, 'https://example.com/videos/wwdc/2026/242/cmaf.m3u8', { locale: 'en' }),
+      'https://example.com/videos/wwdc/2026/242/subtitles/en/prog_index.m3u8'
+    );
+    assert.deepEqual(
+      mediaPlaylistSegmentUrls(media, 'https://example.com/videos/wwdc/2026/242/subtitles/en/prog_index.m3u8'),
+      [
+        'https://example.com/videos/wwdc/2026/242/subtitles/en/sequence_0.webvtt',
+        'https://example.com/videos/wwdc/2026/242/subtitles/en/sequence_1.webvtt'
+      ]
+    );
   });
 
   it('renders transcript text in the local raw format', () => {
@@ -120,6 +183,44 @@ describe('transcript crawler', () => {
       assert.equal(manifest.sessions[0].sessionCode, '101');
       assert.equal(manifest.sessions[0].status, 'written');
       assert.equal(manifest.sessions[0].file, '101.txt');
+    });
+  });
+
+  it('falls back to HLS WebVTT subtitles when static transcript HTML is empty', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'wwdc-transcripts-'));
+    const config = createEventConfig({ year: '2026' });
+    const pageHtml = `<!doctype html>
+      <video src="https://example.com/videos/wwdc/2026/101/cmaf.m3u8"></video>
+      <section id="transcript-content"></section>`;
+    const master = '#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="en",NAME="English",DEFAULT=YES,URI="subtitles/en/prog_index.m3u8",FORCED=NO';
+    const media = '#EXTM3U\n#EXTINF:6.0\nsequence_0.webvtt\n#EXTINF:6.0\nsequence_1.webvtt\n#EXT-X-ENDLIST';
+    const firstSegment = 'WEBVTT\n\n00:00:01.500 --> 00:00:03.000\nWelcome to WWDC.\n';
+    const secondSegment = "WEBVTT\n\n00:00:06.000 --> 00:00:08.000\nLet's begin.\n";
+
+    await withMockFetchRouter(async (url) => {
+      if (url === 'https://developer.apple.com/videos/play/wwdc2026/101/') {
+        return { ok: true, status: 200, statusText: 'OK', text: async () => pageHtml };
+      }
+      if (url === 'https://example.com/videos/wwdc/2026/101/cmaf.m3u8') {
+        return { ok: true, status: 200, statusText: 'OK', text: async () => master };
+      }
+      if (url === 'https://example.com/videos/wwdc/2026/101/subtitles/en/prog_index.m3u8') {
+        return { ok: true, status: 200, statusText: 'OK', text: async () => media };
+      }
+      if (url === 'https://example.com/videos/wwdc/2026/101/subtitles/en/sequence_0.webvtt') {
+        return { ok: true, status: 200, statusText: 'OK', text: async () => firstSegment };
+      }
+      if (url === 'https://example.com/videos/wwdc/2026/101/subtitles/en/sequence_1.webvtt') {
+        return { ok: true, status: 200, statusText: 'OK', text: async () => secondSegment };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }, async (calls) => {
+      const result = await crawlTranscripts(rawData, config, { outputDir: tmp, limit: 1 });
+      assert.equal(result.written, 1);
+      assert.equal(result.missing, 0);
+      assert.equal(result.failed, 0);
+      assert.equal(calls.length, 5);
+      assert.equal(await fs.readFile(path.join(tmp, '101.txt'), 'utf8'), "00:01 Welcome to WWDC.\n00:06 Let's begin.\n");
     });
   });
 
