@@ -1,10 +1,14 @@
+import dns from 'node:dns/promises';
 import fs from 'node:fs/promises';
+import https from 'node:https';
 import path from 'node:path';
 
 import { videoUrl } from './event-config.js';
 import { formatTimestamp, sessionCodeFromId } from './format.js';
 
 const DEFAULT_USER_AGENT = 'wwdc-quick-look/0.1 no-key transcript crawler';
+const DOH_FALLBACK_HOSTS = new Set(['events-delivery.apple.com']);
+const dohAddressCache = new Map();
 
 function decodeHtmlEntities(value) {
   return String(value ?? '')
@@ -224,17 +228,116 @@ async function countTextLines(filePath) {
   return text.split('\n').filter((line) => line.trim()).length;
 }
 
+function headersForFetch(options = {}) {
+  return {
+    'user-agent': options.userAgent ?? DEFAULT_USER_AGENT,
+    'accept': options.accept ?? 'text/html,application/xhtml+xml'
+  };
+}
+
+function isReservedResolverAddress(address) {
+  return /^198\.18\./.test(String(address ?? '')) || /^198\.19\./.test(String(address ?? ''));
+}
+
+async function shouldUseDohFallback(url) {
+  let hostname;
+  try {
+    hostname = new URL(url).hostname;
+  } catch {
+    return false;
+  }
+  if (!DOH_FALLBACK_HOSTS.has(hostname)) return false;
+
+  try {
+    const resolved = await dns.lookup(hostname, { family: 4 });
+    return isReservedResolverAddress(resolved.address);
+  } catch {
+    return true;
+  }
+}
+
+async function resolveHostWithDoh(hostname) {
+  if (dohAddressCache.has(hostname)) return dohAddressCache.get(hostname);
+
+  const response = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(hostname)}&type=A`, {
+    headers: { 'accept': 'application/dns-json' }
+  });
+  if (!response.ok) throw new Error(`DoH lookup failed for ${hostname}: ${response.status} ${response.statusText}`);
+
+  const payload = await response.json();
+  const addresses = (payload.Answer ?? [])
+    .filter((answer) => answer.type === 1 && /^\d+\.\d+\.\d+\.\d+$/.test(answer.data))
+    .map((answer) => answer.data)
+    .filter((address) => !isReservedResolverAddress(address));
+
+  if (addresses.length === 0) throw new Error(`DoH lookup found no usable A records for ${hostname}`);
+  dohAddressCache.set(hostname, addresses);
+  return addresses;
+}
+
+function httpsGetTextWithAddress(url, headers, address) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(url, {
+      headers,
+      lookup: (hostname, options, callback) => {
+        if (options?.all) callback(null, [{ address, family: 4 }]);
+        else callback(null, address, 4);
+      },
+      timeout: 30000
+    }, (response) => {
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        response.resume();
+        const redirected = absoluteUrl(response.headers.location, url);
+        httpsGetTextWithAddress(redirected, headers, address).then(resolve, reject);
+        return;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        response.resume();
+        reject(new Error(`${response.statusCode} ${response.statusMessage}`));
+        return;
+      }
+
+      response.setEncoding('utf8');
+      let text = '';
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => resolve(text));
+    });
+
+    request.on('timeout', () => request.destroy(new Error(`Timed out fetching ${url}`)));
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+async function fetchTextWithDohFallback(url, headers) {
+  const hostname = new URL(url).hostname;
+  const addresses = await resolveHostWithDoh(hostname);
+  const failures = [];
+
+  for (const address of addresses) {
+    try {
+      return await httpsGetTextWithAddress(url, headers, address);
+    } catch (error) {
+      failures.push(`${address}: ${error.message}`);
+    }
+  }
+
+  throw new Error(`DoH fallback failed for ${url}: ${failures.join('; ')}`);
+}
+
 export async function fetchTranscriptHtml(url, options = {}) {
   const attempts = Math.max(1, Math.floor(Number(options.fetchAttempts ?? 3) || 3));
+  const headers = headersForFetch(options);
   let lastError;
+
+  if (await shouldUseDohFallback(url)) {
+    return fetchTextWithDohFallback(url, headers);
+  }
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       const response = await fetch(url, {
-        headers: {
-          'user-agent': options.userAgent ?? DEFAULT_USER_AGENT,
-          'accept': options.accept ?? 'text/html,application/xhtml+xml'
-        }
+        headers
       });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
       return response.text();
@@ -245,6 +348,9 @@ export async function fetchTranscriptHtml(url, options = {}) {
   }
 
   const cause = lastError?.cause?.code ?? lastError?.cause?.message ?? lastError?.message ?? 'unknown error';
+  if (DOH_FALLBACK_HOSTS.has(new URL(url).hostname)) {
+    return fetchTextWithDohFallback(url, headers);
+  }
   throw new Error(`Failed to fetch ${url}: ${cause}`);
 }
 
