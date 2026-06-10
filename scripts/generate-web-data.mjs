@@ -35,6 +35,10 @@ const TOPIC_COLORS = {
   'default': ['#3B82F6', '#1E40AF'],
 };
 
+function isAslSession(title) {
+  return /\(ASL\)\s*$/i.test(title ?? '');
+}
+
 const years = ['2020', '2021', '2022', '2023', '2024', '2025', '2026'];
 const allSessions = [];
 const allTopics = {};
@@ -61,6 +65,8 @@ for (const year of years) {
 
   yearCounts[year] = 0;
   for (const video of videos) {
+    if (isAslSession(video.title)) continue;
+
     // Compact format: [contentId, title, description, primaryTopic, topics, permalink, resources, snippets]
     allSessions.push([
       year,

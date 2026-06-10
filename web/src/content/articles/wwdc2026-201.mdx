@@ -8,48 +8,197 @@ videoUrl: "https://developer.apple.com/videos/play/wwdc2026/201/"
 sessionId: "wwdc2026-201"
 year: "2026"
 relatedSessions:
-  - title: "Best practices for integrating visual intelligence in your app"
-    code: "297"
-    description: "gain insight on how visual intelligence can transform content discovery in your "
-  - title: "Build intelligent Siri experiences with App Schemas"
-    code: "240"
-    description: "bring your app's content and actions to siri with app intents. model your data u"
-  - title: "Code-along: Build powerful drag and drop in SwiftUI"
-    code: "271"
-    description: "follow along as we build a game of solitaire to explore the latest drag-and-drop"
+  - title: "What's new in managing Apple devices"
+    code: "206"
+    description: "declarative device management and enterprise features"
+  - title: "What's new in Wallet"
+    code: "209"
+    description: "new pass styles and developer tools"
+  - title: "Build agentic app experiences with the Foundation Models framework"
+    code: "242"
+    description: "dynamic profiles and multimodal input"
   - title: "Code-along: Make your app available to Siri"
     code: "344"
-    description: "dive deep into an xcode project showing how you can make your app available to s"
----
-
-# Secure your apps with App Attest
-
+    description: "dive deep into app intents implementation"
 ---
 
 ## Highlight
 
-> 深入了解 Secure your apps with App Attest 的技术细节和最佳实践。
+> App Attest 利用 Secure Enclave 生成硬件绑定的加密密钥，让你的服务器能验证"这个请求确实来自未被篡改的官方 App，且运行在真实的 Apple 硬件上"。今年 macOS 27 终于补齐支持，加上 iOS 27 新增的 Fraud Metric 和 Launch Validation Category，让反作弊和防刷有了更完整的工具链。
 
 ---
 
 ## 核心内容
 
-以前做防刷和防篡改，大家各显神通，搞设备指纹、越狱检测，结果往往是和黑客玩猫鼠游戏，道高一尺魔高一丈。App Attest 就是 Apple 给的官方“良民证”，利用 Secure Enclave（安全隔区）生成无法导出的密钥，向服务器证明“这个请求确实来自未被篡改的官方 App，且运行在真实的 Apple 硬件上”。这次 macOS 27 终于补齐了这块拼图，让 Mac 端的高价值业务（比如金融、游戏反作弊）也能用上这套机制。
+### 1. 这场演讲解决什么问题
 
-对后端和风控同学影响最大。客户端只要按文档调几个 API 把 Attestation（证明）和 Assertion（断言）传上去就行，但服务端需要解析 CBOR 格式、验证证书链、校验 counter（计数器），还要把新加的 Fraud Metric 接入风控引擎。如果你们的服务端还没搞定 WebAuthn 标准的解析，现在得赶紧拉后端兄弟一起看文档了。
+你的 App 发布到 App Store 后，面临的威胁不只是网络层的攻击：
 
+- **篡改 App**：攻击者反编译你的 App，修改代码后重新签名，制造一个"看起来一样但行为不同"的版本
+- **伪造请求**：修改后的 App 向你的服务器发送看似合法的请求，比如自动答题、刷游戏分数、绕过付费检查
+- **注入作弊菜单**：在游戏里注入外挂菜单，修改内存数据后提交虚假成绩
 
-### 最佳实践
+传统的防护手段（设备指纹、越狱检测）往往是和黑客玩猫鼠游戏。App Attest 是 Apple 提供的**基于硬件信任的官方解决方案**。
 
-老项目接入 App Attest 最大的阻力往往在服务端。建议先别急着在客户端全量推开，先让后端把 WebAuthn 标准的 CBOR 解析和证书链验证写好，搭个 Mock 环境。客户端可以先在测试环境跑通，把 Attestation 和 Assertion 的 Base64 字符串抓出来给后端验。
+---
 
-对于新项目，把 `DCAppAttestService.shared.isSupported` 作为风控的一道门槛。如果一台声称是 iPhone 15 的设备返回 `false`，直接标记为高危。遇到不支持的设备或验证失败，不要直接弹 Alert 阻断用户，而是采用“降级服务”（比如限制提现额度、隐藏敏感数据），这样既能防黑产，又不会因为 Apple 服务器偶尔抽风而误伤正常用户。
+### 2. App Attest 的核心机制
+
+App Attest 通过三个步骤建立信任链：
+
+#### 2.1 生成密钥（Key Generation）
+
+App 调用 App Attest 服务生成一个**绑定到 Secure Enclave 的密钥对**。私钥永远不会离开设备，也无法被导出或备份。
+
+```swift
+import DeviceCheck
+
+let keyID = try await DCAppAttestService.shared.generateKey()
+```
+
+关键点：
+
+- 密钥通过 Secure Enclave 生成，硬件级别保护
+- 每个 App 实例的密钥唯一，重装 App 后会重新生成
+- 密钥与设备的 Apple ID 和 App 的 Team ID 绑定
+
+#### 2.2 证明（Attestation）
+
+生成密钥后，App 需要向 Apple 服务器请求一个**证明（Attestation）**。这个证明包含：
+
+- 密钥的公钥
+- App 的 bundle ID 和 Team ID
+- 设备的硬件信息
+- Apple 的数字签名
+
+```swift
+import DeviceCheck
+
+let keyId: String = ...
+let clientDataHash: Data = ...
+let attestation = try await DCAppAttestService.shared.attestKey(
+    keyId: keyId, 
+    clientDataHash: clientDataHash
+)
+```
+
+你的服务器收到 Attestation 后，需要：
+
+1. 验证 Apple 的签名
+2. 检查 bundle ID 和 Team ID 是否匹配
+3. 提取公钥并保存，用于后续验证 Assertion
+
+#### 2.3 断言（Assertion）
+
+每次 App 向服务器发送敏感请求时，用私钥对请求内容生成一个**断言（Assertion）**。服务器用之前保存的公钥验证这个断言，确保请求确实来自合法的 App 实例。
+
+```swift
+import DeviceCheck
+
+let keyId: String = ...
+let clientDataHash: Data = ...
+let assertion = try await DCAppAttestService.shared.generateAssertion(
+    keyId: keyId, 
+    clientDataHash: clientDataHash
+)
+```
+
+---
+
+### 3. iOS 27 / macOS 27 的新增能力
+
+#### 3.1 macOS 27 支持
+
+**最大的变化：macOS 27 终于支持 App Attest 了。**
+
+之前 Mac 端的 App（特别是金融、游戏、企业应用）缺少官方的防篡改机制，只能依赖第三方方案。现在 Mac App 可以和 iOS App 使用同一套 API 和验证流程。
+
+```swift
+// 检查平台支持
+if DCAppAttestService.shared.isSupported {
+    // 使用 App Attest
+} else {
+    // 记录为潜在风险信号
+    logRiskSignal(.appAttestUnsupported)
+}
+```
+
+#### 3.2 Launch Validation Category
+
+iOS 27 新增了 **Launch Validation Category**，让服务器知道 App 是通过什么渠道启动的：
+
+- App Store 正式版
+- TestFlight 测试版
+- 开发者本地构建
+- 企业分发
+
+如果你的服务器收到一个声称是 App Store 版本的请求，但 Launch Validation Category 显示是 TestFlight，这就是一个**明确的篡改信号**。
+
+#### 3.3 Fraud Metric
+
+Fraud Metric 是今年的重要新增功能。Apple 会基于全局数据给每个 Attestation 分配一个**风险评分**，帮助你的服务器判断：
+
+- 这个设备是否参与了已知的欺诈活动
+- 这个 Apple ID 是否有异常行为
+- 这个 App 实例是否被多次重新安装（可能是刷机设备）
+
+Fraud Metric 不是简单的"是/否"判断，而是一个连续的风险分数，可以集成到你现有的风控系统中。
+
+---
+
+### 4. 服务端验证流程
+
+App Attest 的核心安全保证在服务端。你的服务器需要：
+
+1. **解析 CBOR 格式**：Attestation 和 Assertion 使用 CBOR（Concise Binary Object Representation）编码
+2. **验证证书链**：从 Apple 的根证书开始，逐级验证中间证书和叶子证书
+3. **检查 Counter**：Assertion 包含一个递增的计数器，重放攻击会被检测
+4. **校验 clientDataHash**：确保请求内容没有被中间人篡改
+5. **集成 Fraud Metric**：将 Apple 提供的风险分数接入你的风控引擎
+
+```swift
+// 服务端验证伪代码
+func verifyAssertion(assertion: Data, keyId: String, clientData: Data) throws {
+    // 1. 解析 CBOR
+    let parsed = try CBOR.decode(assertion)
+    
+    // 2. 验证签名
+    let publicKey = try getPublicKey(for: keyId)
+    guard try publicKey.verify(signature: parsed.signature, data: parsed.authenticatorData) else {
+        throw VerificationError.invalidSignature
+    }
+    
+    // 3. 检查 counter 是否递增
+    let storedCounter = try getCounter(for: keyId)
+    guard parsed.counter > storedCounter else {
+        throw VerificationError.possibleReplayAttack
+    }
+    
+    // 4. 验证 clientDataHash
+    guard parsed.clientDataHash == SHA256.hash(clientData) else {
+        throw VerificationError.clientDataMismatch
+    }
+    
+    // 5. 更新 counter
+    try updateCounter(parsed.counter, for: keyId)
+}
+```
+
+---
+
+## 最佳实践
+
+- **渐进式接入**：不要一次性在所有 API 上启用 App Attest。建议先在最关键的接口（如支付、提交分数、敏感数据访问）上试点。
+- **服务端优先**：App Attest 的安全保证主要来自服务端验证。在客户端调用 API 之前，确保后端团队已经实现了完整的验证逻辑。
+- **Fraud Metric 集成**：不要把 Fraud Metric 当作唯一判断标准。把它作为一个信号输入你的综合风控系统，结合设备指纹、行为分析等多维度数据做决策。
+- **优雅降级**：当 App Attest 不可用时（比如旧系统、企业环境限制），不要直接阻断用户。可以限制功能权限（如禁止提现、隐藏敏感数据），而不是完全拒绝服务。
+- **macOS 适配**：如果你的 App 同时有 iOS 和 macOS 版本，现在可以统一使用 App Attest。注意 macOS 上 `isSupported` 的行为可能与 iOS 略有不同，需要单独测试。
 
 ---
 
 ## 相关 Session
 
-- [Best practices for integrating visual intelligence in your app](/articles?year=2026&topic=all&search=297) — gain insight on how visual intelligence can transform content discovery in your 
-- [Build intelligent Siri experiences with App Schemas](/articles?year=2026&topic=all&search=240) — bring your app's content and actions to siri with app intents. model your data u
-- [Code-along: Build powerful drag and drop in SwiftUI](/articles?year=2026&topic=all&search=271) — follow along as we build a game of solitaire to explore the latest drag-and-drop
-- [Code-along: Make your app available to Siri](/articles?year=2026&topic=all&search=344) — dive deep into an xcode project showing how you can make your app available to s
+- [What's new in managing Apple devices](/articles/wwdc2026-206) — 企业设备管理中的安全策略
+- [What's new in Wallet](/articles/wwdc2026-209) — Pass 的安全和验证机制
+- [Build agentic app experiences with the Foundation Models framework](/articles/wwdc2026-242) — AI 功能的安全考虑
+- [Code-along: Make your app available to Siri](/articles/wwdc2026-344) — App Intents 和安全上下文

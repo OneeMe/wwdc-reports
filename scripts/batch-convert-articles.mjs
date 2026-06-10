@@ -32,12 +32,16 @@ function getSessionData(year, id) {
   return data.videos[`wwdc${year}-${id}`] || null;
 }
 
+function isAslSession(title) {
+  return /\(ASL\)\s*$/i.test(title ?? '');
+}
+
 function getRelatedSessions(year, topicId, excludeId) {
   const dataPath = path.join(DATA_DIR, `wwdc${year.slice(2)}`, 'raw_data.json');
   if (!fs.existsSync(dataPath)) return [];
   const data = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
   return Object.values(data.videos)
-    .filter(v => v.primaryTopicID === topicId && v.eventContentId !== excludeId)
+    .filter(v => v.primaryTopicID === topicId && v.eventContentId !== excludeId && !isAslSession(v.title))
     .slice(0, 4)
     .map(v => ({
       title: v.title,
@@ -103,10 +107,6 @@ relatedSessions:
 ${relatedYaml}
 ---
 
-# ${title}
-
----
-
 ## Highlight
 
 > ${highlight}
@@ -121,7 +121,7 @@ ${coreContent}
 
 ## 相关 Session
 
-${related.length > 0 ? related.map(r => `- [${r.title}](/articles?year=${year}&topic=all&search=${r.code}) — ${r.description}`).join('\n') : '- 暂无相关 Session'}
+${related.length > 0 ? related.map(r => `- [${r.title}](/articles/wwdc${year}-${r.code}) — ${r.description}`).join('\n') : '- 暂无相关 Session'}
 `;
 
   return mdx;

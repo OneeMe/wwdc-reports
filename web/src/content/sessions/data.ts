@@ -36,19 +36,28 @@ export interface SessionData {
 
 const DATA = sessionsJson as unknown as SessionData;
 
+function isAslSession(title: string): boolean {
+  return /\(ASL\)\s*$/i.test(title);
+}
+
 export const years = DATA.y;
-export const yearCounts = DATA.c;
 export const topics = DATA.t;
-export const sessions: Session[] = DATA.s.map((s) => ({
-  year: s[0],
-  contentId: s[1],
-  title: s[2],
-  description: s[3],
-  primaryTopic: s[4],
-  permalink: s[5],
-  resources: s[6],
-  codeSnippets: s[7],
-}));
+export const sessions: Session[] = DATA.s
+  .map((s) => ({
+    year: s[0],
+    contentId: s[1],
+    title: s[2],
+    description: s[3],
+    primaryTopic: s[4],
+    permalink: s[5],
+    resources: s[6],
+    codeSnippets: s[7],
+  }))
+  .filter((s) => !isAslSession(s.title));
+
+export const yearCounts: Record<string, number> = Object.fromEntries(
+  years.map((year) => [year, sessions.filter((s) => s.year === year).length]),
+);
 export const thumbnailUuids = DATA.u;
 
 const topicColorMap: Record<string, [string, string]> = {};
