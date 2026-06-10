@@ -1,0 +1,68 @@
+import sessionsJson from "./sessions.json";
+
+export interface Session {
+  year: string;
+  contentId: string;
+  title: string;
+  description: string;
+  primaryTopic: string;
+  permalink: string;
+  resources: number;
+  codeSnippets: number;
+}
+
+export interface Topic {
+  id: string;
+  title: string;
+  color: [string, string];
+}
+
+export interface SessionData {
+  y: string[];
+  c: Record<string, number>;
+  t: Topic[];
+  s: Array<[
+    string, // year
+    string, // contentId
+    string, // title
+    string, // description
+    string, // primaryTopic
+    string, // permalink
+    number, // resources
+    number  // codeSnippets
+  ]>;
+  u: Record<string, string>;
+}
+
+const DATA = sessionsJson as unknown as SessionData;
+
+export const years = DATA.y;
+export const yearCounts = DATA.c;
+export const topics = DATA.t;
+export const sessions: Session[] = DATA.s.map((s) => ({
+  year: s[0],
+  contentId: s[1],
+  title: s[2],
+  description: s[3],
+  primaryTopic: s[4],
+  permalink: s[5],
+  resources: s[6],
+  codeSnippets: s[7],
+}));
+export const thumbnailUuids = DATA.u;
+
+const topicColorMap: Record<string, [string, string]> = {};
+topics.forEach((t) => {
+  topicColorMap[t.id] = t.color;
+});
+
+export function getGradient(topicId: string): string {
+  const c = topicColorMap[topicId] || ["#667eea", "#764ba2"];
+  return `linear-gradient(135deg, ${c[0]} 0%, ${c[1]} 100%)`;
+}
+
+export function getThumbnailUrl(session: Session): string | null {
+  const uuid = thumbnailUuids[session.year];
+  if (!uuid) return null;
+  return `https://devimages-cdn.apple.com/wwdc-services/images/${uuid}/${session.contentId}/${session.contentId}_wide_900x506_2x.jpg`;
+}
