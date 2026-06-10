@@ -14,30 +14,22 @@ npm run preview  # 本地预览构建结果
 
 ## 部署
 
-推送至 `main` 分支且变更涉及 `web/**` 路径时，GitHub Actions 会自动构建并部署到 Cloudflare Pages。
+本站点通过 **Cloudflare Pages Git 集成** 自动部署。
 
-也可手动触发：在 GitHub 仓库 → Actions → "Deploy Web to Cloudflare Pages" → Run workflow。
+### 配置方式
 
-### 必需的 Secrets
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com) → **Workers & Pages** → **Create application** → **Pages** → **Connect to Git**
+2. 授权 Cloudflare 访问 `SwiftGGTeam/wwdc-quick-look` 仓库
+3. 构建配置：
+   - **Project name**: `wwdc-quick-look`
+   - **Production branch**: `main`
+   - **Build command**: `cd web && npm run build`
+   - **Build output directory**: `web/dist`
+4. 保存并部署
 
-在仓库 Settings → Secrets and variables → Actions 中配置：
+### 自动触发
 
-| Secret | 说明 |
-|--------|------|
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API Token（需包含 `Cloudflare Pages:Edit` 权限） |
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID |
-
-获取方式：
-- **API Token**: Cloudflare Dashboard → My Profile → API Tokens → Create Token → 使用 "Custom token" 模板，权限添加 `Zone:Read` 和 `Cloudflare Pages:Edit`
-- **Account ID**: Cloudflare Dashboard 右侧边栏可见
-
-### 首次创建 Pages 项目
-
-若 Cloudflare Pages 上尚未创建 `wwdc-quick-look` 项目，可通过 Wrangler CLI 创建：
-
-```bash
-npx wrangler pages project create wwdc-quick-look --production-branch=main
-```
+推送至 `main` 分支且变更涉及 `web/**` 路径时，Cloudflare 会自动构建并部署。无需配置 GitHub Actions 或 Secrets。
 
 ## 项目结构
 
