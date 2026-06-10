@@ -1,43 +1,55 @@
-# Astro Starter Kit: Minimal
+# :globe_with_meridians: wwdc-quick-look Web
 
-```sh
-npm create astro@latest -- --template minimal
+Astro 构建的 wwdc-quick-look 静态站点，部署在 Cloudflare Pages。
+
+## 开发
+
+```bash
+cd web
+npm install
+npm run dev      # localhost:4321
+npm run build    # 输出到 web/dist/
+npm run preview  # 本地预览构建结果
 ```
 
-> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
+## 部署
 
-## 🚀 Project Structure
+推送至 `main` 分支且变更涉及 `web/**` 路径时，GitHub Actions 会自动构建并部署到 Cloudflare Pages。
 
-Inside of your Astro project, you'll see the following folders and files:
+也可手动触发：在 GitHub 仓库 → Actions → "Deploy Web to Cloudflare Pages" → Run workflow。
 
-```text
-/
-├── public/
+### 必需的 Secrets
+
+在仓库 Settings → Secrets and variables → Actions 中配置：
+
+| Secret | 说明 |
+|--------|------|
+| `CLOUDFLARE_API_TOKEN` | Cloudflare API Token（需包含 `Cloudflare Pages:Edit` 权限） |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID |
+
+获取方式：
+- **API Token**: Cloudflare Dashboard → My Profile → API Tokens → Create Token → 使用 "Custom token" 模板，权限添加 `Zone:Read` 和 `Cloudflare Pages:Edit`
+- **Account ID**: Cloudflare Dashboard 右侧边栏可见
+
+### 首次创建 Pages 项目
+
+若 Cloudflare Pages 上尚未创建 `wwdc-quick-look` 项目，可通过 Wrangler CLI 创建：
+
+```bash
+npx wrangler pages project create wwdc-quick-look --production-branch=main
+```
+
+## 项目结构
+
+```
+web/
+├── public/          # 静态资源（favicon、图片等）
 ├── src/
-│   └── pages/
-│       └── index.astro
+│   ├── components/  # Astro 组件
+│   ├── layouts/     # 页面布局
+│   ├── pages/       # 路由页面
+│   ├── content/     # MDX 文章集合
+│   └── i18n/        # 文案配置
+├── astro.config.mjs # Astro 配置
 └── package.json
 ```
-
-Astro looks for `.astro` or `.md` files in the `src/pages/` directory. Each page is exposed as a route based on its file name.
-
-There's nothing special about `src/components/`, but that's where we like to put any Astro/React/Vue/Svelte/Preact components.
-
-Any static assets, like images, can be placed in the `public/` directory.
-
-## 🧞 Commands
-
-All commands are run from the root of the project, from a terminal:
-
-| Command                   | Action                                           |
-| :------------------------ | :----------------------------------------------- |
-| `npm install`             | Installs dependencies                            |
-| `npm run dev`             | Starts local dev server at `localhost:4321`      |
-| `npm run build`           | Build your production site to `./dist/`          |
-| `npm run preview`         | Preview your build locally, before deploying     |
-| `npm run astro ...`       | Run CLI commands like `astro add`, `astro check` |
-| `npm run astro -- --help` | Get help using the Astro CLI                     |
-
-## 👀 Want to learn more?
-
-Feel free to check [our documentation](https://docs.astro.build) or jump into our [Discord server](https://astro.build/chat).

@@ -24,7 +24,7 @@ const articles = defineCollection({
         code: z.string(),
         description: z.string(),
       })
-    ),
+    ).optional().default([]),
   }),
 });
 
