@@ -30,22 +30,24 @@ node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2026 --code {COD
 
 ## 输出格式
 
-写入文件：`/Users/onee/Code/onee-workspace/projects/learning/wwdc/src/content/wwdc2026/{CODE}.md`
+写入文件：`/Users/onee/Code/onee-workspace/projects/personal/wwdc-quick-look/web/src/content/articles/wwdc2026-{CODE}.mdx`
 
 文件内容格式如下：
 
-```md
+```mdx
 ---
-id: "{CODE}"
 title: "Session 英文标题"
-titleZh: "Session 英文标题（或适当中文翻译）"
-track: "主题分类"
-level: "intermediate"
-duration: 0
+description: "session 原始描述（从元数据中获取）"
 date: "2026-06-10"
+tags: ["主题1", "主题2"]
 thumbnail: "/images/sessions/2026/{CODE}.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2026/{CODE}/"
-tags: ["主题1", "主题2"]
+sessionId: "wwdc2026-{CODE}"
+year: "2026"
+relatedSessions:
+  - title: "相关 session 标题"
+    code: "xxx"
+    description: "描述"
 ---
 
 ## Highlight

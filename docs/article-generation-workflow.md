@@ -35,7 +35,7 @@ node skills/wwdc-quick-look/scripts/query.mjs list-sessions --year 2026
 # 1. 读取 prompt 模板
 # 2. 运行 query.mjs 获取元数据、代码片段、resources、transcript
 # 3. 按模板生成文章
-# 4. 写入 projects/learning/wwdc/src/content/wwdc2026/{code}.md
+# 4. 写入 web/src/content/articles/wwdc{YYYY}-{code}.mdx
 ```
 
 参数：
@@ -43,12 +43,31 @@ node skills/wwdc-quick-look/scripts/query.mjs list-sessions --year 2026
 - `--code {code}`: Session 编号
 - `--limit 50`: Transcript 预览行数（超过则取完整版）
 
+**输出路径**：`web/src/content/articles/wwdc{YYYY}-{code}.mdx`
+
+frontmatter 格式：
+```yaml
+---
+title: "Session 英文标题"
+description: "session 原始描述"
+date: "2026-06-10"
+tags: ["主题1", "主题2"]
+thumbnail: "/images/sessions/2026/{code}.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/{code}/"
+sessionId: "wwdc2026-{code}"
+year: "2026"
+relatedSessions:
+  - title: "相关 session 标题"
+    code: "xxx"
+    description: "描述"
+---
+```
+
 ### 4. 格式检查
 
 ```bash
 cd /Users/onee/Code/onee-workspace/projects/personal/wwdc-quick-look
-node scripts/check-article-format.mjs \
-  /Users/onee/Code/onee-workspace/projects/learning/wwdc/src/content/wwdc2026
+node scripts/check-article-format.mjs web/src/content/articles/
 ```
 
 检查项：
@@ -65,8 +84,7 @@ node scripts/check-article-format.mjs \
 
 ```bash
 # 修复 AI 风格短语和 Highlight 格式
-node scripts/fix-article-format.mjs \
-  /Users/onee/Code/onee-workspace/projects/learning/wwdc/src/content/wwdc2026
+node scripts/fix-article-format.mjs web/src/content/articles/
 ```
 
 ### 6. 人工修复剩余问题
@@ -80,6 +98,20 @@ node scripts/fix-article-format.mjs \
 
 重复步骤 4，直到通过率为 100%。
 
+## 从其他位置迁移
+
+如果文章已生成在其他位置（如 `learning/wwdc`），可用迁移脚本转换格式：
+
+```bash
+node scripts/migrate-articles.mjs
+```
+
+该脚本会：
+1. 从指定 git commit 提取文章
+2. 转换 frontmatter 为目标格式
+3. 解析正文中的"## 关联 Session"为 YAML relatedSessions
+4. 写入 `web/src/content/articles/wwdc{YYYY}-{code}.mdx`
+
 ## 特殊 Session 处理
 
 | 类型 | 示例 | 处理方式 |
@@ -89,13 +121,14 @@ node scripts/fix-article-format.mjs \
 | Recap | 122 | 浓缩版，简要列出要点 |
 | Design | 250, 251 | 无代码，聚焦设计原则 |
 | Business | 391, 379 | 无代码，聚焦商业策略 |
-| Group Lab | 8001+ | 无需生成 |
+| Graphics/Games | 280, 356 | 无代码，聚焦工具/流程 |
+| Group Lab | 8001+ | 无需生成，直接删除 |
 
 ## 输出目录
 
 ```
-projects/learning/wwdc/src/content/wwdc2026/
-├── {code}.md      # 文章文件
+web/src/content/articles/
+├── wwdc2026-{code}.mdx   # 文章文件
 └── ...
 ```
 
@@ -105,3 +138,4 @@ projects/learning/wwdc/src/content/wwdc2026/
 - `scripts/article-writer-prompt.md` — 文章写作规范
 - `scripts/check-article-format.mjs` — 格式检查脚本
 - `scripts/fix-article-format.mjs` — 自动修复脚本
+- `scripts/migrate-articles.mjs` — 格式迁移脚本

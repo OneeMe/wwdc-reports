@@ -41,14 +41,18 @@ function checkFile(filePath) {
   const lines = content.split("\n");
 
   // 判断 session 类型
+  const basename = filePath.split("/").pop().replace(".mdx", "").replace(".md", "");
+  const sessionCode = basename.match(/\d+$/)?.[0] || "";
   const isASL = content.includes('title:') && content.match(/title:\s*".*ASL.*"/);
-  const isRecap = content.includes("recapOf:");
-  const isKeynote = filePath.includes("/101.md") || filePath.includes("/121.md");
+  const isRecap = content.includes("recapOf:") || content.includes('title:') && content.match(/title:\s*".*Recap.*"/i);
+  const isGroupLab = parseInt(sessionCode) >= 8000;
+  const isGetReady = content.includes('"Get ready') || content.includes('"Get Ready');
   const isDesign = content.includes('"Design"') || content.includes('"Design');
   const isBusiness = content.includes('"Business');
-  const isEssentials = content.includes('"Essentials"');
   const isGraphics = content.includes('Graphics');
-  const isNoCodeSession = isASL || isRecap || isKeynote || isDesign || isBusiness || isEssentials || isGraphics;
+  const isKeynote = content.includes('"Keynote"') || (content.includes('title:') && content.match(/title:\s*".*Keynote.*"/));
+  const isSpecialNoCode = ["121", "280"].includes(sessionCode);
+  const isNoCodeSession = isASL || isRecap || isGroupLab || isGetReady || isDesign || isBusiness || isGraphics || isKeynote || isSpecialNoCode;
 
   // 1. 检查 frontmatter
   if (!content.startsWith("---")) {
