@@ -30,43 +30,121 @@ relatedSessions:
 
 ## 核心内容
 
-Health 应用从 iOS 15 开始支持药物追踪，但第三方 app 一直无法读取这些数据。现在 Medications API 打开了这扇门。
+用户在 Health 应用里记录药物已经四年了。每天定时吃药、漏服、补录、归档——这些数据一直锁在 Health 里。第三方健康 app 想做"用药与症状关联"、"长期依从性图表"、"副作用提醒"这类体验，只能让用户重新输入一遍，体验割裂。
 
-两个核心对象：
-
-**HKUserAnnotatedMedication**：用户添加到 Health 的药物，包含：
-- `isArchived`：是否已归档（不再使用）
-- `hasSchedule`：是否设置了提醒计划
-- `nickname`：用户自定义昵称
-- `medicationConcept`：药物概念，包含唯一标识符、名称、剂型（胶囊/片剂/液体）、相关临床编码（如 RxNorm）
-
-**HKMedicationDoseEvent**：用药记录，是一种新的 HKSample，包含：
-- 用药状态（taken、skipped、snoozed、未交互）
-- 剂量数量（scheduled vs actual 的差异）
-- 与药物概念的关联（通过 medicationConceptIdentifier）
-- 计划时间和实际时间
-
-查询方式：
-- `HKUserAnnotatedMedicationQueryDescriptor` 查询药物列表，支持 `isArchived` 和 `hasSchedule` 谓词
-- 剂量事件是 HKSample，可以用 Sample Query、Anchored Object Query、Observer Query
-- **授权机制特殊**：用户授权某个药物后，你的 app 自动获得该药物和其所有剂量事件的读取权限
-
-Demo app 展示了完整流程：查询授权药物 -> 显示今日最近一次用药 -> 用 RxNorm 编码关联副作用 -> 用 emoji 表示症状强度 -> 用 Anchored Object Query 做图表实时更新。
-
-
-### 最佳实践
-
-- **用 per-object authorization API 请求药物授权**，不要用 sample type 方式。用 `HKUserAnnotatedMedicationType` 作为 object type。
-- **锚定 Object Query 做图表数据**。剂量事件是流式更新的，用锚定查询能高效获取增量变化，避免重复处理。
-- **处理剂量事件的非线性特性**。事件可能是补录的、被删除的、snooz 的。用 anchored query 的 deleted objects 清理数据模型。
-- **用 RxNorm 做标准化关联**。不同设备上药物名称可能不同，但 RxNorm 编码是稳定的跨设备标识符。
-- **用户新增药物时，Health 应用会自动处理授权 UI**，你的 app 只需要在下次查询时发现新数据就行。
+iOS 26 把这扇门打开了。HealthKit 新增了一组 Medications API，分布在 iOS、iPadOS 和 visionOS 上（[00:17](https://developer.apple.com/videos/play/wwdc2025/321/?time=17)）。第三方 app 可以读取用户在 Health 中添加的药物清单和每一次用药记录，配合 RxNorm 等临床编码系统去关联症状、副作用、医学概念。授权方式也做得更顺：用户在 Health 应用里新增一种药物时，系统会直接弹出"是否分享给已授权的 app"的开关，不需要应用再次请求权限（[22:46](https://developer.apple.com/videos/play/wwdc2025/321/?time=1366)）。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — building on background assets, this session will introduce the new capability to
-- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — with writing tools, people can proofread, rewrite, and transform text directly w
-- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — discover the latest updates for the app store server api, app store server notif
-- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — discover how permissionkit helps you enhance communication safety for children i
+### 两个核心数据对象
+
+新 API 围绕两个对象展开（[02:16](https://developer.apple.com/videos/play/wwdc2025/321/?time=136)）：
+
+- `HKUserAnnotatedMedication`：用户加进 Health 的具体药物，包含 `isArchived`（是否归档/不再服用）、`hasSchedule`（是否设置了提醒计划）、`nickname`（用户昵称，比如把 Amoxicillin 叫做 "Antibiotics"）、以及一个对 `HKMedicationConcept` 的引用（[02:59](https://developer.apple.com/videos/play/wwdc2025/321/?time=179)）。
+- `HKMedicationDoseEvent`：是一种新的 `HKSample`，代表"一次本应或实际发生的用药"。包含 log status（taken / skipped / snoozed / 未交互）、scheduled date 和 scheduled quantity、actual dose quantity，以及一个 medication concept identifier 把它和具体药物挂钩（[04:32](https://developer.apple.com/videos/play/wwdc2025/321/?time=272)）。
+
+`HKMedicationConcept` 自己不是处方记录，是"概念意义上的药物"——一个跨设备稳定的 identifier、一个 display text（如 "Amoxicillin Trihydrate 500mg Oral Tablet"）、一个 general form（capsule / tablet / liquid）、以及一组 related codings（例如 RxNorm code 308192）（[03:38](https://developer.apple.com/videos/play/wwdc2025/321/?time=218)）。
+
+### 申请授权：药物用 per-object 授权，剂量自动跟随
+
+药物是 object 而不是 sample，所以授权走 per-object 那条路，object type 用新的 `HKUserAnnotatedMedicationType`（[10:18](https://developer.apple.com/videos/play/wwdc2025/321/?time=618)）：
+
+```swift
+HealthDataAccessRequest(
+    store: healthStore,
+    objectType: HKUserAnnotatedMedicationType(),
+    trigger: $triggerAuthorization
+) { result in
+    // 处理授权结果
+}
+```
+
+关键点：
+
+- `objectType` 用 `HKUserAnnotatedMedicationType()`，告诉系统按 object 级别授权，弹出的是逐条药物的勾选界面，用户可以单独决定每一种药物是否分享给当前 app。
+- `trigger` 是一个 SwiftUI state binding，置为 `true` 时弹出授权 sheet。
+- 用户授权某个药物后，**不需要单独申请该药物的剂量事件读取权限**，dose events 自动跟随被授权（[11:10](https://developer.apple.com/videos/play/wwdc2025/321/?time=670)）。
+
+如果还要读"症状"这种 sample type（headache、nausea），用一份单独的请求，传入 sample type 列表即可（[11:23](https://developer.apple.com/videos/play/wwdc2025/321/?time=683)）。
+
+### 查询药物清单：新的 query descriptor
+
+```swift
+let descriptor = HKUserAnnotatedMedicationQueryDescriptor()
+let medications = try await descriptor.result(for: healthStore)
+```
+
+关键点：
+
+- `HKUserAnnotatedMedicationQueryDescriptor` 是新引入的描述器，专门取药物列表（[02:39](https://developer.apple.com/videos/play/wwdc2025/321/?time=159)）。
+- 不传 predicate、不传 limit 时，会同时返回 active 和 archived 两类药物（[12:32](https://developer.apple.com/videos/play/wwdc2025/321/?time=752)）。
+- 支持的 predicate 包括 `isArchived` 和 `hasSchedule` 两种新谓词（[08:07](https://developer.apple.com/videos/play/wwdc2025/321/?time=487)）。
+- App 只看得到用户授权过的那些 medication，未授权的不会出现在结果里。
+
+### 查询剂量事件：复用 HKSample 的查询体系
+
+剂量事件是 `HKSample` 的新子类型，所以可以用 sample query、anchored object query、observer query 三种现有 query 直接查（[08:29](https://developer.apple.com/videos/play/wwdc2025/321/?time=509)）。Demo 里查"今日已服用的最近一次剂量"时用了 sample query descriptor，传入复合 predicate（按 medication concept、按今天日期、按 log status = taken 过滤），并配置 sort + limit = 1（[13:22](https://developer.apple.com/videos/play/wwdc2025/321/?time=802)）。
+
+### 图表场景：用 anchored object query 实时跟随
+
+要做"用药趋势图"这种持续刷新的视图，就用 anchored object query。Eric 提醒了几个坑（[18:21](https://developer.apple.com/videos/play/wwdc2025/321/?time=1101)）：
+
+- 剂量事件可以补录到过去某天；
+- 编辑一次会先删除旧 sample 再写入新的；
+- 用户没交互的提醒也会留下记录。
+
+处理 result 时必须先消费 deleted objects，再处理 added samples，否则数据模型会出现幻影点。Anchored query 的 swift async 接口会持续 yield 新批次，做实时图表非常合适（[19:57](https://developer.apple.com/videos/play/wwdc2025/321/?time=1197)）。
+
+### 用 RxNorm 把药物连到症状
+
+`HKMedicationConcept.relatedCodings` 里是一组 clinical coding（system + code），其中 RxNorm 系统的 URL 是 `http://www.nlm.nih.gov/research/umls/rxnorm`（[15:55](https://developer.apple.com/videos/play/wwdc2025/321/?time=955)）。Demo 里 Srishti 自己整理了一份"RxNorm code → 副作用症状列表"的静态字典，用药物的 RxNorm code 反查应该展示哪些症状选项，再用 emoji 让用户记录症状强度，最后保存为 HealthKit 的 category sample（[16:18](https://developer.apple.com/videos/play/wwdc2025/321/?time=978)）。
+
+### 新增药物的"零摩擦授权"
+
+App 已经申请过药物授权后，用户在 Health 里再加一种新药时，Health 应用会在保存前直接展示"分享给 XX app"的开关，开发者无需重复请求授权（[22:46](https://developer.apple.com/videos/play/wwdc2025/321/?time=1366)）。App 下次查询时自然能看到新药物。
+
+---
+
+## 核心启发
+
+**1. 把 Health 应用当成药物数据源，不再做重复输入**
+
+为什么值得做：很多健康类 app 之前要求用户重新录入一次药物，体验割裂、依从性低。现在直接读 Health，user 在哪里加的药就在哪里加，第三方只负责增值体验。
+
+怎么开始：在 onboarding 里加一个"从 Health 导入药物"的入口，调用 `HealthDataAccessRequest` + `HKUserAnnotatedMedicationType()` 让用户勾选愿意分享的药物。
+
+**2. 用 RxNorm 把药物关联到副作用知识库**
+
+为什么值得做：药物名在不同设备、不同语言下文本可能漂移，但 RxNorm code 是稳定的全球标识符。一旦你的副作用、相互作用、教育内容索引建立在 RxNorm 上，就能跨用户、跨地区复用。
+
+怎么开始：从 `HKMedicationConcept.relatedCodings` 里筛出 system 为 RxNorm URL（`http://www.nlm.nih.gov/research/umls/rxnorm`）的 code，建立一张"RxNorm code → 副作用列表"的查找表，对照 HealthKit 已有的 category type（headache、nausea 等）让用户记录强度。
+
+**3. 用 anchored object query 做"依从性"图表**
+
+为什么值得做：剂量事件是流式更新的，旧数据会被改，过去日期会被补录。anchored query 提供了"增量 + 删除列表"的双轨更新，是图表场景的最佳匹配，比 observer + sample query 那套更高效（[19:50](https://developer.apple.com/videos/play/wwdc2025/321/?time=1190)）。
+
+怎么开始：在 chart view 上启动一个 swift async 的 anchored query，第一次 anchor 传 nil，后续 yield 来的每一批 result 先 apply deletes 再 apply additions，更新图表数据源。
+
+**4. 为 skipped / snoozed 设计独立视图**
+
+为什么值得做：log status 不止 taken 一种。把 skipped 当成"提醒未起效"、把 snoozed 当成"该重新设计提醒频率"的信号，可以做出比 Health 自带 UI 更深的洞察。
+
+怎么开始：用 dose event 的 log status predicate 拉过去 30 天的非 taken 记录，按 medication 聚合，向用户展示"漏服热点时段"。
+
+**5. 把"新增药物自动授权"做成一句产品话术**
+
+为什么值得做：用户最怕在多个 app 之间反复授权。Health 已经把首次授权后的新药分享内置成一个开关，把这个机制写到 onboarding 的 promise 里——"以后在 Health 加新药，记得勾选分享给我"——能让留存更稳。
+
+怎么开始：在首次授权完成的成功页加一段说明文案，并在 app 主屏的查询路径上保证"新药自动出现"，避免本地缓存挡住新数据。
+
+---
+
+## 关联 Session
+
+- [Get started with HealthKit on visionOS](/articles/wwdc2025-308) — 把 HealthKit 体验扩展到 Apple Vision Pro 的入门指引。
+- [Meet workouts on iOS](/articles/wwdc2025-302) — Eric 在结尾推荐的姊妹 session，讲 iOS 上的 workouts 新能力。
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — 另一种 per-object 风格的授权流程示例。
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — 服务端 API 演进的另一面参考。
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — 为健康数据这类需要后台同步的场景做铺垫。

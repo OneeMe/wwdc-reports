@@ -30,28 +30,161 @@ relatedSessions:
 
 ## 核心内容
 
-三个部分：核心框架增强、签名请求、新的 SwiftUI 商店视图。
+订阅类 App 经常碰到一个尴尬：用户在 iPad 上买过应用，又在 Mac 上下载，开发者很难判断这两次安装属于同一个 Apple Account；用户取消订阅后想做挽回，又不知道用户当初到底是付费应用买入的，还是免费下载后再订阅的。这些信息缺一块，业务策略就只能靠猜。
 
-核心框架方面，AppTransaction、Transaction、RenewalInfo 三个关键类型都新增了 `appTransactionID`（全局唯一应用下载标识，回溯到 iOS 15）、`originalPlatform`（用户最初下载应用的平台）等字段。Transaction 新增了 `offer` 中的 Offer Period 和 `advancedCommerceInfo`。`Transaction.currentEntitlements(productID:)` API 替代了废弃的单值版本，现在返回一个异步序列。Offer code 扩展到消耗品、非消耗品和非续期订阅，新增 `oneTime` 支付模式。
-
-签名请求方面，新增了 `introductoryOfferEligibility` 和 `promotionalOffer` 两个 purchase option，都需要 JWS 格式的签名。Session 演示了用 App Store Server Library 在服务器端生成签名的完整流程。
-
-新的 `SubscriptionOfferView` 是 StoreKit 视图家族的最新成员，支持按订阅关系（upgrade/downgrade/crossgrade/current/all）自动选择展示的套餐。
-
-
-### 最佳实践
-
-建议尽早迁移到 StoreKit 2。新功能（如 offer code 扩展、新字段、签名请求）都只在 StoreKit 2 中可用。如果还在用 StoreKit 1，现在是迁移的最佳时机。
-
-优先使用 `Transaction.currentEntitlements(for:)` 替代旧的单值 API。一个产品可能有多个有效 transaction（比如用户同时拥有订阅和通过 Family Sharing 获得的访问权），新 API 能正确返回所有匹配结果。
-
-避免在签名请求中省略 Transaction ID 字段。虽然它是可选的，但包含它可以让 App Store 更好地验证购买请求的合法性。
+WWDC25 的 StoreKit 更新围绕这条主线展开。`AppTransaction`、`Transaction`、`RenewalInfo` 三个核心类型补齐了 `appTransactionID`、`originalPlatform`、`appAccountToken` 等字段；offer code 从订阅扩展到了消耗品和非续订订阅；签名请求改用 JWS 格式，App Store Server Library 把签名流程压缩成几行代码；`SubscriptionOfferView` 这个新的 SwiftUI 视图能直接根据用户当前订阅状态选展示哪一档套餐。整套更新的目标只有一个：让开发者拿到足够准确的用户身份和购买状态，再把营销决策交回给 App。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Automate your development process with the App Store Connect API](/articles/wwdc2025-324) — learn how the new webhook api can provide you with real-time notifications from 
-- [Optimize your monetization with App Analytics](/articles/wwdc2025-252) — explore the new monetization, subscription, and offer analytics coming to app an
-- [What’s new in AdAttributionKit](/articles/wwdc2025-221) — learn about new features in adattributionkit, including how to measure overlappi
-- [What’s new in App Store Connect](/articles/wwdc2025-328) — get the latest updates for app store connect, including the new web ui for build
+### AppTransaction 与 Transaction 的新字段
+
+`AppTransaction` 描述用户最初下载这个 App 的那次交易。iOS 18.4 起新增两个字段（[01:42](https://developer.apple.com/videos/play/wwdc2025/241/?time=102)）：
+
+- `appTransactionID`：每个下载过 App 的 Apple Account 都有一个全局唯一值，回溯部署到 iOS 15。Family Sharing 场景下，每个家庭成员各自独立。
+- `originalPlatform`：类型为新的 `AppStore.Platform`，取值 `iOS / macOS / tvOS / visionOS`。watchOS 上下载的会被标记为 `iOS`。
+
+获取方式：
+
+```swift
+let result = try await AppTransaction.shared
+guard case .verified(let appTransaction) = result else { return }
+
+let downloadID = appTransaction.appTransactionID
+let platform = appTransaction.originalPlatform
+```
+
+关键点：
+
+- `AppTransaction.shared` 返回的是 `VerificationResult`，StoreKit 已自动校验过 JSON web signature，开发者只需要解出 `.verified` 分支。
+- `appTransactionID` 让你不必再发服务器到服务器请求，就能把同一用户的多个 `originalTransactionID` 关联起来（[02:00](https://developer.apple.com/videos/play/wwdc2025/241/?time=120)）。
+- `originalPlatform` 适合从「付费应用」转「免费 + 内购」时给老用户授权，避免新模式下白送。
+
+### currentEntitlements API 升级
+
+iOS 18.4 起，旧的 `Transaction.currentEntitlement(for:)`（单数）废弃，改用 `Transaction.currentEntitlements(for:)`（复数）：
+
+```swift
+for await result in Transaction.currentEntitlements(for: "com.app.pro") {
+    guard case .verified(let transaction) = result else { continue }
+    unlock(productID: transaction.productID)
+}
+```
+
+关键点：
+
+- 返回的是 `AsyncSequence<VerificationResult<Transaction>>`，可以异步迭代多条记录。
+- 一个产品可能对应多笔有效 transaction，例如用户自己订阅了，又通过 Family Sharing 拿到了访问权（[03:58](https://developer.apple.com/videos/play/wwdc2025/241/?time=238)）。旧 API 只能给一个，会丢信息。
+- 仍然返回 `VerificationResult`，需要走 `.verified` 分支。
+
+### 签名请求与 App Store Server Library
+
+iOS 18.4 引入两个需要 JWS 签名的 purchase option：`introductoryOfferEligibility` 和 `promotionalOffer`，回溯到 iOS 15（[10:29](https://developer.apple.com/videos/play/wwdc2025/241/?time=629)）。客户端通过新的 SwiftUI view modifier 调用：
+
+```swift
+SubscriptionStoreView(productIDs: ["pro.monthly"])
+    .subscriptionPromotionalOffer { product in
+        longestFreeTrialOffer(for: product)
+    } compactJWS: { product, offer in
+        try await NetworkLayer.signPromotionalOffer(
+            productID: product.id,
+            offerID: offer.id
+        )
+    }
+```
+
+关键点：
+
+- 第一个闭包决定要给当前商品挑哪一个促销 offer。
+- 第二个闭包返回一个 compact JWS 字符串，由你自己的服务器签发；不应在客户端持有签名密钥。
+- App Store 校验 JWS 后才放行购买，这是「这次促销由开发者授权」的证据。
+
+服务端用 App Store Server Library（Swift / Java / Python / Node.js 四种语言）签名：
+
+```swift
+import AppStoreServerLibrary
+
+let creator = try PromotionOfferV2SignatureCreator(
+    bundleID: "com.example.SKDemo",
+    signingKey: signingKey,
+    keyID: keyID,
+    issuerID: issuerID
+)
+
+let jws = try creator.createSignature(
+    productID: productID,
+    offerID: offerID,
+    transactionID: appTransactionID
+)
+```
+
+关键点：
+
+- `bundleID`、`signingKey`、`keyID`、`issuerID` 在 App Store Connect 的 Users & Access → Integrations → In-App Purchases 拿（[11:35](https://developer.apple.com/videos/play/wwdc2025/241/?time=695)）。
+- `transactionID` 字段虽然可选，建议传：可以是 `appTransactionID`，也可以是该用户任意一笔 `Transaction` 的 ID（[13:31](https://developer.apple.com/videos/play/wwdc2025/241/?time=811)）。带上能让 App Store 更精确地核验购买归属。
+
+### SubscriptionOfferView 与订阅关系
+
+新的 `SubscriptionOfferView` 用一行声明即可橱窗化某档订阅，并能根据用户当前订阅自动挑套餐：
+
+```swift
+SubscriptionOfferView(
+    groupID: "21181796",
+    visibleRelationship: .upgrade
+) {
+    Image("PlaceholderIcon")
+}
+.subscriptionOfferViewDetailAction {
+    showFullStore = true
+}
+```
+
+关键点：
+
+- `visibleRelationship` 取值 `upgrade / downgrade / crossgrade / current / all`（[17:23](https://developer.apple.com/videos/play/wwdc2025/241/?time=1043)）。`upgrade` 展示比当前档高一级的方案，`crossgrade` 在同档里挑性价比最高的，`current` 用于配合 offer 做挽留。
+- `subscriptionOfferViewDetailAction` 会在视图上画一个 detailLink 按钮，点击后跳转到 App 自己的订阅商店。
+- 配合 iOS 17 的 `subscriptionStatusTask` 拿到 `SubscriptionStatus`，把它翻译成 App 内部的 `SKDemoPlusStatus` 这类模型，再通过 environment 注入到下游 view，决定展示哪一档（[16:08](https://developer.apple.com/videos/play/wwdc2025/241/?time=968)）。
+
+### Offer code 扩展与购买 UI 上下文
+
+Offer code 现在覆盖消耗品、非消耗品、非续订订阅，回溯到 iOS 16.3（[07:54](https://developer.apple.com/videos/play/wwdc2025/241/?time=474)）。`Transaction.Offer.PaymentMode` 新增 `oneTime` 模式，回溯到 iOS 17.2；更老的系统通过 `offerPaymentModeStringRepresentation` 字符串字段读取，回溯到 iOS 15。
+
+从 iOS 18.2 起，UIKit / AppKit 的 `purchase` 方法要求传入 UI context：iOS / macCatalyst / tvOS / visionOS 传 `UIViewController`，macOS 传 `NSWindow`，watchOS 不传（[09:29](https://developer.apple.com/videos/play/wwdc2025/241/?time=569)）。SwiftUI 里读 `purchase` environment 拿到 `PurchaseAction`，直接 `callAsFunction` 即可，StoreKit views 则完全不用管。
+
+---
+
+## 核心启发
+
+**1. 用 `appTransactionID` 重建用户唯一标识**
+
+为什么值得做：过去把用户的多笔订单关联起来需要服务器到服务器调 App Store Server API。`appTransactionID` 在客户端就能拿，回溯到 iOS 15，Family Sharing 也能区分成员。
+
+怎么开始：在 App 启动时调一次 `AppTransaction.shared`，把 `appTransactionID` 作为本地用户身份的一部分缓存；登录后用它和服务器账号绑定，避免一个 Apple Account 在多端被识别成多个用户。
+
+**2. 把 `originalPlatform` 写进授权逻辑**
+
+为什么值得做：从付费应用切到内购模式时，老用户最容易流失。`originalPlatform` 能区分用户最初是从 iOS / macOS / tvOS / visionOS 哪个平台买入的，方便给老用户开白名单。
+
+怎么开始：上线新计费模式前，先记录每个 `appTransactionID` 对应的 `originalPlatform` 和 `originalPurchaseDate`，给「在某日期前已下载」的用户保留旧权益。
+
+**3. 用 `SubscriptionOfferView` + `visibleRelationship` 替代手写套餐墙**
+
+为什么值得做：根据用户当前订阅档位动态展示「升级 / 降级 / 同档替换」是高频需求。自己写要查 `SubscriptionStatus`、对比 group 内各档价格、处理 offer 资格，代码量不小。
+
+怎么开始：先在 `App` 的 `subscriptionStatusTask` 把状态归一化成自家枚举（如 `none / standard / pro`），通过 environment 下发；在挽留位用 `.current` + `subscriptionPromotionalOffer`，在升级位用 `.upgrade`。
+
+**4. 用 App Store Server Library 替代手写 JWS**
+
+为什么值得做：promotional offer 和 introductory offer 的签名一旦写错，购买会直接失败。Apple 官方库覆盖 Swift / Java / Python / Node.js，签名逻辑由 Apple 维护。
+
+怎么开始：在签名服务端引入 App Store Server Library，封装一个 `/sign-promotional-offer` 路由，参数是 `productID`、`offerID`、`transactionID`；客户端在 `subscriptionPromotionalOffer` modifier 的第二个闭包里 GET 这个路由。
+
+---
+
+## 关联 Session
+
+- [Automate your development process with the App Store Connect API](/articles/wwdc2025-324) — App Store Connect 新增 webhook，可以实时收到构建、审核、订阅状态变化。
+- [Optimize your monetization with App Analytics](/articles/wwdc2025-252) — App Analytics 新增订阅与 offer 维度，配合本场更新一起看变现效果。
+- [What’s new in AdAttributionKit](/articles/wwdc2025-221) — AdAttributionKit 新功能，覆盖跨广告网络的归因测量。
+- [What’s new in App Store Connect](/articles/wwdc2025-328) — 新版 Web UI 与 offer code 的配置入口都在这里。

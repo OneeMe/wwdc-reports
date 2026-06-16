@@ -8,51 +8,224 @@ videoUrl: "https://developer.apple.com/videos/play/wwdc2025/254/"
 sessionId: "wwdc2025-254"
 year: "2025"
 relatedSessions:
-  - title: "Bring your SceneKit project to RealityKit"
-    code: "288"
-    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
-  - title: "Combine Metal 4 machine learning and graphics"
-    code: "262"
-    description: "learn how to seamlessly combine machine learning into your graphics applications"
   - title: "Discover Metal 4"
     code: "205"
     description: "learn how to get started leveraging the powerful new features of metal 4 in your"
-  - title: "Engage players with the Apple Games app"
-    code: "215"
-    description: "meet the games app – a new destination for players to keep up with what"
+  - title: "Go further with Metal 4 games"
+    code: "258"
+    description: "learn about advanced metal 4 features for high-end games"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
 ---
 
 ## Highlight
 
 > 这是 Metal 4 四部曲的第二集，由 GPU Driver Engineers Jason 和 Yang 主讲，聚焦游戏引擎优化的三个维度：编码效率、资源管理、管线加载。
 
----
-
 ## 核心内容
 
-这是 Metal 4 四部曲的第二集，由 GPU Driver Engineers Jason 和 Yang 主讲，聚焦游戏引擎优化的三个维度：编码效率、资源管理、管线加载。
+游戏引擎卡在哪里？一个典型的现代 3A 游戏，每帧要发出成千上万次 draw call、kernel dispatch 和 blit。每次切换 fragment shader 输出的 attachment 布局，引擎就得开一个新的 render encoder；每次用到 buffer 数据依赖于上一步 blit，就得插一道同步；几千个 pipeline state 在加载阶段串行编译，玩家盯着 loading 界面等。Ubisoft 的《刺客信条：影》在 Apple Silicon 上跑 GB 级几何与贴图，shader 数以千计——这种规模下，编码热路径每多一次冗余开销都会被放大成可见的卡顿。
 
-编码层面，Metal 4 把最常用的操作统一为 render 和 compute 两个 encoder 类。所有 compute 操作（kernel dispatch、blit、acceleration structure build）可以在一个 compute encoder 中编码，默认并发执行，用 Pass Barrier 处理数据依赖。Color attachment mapping 允许在同一个 render encoder 中切换 fragment shader 输出到不同的 attachment，不需要为不同的 render target 布局创建新的 encoder。Command Allocator 显式管理编码时的内存分配，支持 reset 后复用。Command Buffer 支持多线程编码，Suspend/Resume 选项可以把多个 render encoder 合并为一个 GPU pass。
+Metal 4 把这些痛点拆成三块来解：编码端把 render 和 compute 两类 encoder 做"少而强"，让一个 encoder 容纳更多操作；资源端用 argument table、residency set、queue barrier 把 bindless 模型扩展到数千资源；管线端引入 unspecialized pipeline + specialization 复用编译结果，再配多线程编译和 ahead-of-time 编译把加载时间压到接近零。讲者 Jason 负责前两块，Yang 负责管线，落点都在"少做无用功、把控制权交给开发者"。
 
-资源管理层面，Argument Table 按索引绑定根级资源，与 argument buffer 的 bindless 模型配合扩展到数千个资源。Residency Set 批量管理 GPU 可见性，推荐少而大的 set。Drawable 资源现在由开发者显式管理 residency（通过 layer 的 dynamic residency set）和同步（queue 上的 wait/signal）。Queue Barrier 在 encoder 间表达数据依赖，按 stage 粒度过滤以最大化并发。Texture View Pool 预分配 texture view 内存，支持编码时创建轻量级 view。Placement Sparse Heap 让开发者控制 sparse 资源的内存映射。
+## 详细内容
 
-管线加载层面，Flexible Render Pipeline State 通过先编译 unspecialized pipeline 再按需 specialize，复用 vertex/fragment binary body，大幅减少编译时间。多线程编译支持 GCD 和自定义线程池，关键是设置合适的 QoS 避免与渲染线程争抢。Ahead-of-time 编译通过 Pipeline Data Set Serializer 收集管线描述符、metal-tt 构建 GPU binary archive、运行时从 archive 中查找管线，将管线加载时间降到接近零。
+**统一 compute 编码与 Pass Barrier（[02:24](https://developer.apple.com/videos/play/wwdc2025/254/?time=144)）**。kernel dispatch、blit、acceleration structure build 现在都进同一个 compute encoder，默认并发执行，有依赖时用 Pass Barrier 表达。
 
+```objc
+id<MTL4ComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
 
-### 最佳实践
+[encoder copyFromBuffer:src sourceOffset:0 toBuffer:buffer1 destinationOffset:0 size:64];
 
-- 用 color attachment mapping 合并 render pass，减少 encoder 数量和 load/store 开销，但先 profiling 确认 tile memory 压力。
-- 所有 compute 操作用统一的 compute encoder 编码，用 Pass Barrier 表达串行依赖，默认享受并发执行。
-- Pipeline 加载全部先走 unspecialized + specialize 路径，上线后用 Metal System Trace 找出需要 full-state 编译的 shader。
-- 多线程编译设置 QoS 为 default，避免与渲染线程竞争 CPU 资源。
-- Residency set 宜少不宜多——每个 set 包含尽可能多的资源，不变的 set 挂到 command queue，频繁变化的挂到 command buffer。
-- Ahead-of-time 编译用 pipeline script 收集描述符、metal-tt 构建 archive，运行时查找 miss 时必须有 fallback。
+[encoder barrierAfterEncoderStages:MTLStageBlit
+               beforeEncoderStages:MTLStageDispatch
+                 visibilityOptions:MTL4VisibilityOptionDevice];
 
----
+[encoder setComputePipelineState:pso];
 
-## 相关 Session
+[argTable setAddress:buffer1.gpuAddress atIndex:0];
+[encoder setArgumentTable:argTable];
+[encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
 
-- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — understand scenekit deprecation and explore how to transition your 3d projects t
-- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — learn how to seamlessly combine machine learning into your graphics applications
-- [Discover Metal 4](/articles/wwdc2025-205) — learn how to get started leveraging the powerful new features of metal 4 in your
-- [Engage players with the Apple Games app](/articles/wwdc2025-215) — meet the games app – a new destination for players to keep up with what
+[encoder endEncoding];
+```
+
+**关键点**
+
+- `computeCommandEncoder` 一个 encoder 同时承担 blit 与 dispatch，无需切换。
+- `copyFromBuffer:...` 写入 `buffer1`，是依赖的"生产者"。
+- `barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch` 显式声明 blit 完成后再开始 dispatch；没有这条 barrier，blit 与 dispatch 会并发。
+- `MTL4VisibilityOptionDevice` 指定可见域为整个 device，确保后续 dispatch 看得到 blit 的最新结果。
+
+**Color attachment mapping（[04:29](https://developer.apple.com/videos/play/wwdc2025/254/?time=269)）**。一个 render encoder 配置全部 attachment 的"超集"，再为每个 pipeline 挂不同的 logical→physical 映射，避免为不同输出布局新开 encoder。
+
+```objc
+MTL4RenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
+desc.supportColorAttachmentMapping = YES;
+desc.colorAttachments[0].texture = colortex0;
+desc.colorAttachments[1].texture = colortex1;
+desc.colorAttachments[2].texture = colortex2;
+desc.colorAttachments[3].texture = colortex3;
+desc.colorAttachments[4].texture = colortex4;
+```
+
+```objc
+MTLLogicalToPhysicalColorAttachmentMap* myAttachmentRemap = [MTLLogicalToPhysicalColorAttachmentMap new];
+[myAttachmentRemap setPhysicalIndex:0 forLogicalIndex:0];
+[myAttachmentRemap setPhysicalIndex:3 forLogicalIndex:1];
+[myAttachmentRemap setPhysicalIndex:4 forLogicalIndex:2];
+
+[renderEncoder setRenderPipelineState:myPipeline];
+[renderEncoder setColorAttachmentMap:myAttachmentRemap];
+```
+
+**关键点**
+
+- `supportColorAttachmentMapping = YES` 打开映射开关。
+- 描述符里挂入 5 个 color attachment 形成超集，覆盖所有 pipeline 的输出需求。
+- `setPhysicalIndex:forLogicalIndex:` 把 fragment shader 的 logical index 路由到具体 attachment；切 pipeline 时只需 `setColorAttachmentMap:`，不必新开 encoder。
+
+**Suspend/Resume 把多个 encoder 合并为同一个 GPU pass（[08:03](https://developer.apple.com/videos/play/wwdc2025/254/?time=483)）**，多线程编码后用一次 commit 提交，免去中间 store/load 开销。
+
+```objc
+id<MTL4RenderCommandEncoder> enc0 = [cmdbuf0 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionSuspending];
+id<MTL4RenderCommandEncoder> enc1 = [cmdbuf1 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionResuming | MTL4RenderEncoderOptionSuspending];
+id<MTL4RenderCommandEncoder> enc2 = [cmdbuf2 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionResuming];
+
+id<MTL4CommandBuffer> cmdbufs[] = { cmdbuf0, cmdbuf1, cmdbuf2 };
+[commandQueue commit:cmdbufs count:3];
+```
+
+**关键点**
+
+- `MTL4RenderEncoderOptionSuspending` 标记当前 encoder 不结束 GPU pass。
+- 中间 encoder 同时 `Resuming | Suspending`，串起首尾。
+- 三个 command buffer 一次 `commit:count:`，Metal 把它们识别为同一 pass，tile memory 不落盘。
+
+**Drawable 同步与 queue barrier（[11:48](https://developer.apple.com/videos/play/wwdc2025/254/?time=708) / [13:25](https://developer.apple.com/videos/play/wwdc2025/254/?time=805)）**。drawable 不再隐式追踪，开发者用 queue 上的 wait/signal 显式同步；跨 encoder 的依赖用 Queue Barrier 按 stage 粒度过滤。
+
+```objc
+id<MTL4ComputeCommandEncoder> compute = [commandBuffer computeCommandEncoder];
+[compute dispatchThreadgroups:threadGrid threadsPerThreadgroup:threadsPerThreadgroup];
+[compute endEncoding];
+
+id<MTL4RenderCommandEncoder> render = [commandBuffer renderCommandEncoderWithDescriptor:des];
+
+[render barrierAfterQueueStages:MTLStageDispatch
+                   beforeStages:MTLStageFragment
+              visibilityOptions:MTL4VisibilityOptionDevice];
+
+[renderCommandEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                         vertexStart:vertexStart
+                         vertexCount:vertexCount];
+[render endEncoding];
+```
+
+**关键点**
+
+- `barrierAfterQueueStages:MTLStageDispatch` 等待前面所有 encoder 中的 dispatch 阶段完成。
+- `beforeStages:MTLStageFragment` 只阻塞当前 encoder 的 fragment 阶段；vertex 阶段可以与 compute 重叠，最大化并发。
+- 用 stage 过滤而不是 encoder 整体阻塞，是这套同步模型的核心。
+
+**Flexible render pipeline state（[20:41](https://developer.apple.com/videos/play/wwdc2025/254/?time=1241)）**。先编一个所有 color attachment 字段都是 unspecialized 的 pipeline，再 specialize 出 opaque/transparent/hologram 三个变体，复用 vertex/fragment binary body。
+
+```objc
+pipelineDescriptor.colorAttachments[i].pixelFormat   = MTLPixelFormatUnspecialized;
+pipelineDescriptor.colorAttachments[i].writeMask     = MTLColorWriteMaskUnspecialized;
+pipelineDescriptor.colorAttachments[i].blendingState = MTL4BlendStateUnspecialized;
+```
+
+```objc
+pipelineDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+pipelineDescriptor.colorAttachments[0].writeMask =
+    MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
+pipelineDescriptor.colorAttachments[0].blendingState = MTL4BlendStateEnabled;
+pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+pipelineDescriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+
+id<MTLRenderPipelineState> transparentPipeline =
+    [compiler newRenderPipelineStateBySpecializationWithDescriptor:pipelineDescriptor
+                                                          pipeline:unspecializedPipeline
+                                                             error:&error];
+```
+
+**关键点**
+
+- 第一段：把 pixelFormat、writeMask、blendingState 全部置成 `Unspecialized`，编出来的 pipeline 含 vertex binary、fragment binary body 与默认 fragment output。
+- 第二段：填入真实的 attachment 配置，`newRenderPipelineStateBySpecializationWithDescriptor:pipeline:` 只重新生成 fragment output 部分，不重走完整 shader 编译，因此非常快。
+
+**Ahead-of-time 编译（[28:24](https://developer.apple.com/videos/play/wwdc2025/254/?time=1704)）**。运行时收集 pipeline 描述符序列化为 `mtl4-json`，开发机用 `metal-tt` 构建 archive，发布版从 archive 查 pipeline，miss 时回落到在线编译。
+
+```objc
+MTL4PipelineDataSetSerializerDescriptor *desc = [MTL4PipelineDataSetSerializerDescriptor new];
+desc.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureDescriptors;
+id<MTL4PipelineDataSetSerializer> serializer =
+    [device newPipelineDataSetSerializerWithDescriptor:desc];
+
+MTL4CompilerDescriptor *compilerDesc = [MTL4CompilerDescriptor new];
+[compilerDesc setPipelineDataSetSerializer:serializer];
+id<MTL4Compiler> compiler = [device newCompilerWithDescriptor:compilerDesc error:nil];
+
+NSData *data = [serializer serializeAsPipelinesScriptWithError:&err];
+NSString *path = [NSString pathWithComponents:@[folder, @"pipelines.mtl4-json"]];
+BOOL success = [data writeToFile:path options:NSDataWritingAtomic error:&err];
+```
+
+**关键点**
+
+- `CaptureDescriptors` 模式只记录描述符，不存编译产物，内存占用小。
+- serializer 挂到 compiler 后，所有创建的 pipeline 自动被记录。
+- `serializeAsPipelinesScriptWithError:` 输出 `pipelines.mtl4-json`，再走 `metal-tt` 构建出 GPU binary archive。
+
+```objc
+id<MTL4Archive> archive = [device newArchiveWithURL:archiveURL error:&error];
+id<MTLRenderPipelineState> pipeline =
+    [archive newRenderPipelineStateWithDescriptor:descriptor error:&error];
+
+if (pipeline == nil)
+{
+    pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor
+                                          compilerTaskOptions:nil
+                                                        error:&error];
+}
+```
+
+**关键点**
+
+- `newArchiveWithURL:` 从磁盘加载 archive。
+- 用同一个 descriptor 在 archive 中查 pipeline，命中时近乎零耗时。
+- 查不到时（描述符不匹配/OS 不兼容/GPU 架构不兼容）必须有 fallback 走在线编译，否则游戏会缺 pipeline。
+
+## 核心启发
+
+- **做什么：把所有 compute 操作合到一个 encoder，用 Pass Barrier 表达依赖**
+  - 为什么值得做：Metal 4 默认让 dispatch、blit、acceleration structure build 在同一 compute encoder 内并发，无依赖的工作能自动占满 GPU。
+  - 怎么开始：审计现有 compute 路径，拆掉为 blit/dispatch 分开建 encoder 的逻辑；只在真有数据依赖处加 `barrierAfterEncoderStages:beforeEncoderStages:`。
+
+- **做什么：用 color attachment mapping 合并 render pass**
+  - 为什么值得做：场景里每多开一个 render encoder，就多一次 tile memory 的 store/load 开销；映射机制让一个 encoder 服务多种 fragment 输出布局。
+  - 怎么开始：把 render encoder 配置成所有需要的 attachment 超集，给每个 pipeline 准备一份 `MTLLogicalToPhysicalColorAttachmentMap`，先在 profiling 里确认 tile memory 没爆再上线。
+
+- **做什么：所有 render pipeline 默认走 unspecialized + specialization**
+  - 为什么值得做：city builder 演示里，opaque/transparent/hologram 三个 pipeline 共用 vertex/fragment binary body，specialization 只重新生成 fragment output 部分，编译时间大幅缩短。
+  - 怎么开始：把 pipeline 描述符里的 pixelFormat/writeMask/blendingState 都设成 unspecialized 先编一份；上线后用 Instruments 的 Metal System Trace 找出 specialization 性能下降明显的 shader，对那一小批跑后台 full-state 编译。
+
+- **做什么：把 pipeline 加载推到 ahead-of-time**
+  - 为什么值得做：在线多线程编译已经能减少卡顿，但 ahead-of-time 把加载时间压到接近零，玩家几乎不见 loading。
+  - 怎么开始：在 dev build 里挂 `MTL4PipelineDataSetSerializer` 收集 `mtl4-json`，用 `metal-tt` 构建 archive 进 ship 包；运行时 `MTL4Archive` 查 pipeline，必须保留 fallback 到 `compiler newRenderPipelineStateWithDescriptor:`。
+
+- **做什么：residency set 宜少不宜多，drawable 显式同步**
+  - 为什么值得做：少而大的 residency set 能让 Metal 批量准备资源；drawable 显式 wait/signal 取代隐式追踪，开销更可控。
+  - 怎么开始：把不变的 residency set 挂到 command queue，频繁变化的挂到 command buffer；CAMetalLayer 的 dynamic residency set 加到 queue 一次即可，每帧 `[queue waitForDrawable:]` → 提交 → `[queue signalDrawable:]` → `present`。
+
+## 关联 Session
+
+- [Discover Metal 4](/articles/wwdc2025-205) — Metal 4 四部曲第一集，覆盖 encoder、argument table、residency set 的总体设计
+- [Go further with Metal 4 games](/articles/wwdc2025-258) — 第三集，讲 MetalFX 与 ray tracing 的进阶用法
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — 第四集，把 ML 推理直接嵌入图形管线
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — SceneKit 弃用后，3D 项目向 RealityKit 迁移的路径

@@ -15,29 +15,112 @@ relatedSessions:
 
 ## Highlight
 
-> 深入了解 Learn more about Declarative Web Push 的技术细节和最佳实践。
+> Declarative Web Push 通过在推送消息中添加 `web_push: 8030` 标识键，让浏览器无需运行 Service Worker JavaScript 就能直接展示通知，向后兼容旧浏览器。
 
 ---
 
 ## 核心内容
 
-原生 app 从来不需要在设备上写代码来展示 push 通知——通知内容直接在 push 消息中描述，系统自动展示。Web Push 却一直需要一个 Service Worker 来解析消息并调用 `showNotification()`。这带来了三个问题：你需要写和维护 JavaScript 代码；运行代码消耗 CPU 和电量；ITP（Intelligent Tracking Prevention）会限制 Service Worker JavaScript 的生命周期以保护隐私。
+原生 app 从来不需要在设备上写代码来展示推送通知——通知内容直接以标准格式描述在 push 消息里，系统读到就展示。被 iOS 卸载到云端的 app，照样能正确弹出通知。Web 这边却要绕一圈：每条 push 都要先唤醒一个 Service Worker，由开发者写的 JavaScript 解析 JSON，再调用 `showNotification()`。这意味着多写一段必须维护的代码、多耗一份 CPU 和电量；更糟的是，Intelligent Tracking Prevention 出于隐私考虑，会限制 Service Worker JavaScript 的存活时间，导致推送有时根本到不了用户。
 
-Declarative Web Push 的核心思路很简单：如果大部分网站的 push 消息都是标准 JSON、Service Worker 逻辑都是"解析 JSON 调用 showNotification"，那就让浏览器直接做这件事。在 push 消息中加入一个特殊的 `web_push: "8-0-3-0"` 键值对，浏览器就会自动解析 JSON 并展示通知，无需启动 Service Worker。
+WebKit 团队观察到一件事：很多网站的 push 消息其实就是一段简单的 JSON，Service Worker 里的逻辑也只是把字段翻译成 `showNotification()` 的参数。既然这是常见模式，那就把这段流程交给浏览器。Declarative Web Push 的核心是一个约定：push 消息里只要带上 `"web_push": 8030`，浏览器就把整段 JSON 当作标准通知描述，自动弹出，不再启动 Service Worker。Safari 18.5（macOS）和 iOS 18.4 / iPadOS 18.4 起的"添加到主屏幕"web app 已经支持。
 
-它完全向后兼容：如果浏览器不支持声明式 push（没有找到 magic key），自动回退到原生 Web Push 流程。如果需要更复杂的逻辑（比如解密端到端加密消息），可以设置 `mutable: true` 让 Service Worker 做可选的后处理。
-
-
-### 最佳实践
-
-建议已经使用 Web Push 的网站尽快迁移到声明式格式。迁移成本很低：把现有的 ad-hoc JSON 重构为标准 NotificationOptions 格式，加上 magic key，把 Service Worker 中的 push event handler 简化为直接调用 `showNotification(event.data.notification)`。
-
-优先保持 Service Worker 作为 fallback——即使迁移到声明式 push，保留一个简化的 Service Worker 可以确保旧浏览器仍然能正常工作。声明式 push 是渐进增强，不是硬切换。
-
-避免在 `mutable` 模式中执行耗时操作。Service Worker 后处理的目的是解密或微调通知内容，不是做复杂业务逻辑。如果 Service Worker 处理时间过长，系统会超时并回退到原始通知。
+向后兼容是这套设计最舒服的地方：浏览器不认识 magic key，就回退到原始 Web Push；JSON 解析失败，也回退；JSON 合法但描述不出有效通知，浏览器直接丢弃。如果你确实需要在客户端做端到端解密或修正未读数，可以在 JSON 里加 `"mutable": true`，让 Service Worker 做一次可选的后处理，处理失败时再回退到声明式 JSON 里的明文通知。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Meet WebKit for SwiftUI](/articles/wwdc2025-231) — discover how you can use webkit to effortlessly integrate web content into your 
+原始 Web Push 的流程依赖 Service Worker：先注册 worker、再通过 `pushManager` 申请订阅、push 到来时由 worker 接收 `push` 事件并调用 `showNotification`（[04:41](https://developer.apple.com/videos/play/wwdc2025/235/?time=281)）。Declarative Web Push 把申请订阅之外的代码全部砍掉。订阅入口也从 `ServiceWorkerRegistration.pushManager` 提升到 `window.pushManager`，因为不再强制需要 Service Worker（[07:54](https://developer.apple.com/videos/play/wwdc2025/235/?time=474)）。
+
+最小可用的声明式推送消息长这样（[08:14](https://developer.apple.com/videos/play/wwdc2025/235/?time=494)）：
+
+```json
+{
+  "web_push": 8030,
+  "notification": {
+    "title": "Hello from Browser Pets",
+    "navigate": "https://browserpets.example/inbox"
+  }
+}
+```
+
+关键点：
+- `"web_push": 8030`：magic key，值固定为 8030（IETF Web Push 的 RFC 编号）。浏览器靠这个键决定是否走声明式路径；找不到就回退到原始 Web Push。
+- `notification`：必填字段，描述用户可见通知。
+- `title`：通知标题，必填。
+- `navigate`：用户点击通知时打开的 URL，必填。这是声明式通知的最小合法形态。
+
+完整字段直接复用 W3C `NotificationOptions` 字典，所以 body、tag、声音、应用角标都能塞进去（[10:08](https://developer.apple.com/videos/play/wwdc2025/235/?time=608)）：
+
+```json
+{
+  "web_push": 8030,
+  "notification": {
+    "title": "Hello from Browser Pets",
+    "navigate": "https://browserpets.example/inbox",
+    "body": "You have a new direct message",
+    "tag": "dm",
+    "silent": false
+  },
+  "app_badge": "3"
+}
+```
+
+关键点：
+- `body`：通知正文，与 `Notification.options.body` 含义一致。
+- `tag`：合并/替换通知用的标识，跟原生 `NotificationOptions.tag` 同义。
+- `silent: false`：请求平台播放默认通知声音，受系统策略影响。
+- `app_badge`：声明式 push 内置应用角标更新，省掉 Service Worker 单独调 `Badging API` 那一步。
+
+需要客户端解密或修正内容时，加 `"mutable": true`，浏览器会把这条 push 派发给 Service Worker，并在事件上挂一份提议中的通知（[12:45](https://developer.apple.com/videos/play/wwdc2025/235/?time=765)）：
+
+```js
+self.addEventListener("push", (event) => {
+  const proposed = event.proposedNotification;
+  const data = event.data.json();
+  const decrypted = tryDecrypt(data.encrypted);
+  if (decrypted) {
+    event.waitUntil(
+      self.registration.showNotification(decrypted.title, decrypted.options)
+    );
+  }
+  // 不调用 showNotification 时，浏览器会使用 proposedNotification 兜底
+});
+```
+
+关键点：
+- `event.proposedNotification`：声明式 JSON 在 mutable 流程里的"原始提议"，Service Worker 可以读它判断这是不是 DM。
+- `tryDecrypt(...)`：本地用密钥解密 push 中的密文 payload；只有持有密钥的设备能拿到明文。
+- `showNotification(...)`：成功解密后用真实文案替换提议；浏览器会优先展示替换版。
+- 不调用 `showNotification`：解密失败、worker 启动失败或资源紧张时，浏览器自动用声明式 JSON 里的明文通知兜底（[14:01](https://developer.apple.com/videos/play/wwdc2025/235/?time=841)）。
+
+Browser Pets 的迁移示例展示了改造路径（[15:36](https://developer.apple.com/videos/play/wwdc2025/235/?time=936)）：原本积累出的 ad-hoc JSON 字段（`title`、`clickURL`、`body`、`silent` …）逐项重命名到 `NotificationOptions` 标准字段，加上 magic key，新浏览器立即走声明式；旧浏览器仍走 Service Worker，只是 worker 里的代码可以简化为 `showNotification(data.notification.title, data.notification)`，不再需要逐个 `data.clickURL` 这样手写解析。
+
+---
+
+## 核心启发
+
+- **做什么**：把现有的 ad-hoc push JSON 重命名为 `NotificationOptions` 标准字段，加上 `"web_push": 8030`。
+  - 为什么值得做：新浏览器立刻走声明式路径，省一次 Service Worker 启动，更省电、更不容易被 ITP 拦掉；旧浏览器自动回退，零风险。
+  - 怎么开始：先在服务端 push 消息构造层做一次字段映射（如 `clickURL → navigate`、`text → body`），再把 magic key 注入顶层 JSON。
+
+- **做什么**：把 Service Worker 的 push handler 简化为"取 `notification` 字段直接转发给 `showNotification`"。
+  - 为什么值得做：声明式 JSON 的 `notification` 子对象本身就是一个合法的 `NotificationOptions`，不需要再字段拼接，bug 面积大幅缩小。
+  - 怎么开始：在 `push` 事件里读 `event.data.json().notification`，把 `title` 取出，剩下整个对象作为 options 传给 `showNotification`。
+
+- **做什么**：仅在端到端加密、未读数修正这类必须本地处理的场景下设置 `"mutable": true`。
+  - 为什么值得做：默认让浏览器自动展示，可以让你的通知在 Service Worker 被 ITP 清理、或设备资源紧张时仍然到达；只在必要时才走 mutable 流程。
+  - 怎么开始：盘点现有 push 类型，把"纯展示"和"需要本地解密/修正"分开标记，前者完全声明式，后者保留 mutable + Service Worker 兜底。
+
+- **做什么**：用 `app_badge` 字段把应用角标更新与通知合并到一条 push。
+  - 为什么值得做：减少一次 worker 唤醒和 Badging API 调用，角标和通知保持原子一致。
+  - 怎么开始：在服务端组装 push 时，把"未读数"直接写进 `app_badge`，不再单独发一条空 push 去更新角标。
+
+---
+
+## 关联 Session
+
+- [Meet WebKit for SwiftUI](/articles/wwdc2025-231) — 在 SwiftUI 里用 WebKit 嵌入和控制 web 内容
+- [What's new in Safari and WebKit](/articles/wwdc2025-233) — 概览 Safari 与 WebKit 今年的新能力，含 Web Push 进展
+- [What's new in web apps](/articles/wwdc2025-225) — 主屏幕 Web App 的新特性，是 iOS 上声明式 push 的承载形态

@@ -24,32 +24,187 @@ relatedSessions:
 
 ## Highlight
 
-> WebGPU 不仅是 WebGL 的升级版，更是浏览器中唯一能做通用 GPU 计算的 API。Session 从三个方面展开：API 概览、着色器开发、性能优化。
+> WebGPU 是浏览器中目前唯一能跑通用 GPU 计算的 API，在 Apple 平台上由 Metal 实现，覆盖 Mac、iPhone、iPad 与 Vision Pro。
 
 ---
 
 ## 核心内容
 
-WebGPU 不仅是 WebGL 的升级版，更是浏览器中唯一能做通用 GPU 计算的 API。Session 从三个方面展开：API 概览、着色器开发、性能优化。
+过去做网页 3D，开发者只能用 WebGL。WebGL 不支持 compute shader，想在浏览器里跑物理模拟、粒子系统、神经网络推理，要么靠 CPU 硬算，要么把工作搬到原生 App。WebGL 的状态机式 API 也有沉重的历史包袱：每次 draw call 都要做大量边界校验，性能远不及原生。
 
-API 层面，WebGPU 是一个扁平的接口体系，核心概念和 Metal 高度对齐：`GPUDevice` 对应 `MTLDevice`，`GPUBindGroup` 对应 Metal 的 argument buffer，render/compute pipeline 对应 `MTLRenderPipelineState`/`MTLComputePipelineState`。着色语言 WGSL 是从零设计的安全着色语言，支持 vertex、fragment 和 compute 三种程序类型。Session 用一个粒子动画示例展示了从顶点着色、片段着色到 compute shader 物理模拟的完整流程。
+WebGPU 把这件事重新做了一遍。Safari 团队的 Mike 在 Session 里给出三层结论。第一，WebGPU 在 3D 图形上能做 WebGL 的所有事，性能与灵活性都更好（[00:16](https://developer.apple.com/videos/play/wwdc2025/236/?time=16)）。第二，WebGPU 是浏览器里唯一能跑通用 GPU 计算的 API（[00:28](https://developer.apple.com/videos/play/wwdc2025/236/?time=28)）。第三，WebGPU 在 Apple 平台上以 Metal 为后端实现，Mac、iPhone、iPad、Vision Pro 全覆盖，调用大多与 Metal 一一对应，熟悉 Metal 的开发者上手成本接近零（[00:38](https://developer.apple.com/videos/play/wwdc2025/236/?time=38)）。
 
-性能优化部分是亮点：使用 f16（half-precision float）减少内存带宽压力；用 render bundle 缓存绘制命令避免每帧重复验证；用 dynamic offset 合并 bind group 减少 Metal 对象数量；尽量合并 command buffer 和 pass 以减少同步开销。
-
-
-### 最佳实践
-
-建议新项目优先使用 WebGPU 而不是 WebGL。WebGPU 在所有 Apple 平台上都通过 Metal 实现，性能和功能都优于 WebGL。如果你的应用对性能敏感，请从一开始就考虑使用 f16 数据类型。
-
-优先使用 render bundle 缓存重复的绘制命令。这在渲染静态或半静态内容（UI 元素、不频繁更新的 3D 场景）时收益最大。
-
-避免频繁更新 index/indirect buffer。这类 buffer 的更新需要额外的边界验证，成本比普通 buffer 高。只在需要时更新，优先使用 read-only 访问模式。
+API 设计上，WebGPU 是扁平结构。顶层是 `GPU` 与 `GPUAdapter`，`GPUDevice` 是大多数调用的入口，对应 Metal 的 `MTLDevice`；资源层是 buffer、texture、sampler；编码器（encoder）发命令；pipeline 描述资源如何被解释；bind group 把相关资源打包，底层映射到 Metal 的 argument buffer。着色语言 WGSL 从零设计，专门为 Web 的安全模型服务，支持 vertex、fragment、compute 三类程序。Session 用一个 10 万三角形 + 粒子物理模拟的例子，把整条管线串了起来。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — building on background assets, this session will introduce the new capability to
-- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — with writing tools, people can proofread, rewrite, and transform text directly w
-- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — discover the latest updates for the app store server api, app store server notif
-- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — discover how permissionkit helps you enhance communication safety for children i
+### 设备初始化与 f16 扩展
+
+任何 WebGPU 应用都从拿到 `GPUDevice` 开始。Mike 在（[05:14](https://developer.apple.com/videos/play/wwdc2025/236/?time=314)）展示了带 `shader-f16` 扩展的设备创建写法：
+
+```js
+const canvas = document.querySelector('canvas');
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice({
+  requiredFeatures: ['shader-f16'],
+});
+
+const context = canvas.getContext('webgpu');
+context.configure({ device, format: 'bgra8unorm' });
+```
+
+关键点：
+
+- `navigator.gpu.requestAdapter()` 返回当前系统可用的 GPU 适配器，相当于挑选物理设备。
+- `requestDevice` 是大多数后续 API 的入口，等价于 Metal 的 `MTLDevice`。
+- `requiredFeatures: ['shader-f16']` 启用半精度浮点，能省一半显存带宽，但不是所有平台都支持，使用前要先检查可用性（[05:39](https://developer.apple.com/videos/play/wwdc2025/236/?time=339)）。
+- `context.configure` 把 canvas 与 GPU 可写内存绑定，之后才能把渲染结果上屏。
+
+### 创建 buffer 与 texture
+
+资源层的两类核心对象是 buffer 和 texture，对应 `MTLBuffer` 和 `MTLTexture`（[06:24](https://developer.apple.com/videos/play/wwdc2025/236/?time=384)）。
+
+```js
+const particleBuffer = device.createBuffer({
+  size: byteLength,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+device.queue.writeBuffer(particleBuffer, 0, particleData);
+
+const texture = device.createTexture({
+  size: [width, height],
+  format: 'rgba8unorm',
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+});
+device.queue.copyExternalImageToTexture(
+  { source: imageBitmap },
+  { texture },
+  [width, height],
+);
+```
+
+关键点：
+
+- `usage` 是位掩码，告诉 WebGPU 这块内存的用途。声明清楚后，WebGPU 能在不引入额外 API 复杂度的前提下避免数据竞争（[07:00](https://developer.apple.com/videos/play/wwdc2025/236/?time=420)）。
+- `device.queue.writeBuffer` 接收 buffer、偏移量和 JS `ArrayBuffer`，把数据从 JS 拷进 GPU 可见内存。
+- 纹理通过 `copyExternalImageToTexture` 从 `ImageBitmap` 上传，常用于贴图。
+- 纹理支持 1D、2D、2D 数组、cube map（6 张 2D 纹理）和 3D 五种形态（[07:44](https://developer.apple.com/videos/play/wwdc2025/236/?time=464)）。
+
+### 用 WGSL 写 compute shader
+
+WebGL 没有 compute shader，这是 WebGPU 最大的能力跃迁（[12:17](https://developer.apple.com/videos/play/wwdc2025/236/?time=737)）。一段粒子物理 compute shader 的骨架如下（[12:26](https://developer.apple.com/videos/play/wwdc2025/236/?time=746)）：
+
+```wgsl
+enable f16;
+
+@group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  var p = particles[gid.x];
+  p.velocity += gravity * deltaTime;
+  p.position += p.velocity * deltaTime;
+  particles[gid.x] = p;
+}
+```
+
+关键点：
+
+- `enable f16` 在着色器里开启半精度类型，必须搭配 device 端的 `shader-f16` 扩展（[15:24](https://developer.apple.com/videos/play/wwdc2025/236/?time=924)）。
+- `@workgroup_size(64)` 定义每个 workgroup 的网格大小，决定了 compute shader 的并行粒度。
+- `@builtin(global_invocation_id)` 是 WGSL 内建变量，给出当前线程在整个 dispatch 网格中的位置，无需从 JS 传参（[12:34](https://developer.apple.com/videos/play/wwdc2025/236/?time=754)）。
+- `var<storage, read_write>` 声明可读写的存储 buffer；如果只读，应该用 `read`，能让 WebGPU 跳过部分校验（[16:38](https://developer.apple.com/videos/play/wwdc2025/236/?time=998)）。
+
+### Render bundle 缓存绘制命令
+
+WebGPU 每帧都要校验所有读写边界，这部分开销在静态场景里完全是浪费。Render bundle 把校验提前到一次性创建时（[17:04](https://developer.apple.com/videos/play/wwdc2025/236/?time=1024)）：
+
+```js
+const encoder = device.createRenderBundleEncoder({
+  colorFormats: ['bgra8unorm'],
+});
+encoder.setPipeline(pipeline);
+encoder.setBindGroup(0, bindGroup);
+encoder.setVertexBuffer(0, vertexBuffer);
+encoder.draw(vertexCount);
+const bundle = encoder.finish();
+
+// 每帧重放
+renderPass.executeBundles([bundle]);
+```
+
+关键点：
+
+- `createRenderBundleEncoder` 只是录制器，`finish()` 才生成真正可重放的 bundle。
+- `executeBundles([bundle])` 一次性回放所有命令，跳过逐帧校验。
+- 底层映射到 Metal 的 indirect command buffer，性能收益与原生 Metal 相当（[18:03](https://developer.apple.com/videos/play/wwdc2025/236/?time=1083)）。
+
+### Dynamic offset 合并 bind group
+
+每个 bind group 都对应一个 `MTLBuffer`，数量一多 Metal 对象会爆炸。dynamic offset 让一个 bind group 复用同一布局、运行时切换不同偏移（[19:49](https://developer.apple.com/videos/play/wwdc2025/236/?time=1189)）：
+
+```js
+const layout = device.createBindGroupLayout({
+  entries: [{
+    binding: 0,
+    visibility: GPUShaderStage.VERTEX,
+    buffer: { type: 'uniform', hasDynamicOffset: true },
+  }],
+});
+
+const bindGroup = device.createBindGroup({
+  layout,
+  entries: [{ binding: 0, resource: { buffer: bigBuffer, size: 64 } }],
+});
+
+renderPass.setBindGroup(0, bindGroup, [offset]);
+```
+
+关键点：
+
+- `hasDynamicOffset: true` 必须用自定义 layout 创建，不能用 shader 的 auto layout（[20:07](https://developer.apple.com/videos/play/wwdc2025/236/?time=1207)）。
+- `setBindGroup` 第三个参数是动态偏移数组，每个动态 buffer 对应一个偏移。
+- Mike 给出的对比：10 个 64 字节 bind group，可以合并成 1 个 640 字节 buffer + 10 个 offset，省下 9 个 Metal buffer（[20:43](https://developer.apple.com/videos/play/wwdc2025/236/?time=1243)）。
+
+### Command buffer 与 pass 数量
+
+Command buffer 边界要在片上高速内存与统一内存之间做同步，开销不小。建议每个更新循环只用一个 command buffer，只有需要把数据回写到统一内存时才拆分（[18:28](https://developer.apple.com/videos/play/wwdc2025/236/?time=1108)）。Pass 不需要同步，但每个 pass 都要消耗带宽，应尽量合并。Apple GPU 是 tile-based deferred renderer，合并 pass 的收益比桌面 GPU 更明显（[19:15](https://developer.apple.com/videos/play/wwdc2025/236/?time=1155)）。
+
+---
+
+## 核心启发
+
+**1. 新 Web 项目直接押注 WebGPU，跳过 WebGL**
+
+为什么值得做：WebGPU 在 Apple 全平台都通过 Metal 实现，性能上限与 WebGL 不在一个量级，而且只有它能跑 compute shader。WebGL 的能力上限注定撑不起 LLM 推理、物理模拟、复杂粒子这类应用。
+
+怎么开始：用 three.js 或 Babylon.js 这类已支持 WebGPU 后端的库起步，把 renderer 切到 `WebGPURenderer`；要写底层就直接用 `navigator.gpu.requestAdapter()`，参考 [WebGPU Samples](https://webgpu.github.io/webgpu-samples/)。
+
+**2. 把浏览器端推理与物理迁到 compute shader**
+
+为什么值得做：浏览器里跑 transformer 模型、刚体仿真、流体模拟过去要么走 WASM SIMD 要么放弃。compute shader 让这些任务能用 GPU 的并行度跑起来，且全程不离开浏览器，部署成本几乎为零。
+
+怎么开始：先跑通 [Transformers.js](https://huggingface.co/docs/transformers.js/index)（已支持 WebGPU 后端）的端侧推理；自研模型可参考 WGSL 的 `@compute @workgroup_size` 与 `global_invocation_id` 写最小可用 kernel。
+
+**3. 静态/半静态场景全部走 render bundle**
+
+为什么值得做：UI 元素、不频繁更新的 3D 场景每帧都做一遍校验是纯浪费。Render bundle 把校验前置一次，性能直接逼近原生 Metal。
+
+怎么开始：把现有 render pass 中那些每帧重复的命令抽出来，用 `createRenderBundleEncoder` 录一次，主循环改成 `executeBundles`；动态部分仍走普通 pass。
+
+**4. 在 iOS / visionOS 上默认用 f16 + dynamic offset 控内存**
+
+为什么值得做：Mike 在 [15:01](https://developer.apple.com/videos/play/wwdc2025/236/?time=901) 提到 iOS 与 visionOS 对内存极其敏感，超限会被系统杀进程。f16 直接砍一半带宽，dynamic offset 减少 Metal 对象数量，两者结合是延长进程寿命的最直接手段。
+
+怎么开始：在 `requestDevice` 里加 `requiredFeatures: ['shader-f16']`，在 WGSL 里 `enable f16`，先把权重、顶点这类大块只读数据切到 f16；bind group 全部走 dynamic offset，把同类对象合并成大 buffer。
+
+---
+
+## 关联 Session
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — 用 Apple 托管的后台资源把大模型权重、纹理这类资产分发到端侧。
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — Writing Tools 的进阶集成，端侧 AI 写作的另一条路径。
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — 把 GPU 密集型 Web 应用变现时会用到的 IAP 服务端 API。
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — PermissionKit 帮助提升儿童在通信场景下的安全保护。

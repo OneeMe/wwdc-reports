@@ -30,26 +30,91 @@ relatedSessions:
 
 ## 核心内容
 
-这个 Session 覆盖了两个完整的 API 实现：网站端的 W3C Digital Credentials API 和 iOS 端的 IdentityDocumentServices framework。
+线上身份验证的现状很糟糕。用户要先翻出实体证件，找一块干净背景，拍一张清晰不模糊的照片上传给网站；网站则要花大力气搭建一套图像识别系统，去判断这张照片到底是不是真的。这套流程对双方都不友好，而且很容易被伪造。
 
-网站端的流程是：服务器构建 ISO 18013-7 格式的 mdoc 请求（包含需要验证的字段、加密信息和签名），前端通过 `navigator.credentials.get()` 触发系统 UI，用户选择证件来源（Wallet 或第三方 app），授权后加密响应返回给服务器解密验证。整个链路是端到端加密的，浏览器和操作系统都无法读取身份数据。
-
-iOS 端的 Document Provider API 让任何管理身份证件的 app 都能作为验证来源出现在系统选择 UI 中。app 需要注册证件信息、实现一个 UI App Extension 来显示授权界面，并在用户授权后构建加密响应返回给请求方。关键的安全设计是"partial request"——系统先在沙箱中解析请求的一部分用于构建 UI，完整请求只在用户授权后才释放给 app。
-
-
-### 最佳实践
-
-建议网站开发者先在 development-signed build 上测试完整流程，因为开发环境不需要 Oblivious HTTP Relay 审批。在提交到 App Store 之前，必须完成 Apple 的 capability 申请流程。
-
-优先使用 `navigator.credentials.get()` 的标准错误处理——API 提供了丰富的异常类型，不要用 try-catch 包裹后静默失败。考虑降级方案：如果 API 不可用（比如旧浏览器），回退到传统的表单上传方式。
-
-避免在请求中只验证最少字段。根据业务需要合理选择验证字段，但也要注意隐私——只请求你真正需要的信息，用户在授权界面会看到完整的请求列表。
+WWDC25 给出了完整的替代方案。Safari 和 WebKit 接入了 W3C Digital Credentials API，可以直接通过 `navigator.credentials.get()` 请求一份基于 ISO 18013-5 标准的 mobile document（mdoc）。用户在系统 UI 中选择来源——Apple Wallet 里的驾照，或者第三方的 Document Provider app，比如 Demo 里的 Local Driving Authority——然后用 Face ID 授权，加密后的响应直接回到网站服务器。整条链路端到端加密，连浏览器和操作系统都读不到证件内容。配套的还有 iOS 端的新框架 IdentityDocumentServices，让任何管理身份证件的 app 都可以通过 UI App Extension 出现在系统选择器里。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — building on background assets, this session will introduce the new capability to
-- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — with writing tools, people can proofread, rewrite, and transform text directly w
-- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — discover the latest updates for the app store server api, app store server notif
-- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — discover how permissionkit helps you enhance communication safety for children i
+网站侧的请求分两半：Device Request 和 Encryption Information（[10:17](https://developer.apple.com/videos/play/wwdc2025/232/?time=617)）。Device Request 用 `docType` 字符串声明要请求驾照，再列出具体字段（given name、family name、age over 21、portrait、driving privileges）。Encryption Information 里要生成一个 nonce 防重放，再生成一对 recipient encryption key-pair，公钥放进请求里发给 provider，私钥留在服务器上等响应回来时解密。
+
+签名要走 Apple Business Connect。先生成签名密钥对，再提交 CSR 拿到证书，运行时用站点 origin URL 加 Encryption Information 算出 Session Transcript，再用证书签名得到 Signed Authentication Structure，塞进 `Reader Authentication All` 列表里（[13:16](https://developer.apple.com/videos/play/wwdc2025/232/?time=796)）。这个列表是数组，所以一个请求可以同时被多家 provider 信任的证书签名——比如同时支持 Apple Wallet 和 Local Driving Authority。
+
+前端调用很简单：
+
+```javascript
+const response = await navigator.credentials.get({
+  digital: {
+    requests: [{
+      protocol: "org-iso-mdoc",
+      data: requestData
+    }]
+  }
+});
+```
+
+关键点：
+
+- `protocol` 字段必须是标准化字符串 `org-iso-mdoc`，浏览器据此识别这是 mdoc 请求。
+- `data` 是服务器构建并签名好的请求二进制，前端不参与构造。
+- `navigator.credentials.get()` 必须在用户手势（点击、按键）里调用，不然浏览器会拒绝。
+- 返回的 `response` 是 JSON-serializable，直接用 fetch 或 XHR 发回服务器解密。
+- API 提供丰富的异常类型，可以在 catch 里降级到旧的"上传证件照片"流程（[15:08](https://developer.apple.com/videos/play/wwdc2025/232/?time=908)）。
+
+响应解密走 HPKE（RFC-9180）（[18:05](https://developer.apple.com/videos/play/wwdc2025/232/?time=1085)）。输入是密文、provider 的 sender public key、服务器之前生成的 recipient private key，以及和签名时同一份 Session Transcript。解密出来是 Device Response，每份文档里包含 Mobile Security Object——immutable、由 issuer 签名，里面有所有字段的 hash digest。验证流程：先验 Document Signer Certificate 是否能链回受信任的 Issuing Authority root；再算每个返回字段的 digest，跟 MSO 里的 digest 对比；最后用 MSO 里的 Device Public Key 验 Device Authentication，确认这份 mdoc 真的来自当初发证的那台设备，没被复制（[20:32](https://developer.apple.com/videos/play/wwdc2025/232/?time=1232)）。
+
+iOS 端 Document Provider 的注册流程（[26:19](https://developer.apple.com/videos/play/wwdc2025/232/?time=1579)）：
+
+```swift
+let store = IdentityDocumentProviderRegistrationStore.shared
+
+let registration = MobileDocumentRegistration(
+    mobileDocumentType: .mDL,
+    authorityKeyIdentifiers: trustedAuthorities,
+    documentIdentifier: localStorageID
+)
+
+try await store.addRegistration(registration)
+```
+
+关键点：
+
+- `IdentityDocumentProviderRegistrationStore` 是所有注册操作的入口。
+- `mobileDocumentType` 用标准化字符串，`mDL` 对应 mobile driver's license。
+- `authorityKeyIdentifiers` 决定了哪些证书签发的请求会触发选择 app——不在列表里的请求方，app 就不会出现在系统选择器里。
+- `documentIdentifier` 是 app 自己的本地 ID，用来把系统注册和 app 内部存储的 mdoc 对应起来。
+- 用户在 app 里删除证件时，调用 `removeRegistration()` 传同一个 ID 即可下线。
+- 还可以读 `registrations` 属性来枚举当前所有注册项做核对。
+
+UI 部分通过 Xcode 的 `Identity Document Provider` 模板生成 App Extension（[28:19](https://developer.apple.com/videos/play/wwdc2025/232/?time=1699)）。最关键的设计是 partial request：系统先在沙箱里解析请求的一部分，验签后只交给 app 构建 UI 所需的信息（document requests、authentication certificates）。完整的 ISO 18013 Device Request 只有在用户在 app 里按下"接受"后才会通过 `sendResponse()` 闭包的 `rawRequest` 参数释放给 app。app 拿到完整请求后，要先和 partial request 做一致性比对，再验签、构建并加密响应——这套设计把"未授权前 OS 组件解析任意网络数据"这个攻击面挡在了沙箱里。
+
+---
+
+## 核心启发
+
+- **做什么**：把"上传证件照片"流程升级为 Digital Credentials API 入口
+  - 为什么值得做：实体证件拍照流程的转化率天然受限，照片质量、光线、人工审核都拖慢链路；Digital Credentials 直接拿到加密、可验签的结构化数据，省掉 OCR 和反欺诈系统的大半工作量。
+  - 怎么开始：在 development-signed build 上验证完整流程（开发环境免去 Oblivious HTTP Relay 审批），然后到 Apple Business Connect 申请签名证书，按 ISO 18013-7 Annex C 实现服务端构建/解密逻辑。
+
+- **做什么**：保留传统上传作为降级回退
+  - 为什么值得做：旧浏览器、未注册证件的用户、跨境用户都可能不支持 Digital Credentials API，硬切会直接断掉一部分订单。
+  - 怎么开始：在 `navigator.credentials.get()` 的 try-catch 里捕获标准异常，按异常类型决定是重试、提示用户还是回退到 HTML form 上传，不要 catch 后静默失败。
+
+- **做什么**：身份证件 app 接入 IdentityDocumentServices
+  - 为什么值得做：政府、行业协会、企业内部颁发的电子证件都可以通过同一个系统选择器出现在 Safari 和其他 app 的请求里，省去自己做 deep link、自己谈集成的工作。
+  - 怎么开始：用 Xcode 的 `Identity Document Provider` 模板新建 App Extension，在 `performRegistrationUpdates()` 里同步本地 mdoc 到 `IdentityDocumentProviderRegistrationStore`，在 `RequestAuthorizationView` 里实现授权 UI。
+
+- **做什么**：最小披露原则约束请求字段
+  - 为什么值得做：用户在授权界面会看到完整的请求列表，请求过多字段会直接拉低授权率，也会引来合规审查。
+  - 怎么开始：审计现有验证流程，把"姓名 + 是否年满 21"这类业务真实需要的字段单独列出来，只在 Device Request 的 namespace 里声明这些 element identifier，不要顺手把整张证件都拉走。
+
+---
+
+## 关联 Session
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — Apple 托管的后台资源下发，扩展 Background Assets 能力。
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — Writing Tools 的进阶集成，让 app 文本字段获得校对、改写能力。
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — App Store 服务端 API 与通知更新，覆盖订阅与一次性购买。
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — 用 PermissionKit 增强儿童沟通安全的权限请求与审核流程。

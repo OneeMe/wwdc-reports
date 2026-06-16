@@ -8,58 +8,239 @@ videoUrl: "https://developer.apple.com/videos/play/wwdc2025/270/"
 sessionId: "wwdc2025-270"
 year: "2025"
 relatedSessions:
-  - title: "Code-along: Explore localization with Xcode"
-    code: "225"
-    description: "learn how to localize your app into additional languages using xcode. we"
-  - title: "Get started with Game Center"
-    code: "214"
-    description: "explore the features of game center and learn how to get started. we"
-  - title: "Meet Containerization"
-    code: "346"
-    description: "meet containerization, an open source project written in swift to create and run"
   - title: "What’s new in Swift"
     code: "245"
     description: "join us for an update on swift. we"
+  - title: "Code-along: Explore localization with Xcode"
+    code: "225"
+    description: "learn how to localize your app into additional languages using xcode. we"
+  - title: "Meet Containerization"
+    code: "346"
+    description: "meet containerization, an open source project written in swift to create and run"
+  - title: "Get started with Game Center"
+    code: "214"
+    description: "explore the features of game center and learn how to get started. we"
 ---
 
 ## Highlight
 
-> Sima 构建了一个从照片提取贴纸的 app，分阶段优化：
+> 用 `nonisolated` 类型加 `@concurrent` 方法把图片处理移出主线程，配合 `async let` 并行执行贴纸提取和颜色计算，把超过 10 秒的 Severe Hang 消除。
 
 ---
 
 ## 核心内容
 
-Sima 构建了一个从照片提取贴纸的 app，分阶段优化：
+Sima 在做一个把照片做成贴纸册的 app，跑起来一切正常，直到她加了「贴纸抠图 + 主色提取」这一步。Instruments 的 Time Profiler 给出了直接的判决：Severe Hang，最重的栈帧停留在 PhotoProcessor 上，主线程被阻塞超过 10 秒（[11:23](https://developer.apple.com/videos/play/wwdc2025/270/?time=683)）。滚动卡死、点击没反应，问题不在算法，而在「这段计算根本不该跑在主线程」。
 
-**异步加载照片**：PhotosPickerItem 的 `loadTransferable` 是异步 API，用 SwiftUI 的 `task` modifier 启动。await 标记 suspension point，主线程在等待期间可以响应 UI 事件。LazyHStack 确保只对可见视图启动加载任务。
-
-**移出主线程**：图片处理（贴纸提取 + 主色计算）阻塞主线程超过 10 秒导致严重 hang。解决方案：PhotoProcessor 标记 `nonisolated`（脱离 MainActor），`process` 方法加 `@concurrent` + `async`（强制切换到后台线程）。
-
-**并行化**：贴纸提取和颜色提取相互独立，用 `async let` 并行执行，利用多核 CPU。引入第一个数据竞争——ColorExtractor 的可变像素缓冲区被多个并发任务共享。解决方案：将 ColorExtractor 从存储属性移到 extractColors 函数的局部变量，每个任务获得独立实例。
-
-**SwiftUI 中的数据竞争**：`visualEffect` 闭包是 @Sendable 的（SwiftUI 在后台调用），访问 self.pulse（@MainActor 属性）触发编译器错误。解决方案：在闭包捕获列表中拷贝 selection 值。
-
-**TaskGroup**：处理所有照片时任务数量不确定，用 TaskGroup 动态创建子任务。Group 遵循 AsyncSequence，结果按完成顺序迭代存储到 dictionary。
-
-
-### 最佳实践
-
-1. **先 profile 再优化**。用 Instruments Time Profiler 确认主线程被阻塞的事实和严重程度，再决定用 async/await 还是其他优化手段。没有测量数据的优化是盲目的。
-
-2. **能不引入并发就不引入**。如果可以通过算法优化减少计算量（比如用更快的图片处理库），优先考虑。并发引入了复杂性（数据竞争、调试难度），只有在确实需要时才使用。
-
-3. **@concurrent 是声明方法线程语义的正确方式**。比在每个调用点手动创建 Task 更清晰。配合 nonisolated 使用，让整个类型脱离 MainActor。
-
-4. **数据竞争的通用解决方案是避免共享**。问自己：这个可变状态真的需要在并发任务间共享吗？如果每个任务可以有独立实例（比如 ColorExtractor），那就给每个任务一个实例。
-
-5. **SwiftUI 的 Sendable 闭包用捕获列表处理**。`visualEffect`、`onGeometryChange` 等闭包会在后台调用。需要访问 @MainActor 状态时，在捕获列表中拷贝值类型数据，不要通过 self 引用。
+Xcode 26 默认开启的 main actor by default 模式让事情更隐蔽：所有类型默认绑定到 `@MainActor`，只要不主动声明，就会被串行排到主线程上跑。这节课的核心思路是把代码沿着这条路径推进——先用 `async/await` 让 UI 能等待异步加载；再用 `nonisolated` + `@concurrent` 把昂贵计算搬到后台；接着用 `async let` 让两条独立任务并行；最后用 `withTaskGroup` 处理数量不固定的并发工作。每一步都先用 Instruments 观察到具体的性能问题，再用刚好够用的 concurrency 工具去解决它，不提前引入额外复杂度。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Code-along: Explore localization with Xcode](/articles/wwdc2025-225) — learn how to localize your app into additional languages using xcode. we
-- [Get started with Game Center](/articles/wwdc2025-214) — explore the features of game center and learn how to get started. we
-- [Meet Containerization](/articles/wwdc2025-346) — meet containerization, an open source project written in swift to create and run
-- [What’s new in Swift](/articles/wwdc2025-245) — join us for an update on swift. we
+**第一步：用 `task` 触发异步加载（[06:29](https://developer.apple.com/videos/play/wwdc2025/270/?time=389)）**
+
+PhotosPickerItem 提供 `loadTransferable`，它本身就是异步的。把 `loadPhoto` 标 `async`，调用处加 `await`：
+
+```swift
+func loadPhoto(_ item: SelectedPhoto) async {
+    var data: Data? = try? await item.loadTransferable(type: Data.self)
+
+    if let cachedData = getCachedData(for: item.id) { data = cachedData }
+
+    guard let data else { return }
+    processedPhotos[item.id] = Image(data: data)
+
+    cacheData(item.id, data)
+}
+```
+
+关键点：
+
+- `async` 标记函数可以包含挂起点；`await` 标记一个具体的挂起点。
+- `loadTransferable` 在挂起期间，主线程腾出来处理 UI 事件，框架在后台跑加载。
+- `loadPhoto` 恢复执行时回到主线程，更新 `processedPhotos` 字典是安全的。
+
+在 SwiftUI 里通过 `task` modifier 启动这个异步函数：
+
+```
+StickerPlaceholder()
+    .task {
+        await viewModel.loadPhoto(selectedPhoto)
+    }
+```
+
+关键点：
+
+- `task` 会在 view 出现时启动，view 消失时自动取消。
+- 配合 LazyHStack，只有屏幕上可见的 placeholder 才会触发加载，避免做无用功。
+
+**第二步：把 PhotoProcessor 移出主线程（[14:13](https://developer.apple.com/videos/play/wwdc2025/270/?time=853)）**
+
+加上贴纸抠图后跑起来卡顿严重，Instruments 显示主线程被堵超过 10 秒。原因是 main actor by default 模式让 PhotoProcessor 默认绑在主线程：
+
+```swift
+nonisolated struct PhotoProcessor {
+
+    let colorExtractor = ColorExtractor()
+
+    @concurrent
+    func process(data: Data) async -> ProcessedPhoto? {
+        let sticker = extractSticker(from: data)
+        let colors = extractColors(from: data)
+
+        guard let sticker = sticker, let colors = colors else { return nil }
+
+        return ProcessedPhoto(sticker: sticker, colorScheme: colors)
+    }
+
+    private func extractColors(from data: Data) -> PhotoColorScheme? {
+        // ...
+    }
+
+    private func extractSticker(from data: Data) -> Image? {
+        // ...
+    }
+}
+```
+
+关键点：
+
+- `nonisolated` 加在 struct 上，整个类型脱离 MainActor，所有方法和属性自动 nonisolated（Swift 6.1 新特性）。
+- `@concurrent` 是新属性，告诉 Swift 这个方法**总是**切到后台线程执行，不再继承调用方的 actor。
+- `async` 让调用方需要 `await`——这是「跨线程切换」在类型层面的可见标记。
+- 调用点变成 `await PhotoProcessor().process(data: data)`，主线程在等待期间继续处理滚动手势。
+
+**第三步：把贴纸提取和颜色计算并行化（[20:55](https://developer.apple.com/videos/play/wwdc2025/270/?time=1255)）**
+
+抠图和取色相互独立，可以同时跑，用 `async let`：
+
+```swift
+nonisolated struct PhotoProcessor {
+
+    @concurrent
+    func process(data: Data) async -> ProcessedPhoto? {
+        async let sticker = extractSticker(from: data)
+        async let colors = extractColors(from: data)
+
+        guard let sticker = await sticker, let colors = await colors else { return nil }
+
+        return ProcessedPhoto(sticker: sticker, colorScheme: colors)
+    }
+
+    private func extractColors(from data: Data) -> PhotoColorScheme? {
+        let colorExtractor = ColorExtractor()
+        return colorExtractor.extractColors(from: data)
+    }
+
+    private func extractSticker(from data: Data) -> Image? {
+        // ...
+    }
+}
+```
+
+关键点：
+
+- `async let` 立即启动子任务，把 sticker 和 colors 两条计算扔到不同线程并发执行。
+- `await sticker`、`await colors` 是真正等待结果的地方；两条任务大约同时完成，总耗时接近耗时较长的那条。
+- ColorExtractor 从存储属性挪到 `extractColors` 局部变量——并发任务各自创建独立实例，避免共享可变像素缓冲区导致的数据竞争。
+
+**第四步：处理 SwiftUI 闭包中的数据竞争（[24:20](https://developer.apple.com/videos/play/wwdc2025/270/?time=1460)）**
+
+`visualEffect` 闭包是 `@Sendable` 的，SwiftUI 会在后台线程调用它。直接读 `viewModel.selection`（@MainActor 状态）会编译错。解法是在捕获列表里把值拷出来：
+
+```swift
+.visualEffect { [selection = viewModel.selection] content, proxy in
+    let frame = proxy.frame(in: .scrollView(axis: .horizontal))
+    let distance = min(0, frame.minX)
+    let isLast = selectedPhoto.id == selection.last?.id
+
+    return content
+        .hueRotation(.degrees(frame.origin.x / 10))
+        .scaleEffect(1 + distance / 700)
+        .offset(x: isLast ? 0 : -distance / 1.25)
+        .brightness(-distance / 400)
+        .blur(radius: isLast ? 0 : -distance / 50)
+        .opacity(isLast ? 1.0 : min(1.0, 1.0 - (-distance / 400)))
+}
+```
+
+关键点：
+
+- `[selection = viewModel.selection]` 在主线程上完成快照；闭包内部使用拷贝出来的 `selection`，不再回访 `self`。
+- 值类型（数组、ID）拷贝便宜，又天然 Sendable，跨线程读取安全。
+
+**第五步：用 TaskGroup 并发处理整个相册（[29:00](https://developer.apple.com/videos/play/wwdc2025/270/?time=1740)）**
+
+进入 grid 视图时要把所有照片一次性处理完，数量在运行时才知道，用 TaskGroup：
+
+```swift
+func processAllPhotos() async {
+    await withTaskGroup { group in
+        for item in selection {
+            guard processedPhotos[item.id] == nil else { continue }
+            group.addTask {
+                let data = await self.getData(for: item)
+                let photo = await PhotoProcessor().process(data: data)
+                return photo.map { ProcessedPhotoResult(id: item.id, processedPhoto: $0) }
+            }
+        }
+
+        for await result in group {
+            if let result {
+                processedPhotos[result.id] = result.processedPhoto
+            }
+        }
+    }
+}
+```
+
+关键点：
+
+- `withTaskGroup` 适合任务数量在编译期不固定的场景，`async let` 不行。
+- `group.addTask` 在循环里动态加子任务；TaskGroup 遵循 AsyncSequence。
+- `for await result in group` 按**完成顺序**而非提交顺序拿结果，最快做完的先写进 dictionary。
+- 整个 group 在 `await withTaskGroup` 退出时自动等所有子任务结束——结构化并发避免任务泄漏。
+
+---
+
+## 核心启发
+
+**1. 先 profile 再加 concurrency**
+
+为什么值得做：没有测量数据的优化是盲目的。Sima 在 session 里反复用 Instruments 的 Time Profiler 确认主线程阻塞的事实，再决定要不要切线程。
+
+怎么开始：在 Xcode 选 Product → Profile，跑 Time Profiler，看 heaviest stack trace 里有没有自己的代码挂在主线程。看到 Severe Hang 才动手。
+
+**2. 用 `nonisolated` + `@concurrent` 描述「这个类型不属于主线程」**
+
+为什么值得做：main actor by default 模式让默认在主线程跑，这对 UI 代码合理，对计算代码致命。把 `nonisolated` 加在类型上，整个类型脱离 MainActor；`@concurrent` 加在 async 方法上，强制切后台线程。比在每个调用点手写 `Task { @concurrent in ... }` 更清晰。
+
+怎么开始：识别项目里的纯计算类型（图片处理、解码、签名等），加 `nonisolated struct` 或 `nonisolated class`，把入口方法标 `@concurrent async`。
+
+**3. 数据竞争优先用「不共享」解决**
+
+为什么值得做：ColorExtractor 一开始是 PhotoProcessor 的存储属性，并发调用就会冲突。把它改成函数局部变量，每个任务一个独立实例，问题消失。比加锁、加 actor 更省事。
+
+怎么开始：碰到 Sendable 报错时先问——这个可变状态真的需要共享吗？如果每次调用都能新建一个，就别让它当属性。
+
+**4. SwiftUI 的 `@Sendable` 闭包用捕获列表拷值**
+
+为什么值得做：`visualEffect`、`onGeometryChange` 这类闭包会在后台调用。在闭包里访问 `self.someMainActorProperty` 编译错；在捕获列表里拷一份值类型快照就解决了。
+
+怎么开始：见到「Sending main actor-isolated value to nonisolated context」错误，先看闭包是不是 `@Sendable`，再用 `[x = self.x]` 拷出来。
+
+**5. 任务数量动态时用 TaskGroup，固定时用 `async let`**
+
+为什么值得做：`async let` 是结构化并发的最简形式，但只能开固定条数。处理「相册里所有照片」这类运行时才知数量的场景，必须用 `withTaskGroup`，并通过 `for await` 按完成顺序消费结果。
+
+怎么开始：写并发批处理时先数任务条数——固定 2~3 条用 `async let`；循环里 addTask 用 TaskGroup；提交完别忘 `for await result in group` 收结果。
+
+---
+
+## 关联 Session
+
+- [What’s new in Swift](/articles/wwdc2025-245) — Swift 6.2 的语言更新，包括 `@concurrent`、`nonisolated` 类型修饰这些本节用到的特性。
+- [Code-along: Explore localization with Xcode](/articles/wwdc2025-225) — 同系列 code-along，用一个 sample app 一步步演示 Xcode 的本地化流程。
+- [Meet Containerization](/articles/wwdc2025-346) — 用 Swift 写的开源容器项目，展示 Swift 在系统级并发场景下的工程实践。
+- [Get started with Game Center](/articles/wwdc2025-214) — Game Center 入门，体会 SwiftUI app 接入系统服务时常见的异步 API 模式。

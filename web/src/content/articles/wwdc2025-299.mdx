@@ -30,24 +30,130 @@ relatedSessions:
 
 ## 核心内容
 
-Apple 在 iOS 26 推出了 Declared Age Range API，让 App 能以隐私保护的方式获取用户的年龄段，而不是精确生日。核心思路是：App 提交自己关心的年龄节点（比如 13 岁和 16 岁），系统返回一个区间（比如"13 到 15 岁"），而不是精确出生日期。这解决了开发者长期以来的一个两难问题——需要知道用户年龄来做内容分级，但又不想承担存储精确生日的隐私风险。
+做内容分级的开发者长期面临一个尴尬场景：要判断"这个用户能不能用社交分享功能"，最准确的办法是问生日，但一旦把精确生日存进数据库，就要面对 COPPA、GDPR-K 等一连串的合规审计。结果很多 App 干脆做一道弹窗"请确认你已年满 13 岁"，让用户随手一点过去——既没真正保护未成年人，也没解决合规问题。
 
-Session 围绕三个层面展开：背景政策（Apple 2025 年的儿童保护白皮书、App Store 年龄分级从三档变五档）、框架机制（Declared Age Range 框架的请求-响应模型、缓存策略、家长控制集成），以及实际代码（如何在 SwiftUI 中接入，如何处理分享/拒绝/错误三种情况）。
-
-
-### 最佳实践
-
-接入 Declared Age Range API 的第一步是确定你需要哪些年龄节点。不要贪多——每个节点都会增加区间划分的复杂度。从你的合规需求出发：哪些功能有法定年龄限制？通常 13（COPPA）和 16（GDPR）就够了。
-
-请求时机上，建议在功能入口处按需请求，而不是 App 启动时全量请求。API 有缓存机制，同一用户短期内不会重复弹窗，所以不用担心频繁请求打扰用户。
-
-处理 decline sharing 的情况时，不要粗暴地拒绝所有功能——可以降级体验，比如隐藏社交分享但保留浏览功能。毕竟用户（或家长）选择不分享年龄并不等于他们是儿童。
+iOS 26 给出了新的中间层。Declared Age Range 框架让 App 提交关心的年龄节点（最多 3 个，每个区间至少跨 2 年），系统返回一个区间值。Olivia 14 岁，App 问 13 和 16，系统就回答"13 到 15"；Emily 9 岁，得到的是"12 或更小"；42 岁的 Ann 则是"16 或更大"。生日始终留在系统里，App 只拿到决策需要的最小信息。年龄声明背后还有家长流程：儿童账号下的年龄由监护人确认，三种共享模式（Always Share / Ask First / Never Share）都由家长在"屏幕使用时间"或"家庭"设置里管理。响应有一年缓存，跨设备同步，到了周年才会重新提示，避免 App 被反复弹窗骚扰，也避免连续追问反推出生日。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — learn about the apis in the networkextension framework that give your app the po
-- [Finish tasks in the background](/articles/wwdc2025-227) — discover background execution advancements and understand how the system schedul
-- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — learn how to protect your app
-- [Optimize home electricity usage with EnergyKit](/articles/wwdc2025-257) — learn how to support energykit in your app so people can optimize electricity us
+接入分两步：先在 Xcode 的 Signing & Capabilities 里加上 Declared Age Range capability，然后在 SwiftUI 里通过环境值发起请求。下面是官方示例（[08:03](https://developer.apple.com/videos/play/wwdc2025/299/?time=483)）：
+
+```swift
+// Request an age range
+
+import SwiftUI
+import DeclaredAgeRange
+
+struct LandmarkDetail: View {
+    // ...
+    @State var photoSharingEnabled = false
+    @Environment(\.requestAgeRange) var requestAgeRange
+
+    var body: some View {
+        ScrollView {
+            // ...
+            Button("Share Photos") {}
+                .disabled(!photoSharingEnabled)
+        }
+        .task {
+            await requestAgeRangeHelper()
+        }
+    }
+
+    func requestAgeRangeHelper() async {
+        do {
+            // TODO: Check user region
+            let ageRangeResponse = try await requestAgeRange(ageGates: 16)
+            switch ageRangeResponse {
+            case let .sharing(range):
+                 // Age range shared
+                if let lowerBound = range.lowerBound, lowerBound >= 16 {
+                    photoSharingEnabled = true
+                }
+                // guardianDeclared, selfDeclared
+                print(range.ageRangeDeclaration)
+            case .declinedSharing:
+                // Declined to share
+                print("Declined to share")
+            }
+        } catch AgeRangeService.Error.invalidRequest {
+            print("Handle invalid request error")
+        } catch AgeRangeService.Error.notAvailable {
+            print("Handle not available error")
+        } catch {
+            print("Unhandled error: \(error)")
+        }
+    }
+}
+```
+
+关键点：
+
+- `import DeclaredAgeRange` 引入新框架，必须先在 capability 列表里勾选才能编译通过。
+- `@Environment(\.requestAgeRange)` 拿到一个异步闭包，把请求挂在环境上是为了让系统知道在哪个窗口弹提示——iPad 多窗口、Mac 多窗口都靠它。
+- `requestAgeRange(ageGates: 16)` 只传一个年龄节点，意味着 App 只关心"16 岁分界"。需要更精细的分级可以传多个节点（最多 3 个）。
+- `case let .sharing(range)` 解出 `range.lowerBound` 和 `range.upperBound`，两端都可能为 `nil`：上界 `nil` 表示"X 岁及以上"，下界 `nil` 表示"X 岁及以下"。所以代码先 `if let lowerBound` 再比较。
+- `range.ageRangeDeclaration` 返回 `guardianDeclared` 或 `selfDeclared`：儿童恒为 `guardianDeclared`，加入 iCloud 家庭的青少年也是 `guardianDeclared`，单飞青少年和成人是 `selfDeclared`，可以用来决定是否需要更严格的家长背书。
+- `invalidRequest` 是开发者错误（[10:33](https://developer.apple.com/videos/play/wwdc2025/299/?time=633)），常见原因是某个区间不足两年；`notAvailable` 是设备配置问题，比如用户没登 Apple 账号——这两个错误要分别处理，不能一锅端。
+
+如果年龄区间的上界低于该地区的成年年龄，响应里还会带上 `activeParentalControls`，App 可以据此进一步收敛体验（[11:49](https://developer.apple.com/videos/play/wwdc2025/299/?time=709)）：
+
+```swift
+// Request an age range
+
+func requestAgeRangeHelper() async {
+    do {
+        // TODO: Check user region
+        let ageRangeResponse = try await requestAgeRange(ageGates: 16)
+        switch ageRangeResponse {
+        case let .sharing(range):
+            if range.activeParentalControls.contains(.communicationLimits) {
+                print("Communication Limits enabled")
+            }
+            // ...
+        case .declinedSharing:
+            // Declined to share
+            print("Declined to share")
+        }
+    } catch {
+        // ...
+    }
+}
+```
+
+关键点：
+
+- `activeParentalControls` 是一个集合，目前包含 `.communicationLimits` 等家长在"屏幕使用时间"中开启的限制；当家长禁止陌生人沟通时，App 就该自动关闭好友邀请、陌生人私信入口。
+- 配套 PermissionKit 可让家长批准/拒绝第三方 App 内的具体联系人请求（[12:08](https://developer.apple.com/videos/play/wwdc2025/299/?time=728)），与 Declared Age Range 互补：年龄段决定默认开关，PermissionKit 决定个案授权。
+- 缓存策略（[11:21](https://developer.apple.com/videos/play/wwdc2025/299/?time=681)）：响应一年内有效，跨 iPhone/Mac 同步，App 即使频繁调用也不会反复弹窗。用户可以在 Settings → Age Range for Apps 手动重置某个 App 的缓存，这样过完生日当天就能立刻拿到新区间，而不必等周年。
+
+---
+
+## 核心启发
+
+- **做什么**：在功能入口按需请求年龄段，而不是 App 启动时一次性获取。
+  - 为什么值得做：API 自带一年缓存，请求成本极低；按需请求可以让用户清楚"为什么此刻被问"，提升授权率。
+  - 怎么开始：先梳理 App 中受年龄影响的功能（社交分享、聊天、广告、内购），把 `.task { await requestAgeRangeHelper() }` 挂在对应视图上，每个入口只问与该功能相关的最小年龄节点。
+
+- **做什么**：把"拒绝共享"做成降级体验，而非全员封禁。
+  - 为什么值得做：选择 Never Share 的用户里大量是注重隐私的成年人；一律按"未成年"处理会损失正常用户。
+  - 怎么开始：在 `.declinedSharing` 分支里保留浏览、查询等基础功能，仅隐藏需要年龄确认的入口；UI 文案说明"开启年龄共享后可解锁分享功能"。
+
+- **做什么**：用 `ageRangeDeclaration` 区分 `guardianDeclared` 与 `selfDeclared`，决定二次校验强度。
+  - 为什么值得做：儿童账号的区间一定来自家长，可信度更高；单飞青少年是自我声明，对高风险功能（如内购、直播开通）值得加额外提醒。
+  - 怎么开始：在 `.sharing(range)` 分支里读取 `range.ageRangeDeclaration`，对 `selfDeclared` 的边界用户加一道家长邮件确认或延迟开启策略。
+
+- **做什么**：响应里命中 `activeParentalControls.communicationLimits` 时自动隐藏陌生人沟通入口。
+  - 为什么值得做：家长一旦开启 Communication Limits，App 还把陌生人入口暴露出来，本身就是合规风险。
+  - 怎么开始：在视图模型里维护一个 `canMessageStrangers` 标志，结合 PermissionKit 的批准流程，把"被拒绝"和"未授权"两种状态分开提示。
+
+---
+
+## 关联 Session
+
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-275) — 用 PermissionKit 让家长在第三方 App 中逐项批准联系人。
+- [What's new in StoreKit and In-App Purchase](/articles/wwdc2025-241) — App Store 新分级（4+/9+/13+/16+/18+）下的内购合规要点。
+- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — 系统级网络过滤能力，与年龄段策略配合做家庭网络管控。
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — 隐私保护的另一面：用更强加密守住已收集的用户数据。

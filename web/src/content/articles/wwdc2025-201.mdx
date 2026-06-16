@@ -24,32 +24,89 @@ relatedSessions:
 
 ## Highlight
 
-> Metal 这次的更新覆盖了四个方向，但逻辑其实是一条线：把渲染流水线上那些开发者不得不自己处理的脏活累活收进框架层。渲染状态切换的 CPU 开销、着色器编译的冷启动卡顿、低分辨率渲染的画面折损——这些问题存在好几年了，大家各自写了各种 workaround，现在 Apple 给了官方解法。
+> Apple Pay 按钮今年变成动态的：相关用户在 SwiftUI/UIKit 应用里会直接看到自己的默认银行卡卡面，前提是付款请求里带上了 Merchant Category Code 和支持的支付网络。
 
 ---
 
 ## 核心内容
 
-Metal 这次的更新覆盖了四个方向，但逻辑其实是一条线：把渲染流水线上那些开发者不得不自己处理的脏活累活收进框架层。渲染状态切换的 CPU 开销、着色器编译的冷启动卡顿、低分辨率渲染的画面折损——这些问题存在好几年了，大家各自写了各种 workaround，现在 Apple 给了官方解法。
+过去十年 Apple Pay 一直在解决"如何让用户更快付款"这件事，但商户侧体验长期没什么变化：按钮就是一个黑色按钮，预授权扣款（preauthorised payments）只能显示支付网络给的默认商户名，订单追踪要么走 Apple Pay 流程，要么靠 email 附件，要么放一个"加入 Wallet"按钮。结果就是用户付了钱也认不出哪个商户是谁，开发者也没法把品牌信息延伸到 Wallet 里。
 
-MetalFX 的时间放大（Temporal Upscaling）做了比较大的质量提升，特别是高速运动和密集几何体场景下的时序稳定性。运动向量精度更高，重投影算法对遮挡区域的处理更智能，这意味着"低内部分辨率渲染 + 放大输出"这个策略终于可以在正式项目里放心用了。以前提 2x 放大倍率，美术团队总会抱怨高速运镜时的拖影和闪烁，现在这些问题基本被压住了。着色器编译方面，增量编译、异步 PSO 创建、SwiftUI Shader 的构建时预编译三管齐下，基本上把开发迭代中最让人头疼的编译等待砍掉了大半。特别是增量编译——你改了一行着色器代码，不再需要等几分钟的全量重编，这个体验差距是数量级的。
-
-另外一块容易被忽略的变化是 Indirect Command Buffer（ICB）的扩展，以及 visionOS 立体渲染的深度集成。ICB 支持更多命令类型后，GPU 驱动的剔除和延迟渲染管线终于有了比较完整的编程模型。visionOS 那边，Remote Immersive Space 让 Mac 应用也能驱动 Vision Pro 的立体内容，跨设备渲染的门槛降了不少。
-
-
-### 最佳实践
-
-优先从 MetalFX 的时间放大开始集成。这是投入产出比最高的改动——不需要重构渲染管线，只需要在渲染末尾加一个 pass，就能把内部分辨率降下来换帧率。先在项目里跑起来，验证 2x 放大倍率下画质能否通过 QA，再考虑是否更激进。
-
-渲染状态管理的迁移建议放第二优先级。这个改动收益大，但需要重构渲染循环，风险也高。先在新功能或新场景里用新 API，老代码逐步迁移，不要一次性全改。
-
-Shader 编译方面，SwiftUI 项目立刻用 `compiled(as:)`，纯 Metal 项目先把异步 PSO 创建加上——改动最小，效果最直接。增量编译是框架自动生效的，不需要额外操作。ICB 和 GPU 驱动管线，除非在做大型 3D 场景渲染，否则可以先观望。它的编程模型复杂度高，调试工具链还不够成熟，投入产出比不如前几项。
+今年 WWDC 把这三件事一次性补上了。Apple Pay 按钮变成动态按钮，会显示用户即将使用的那张银行卡的卡面；预授权扣款页面被统一改造，商户可以提供自定义 logo、名称、描述和图片；订单追踪接入 Apple Intelligence，Wallet 能从 Mail 里自动识别订单邮件并生成 Wallet 订单。配合 FinanceKit 新增的 background delivery extension，金融类应用可以在 app 没启动时也保持数据更新，这对于做记账、消费分析、widget 实时更新的开发者来说是个比较关键的能力。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — building on background assets, this session will introduce the new capability to
-- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — with writing tools, people can proofread, rewrite, and transform text directly w
-- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — discover the latest updates for the app store server api, app store server notif
-- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — discover how permissionkit helps you enhance communication safety for children i
+动态 Apple Pay 按钮（[01:11](https://developer.apple.com/videos/play/wwdc2025/201/?time=71)）的核心是让按钮自己挑出"最适合本次交易的那张卡"。要让按钮知道交易适配哪些卡，需要在 `PKPaymentRequest` 里把 `merchantCategoryCode` 填进去：
+
+```swift
+let paymentRequest = PKPaymentRequest()
+paymentRequest.supportedNetworks = [.visa, .masterCard]
+paymentRequest.merchantCapabilities = [.threeDSecure]
+paymentRequest.merchantCategoryCode = PKMerchantCategoryCode(rawValue: 5995) // Pet Shops, Pet Food and Supplies
+
+// 使用接受 PKPaymentRequest 的初始化器，按钮才会根据这些字段挑卡
+PayWithApplePayButton(paymentRequest: paymentRequest) {
+    // handle payment
+}
+```
+
+关键点：
+
+- `supportedNetworks` 决定哪些支付网络可用，不在数组里的卡会被标记为不可用。
+- `merchantCapabilities` 指定支持的加密协议和卡类型。
+- `merchantCategoryCode` 是行业标准代码（例如 5995 是宠物用品），让用户提前知道哪张卡能用，避免支付失败。
+- 必须使用接受 `PKPaymentRequest` 的初始化器，按钮才会根据上述字段挑卡；否则只是回退到原始按钮样式。
+
+如果不想要新的卡面外观（比如品牌设计稿强制要纯黑按钮），可以用 view modifier 关掉（[03:25](https://developer.apple.com/videos/play/wwdc2025/201/?time=205)）：
+
+```swift
+VStack {
+    PayWithApplePayButton(.buy) {
+        // handle payment
+    }
+}
+.payWithApplePayButtonDisableCardArt()
+```
+
+关键点：
+
+- `payWithApplePayButtonDisableCardArt` 强制使用原始按钮样式。
+- 这个 modifier 作用于整个 view hierarchy，可以一次性套到多个按钮甚至整个 app 上。
+- SwiftUI 和 UIKit 应用默认免费拿到新按钮，不需要额外开发。
+
+预授权扣款（[03:55](https://developer.apple.com/videos/play/wwdc2025/201/?time=235)）这一块改动更大。Wallet 新增了一个统一的 preauthorised payments 视图，把所有订阅、定期扣款集中显示，并能推送即将扣款的通知。商户要让自己的 logo、名称和支付详情显示出来，需要实现 Merchant Token API：服务端提供一个 bundle-vending endpoint，返回 zip 包（包含 usage information JSON、商户 logo、商品图、可选本地化文件），整个包用 HPKE in auth mode 端到端加密给客户设备，单包上限 5MB。schema 的关键字段是 `merchantTokenIdentifier`、`merchantName`、`merchantLogoName`、`upcomingPayments`、`pastPayments`。
+
+订单自动追踪（[10:19](https://developer.apple.com/videos/play/wwdc2025/201/?time=619)）是用 Apple Intelligence 在设备上识别 Mail 里的订单邮件，自动转成 Wallet 订单。要让识别效果好，邮件正文里要有商户名、每封邮件要有订单号、要有 tracking number 用来关联物流邮件。商户可以在 Apple Business Connect 注册邮件地址和 logo，让识别出来的订单带上品牌信息。如果需要更深度的功能（无邮件的订单更新、集成收据、退货流程），仍然可以用传统的 order bundle 或在付款请求里设置 `webServiceURL`。
+
+FinanceKit background delivery extension（[13:56](https://developer.apple.com/videos/play/wwdc2025/201/?time=836)）是这次最实用的开发能力。新的 extension 类型实现两个端点：`didReceiveData` 接收一个 `[BackgroundDataType]` 数组（值为 `accounts`、`accountBalances`、`transactions`），告诉你哪些数据变了；`willTerminate` 在时间窗口结束时调用，给你机会保存进行中的工作。App 端只需要向 FinanceStore 声明感兴趣的数据类型和更新频率（`hourly` / `daily` / `weekly`），扣款发生时系统会自动唤起 extension，让你在 app 没运行的情况下也能更新 widget 或生成日常消费报告。FinanceKit 今年也扩到了英国市场（[12:55](https://developer.apple.com/videos/play/wwdc2025/201/?time=775)），通过 Open Banking Standard 接入 Connected Cards。
+
+---
+
+## 核心启发
+
+- **做什么**：给现有 Apple Pay 集成补上 Merchant Category Code 和 supportedNetworks。
+  - 为什么值得做：这是动态按钮生效的前提，改动只有几行代码，但能直接降低支付失败率（用户在结账前就知道哪张卡能用）。SwiftUI/UIKit 应用免费拿到新按钮外观，不补这个字段就拿不到。
+  - 怎么开始：找到所有 `PKPaymentRequest` 创建的地方，加上 `merchantCategoryCode`、确认 `supportedNetworks` 和 `merchantCapabilities` 填齐，确保初始化按钮时传的是 `PKPaymentRequest` 而非简单回调。
+
+- **做什么**：为订阅类业务实现 Merchant Token Usage Information bundle。
+  - 为什么值得做：用户在 Wallet 里看到的不再是支付网络给的奇怪商户名，而是你的 logo、自定义名称和订阅详情。这是品牌曝光的新入口，特别适合 SaaS、流媒体、健身订阅这类需要持续扣款的产品。
+  - 怎么开始：先在服务端生成 Merchant Public/Private key pair 并持久化；按文档实现 bundle-vending endpoint；构造一个示例 zip（≤5MB，含 logo、JSON schema、产品图）跑通端到端加密流程。
+
+- **做什么**：把记账/消费类应用迁移到 FinanceKit background delivery extension。
+  - 为什么值得做：widget 不再依赖主 app 启动才能刷新数据，用户买完东西、卡片入账就能立刻看到最新余额。这对留存和"实时感"体验差距很大。
+  - 怎么开始：新建 background delivery extension target，实现 `didReceiveData` 和 `willTerminate`；把数据存储迁到 app group；在主 app 里向 FinanceStore 注册关心的数据类型和频率（hourly/daily/weekly）；测试时用真实交易触发，验证 widget 能在 app 关闭时刷新。
+
+- **做什么**：把订单确认邮件按 Wallet 自动追踪的格式重新模板化。
+  - 为什么值得做：用户不需要做任何事就能在 Wallet 里看到订单和物流信息，客服压力下降，错过配送的概率也降低。Apple Business Connect 注册后还能带上品牌 logo。
+  - 怎么开始：审计现有的订单确认邮件模板，确认正文里有商户名、订单号；让物流邮件带上同一个 tracking number；去 Apple Business Connect 注册业务邮箱和 logo；发一封测试邮件到测试账户验证 Wallet 能正确识别字段。
+
+---
+
+## 关联 Session
+
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — App Store Server API 与服务端通知的最新更新，订阅业务的服务端必修。
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — 利用 Apple 托管的资源在后台静默更新，与 FinanceKit background delivery 思路相通。
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — PermissionKit 的儿童通信安全能力，同样属于 App Services 主题下的新框架。
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — Writing Tools 的深度集成，展示 Apple Intelligence 在系统级体验中的另一类应用。

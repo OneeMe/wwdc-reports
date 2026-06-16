@@ -30,38 +30,259 @@ relatedSessions:
 
 ## 核心内容
 
-如果你之前只在 Apple Watch 上做锻炼追踪，现在可以把同样的代码搬到 iPhone/iPad 上了。核心流程完全一致：
+过去开发健身类 app 有个尴尬：所有强大的 workout API 都长在 Apple Watch 上。如果用户没买 Watch，开发者要么放弃锻炼追踪，要么自己拼凑一套传感器读数和数据库写入逻辑，结果是 Activity Rings 不更新、锻炼记录不进 HealthKit、跨设备状态也对不上。Health & Fitness 类目里，没有 Watch 的那一半用户长期只能拿到二等体验。
 
-1. 创建 `HKWorkoutConfiguration`（类型 + 位置）
-2. 创建 `HKWorkoutSession`，获取 builder，设置 data source
-3. `prepare()` 后 3 秒倒计时，让传感器就绪
-4. `startActivity()` + `beginCollection()`
-5. 通过 builder delegate 获取实时指标
-6. `stopActivity()` -> `endCollection()` -> `finishWorkout()` -> `end()`
-
-**和 Watch 的关键区别**：
-
-1. **传感器差异**：iPhone/iPad 没有心率传感器，需要配对 BLE 心率带（如 Powerbeats Pro 2）。系统会自动处理心率数据。
-2. **Generated vs Collected types**：Generated types 是系统在锻炼期间自动产生的（卡路里、距离）；Collected types 是你想观察并添加到锻炼样本的数据（比如锻炼期间喝的水）。可以用 `enableCollection(for:)` / `disableCollection(for:)` 控制。
-3. **锁屏行为**：iPhone 很可能在锻炼时锁屏。首次启动锻炼时系统会提示"即使锁屏也可访问锻炼数据"。你的 app 应该用 **Live Activity** 在锁屏显示关键指标。
-4. **Siri 锁屏控制**：新增 Siri Intent 支持在锁屏上启动、暂停、恢复、取消锻炼，不需要解锁。
-5. **Crash Recovery**：系统自动重启崩溃的 app，恢复 workout session 和 builder 状态，但你需要重建 data source。新增 scene delegate 处理恢复流程。
-
-
-### 最佳实践
-
-- **优先从 Watch 启动锻炼**（如果用户有 Watch），用 `healthStore.startWatchApp()` 启动，然后 mirror 到 iPhone。这样能获取心率等全部指标。
-- **只请求你需要的数据类型授权**。不要请求和锻炼无关的 HealthKit 权限。
-- **始终用 Workout Builder API** 创建和保存 workout。这是确保 Activity Rings 正确更新的唯一方式。
-- **锻炼期间用 Live Activity** 在锁屏显示关键指标。用 ActivityKit 配合 builder delegate 的实时数据。
-- **处理锁屏隐私场景**。检查是否有数据访问权限，没有则优雅降级 UI。
-- **Siri Intent handler 要处理"已有锻炼在进行"的情况**，返回有意义的错误。
+WWDC25 把 Workout Builder 这套 API 带到了 iPhone 和 iPad。Watch 上原本能跑的 session、builder、data source、live metrics、crash recovery，现在 iOS 和 iPadOS 上都能跑，代码改动很小（[00:55](https://developer.apple.com/videos/play/wwdc2025/322/?time=55)）。差异主要落在传感器（iPhone 没有心率传感器，需要外接 BLE 心率带或 Powerbeats Pro 2）、锁屏（iPhone 在锻炼中很可能锁屏，需要 Live Activity 和 Siri Intent 配合）、崩溃恢复（新增 scene delegate 入口）三件事上。流程本身没变：配置 → session → builder → 倒计时 → 开始采集 → delegate 接实时数据 → 停止 → 保存。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — building on background assets, this session will introduce the new capability to
-- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — with writing tools, people can proofread, rewrite, and transform text directly w
-- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — discover the latest updates for the app store server api, app store server notif
-- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — discover how permissionkit helps you enhance communication safety for children i
+一次 workout session 的生命周期，从配置到结束，分四个阶段。第一步先建配置和 session，把 builder 与 data source 串起来（[01:30](https://developer.apple.com/videos/play/wwdc2025/322/?time=90)）：
+
+```swift
+// Set up workout session
+
+// Create workout configuration
+let configuration = HKWorkoutConfiguration()
+configuration.activityType = .running
+configuration.locationType = .outdoor
+
+// Create workout session
+let session = try HKWorkoutSession(healthStore: healthStore, configuration: configuration)
+session.delegate = self
+
+// Get associated workout builder and add data source
+let builder = session.associatedWorkoutBuilder()
+builder.delegate = self
+builder.dataSource = HKLiveWorkoutDataSource(healthStore: healthStore,
+                                             workoutConfiguration: configuration)
+```
+
+关键点：
+
+- `HKWorkoutConfiguration` 描述这次锻炼的活动类型和位置，传感器栈会按此配置拉数据。
+- `HKWorkoutSession` 用 `healthStore` 和 configuration 初始化，session 的 delegate 用来接状态变化。
+- `associatedWorkoutBuilder()` 返回与这个 session 绑定的 builder，最终用它把锻炼写进 HealthKit。
+- `HKLiveWorkoutDataSource` 是 builder 的输入源，负责把传感器或外部样本喂给 builder。
+
+启动时先 `prepare()` 让传感器就绪，UI 显示 3 秒倒计时，倒计时结束再正式开始（[01:54](https://developer.apple.com/videos/play/wwdc2025/322/?time=114)）：
+
+```swift
+// Prepare and start session
+
+session.prepare()
+
+// Start and display count down
+
+// Start session and builder collection once count down finishes
+session.startActivity(with: startDate)
+try await builder.beginCollection(at: startDate)
+```
+
+关键点：
+
+- `prepare()` 会唤醒板载传感器、连接外接心率带，确保正式开始时第一个样本就有效。
+- `startActivity(with:)` 把 session 切到 running，传入的时间作为锻炼起点。
+- `beginCollection(at:)` 让 builder 从这个时间点起接收样本。
+
+锻炼期间，所有实时指标都通过 builder 的 delegate 推送，不需要 anchored object query（[02:14](https://developer.apple.com/videos/play/wwdc2025/322/?time=134)）：
+
+```swift
+// Handling collected metrics
+
+func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder, 
+                    didCollectDataOf collectedTypes: Set<HKSampleType>) {
+    for type in collectedTypes {
+        guard let quantityType = type as? HKQuantityType else { return }
+
+        let statistics = workoutBuilder.statistics(for: quantityType)
+
+        // Update the published values
+        updateForStatistics(statistics)
+    }
+}
+```
+
+关键点：
+
+- 每当 builder 收到新样本，就回调一次，参数是发生变化的 sample type 集合。
+- `statistics(for:)` 拿到该类型当前的累计统计（平均、累加、最大值等），可直接驱动 UI。
+- builder 在锻炼保存时会自动同步指标，UI 数据和最终样本天然一致。
+
+结束流程要严格按顺序：先 stop session、等 delegate 回到 stopped 状态，再 endCollection、finishWorkout、end（[02:28](https://developer.apple.com/videos/play/wwdc2025/322/?time=148)）：
+
+```swift
+// Stopping the workout session
+
+session.stopActivity(with: .now)
+
+// Session transitions to stopped then call end
+func workoutSession(_ workoutSession: HKWorkoutSession,
+                    didChangeTo toState: HKWorkoutSessionState,
+                    from fromState: HKWorkoutSessionState,
+                    date: Date) {
+    guard change.newState == .stopped, let builder else { return }
+     
+    try await builder.endCollection(at: change.date)
+    let finishedWorkout = try await builder.finishWorkout()
+    session.end()
+}
+```
+
+关键点：
+
+- `stopActivity` 先让 builder 把最后一批样本收完，避免数据丢尾。
+- 等 session 状态变成 `.stopped` 再 `endCollection`，否则 builder 还在采集中。
+- `finishWorkout()` 返回保存到 HealthKit 的 `HKWorkout` 对象，用它做总结页。
+- 最后 `session.end()` 才真正释放 session 资源。
+
+iPhone 与 Watch 的关键差异在于**传感器**和**锁屏**（[03:00](https://developer.apple.com/videos/play/wwdc2025/322/?time=180)）。iPhone/iPad 没有心率传感器，但只要外接支持 GAT profile 的设备（比如 Powerbeats Pro 2），HealthKit 会自动把心率写进 Health Store。系统区分两类样本：**Generated types** 是系统在锻炼期间自动产生的（卡路里、距离）；**Collected types** 是 app 想观察并写入锻炼样本的指标（比如锻炼时喝的水）。可以用 `enableCollection(for:)` / `disableCollection(for:)` 增删（[04:43](https://developer.apple.com/videos/play/wwdc2025/322/?time=283)）。
+
+锁屏处理是 iPhone 特有的问题。第一次启动锻炼时，系统会弹出隐私提示，告诉用户「锻炼数据即使在锁屏时也可访问」（[06:15](https://developer.apple.com/videos/play/wwdc2025/322/?time=375)）。app 应该用 Live Activity 在锁屏上展示关键指标。如果用户拒绝授予锁屏访问权限，UI 应当降级到只显示锻炼时长，不显示具体数值。
+
+更进一步是 Siri 锁屏控制（[06:54](https://developer.apple.com/videos/play/wwdc2025/322/?time=414)）。注册 Intent Handler 之后，用户可以在锁屏上用 Siri 启动、暂停、恢复、取消锻炼，不用解锁手机（[07:17](https://developer.apple.com/videos/play/wwdc2025/322/?time=437)）：
+
+```swift
+// Create an INExtension within your main app
+
+// Define an intent handler
+public class IntentHandler: INExtension {
+
+}
+
+// Define the intents to support
+extension IntentHandler: INStartWorkoutIntentHandling
+
+extension IntentHandler: INPauseWorkoutIntentHandling
+
+extension IntentHandler: INResumeWorkoutIntentHandling
+
+extension IntentHandler: INEndWorkoutIntentHandling
+```
+
+关键点：
+
+- Intent Handler 必须放在主 app 内，extension 形式无法在锁屏触发。
+- 一次性声明四类 workout intent：开始、暂停、恢复、结束。
+- 这是后续 handle 实现的入口签名。
+
+收到 `INStartWorkoutIntent` 时，先检查是否已有锻炼在进行，避免重复启动（[07:32](https://developer.apple.com/videos/play/wwdc2025/322/?time=452)）：
+
+```swift
+// Handle the intent
+
+public func handle(intent: INStartWorkoutIntent) async -> INStartWorkoutIntentResponse {
+    let state = await WorkoutManager.shared.state
+        
+    switch state {
+    case .running, .paused, .prepared, .stopped:
+        return INStartWorkoutIntentResponse(code: .failureOngoingWorkout, 
+                                            userActivity: nil)
+    default:
+        break;
+    }
+    Task {
+        await MainActor.run {
+            // Handle the intents activity type and location
+            WorkoutManager.shared.setWorkoutConfiguration(activityType: .running,   
+                                                          location: .outdoor)
+        }
+    }
+    return INStartWorkoutIntentResponse(code: .success, userActivity: nil)
+ }
+```
+
+关键点：
+
+- 检查 `WorkoutManager` 的状态，已在 running/paused/prepared/stopped 时返回 `.failureOngoingWorkout`。
+- 配置工作切到 `MainActor`，避免线程问题。
+- 通过 `setWorkoutConfiguration` 触发后续启动流程，handle 立刻返回 success。
+
+崩溃恢复（[08:37](https://developer.apple.com/videos/play/wwdc2025/322/?time=517)）：系统会自动重启 app、恢复 session 与 builder 状态，但 data source 需要 app 自行重建。iOS 用 scene delegate 入口（[09:09](https://developer.apple.com/videos/play/wwdc2025/322/?time=549)）：
+
+```swift
+// App Delegate
+
+func application(_ application: UIApplication,
+                 configurationForConnecting connectingSceneSession: UISceneSession,
+                 options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+    if options.shouldHandleActiveWorkoutRecovery {
+        let store = HKHealthStore()
+        store.recoverActiveWorkoutSession(completion: { (workoutSession, error) in
+            // Handle error
+            Task {
+                await WorkoutManager.shared.recoverWorkout(recoveredSession: workoutSession)
+            }
+        })
+    }
+    let configuration = UISceneConfiguration(name: "Default Configuration", 
+                                             sessionRole: connectingSceneSession.role)
+    configuration.delegateClass = WorkoutsOniOSSampleAppSceneDelegate.self
+    return configuration
+}
+```
+
+关键点：
+
+- `options.shouldHandleActiveWorkoutRecovery` 是新增标记，标识本次启动是从崩溃中恢复。
+- `recoverActiveWorkoutSession` 由 HealthStore 提供，回调里拿到已恢复的 session。
+- 把恢复的 session 传给 `WorkoutManager` 完成业务侧重新挂接。
+
+`recoverWorkout` 重新建立 delegate 与 data source（[09:25](https://developer.apple.com/videos/play/wwdc2025/322/?time=565)）：
+
+```swift
+// Recover the workout for the session
+
+
+func recoverWorkout(recoveredSession: HKWorkoutSession) {
+    session = recoveredSession
+    builder = recoveredSession.associatedWorkoutBuilder()
+    session?.delegate = self
+    builder?.delegate = self
+    workoutConfiguration = recoveredSession.workoutConfiguration
+
+    let dataSource = HKLiveWorkoutDataSource(healthStore: healthStore,                                                                  
+                                             workoutConfiguration: workoutConfiguration)
+    builder?.dataSource = dataSource
+}
+```
+
+关键点：
+
+- `associatedWorkoutBuilder()` 在恢复出的 session 上仍可用，状态由系统保留。
+- delegate 必须重新指向当前的 manager 实例，否则收不到回调。
+- data source 是唯一需要重建的部分，配合恢复出的 `workoutConfiguration` 重新挂上即可。
+
+---
+
+## 核心启发
+
+**1. 优先从 Apple Watch 启动锻炼，再镜像到 iPhone**
+
+为什么值得做：Watch 有心率、惯性传感器、皮肤接触，能产生最完整的 generated types；iPhone 上得靠外接 BLE 设备才能补齐心率。怎么开始：检测到用户配对了 Watch 时，调用 `healthStore.startWatchApp()` 拉起 Watch 端 session，再用多设备 mirror（参考 WWDC23 "Build a multi-device workout app"）把状态同步到 iPhone（[09:34](https://developer.apple.com/videos/play/wwdc2025/322/?time=574)）。
+
+**2. 给锻炼配一个 Live Activity + Siri Intent 组合**
+
+为什么值得做：iPhone 锻炼时屏幕大概率锁着，Live Activity 让用户无需解锁就看到关键指标，Siri Intent 让 ta 能用语音操控开始/暂停/结束。两者叠加才能撑得住户外跑步、骑行这类场景。怎么开始：Live Activity 用 ActivityKit + builder delegate 推送实时数据；Siri 端按 [07:17](https://developer.apple.com/videos/play/wwdc2025/322/?time=437) 的 INExtension 模板注册 4 个 workout intent，handler 必须放在主 app 内。
+
+**3. 把崩溃恢复当成必做项，而不是可选项**
+
+为什么值得做：户外锻炼一跑就是 30~60 分钟，中途 app 崩溃如果不能恢复，用户的整次记录就丢了，Activity Rings 也不更新。怎么开始：在 `application(_:configurationForConnecting:options:)` 检查 `shouldHandleActiveWorkoutRecovery`，调用 `store.recoverActiveWorkoutSession`，然后在 `WorkoutManager` 里重新挂 delegate 和 data source，配置从恢复出的 session 上读。
+
+**4. 严格区分 Generated types 与 Collected types，按需 enable/disable**
+
+为什么值得做：默认 data source 会观察当前活动类型的所有可能样本，包括你 app 不关心的。多余样本会增加电量消耗、混淆 UI 数据。怎么开始：在 builder 创建之后立刻调 `enableCollection(for:)` / `disableCollection(for:)` 收紧采集集合，比如骑行 app 只关心心率、卡路里、距离；如果要写自定义样本（如喝水量），用 enableCollection 显式打开。
+
+**5. 锁屏权限拒绝要做 UI 降级**
+
+为什么值得做：用户拒绝「锁屏访问健康数据」后，HealthKit 在锁屏期间不会推送数值，UI 如果硬塞会显示 0 或上一次的旧值，比直接隐藏更糟糕。怎么开始：检测当前是否能读到样本，读不到时把数值字段换成「锻炼中…」+时长，解锁后再恢复完整 UI。
+
+---
+
+## 关联 Session
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — Apple 托管的后台资源，简化大型素材分发
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — Writing Tools 的进阶集成，定制改写与校对
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — App Store Server API 的最新更新与最佳实践
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — 用 PermissionKit 增强儿童通讯安全
