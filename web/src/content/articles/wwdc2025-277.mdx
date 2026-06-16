@@ -24,32 +24,182 @@ relatedSessions:
 
 ## Highlight
 
-> 深入了解 Bring advanced speech-to-text to your app with SpeechAnalyzer 的技术细节和最佳实践。
+> iOS 26 推出的 SpeechAnalyzer 用全新的本地模型替代 SFSpeechRecognizer，支持长音频、远距离语音、低延迟实时转写，模型存储在系统空间，不占 App 体积和内存。
 
 ---
 
 ## 核心内容
 
-SpeechAnalyzer 取代 SFSpeechRecognizer 成为 iOS 26 上的语音转文字标准 API。核心架构是：SpeechAnalyzer 管理一个分析会话，你向它喂入音频 buffer（通过 AsyncSequence），它经过 SpeechTranscriber 模块处理后返回转写结果（也是 AsyncSequence）。所有操作基于音频时间轴上的 timecode 对齐，精确到单个采样点。
+iOS 10 引入的 SFSpeechRecognizer 用的是 Siri 模型。这个模型是为短句听写设计的，识别会议、讲座这类长音频效果很差，远距离麦克风场景下准确率掉得厉害。需要哪种语言还得让用户自己去设置里打开 Siri 或键盘听写——这个流程对开发者很尴尬。Notes、Voice Memos、Journal 这些苹果自家 App 想做更复杂的语音功能时也卡在这里。
 
-模型方面，SpeechTranscriber 搭载了 Apple 自研的新模型，相比 SFSpeechRecognizer 依赖的 Siri 模型有两个关键优势：支持长音频和远距离场景（会议、讲座），并且速度快得多。模型存储在系统级存储空间里，不增加 App 的下载体积和运行时内存。模型通过 AssetInventory API 下载和管理，支持的语言有中文、英文等，更多语言持续添加中。不支持的语言还可以走 DictationTranscriber 路径。
+iOS 26 推出 SpeechAnalyzer 替换掉这套老 API。架构上，SpeechAnalyzer 类管理一个分析会话，往里加 SpeechTranscriber 模块就变成转写会话。开发者通过 AsyncSequence 喂入音频 buffer，结果通过另一个 AsyncSequence 异步返回。所有操作以音频时间轴上的 timecode 对齐，精确到单个采样点，因此输入和结果可以解耦在两个独立的 task 里跑。
 
-Session 用一个儿童睡前故事录音 App 做了完整 demo：录音 -> 实时转写 -> 播放时逐词高亮 -> 结束后用 Foundation Models 生成标题。整个流程展示了 volatile result（实时预览）、finalized result（最终结果）、AudioTimeRange 时间同步、音频格式转换、模型下载检查等全部关键 API。
-
-
-### 最佳实践
-
-模型管理方面，不要在 App 启动时就下载所有语言的模型——设备存储有限，而且每个 App 同时只能持有有限数量的语言模型。按需下载，用户切换语言时再下载对应模型。如果超出语言数量限制，用 AssetInventory.deallocate 释放不常用的。
-
-对于只需要转写录音文件（非实时）的场景，用最简单的单函数模式：创建 transcriber -> 创建 analyzer -> 用 analyzeSequence 读文件 -> reduce 拼接结果 -> 返回 AttributedString。不需要处理 volatile result，不需要管理音频流，代码量极少。
-
-Foundation Models 配合 SpeechAnalyzer 是一个自然的组合——转写结果作为 LLM 的输入，可以做摘要、标题生成、情感分析等。Session 的 demo 用这个组合在转写完成后自动生成了故事标题，代码量只有一行。
+底层模型是 Apple 全新训练的，在长音频、远距离、对话场景下都做了优化，速度也比旧模型快。模型存储在系统级空间，不算进 App 的下载体积和运行内存，系统会自动更新。开发者通过 AssetInventory API 按需下载语言资源。当前支持中文、英文等若干语言，watchOS 暂不支持，不支持的语言可以走 DictationTranscriber 这个备选类——它复用 iOS 10 的 on-device 模型，但不再要求用户去设置里打开 Siri。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — develop generative ai features for your swiftui apps using the foundation models
-- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — level up with the foundation models framework. learn how guided generation works
-- [Design interactive snippets](/articles/wwdc2025-281) — snippets are compact views invoked from app intents that display information fro
-- [Develop for Shortcuts and Spotlight with App Intents](/articles/wwdc2025-260) — learn about how building app intents that make actions available and work best w
+最简单的场景是把一个录音文件转成文字。一个函数就够了（[05:21](https://developer.apple.com/videos/play/wwdc2025/277/?time=321)）：
+
+```swift
+// Set up transcriber. Read results asynchronously, and concatenate them together.
+let transcriber = SpeechTranscriber(locale: locale, preset: .offlineTranscription)
+async let transcriptionFuture = try transcriber.results
+    .reduce("") { str, result in str + result.text }
+
+let analyzer = SpeechAnalyzer(modules: [transcriber])
+if let lastSample = try await analyzer.analyzeSequence(from: file) {
+    try await analyzer.finalizeAndFinish(through: lastSample)
+} else {
+    await analyzer.cancelAndFinishNow()
+}
+
+return try await transcriptionFuture
+```
+
+关键点：
+
+- `preset: .offlineTranscription` 是文件转写的预设，省去手动配置 reportingOptions、attributeOptions。
+- `transcriber.results` 是 AsyncSequence，用 `reduce` 把所有片段拼成一个字符串。
+- `async let` 在后台跑结果消费，主流程同时调 `analyzeSequence(from:)` 把文件读进 input sequence。
+- `finalizeAndFinish(through:)` 告诉 analyzer 已经没有更多音频了，让它收尾。
+
+实时场景要复杂一些，需要打开 volatile result。SpeechTranscriber 的初始化参数控制这一点（[11:02](https://developer.apple.com/videos/play/wwdc2025/277/?time=662)）：
+
+```swift
+func setUpTranscriber() async throws {
+    transcriber = SpeechTranscriber(locale: Locale.current,
+                                    transcriptionOptions: [],
+                                    reportingOptions: [.volatileResults],
+                                    attributeOptions: [.audioTimeRange])
+
+    guard let transcriber else {
+        throw TranscriptionError.failedToSetupRecognitionStream
+    }
+
+    analyzer = SpeechAnalyzer(modules: [transcriber])
+
+    self.analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+}
+```
+
+关键点：
+
+- `reportingOptions: [.volatileResults]` 启用实时初步结果。模型会先吐一个粗略猜测，几秒后随着上下文累积再用 finalized 结果替换它。
+- `attributeOptions: [.audioTimeRange]` 让结果附带每个词对应的音频时间区间，用于回放高亮。
+- `bestAvailableAudioFormat` 返回当前 transcriber 模块期望的音频格式，后续要把麦克风的 PCM buffer 转换到这个格式。
+
+模型不一定预装在设备上，要先检查并下载（[12:30](https://developer.apple.com/videos/play/wwdc2025/277/?time=750)、[12:52](https://developer.apple.com/videos/play/wwdc2025/277/?time=772)）：
+
+```swift
+public func ensureModel(transcriber: SpeechTranscriber, locale: Locale) async throws {
+    guard await supported(locale: locale) else {
+        throw TranscriptionError.localeNotSupported
+    }
+
+    if await installed(locale: locale) {
+        return
+    } else {
+        try await downloadIfNeeded(for: transcriber)
+    }
+}
+
+func downloadIfNeeded(for module: SpeechTranscriber) async throws {
+    if let downloader = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
+        self.downloadProgress = downloader.progress
+        try await downloader.downloadAndInstall()
+    }
+}
+```
+
+关键点：
+
+- `SpeechTranscriber.supportedLocales` 给出当前系统能支持的语言列表，先校验。
+- `SpeechTranscriber.installedLocales` 给出已经下载到本地的语言。
+- `AssetInventory.assetInstallationRequest(supporting:)` 申请安装请求，返回的 downloader 对象带 `progress`，可以绑到 UI 上显示下载进度。
+
+每个 App 同时能持有的语言模型数量有限。如果超出限额，用 `AssetInventory.deallocate(locale:)` 释放不常用的（[13:19](https://developer.apple.com/videos/play/wwdc2025/277/?time=799)）。
+
+结果消费这边，用 `isFinal` 区分 volatile 和 finalized 两种结果（[13:31](https://developer.apple.com/videos/play/wwdc2025/277/?time=811)）：
+
+```swift
+recognizerTask = Task {
+    do {
+        for try await case let result in transcriber.results {
+            let text = result.text
+            if result.isFinal {
+                finalizedTranscript += text
+                volatileTranscript = ""
+                updateStoryWithNewText(withFinal: text)
+                print(text.audioTimeRange)
+            } else {
+                volatileTranscript = text
+                volatileTranscript.foregroundColor = .purple.opacity(0.4)
+            }
+        }
+    } catch {
+        print("speech recognition failed")
+    }
+}
+```
+
+关键点：
+
+- `result.isFinal == true` 时把内容追加进最终稿，清空 volatile 缓冲。
+- `isFinal == false` 时显示半透明紫色，提示用户这是临时猜测。
+- `text.audioTimeRange` 拿到这段文字对应的音频时间，可以做播放高亮。
+
+音频侧，用 AVAudioEngine 装 tap，把 PCM buffer 喂给 input builder（[16:01](https://developer.apple.com/videos/play/wwdc2025/277/?time=961)）：
+
+```swift
+func streamAudioToTranscriber(_ buffer: AVAudioPCMBuffer) async throws {
+    guard let inputBuilder, let analyzerFormat else {
+        throw TranscriptionError.invalidAudioDataType
+    }
+
+    let converted = try self.converter.convertBuffer(buffer, to: analyzerFormat)
+    let input = AnalyzerInput(buffer: converted)
+
+    inputBuilder.yield(input)
+}
+```
+
+关键点：
+
+- 麦克风采集到的 buffer 格式不一定匹配模型期望，`converter.convertBuffer(_:to:)` 转到 `analyzerFormat`。
+- 包成 `AnalyzerInput` 后通过 `inputBuilder.yield` 投递到 input sequence，analyzer 自动消费。
+- 录音结束时调 `analyzer?.finalizeAndFinishThroughEndOfInput()` 通知收尾。
+
+---
+
+## 核心启发
+
+- **做什么**：在录音类 App 里加实时转写 + 播放高亮。
+  - 为什么值得做：会议记录、播客笔记、采访整理这些场景都要转写，旧 SFSpeechRecognizer 在长录音上不可用，SpeechTranscriber 直接补齐能力。
+  - 怎么开始：照 demo 的 Recorder + SpokenWordTranscriber 双类拆分，启用 `.volatileResults` 加 `.audioTimeRange`，转写时显示半透明 volatile 文字，播放时按 `audioTimeRange` 匹配当前播放位置高亮单词。
+
+- **做什么**：转写结果直接接 Foundation Models 做摘要、标题、待办提取。
+  - 为什么值得做：转写本身没多大价值，价值在于后续处理。Apple 自己在 Notes 里做的 Call Summarization 就是这条链路。
+  - 怎么开始：转写完 reduce 出 AttributedString，直接喂给 `LanguageModelSession`，让它生成标题或要点。本地模型，不联网，免费。
+
+- **做什么**：会议、讲座录音 App 用 `.offlineTranscription` 预设做后台批量转写。
+  - 为什么值得做：远距离场景是新模型相对老 Siri 模型最大的优势区间，旧 API 几乎不可用。
+  - 怎么开始：用文件转写那个单函数模式，搭一个后台任务队列，用户录完立即丢进队列，跑完通知用户。不用管 volatile，代码极少。
+
+- **做什么**：按需下载语言模型，避免首次启动卡很久。
+  - 为什么值得做：每个 App 同时能持有的语言模型数量有限制，全量预下载浪费存储也可能失败。
+  - 怎么开始：启动时不下载，等用户切换到某个语言再调 `AssetInventory.assetInstallationRequest`，把 `downloader.progress` 绑到 SwiftUI 的 ProgressView，下载完再开始转写。超过限额时调 `deallocate` 释放最久未用的语言。
+
+- **做什么**：在不支持的语言或设备上回退到 DictationTranscriber。
+  - 为什么值得做：SpeechTranscriber 不支持 watchOS，部分语言也还在路上。DictationTranscriber 复用 iOS 10 旧模型但不再要求用户进设置开 Siri，体验比 SFSpeechRecognizer 好。
+  - 怎么开始：检查 `SpeechTranscriber.supportedLocales`，不在列表里就构造 DictationTranscriber，其余 SpeechAnalyzer 用法一致。
+
+---
+
+## 关联 Session
+
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — 在 SwiftUI App 里用 Foundation Models 框架开发本地生成式 AI 功能。
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — 深入 Foundation Models 框架，讲 guided generation 等高级用法，转写后的文本接入 LLM 必看。
+- [Design interactive snippets](/articles/wwdc2025-281) — App Intents 触发的紧凑视图，可以把转写或摘要结果以 snippet 形式展示。
+- [Develop for Shortcuts and Spotlight with App Intents](/articles/wwdc2025-260) — 用 App Intents 把语音转写、摘要等能力暴露给 Shortcuts 和 Spotlight。

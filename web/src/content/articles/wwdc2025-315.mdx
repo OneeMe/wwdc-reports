@@ -30,35 +30,232 @@ relatedSessions:
 
 ## 核心内容
 
-MLX 是 Apple 自研的开源数组框架，专为 Apple Silicon 的统一内存架构设计。核心理念很颠覆：**CPU 和 GPU 共享内存，不需要手动搬数据**。
+如果你在 Mac 上跑过 PyTorch，大概率被一件事折磨过：明明 CPU 和 GPU 是一颗芯片，模型张量却要在两块"虚拟"内存之间来回搬。每次 `.to("mps")` 都是一次拷贝，大模型推理时显存还容易爆。Apple 在 WWDC 2025 推出的 MLX，就是冲着这件事来的。
 
-和传统框架的根本区别：传统框架是"计算跟着数据走"（数组在 CPU 内存就在 CPU 算，在 GPU 内存就在 GPU 算），MLX 是"你在操作里指定设备"（同一个数组可以同时在 CPU 和 GPU 上做不同操作）。
-
-关键特性：
-- **惰性计算**：操作调用时不实际执行，先构建计算图，需要结果时才 evaluate。可以做图优化，只为用到的部分付费。
-- **函数变换**：`mx.grad` 可以对任意函数求梯度，而且可以任意组合（二阶导就是 `mx.grad(mx.grad(f))`）。
-- **mlx.nn 和 mlx.optimizers**：高级 API 类似 PyTorch，nn.Module 基类、Linear 层等几乎一样。
-- **mx.compile**：把计算图融合成单个 GPU kernel，减少 memory bandwidth 和 launch 开销。
-- **mx.fast**：RMS Norm、Scaled Dot Product Attention 等 transformer 核心操作的高性能实现。
-- **量化**：`mx.quantize` 支持 4-bit 量化，大幅降低内存占用和推理延迟。
-- **分布式计算**：`mx.distributed` 支持多机计算，通过以太网或 Thunderbolt 连接。
-- **Metal Kernel 自定义**：可以直接写 Metal shader 集成到计算图里。
-
-
-### 最佳实践
-
-- **用 pip install mlx 开始**，先在 Python 里熟悉 API，再考虑 Swift 集成。
-- **需要 on-device 推理时用 MLX Swift**，API 一致，不用重新学。
-- **大模型用量化**，4-bit 量化能大幅降低内存占用，对生成速度也有提升。
-- **用 mx.compile 包装反复调用的函数**，特别是激活函数、normalization 等。
-- **用 mx.fast 里的现成实现**（RMS Norm、SDPA），别自己写，它们是高度优化过的。
-- **多机训练用 mx.distributed + mlx.launch**，支持以太网和 Thunderbolt。
+MLX 的核心改动是把"计算追着数据走"翻过来。传统框架里，数组在 CPU 内存就只能在 CPU 算，在 GPU 内存就只能在 GPU 算。MLX 把数组分配到 Apple Silicon 的统一内存里，**不再属于某个设备**，而是在调用每个 op 时通过 `stream=mx.cpu` 或 `stream=mx.gpu` 指定执行位置。同一份数据，CPU 和 GPU 可以并行操作，框架自动管理依赖。围绕这个底座，MLX 又把 NumPy 风格的 API、PyTorch 风格的 `nn.Module`、JAX 风格的函数变换（`mx.grad`、`mx.compile`）整合在同一个包里，让你在 Mac、iPhone、iPad、Vision Pro 上都能跑同一套代码，而且 Python、Swift、C++、C 四套 API 都覆盖。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Bring advanced speech-to-text to your app with SpeechAnalyzer](/articles/wwdc2025-277) — discover the new speechanalyzer api for speech to text. we
-- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — develop generative ai features for your swiftui apps using the foundation models
-- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — level up with the foundation models framework. learn how guided generation works
-- [Design interactive snippets](/articles/wwdc2025-281) — snippets are compact views invoked from app intents that display information fro
+**安装与基础数组操作**（[03:48](https://developer.apple.com/videos/play/wwdc2025/315/?time=228)）。一行 `pip3 install mlx` 装好之后，API 几乎和 NumPy 一致：
+
+```python
+import mlx.core as mx
+
+# Make an array
+a = mx.array([1, 2, 3])
+
+# Make another array
+b = mx.array([4, 5, 6])
+
+# Do an operation
+c = a + b
+
+# Access information about the array
+shape = c.shape
+dtype = c.dtype
+
+print(f"Result c: {c}")
+print(f"Shape: {shape}")
+print(f"Data type: {dtype}")
+```
+
+关键点：
+- `import mlx.core as mx`：MLX 的核心数组库，命名约定模仿 NumPy。
+- `mx.array([...])`：从 Python 列表创建数组，数据存在统一内存里，没有 device 概念。
+- `a + b`：算子重载，返回的 `c` 是一个未求值的"延迟"数组（见下文）。
+- `c.shape`、`c.dtype`：和 NumPy 同名同义，已有 NumPy 经验直接迁移。
+
+**统一内存编程**（[05:31](https://developer.apple.com/videos/play/wwdc2025/315/?time=331)）。这是 MLX 和别的框架最大的差异——`stream` 参数挂在 op 上，不挂在数组上：
+
+```python
+import mlx.core as mx
+
+a = mx.array([1, 2, 3])
+b = mx.array([4, 5, 6])
+
+c = mx.add(a, b, stream=mx.gpu)
+d = mx.multiply(a, b, stream=mx.cpu)
+
+print(f"c computed on the GPU: {c}")
+print(f"d computed on the CPU: {d}")
+```
+
+关键点：
+- `a` 和 `b` 是同一份数据，没有"在 CPU 还是 GPU"之说。
+- `mx.add(a, b, stream=mx.gpu)`：让加法在 GPU 上执行。
+- `mx.multiply(a, b, stream=mx.cpu)`：同一份输入，乘法挪到 CPU 跑。
+- 两个 op 没有依赖关系，可以**并行执行**；如果有依赖，MLX 自动排序。
+
+**惰性求值**（[06:20](https://developer.apple.com/videos/play/wwdc2025/315/?time=380)）。MLX 调用 op 时只搭计算图，不真跑：
+
+```python
+import mlx.core as mx
+
+a = mx.array([1, 2, 3])
+b = mx.array([4, 5, 6])
+c = a + b
+
+# Evaluates c before printing it
+print(c)
+
+# Also evaluates c
+c_list = c.tolist()
+
+# Also evaluates c
+mx.eval(c)
+```
+
+关键点：
+- `c = a + b` 时不发生计算，只在图里加一个加法节点。
+- `print(c)`、`.tolist()`、`mx.eval(c)` 任一种触发求值；不用结果就完全不算。
+- 这给 MLX 留下了图优化空间，比如把多个 op 融成一个 kernel。
+
+**函数变换：自动求导**（[07:32](https://developer.apple.com/videos/play/wwdc2025/315/?time=452)）。`mx.grad` 把函数变成新函数：
+
+```python
+import mlx.core as mx
+
+def sin(x):
+    return mx.sin(x)
+
+dfdx = mx.grad(sin)
+
+d2fdx2 = mx.grad(mx.grad(mx.sin))
+
+# Computes the second derivative of sine at 1.0
+d2fdx2(mx.array(1.0))
+```
+
+关键点：
+- `mx.grad(sin)` 返回求导后的函数 `dfdx`，本身还是一个函数。
+- 函数变换可任意嵌套：`mx.grad(mx.grad(...))` 直接拿到二阶导。
+- 这种风格来自 JAX，用来训练模型、计算梯度都很顺手。
+
+**用 mlx.nn 搭神经网络**（[09:16](https://developer.apple.com/videos/play/wwdc2025/315/?time=556)）：
+
+```python
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+
+class MLP(nn.Module):
+    """A simple MLP."""
+
+    def __init__(self, dim, h_dim):
+        super().__init__()
+        self.linear1 = nn.Linear(dim, h_dim)
+        self.linear2 = nn.Linear(h_dim, dim)
+
+    def __call__(self, x):
+        x = self.linear1(x)
+        x = nn.relu(x)
+        x = self.linear2(x)
+        return x
+```
+
+关键点：
+- `nn.Module` 是所有层和容器的基类，提供参数访问、加载、保存等方法。
+- `nn.Linear`、`nn.relu` 这些标准层名字和签名都贴合 PyTorch 习惯。
+- 注意 MLX 用 `__call__` 而不是 PyTorch 的 `forward`——这是和 PyTorch 仅有的两处差异之一。
+
+**用 `mx.compile` 融合 kernel**（[11:35](https://developer.apple.com/videos/play/wwdc2025/315/?time=695)）。装饰器一加，多个 element-wise op 会被融成单个 GPU kernel，省掉重复的内存往返和 kernel launch 开销：
+
+```python
+import mlx.core as mx
+import math
+
+def gelu(x):
+    return x * (1 + mx.erf(x / math.sqrt(2))) / 2
+
+@mx.compile
+def compiled_gelu(x):
+    return x * (1 + mx.erf(x / math.sqrt(2))) / 2
+```
+
+关键点：
+- `gelu` 里有四个 op（`erf`、除法、加法、乘法），原本对应四次 kernel 启动。
+- `@mx.compile` 让 MLX 把这些节点编译进同一个 kernel。
+- 对反复调用的小函数（激活函数、归一化）收益最明显。
+
+**`mx.fast` 高性能算子**（[12:32](https://developer.apple.com/videos/play/wwdc2025/315/?time=752)）。Transformer 的几个核心 op（RMS Norm、SDPA、RoPE）都有手写优化版本，直接用比自己拼快很多。**自定义 Metal kernel**（[13:30](https://developer.apple.com/videos/play/wwdc2025/315/?time=810)）允许把 Metal 着色器源码直接挂进计算图：
+
+```python
+import mlx.core as mx
+
+source = """
+    uint elem = thread_position_in_grid.x;
+    out[elem] = metal::exp(inp[elem]);
+"""
+kernel = mx.fast.metal_kernel(
+    name="myexp",
+    input_names=["inp"],
+    output_names=["out"],
+    source=source,
+)
+
+x = mx.array([1.0, 2.0, 3.0])
+out = kernel(
+    inputs=[x],
+    grid=(x.size, 1, 1),
+    threadgroup=(256, 1, 1),
+    output_shapes=[x.shape],
+    output_dtypes=[x.dtype],
+)[0]
+```
+
+关键点：
+- `source` 是一段裸 Metal 代码，`thread_position_in_grid` 是标准 Metal 内置变量。
+- `mx.fast.metal_kernel(...)` 把这段源码包装成可调用对象。
+- 调用时给 `grid` 和 `threadgroup` 指定线程划分，`output_shapes`/`output_dtypes` 描述输出张量。
+- 用来在 MLX 没覆盖的算子上手写极致优化，仍然能享受惰性图调度。
+
+**4-bit 量化**（[14:41](https://developer.apple.com/videos/play/wwdc2025/315/?time=881)）。`mx.quantize` 把权重打包成 4-bit，配合 `mx.quantized_matmul` 做推理；模型层级用 `nn.quantize(model, bits=4, group_size=32)` 一行替换全部 `Linear`/`Embedding`。**多机分布式**（[16:50](https://developer.apple.com/videos/play/wwdc2025/315/?time=1010)）通过 `mx.distributed.init()` 拿到 group，再用 `mx.distributed.all_sum` 这类集合通信原语，配合 `mlx.launch --hosts ip1,ip2,ip3,ip4 my_script.py` 在以太网或 Thunderbolt 互联的多台 Mac 上跑同一份代码。
+
+**MLX Swift**（[18:20](https://developer.apple.com/videos/play/wwdc2025/315/?time=1100)）。同一套 API 翻译成 Swift，方便 iOS/macOS 应用集成：
+
+```swift
+import MLX
+
+let a = MLXArray([1, 2, 3])
+let b = MLXArray([1, 2, 3])
+let c = a + b
+
+let shape = c.shape
+let dtype = c.dtype
+```
+
+关键点：
+- `MLXArray` 对应 Python 的 `mx.array`，构造方式一致。
+- 算子重载、属性名（`shape`、`dtype`）保持一致，便于跨语言迁移。
+- iOS、iPadOS、visionOS 上都能直接打包，不依赖额外运行时。
+
+---
+
+## 核心启发
+
+- **做什么：在 Mac 上把现有 PyTorch 推理迁到 MLX，验证统一内存的延迟收益。**
+  - 为什么值得做：MPS 后端的拷贝/同步开销在大模型上很可观，MLX 没有"搬数据"这一步，且 4-bit 量化原生支持。
+  - 怎么开始：挑一个 7B 量级的模型，在 MLX LM 仓库找到对应权重；用 `nn.quantize(model, bits=4, group_size=32)` 量化，对比 token/s 和峰值内存。
+
+- **做什么：把训练循环里的激活函数、归一化用 `@mx.compile` 包起来。**
+  - 为什么值得做：这些函数被反复调用，每次都走多个 kernel；编译融合后省掉的是 launch 开销，最容易吃到加速。
+  - 怎么开始：先用 `mx.fast.rms_norm`、`mx.fast.scaled_dot_product_attention` 这些现成实现替换手写版本；剩下自己写的小函数加 `@mx.compile` 装饰器。
+
+- **做什么：用两到三台 Mac mini 通过 Thunderbolt 串成本地分布式集群。**
+  - 为什么值得做：相比单机塞满显存，横向扩展能跑下更大的模型，而 MLX 提供的 `mlx.launch` 把启动复杂度压到一行命令。
+  - 怎么开始：在每台机器上装好 MLX，用 `mx.distributed.init()` 拿到 group，写一个最小的 `all_sum` demo 验证连通；再把已有训练脚本接进 `mlx.launch --hosts`。
+
+- **做什么：在 iOS/visionOS App 中嵌入 MLX Swift 做端侧推理。**
+  - 为什么值得做：跟 Foundation Models 不同，MLX 让你自带模型权重和图结构，对自训模型或社区模型最友好。
+  - 怎么开始：从 `mlx-swift-examples` 仓库 clone 一个最小推理示例，把模型权重换成你自己的 Hugging Face MLX community 版本，跑通后再接进 SwiftUI。
+
+---
+
+## 关联 Session
+
+- [Bring advanced speech-to-text to your app with SpeechAnalyzer](/articles/wwdc2025-277) — SpeechAnalyzer 端侧语音识别 API 的整体设计与接入方式。
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — 用 Foundation Models 框架在 SwiftUI 应用里加生成式 AI 功能。
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — Foundation Models 的引导式生成、工具调用等高级用法。
+- [Design interactive snippets](/articles/wwdc2025-281) — App Intent 的交互式 snippet 设计模式。

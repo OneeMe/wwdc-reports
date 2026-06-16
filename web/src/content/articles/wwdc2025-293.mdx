@@ -26,43 +26,165 @@ relatedSessions:
 
 > PermissionKit 解决的问题很具体：当一个孩子在 app 中想和一个陌生人开始通信时，app 如何安全地获取父母的许可？
 
----
-
 ## 核心内容
 
-PermissionKit 解决的问题很具体：当一个孩子在 app 中想和一个陌生人开始通信时，app 如何安全地获取父母的许可？
+孩子在 app 里第一次收到陌生人的消息，这是一个所有面向全年龄用户的社交、聊天、游戏 app 都会遇到的难题。开发者需要一套机制：让孩子能向父母发起请求，让父母能在自己熟悉的地方决策，最后把结果回传到 app。自己实现这套链路，要做账号体系、要做推送、要做家长端 UI，技术开销巨大。
 
-**核心流程：**
-1. App 检测到当前用户是孩子，且对方是未知联系人。
-2. App 创建一个 `PermissionQuestion`，附带 `CommunicationTopic`（包含对方的 handle、姓名、头像、通信方式如 message/call/video）。
-3. 系统在 Messages 中打开一个预填好的消息窗口，收件人是 Family Sharing 组中的父母/监护人。
-4. 父母收到消息后可以直接 decline 或 review（review 会显示更多上下文信息），做出 approve 或 decline 决定。
-5. 父母的决定自动通知孩子，同时在后台送达你的 app。
+iOS、iPadOS、macOS 26 上 Apple 把这件事接到了 Messages 里。新的 PermissionKit 框架基于 Family Sharing，让孩子在你的 app 里点一下按钮，系统就会在 Messages 中打开一条预填好的消息，收件人是家庭组里的父母或监护人。父母在 Messages 气泡里可以直接 decline，或者点开看完整上下文后 approve。决策结果会通知孩子，同时在后台送达你的 app（[00:30](https://developer.apple.com/videos/play/wwdc2025/293/?time=30)）。
 
-**判断用户是否为孩子的两种方式：** 用你自己的账号系统，或者用新的 Declared Age Range API（父母可以允许孩子分享年龄范围）。
+前提条件有两个：用户必须在 Family Sharing 组里，父母必须为孩子开启了 Communication Limits。任一条件不满足，API 会返回默认响应（[02:22](https://developer.apple.com/videos/play/wwdc2025/293/?time=142)）。判断当前用户是否为孩子，可以用自己的账号系统，也可以用同年新增的 Declared Age Range API（[01:43](https://developer.apple.com/videos/play/wwdc2025/293/?time=103)）。
 
-**UI 适配：** 对孩子的账户，默认隐藏未知联系人的消息预览、头像等内容。用 `CommunicationLimits.knownHandles(in:)` 做批量查找，返回已知 handle 的子集。
+## 详细内容
 
-**SwiftUI 集成：** `CommunicationLimitsButton` 直接在 SwiftUI 视图中使用，点击触发系统流程。UIKit 用 `CommunicationLimits` singleton 配合 UIViewController。AppKit 配合 NSWindow。
+第一步是给孩子账号定制 UI。对未知发件人，默认隐藏消息预览、头像和其他可能不适合孩子的内容。判断 handle 是否已知，调用 `CommunicationLimits.current.knownHandles(in:)`（[04:03](https://developer.apple.com/videos/play/wwdc2025/293/?time=243)）：
 
-**异步响应处理：** 通过 `CommunicationLimits` singleton 的 AsyncSequence 持续监听父母的审批结果。App 会以 background launch 方式唤醒。
+```swift
+import PermissionKit
 
+let knownHandles = await CommunicationLimits.current.knownHandles(in: conversation.participants)
 
-### 最佳实践
+if knownHandles.isSuperset(of: conversation.participants) {
+    // Show content
+} else {
+    // Hide content
+}
+```
 
-**只对确认是孩子的用户展示 PermissionKit 流程。** 误用（对成人用户展示）会让用户体验变差且可能违反 App Store 审核规则。Declared Age Range API 是判断年龄的推荐方式。
+关键点：
+- `CommunicationLimits.current` 是单例入口，所有跨进程的权限查询都从这里取。
+- `knownHandles(in:)` 是 async 方法，系统做一次优化过的批量查询，返回入参集合中已被识别的子集。
+- `isSuperset(of:)` 用来判断「会话的全部参与者是否都是已知 handle」，只要有一个未知就走隐藏分支。
+- 这个 API 不替你管你自己的数据库，文档里建议把它和你已有的联系人系统合并使用。
 
-**提供丰富的 metadata。** 对方的姓名和头像会显著提升父母的审批意愿和决策质量。但只收集你合法拥有的信息。
+第二步是构造 `PermissionQuestion`。最小信息只需要 handle（[05:15](https://developer.apple.com/videos/play/wwdc2025/293/?time=315)）：
 
-**不要依赖 PermissionKit 做唯一的安全机制。** 它是 Apple 生态内的解决方案。跨平台场景（你的 web 版、Android 版）需要你自己实现类似逻辑。把 PermissionKit 的审批结果同步到你自己的服务器，作为统一的权限来源。
+```swift
+import PermissionKit
 
-**处理好"没有 Family Sharing"的情况。** API 会返回默认响应，但你应该在 UI 上告诉用户发生了什么，而不是静默失败。
+var question = PermissionQuestion(handles: [
+    CommunicationHandle(value: "dragonslayer42", kind: .custom),
+    CommunicationHandle(value: "progamer67", kind: .custom)
+])
+```
 
----
+关键点：
+- `CommunicationHandle.value` 可以是手机号、邮箱，或自定义用户名；`kind: .custom` 表示用户名这种非系统标识。
+- 只传 handle 时，父母看到的只是一个 ID，决策信息少。
 
-## 相关 Session
+更推荐的做法是补足 metadata，让父母看到名字和头像（[05:38](https://developer.apple.com/videos/play/wwdc2025/293/?time=338)）：
 
-- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — building on background assets, this session will introduce the new capability to
-- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — with writing tools, people can proofread, rewrite, and transform text directly w
-- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — discover the latest updates for the app store server api, app store server notif
-- [Explore enhancements to your spatial business app](/articles/wwdc2025-223) — discover how the latest enhancements and apis in visionos 26 expand access and e
+```swift
+import PermissionKit
+
+let people = [
+    PersonInformation(
+        handle: CommunicationHandle(value: "dragonslayer42", kind: .custom),
+        nameComponents: nameComponents,
+        avatarImage: profilePic
+    ),
+    PersonInformation(
+        handle: CommunicationHandle(value: "progamer67", kind: .custom)
+    )
+]
+
+var topic = CommunicationTopic(personInformation: people)
+topic.actions = [.message]
+
+var question = PermissionQuestion(communicationTopic: topic)
+```
+
+关键点：
+- `PersonInformation` 把 handle、`nameComponents`、`avatarImage` 打包，metadata 越全，父母决策越准。
+- `CommunicationTopic` 是 question 的载体，`actions` 决定系统在父母端用什么措辞（`.message`、`.call`、`.video` 等）。
+- metadata 由系统在审批界面展示给父母，前提是你合法持有这些信息（[05:29](https://developer.apple.com/videos/play/wwdc2025/293/?time=329)）。
+
+第三步是把 question 抛给系统。SwiftUI 用 `CommunicationLimitsButton`（[06:25](https://developer.apple.com/videos/play/wwdc2025/293/?time=385)）：
+
+```swift
+import PermissionKit
+import SwiftUI
+
+struct ContentView: View {
+    let question: PermissionQuestion<CommunicationTopic>
+
+    var body: some View {
+        // ...
+        CommunicationLimitsButton(question: question) {
+            Label("Ask Permission", systemImage: "paperplane")
+        }
+    }
+}
+```
+
+关键点：
+- `CommunicationLimitsButton` 是 PermissionKit 提供的 SwiftUI 控件，绑定一个 question。
+- 孩子点按钮后，系统弹出 alert，让孩子确认或选择面对面用 Screen Time 密码授权。
+- 确认 Ask 之后，系统打开预填好的 Messages Compose 窗口，收件人是 Family Sharing 组里的父母。
+
+UIKit 走 singleton（[06:43](https://developer.apple.com/videos/play/wwdc2025/293/?time=403)）：
+
+```swift
+import PermissionKit
+import UIKit
+
+try await CommunicationLimits.current.ask(question, in: viewController)
+```
+
+关键点：
+- `ask(_:in:)` 是 async throws 方法，传入 `UIViewController` 让系统决定从哪里 present。
+- AppKit 等价写法是 `try await CommunicationLimits.current.ask(question, in: window)`，传 `NSWindow`（[06:54](https://developer.apple.com/videos/play/wwdc2025/293/?time=414)）。
+
+第四步处理父母的回复。父母在 Messages 里点 approve 或 decline，孩子的设备会在后台被唤醒，你的 app 会收到回调。监听用 AsyncSequence（[07:19](https://developer.apple.com/videos/play/wwdc2025/293/?time=439)）：
+
+```swift
+import PermissionKit
+import SwiftUI
+
+struct ChatsView: View {
+    @State var isShowingResponseAlert = false
+
+    var body: some View {
+        List {
+           // ...
+        }
+        .task {
+            let updates = CommunicationLimits.current.updates
+            for await update in updates {
+                // Received a response!
+                self.isShowingResponseAlert = true
+            }
+        }
+    }
+}
+```
+
+关键点：
+- `CommunicationLimits.current.updates` 是 AsyncSequence，订阅父母审批结果。
+- `for await` 在 `.task` 修饰符里运行，View 出现时启动，消失时自动取消。
+- App 是被 background launch 唤醒的，要尽快读取 update 并落库或刷新 UI。
+- 决策同时通过通知告知孩子，所以你不必自己再发一次本地通知（[09:30](https://developer.apple.com/videos/play/wwdc2025/293/?time=570)）。
+
+## 核心启发
+
+- **做什么：在面向全年龄的 app 里加一条「向父母申请通信」的快捷路径**
+  - 为什么值得做：自建家长审批系统的成本极高，而 PermissionKit 把渠道、模板、推送、回执全部接到 Messages 里，开发量从一个完整子系统降到几十行代码。
+  - 怎么开始：先用 Declared Age Range API 或自家账号识别孩子用户；接着在收到陌生人消息时插入 `CommunicationLimitsButton`，把当前 handle 包成 `PermissionQuestion`。
+
+- **做什么：把 metadata 当成转化率指标来打磨**
+  - 为什么值得做：父母端看到的姓名、头像、行为类型直接影响 approve 率，metadata 缺失时父母倾向于直接 decline。
+  - 怎么开始：在构造 `PersonInformation` 时尽量填齐 `nameComponents` 和 `avatarImage`；如果只能拿到用户名，至少在 `CommunicationTopic.actions` 里准确声明是 message、call 还是 video，让系统用对动词。
+
+- **做什么：把审批结果同步到自己的服务器，做跨平台一致性**
+  - 为什么值得做：PermissionKit 只覆盖 Apple 生态，web 版和 Android 版孩子用户也需要同样的保护逻辑。
+  - 怎么开始：在 `CommunicationLimits.current.updates` 的 `for await` 里把每条 update 上报到自己的后端，作为权限主源；其他端读后端的开关，而不是各自维护一份。
+
+- **做什么：降级处理「家庭组缺失」与「Communication Limits 未开启」两种状态**
+  - 为什么值得做：API 会返回默认响应，如果 UI 不解释，孩子会以为按钮坏了，父母会以为 app 在静默允许。
+  - 怎么开始：在 ask 之前提示「需要父母先在 Settings 里开启 Communication Limits」，对默认响应的分支显示明确文案，并提供面对面用 Screen Time 密码授权的入口。
+
+## 关联 Session
+
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-260) — Declared Age Range API 的完整介绍，是 PermissionKit 的前置依赖。
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — 后台启动场景下如何安全地预取资源，配合 PermissionKit 的 background launch 一起做。
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — 系统级文本能力的另一个例子，模式与 PermissionKit 类似：不重造轮子，复用系统体验。
+- [Explore enhancements to your spatial business app](/articles/wwdc2025-223) — visionOS 26 的新 API 同样强调家庭与儿童场景，可以横向参考。

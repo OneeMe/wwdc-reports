@@ -8,9 +8,6 @@ videoUrl: "https://developer.apple.com/videos/play/wwdc2025/250/"
 sessionId: "wwdc2025-250"
 year: "2025"
 relatedSessions:
-  - title: "Deliver age-appropriate experiences in your app"
-    code: "299"
-    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
   - title: "Filter and tunnel network traffic with NetworkExtension"
     code: "234"
     description: "learn about the apis in the networkextension framework that give your app the po"
@@ -20,6 +17,9 @@ relatedSessions:
   - title: "Get ahead with quantum-secure cryptography"
     code: "314"
     description: "learn how to protect your app"
+  - title: "Deliver age-appropriate experiences in your app"
+    code: "299"
+    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
 ---
 
 ## Highlight
@@ -30,31 +30,231 @@ relatedSessions:
 
 ## 核心内容
 
-这场 Session 介绍了 Network framework 在 iOS/macOS 26 中的三个全新 Swift 类型：NetworkConnection、NetworkListener 和 NetworkBrowser，全部基于 Swift 结构化并发构建。整体设计哲学与 SwiftUI 类似——声明式创建、自动生命周期管理、在 task 取消时自动清理。
+很多 app 开发者一遇到底层网络就头疼。BSD socket 那一套 API 写起来繁琐：要自己处理 sockaddr、ioctl、阻塞调用，要手动集成 TLS 库，要为 Wi-Fi 和蜂窝网络的切换写状态机，要为消息边界做粘包处理。如果某天想从 TCP 切换到 QUIC，往往等于一次推倒重写。这些细节让人没法专心写业务逻辑。
 
-NetworkConnection 负责建立连接和收发数据。端点（endpoint）定义目标地址，protocol stack 定义连接方式（TCP、TLS、QUIC 等），parameters 定义行为约束（如 low data mode 下不使用受限网络）。连接状态由框架自动管理：preparing → ready → failed/canceled，开发者可以安装 state handler 做 UI 更新，也可以完全不管——send/receive 会自动等待 ready 状态。
+iOS/macOS 26 的 Network framework 引入了三个新 Swift 类型来解决这件事：NetworkConnection 负责单个连接，NetworkListener 监听入站连接，NetworkBrowser 在网络上发现服务。三个类型都和 Swift 结构化并发深度集成，写法风格接近 SwiftUI——声明式构建协议栈、async/await 收发数据、task 取消时自动清理资源。
 
-数据收发方面，除了传统的 byte stream 模式（指定接收字节数），今年新增了两个重要能力。一是内置的 TLV（Type-Length-Value）framer，自动帧化消息，解决 TCP 这类流协议不保留消息边界的问题。二是 Coder 协议，直接发送和接收 Codable 类型，支持 JSON 和 property list 格式，彻底省去手动序列化。
+NetworkConnection 由三部分组成：endpoint（连到哪里）、protocol stack（怎么连，比如 TLS over TCP over IP）、parameters（行为约束，比如禁止使用受限网络）。连接状态由框架管理：preparing → ready → failed/canceled。开发者可以装一个 stateUpdateHandler 用于刷新 UI，也可以完全不管状态——`send` 和 `receive` 会自动等待 ready 才执行。
 
-NetworkListener 监听入站连接，每次新连接自动启动 subtask，不会阻塞后续连接的接收。NetworkBrowser 发现网络上的设备，支持 Bonjour 和 iOS 26 新增的 Wi-Fi Aware 跨平台点对点发现。
-
-主讲人最后给了一条简洁的选型建议：如果你的 app 做 HTTP 网络请求，继续用 URLSession，不需要改。如果你需要底层连接或者和自己的 app 通信，用 NetworkConnection + TLS/QUIC + Coder 是最佳组合。
-
-
-### 最佳实践
-
-- HTTP 网络请求继续使用 URLSession，不需要迁移到 Network framework。
-- App-to-app 通信优先选择 Coder over TLS/QUIC，获得类型安全和零样板代码的双重收益。
-- 对接已有服务器时，先确认服务器使用的协议格式，再选择 TLV framer 或 byte stream 模式。
-- 为 NetworkConnection 安装 stateUpdateHandler 以在 UI 中反映连接状态，即使你不需要主动管理状态。
-- 不同线程使用不同的 Command Allocator（Metal 4 类比：NetworkConnection 的 task 取消会自动清理连接，但自己创建的 task 仍需注意生命周期）。
-- Wi-Fi Aware 仅支持 iOS 26 的 iPhone，跨平台场景用 Bonjour + NetworkBrowser。
+数据收发上，今年新增了两件事。一是内置的 TLV（Type-Length-Value）framer，自动帧化消息，解决 TCP 这类流协议不保留消息边界的问题。二是 Coder 协议，直接收发 Codable 类型，支持 JSON 和 property list，省掉手动序列化的样板代码。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — learn how to deliver age-appropriate experiences in your app with the new declar
-- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — learn about the apis in the networkextension framework that give your app the po
-- [Finish tasks in the background](/articles/wwdc2025-227) — discover background execution advancements and understand how the system schedul
-- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — learn how to protect your app
+**最朴素的连接：TLS over TCP over IP**
+
+主讲人 Scott 在视频开头给了一个最小例子（[04:04](https://developer.apple.com/videos/play/wwdc2025/250/?time=244)）：
+
+```swift
+// Make a connection
+
+import Network
+
+let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029)) {
+  TLS()
+}
+```
+
+关键点：
+
+- `NetworkConnection(to:)` 第一个参数是 endpoint，`.hostPort` 表示主机名+端口，框架会自动解析 DNS 并用 Happy Eyeballs 选最优地址。
+- 尾随闭包描述协议栈。这里只写了 `TLS()`，TCP 和 IP 自动推断为底层。
+- 协议栈是声明式的，风格类似 SwiftUI 的 view builder。
+
+**自定义协议栈选项**
+
+需要关闭 IP 分片时，必须显式写出底层协议（[04:41](https://developer.apple.com/videos/play/wwdc2025/250/?time=281)）：
+
+```swift
+let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029) {
+  TLS {
+    TCP {
+      IP()
+        .fragmentationEnabled(false)
+    }
+  }
+}
+```
+
+关键点：
+
+- 协议栈从顶到底嵌套：TLS 在最外层，TCP 在 TLS 内部，IP 在 TCP 内部。
+- `.fragmentationEnabled(false)` 是 IP 这一层的修饰符，只在需要定制时才写。
+- 默认值适用绝大多数场景，按需覆盖即可。
+
+**收发字节流：流式协议要指定字节数**
+
+TLS/TCP 是字节流协议，receive 必须告诉框架要读多少字节（[07:30](https://developer.apple.com/videos/play/wwdc2025/250/?time=450)）：
+
+```swift
+// Send and receive on a connection
+
+import Network
+
+public func sendAndReceiveWithTLS() async throws {
+  let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029)) {
+    TLS()
+  }
+
+  let outgoingData = Data("Hello, world!".utf8)
+  try await connection.send(outgoingData)
+
+  let incomingData = try await connection.receive(exactly: 98).content
+  print("Received data: \(incomingData)")
+}
+```
+
+关键点：
+
+- `send` 是 async，挂起到框架处理完数据为止。
+- 第一次 `send` 或 `receive` 会自动启动连接，无需手动 `start()`。
+- `receive(exactly: 98)` 表示精确读取 98 字节，返回 `(content, metadata)` 元组，这里只取 `.content`。
+- 错误（如飞行模式断网）以 `throws` 抛出，可以用 do/catch 处理。
+
+**TLV framer：让消息保留边界**
+
+字节流的麻烦在于：sender 调一次 `send(3 bytes)`，receiver 那边可能分两次收到，也可能合并到一次。今年新增的 TLV framer 自动帧化消息（[11:24](https://developer.apple.com/videos/play/wwdc2025/250/?time=684)）：
+
+```swift
+// Send TicTacToe game messages with TLV
+
+import Network
+
+public func sendWithTLV() async throws {
+  let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029)) {
+    TLV {
+      TLS()
+    }
+  }
+
+  let characterData = try JSONEncoder().encode(GameCharacter(character: "🐨"))
+  try await connection.send(characterData, type: GameMessage.selectedCharacter.rawValue)
+}
+```
+
+关键点：
+
+- `TLV { TLS() }` 把 TLV framer 叠加在 TLS 之上。
+- `send` 多了一个 `type:` 参数，用于在消息头部写入类型字段，对端可以用它分发不同的消息处理器。
+- 序列化仍由开发者负责（这里用 `JSONEncoder`），TLV 只解决「这条消息有多长、是什么类型」。
+
+**Coder 协议：直接收发 Codable 类型**
+
+如果序列化也想省掉，用 Coder（[13:13](https://developer.apple.com/videos/play/wwdc2025/250/?time=793)）：
+
+```swift
+// Send TicTacToe game messages with Coder
+
+import Network
+
+public func sendWithCoder() async throws {
+  let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029)) {
+    Coder(GameMessage.self, using: .json) {
+      TLS()
+    }
+  }
+
+  let selectedCharacter: GameMessage = .selectedCharacter("🐨")
+  try await connection.send(selectedCharacter)
+}
+```
+
+关键点：
+
+- `Coder(GameMessage.self, using: .json)` 把消息类型和编码格式（`.json` 或 property list）声明在协议栈里。
+- `connection.send(selectedCharacter)` 直接发送 Swift 值，框架内部完成 encode + frame。
+- 接收端用 `connection.receive().content` 拿到的就是 `GameMessage` 枚举值，可以直接 switch 分支处理。
+- 适用于客户端和服务端都自己写、都用 Swift 的场景；对接已有协议的服务器仍要用 TLV 或字节流。
+
+**监听入站连接**
+
+服务端用 NetworkListener，每一个新连接自动启动一个 child task，并发接受多个连接而不阻塞（[15:16](https://developer.apple.com/videos/play/wwdc2025/250/?time=916)）：
+
+```swift
+// Listen for incoming connections with NetworkListener
+
+import Network
+
+public func listenForIncomingConnections() async throws {
+  try await NetworkListener {
+    Coder(GameMessage.self, using: .json) {
+      TLS()
+    }
+  }.run { connection in
+    for try await (gameMessage, _) in connection.messages {
+      // Handle the GameMessage
+    }
+  }
+}
+```
+
+关键点：
+
+- `NetworkListener { ... }` 复用同一套协议栈 builder。
+- `.run { connection in ... }` 是结构化并发入口，每条新连接调用一次闭包。
+- `connection.messages` 是 AsyncSequence，可以直接 `for try await` 迭代消息。
+- 闭包返回时 child task 自动结束，listener 取消时所有连接级联取消。
+
+**Wi-Fi Aware：iOS 26 的跨平台点对点发现**
+
+NetworkBrowser 在网络上找服务，iOS 26 新增了 Wi-Fi Aware 支持（[17:39](https://developer.apple.com/videos/play/wwdc2025/250/?time=1059)）：
+
+```swift
+// Browse for nearby paired Wi-Fi Aware devices
+
+import Network
+import WiFiAware
+
+public func findNearbyDevice() async throws {
+  let endpoint = try await NetworkBrowser(for: .wifiAware(.connecting(to: .allPairedDevices, from: .ticTacToeService))).run { endpoints in
+    .finish(endpoints.first!)
+  }
+
+  // Make a connection to the endpoint
+}
+```
+
+关键点：
+
+- `.wifiAware(.connecting(to: .allPairedDevices, from: .ticTacToeService))` 指定要找的服务和设备范围。
+- `.run { endpoints in ... }` 闭包返回 `.finish(endpoint)` 会停止 browse 并返回结果，返回 `.continue` 继续等更多设备。
+- 拿到 endpoint 后即可传给 `NetworkConnection(to:)` 建立连接。
+
+---
+
+## 核心启发
+
+**1. 用 NetworkConnection 替换 BSD socket 自研协议**
+
+- 为什么值得做：自研二进制协议时，如果还在用 socket + 自己解析帧头，迁移到 `NetworkConnection { TLV { TLS() } }` 可以一次性拿到 TLS、Happy Eyeballs、Wi-Fi Assist、网络切换处理。
+- 怎么开始：先把单个连接的发送路径替换成 `connection.send(data, type:)`，接收侧从 byte buffer 改为 `connection.receive()`，对端协议格式不动即可联调。
+
+**2. App-to-app 通信首选 Coder over TLS**
+
+- 为什么值得做：双端都是自己写的 Swift app，没有协议历史包袱，Coder 让你直接传 Codable 枚举，省掉 JSON encode/decode 的胶水代码，类型错误编译期就暴露。
+- 怎么开始：把消息定义成一个 `Codable` 枚举（每个 case 携带 associated value），`Coder(MessageType.self, using: .json) { TLS() }` 即可上手；后续要换二进制格式，把 `.json` 换成 `.propertyList` 一行搞定。
+
+**3. 用 NetworkListener 重构服务端的 accept 循环**
+
+- 为什么值得做：传统 `accept` 循环要自己处理 GCD/Thread 把每个连接派发出去，现在 `NetworkListener.run` 自动给每条连接起 child task，task 取消时连接级联取消，符合结构化并发，关停服务时不会留孤儿连接。
+- 怎么开始：把现有的 dispatch_async 处理函数搬进 `.run { connection in ... }` 闭包；用 `connection.messages` 替代手动 receive 循环。
+
+**4. 把 stateUpdateHandler 接进 UI 层**
+
+- 为什么值得做：连接 preparing/waiting/ready/failed 几种状态可以直接驱动一个 connectionStatus banner，用户能看到「正在连接」「网络受限」「已断开」，比静默等待体验好很多。
+- 怎么开始：在 `NetworkConnection` 上注册 state handler，把状态映射到一个 SwiftUI `@Observable` 的属性，View 层订阅即可。
+
+**5. iOS-only 场景试 Wi-Fi Aware，跨平台仍走 Bonjour**
+
+- 为什么值得做：Wi-Fi Aware 不依赖共同 Wi-Fi 网络，适合户外或多人本地协作；但目前仅限 iOS 26 的 iPhone，跨平台兼容仍要 Bonjour。
+- 怎么开始：用 `NetworkBrowser(for: .wifiAware(...))` 做 iOS 双机 demo 先跑通，再封一层抽象，根据设备能力 fallback 到 `.bonjour(...)`。
+
+---
+
+## 关联 Session
+
+- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — NetworkExtension 框架，做 VPN、内容过滤、代理的底层接入。
+- [Finish tasks in the background](/articles/wwdc2025-227) — 后台执行机制更新，长连接和后台 fetch 的调度策略。
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — 后量子密码学在 TLS 链路里的影响和迁移路径。
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — 新的 declared age range API，与网络层的内容分发策略相关。

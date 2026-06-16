@@ -24,32 +24,119 @@ relatedSessions:
 
 ## Highlight
 
-> 深入了解 What’s new in AdAttributionKit 的技术细节和最佳实践。
+> iOS 18.4 起，同一个 App 可以同时持有多个有效的 re-engagement 转化窗口，通过 conversion tag 精确标记每一次广告召回。
 
 ---
 
 ## 核心内容
 
-苹果终于对辅助功能动了真格。过去十年，辅助功能更新的套路基本不变：加几个新 API，发一段感人视频，呼吁开发者重视。这次不一样。Accessibility Nutrition Labels 把你的辅助功能支持情况直接挂在 App Store 产品页上，用户不需要下载就能看到你的应用是否支持 VoiceOver、Dynamic Type、高对比度模式。食品营养标签的比喻很精准——一旦信息透明化，市场机制会比任何 WWDC 演讲都更有效地推动改变。
+广告归因里有一个长期被回避的问题：同一时刻只能有一个 re-engagement 转化在跑。假设你同时在投两个促销广告，用户先点了 Discount 1 进入 App 没下单，几小时后又点了 Discount 2，最终回头买了 Discount 1 的商品。在 iOS 18.3 之前，前一个转化早就被锁住，购买数据只能挂到 Discount 2 头上，第一个广告的真实价值被埋没。运营会发现 ROI 数据和直觉对不上，但又找不到归因可以校正的地方。
 
-技术层面，今年的更新围绕两条线展开。一条是评估和度量：新的 Accessibility Evaluation API 给了开发者一套系统化的检查工具，能量化你的应用在各辅助功能维度的表现，然后把这些数据提交到 App Store Connect。另一条是适配：Assistive Access 模式的 API 更成熟了，Liquid Glass 的辅助功能兼容机制也补上了——Reduced Transparency、Increased Contrast、Reduced Motion 三个环境值让自定义视图能正确响应系统级辅助功能设置。
-
-
-### 最佳实践
-
-建议按以下优先级推进：
-
-第一，立即跑一次 Accessibility Evaluation API，拿到基线数据。不用急着修所有问题，先了解应用在什么水平。很多团队对自家应用的辅助功能状态有不切实际的乐观。
-
-第二，VoiceOver 支持是投入产出比最高的方向。Dynamic Type 大多数应用已经用语义字体了，高对比度系统会自动处理标准控件——但 VoiceOver 要求逐个检查交互元素，工作量最大，也是用户感知最强的。
-
-第三，Assistive Access 的适配优先级较低。除非应用目标用户群体中认知障碍用户占比很高，否则优先级低于前两项。等 Accessibility Nutrition Labels 正式上线后，根据用户反馈再决定投入力度。
+iOS 18.4 把这个限制拆掉了。多个 re-engagement 转化窗口可以同时存在，每个窗口附带一个 conversion tag，类似一份转化书签。App 在 `Info.plist` 里把 `EligibleForAdAttributionKitOverlappingConversions` 设为 `YES`，AdAttributionKit 就会在 re-engagement URL 上追加一个查询参数；App 取出 tag、本地或服务器持久化，等用户真的下单时拿这个 tag 去更新对应那次转化的 postback。归因从"谁离购买最近"变成"用户究竟是被哪个广告召回的"。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Automate your development process with the App Store Connect API](/articles/wwdc2025-324) — learn how the new webhook api can provide you with real-time notifications from 
-- [Optimize your monetization with App Analytics](/articles/wwdc2025-252) — explore the new monetization, subscription, and offer analytics coming to app an
-- [What’s new in App Store Connect](/articles/wwdc2025-328) — get the latest updates for app store connect, including the new web ui for build
-- [What’s new in StoreKit and In-App Purchase](/articles/wwdc2025-241) — learn about the latest storekit api enhancements to help you deliver great in-ap
+整套机制围绕 `Postback.reengagementOpenURLParameter` 这一个 query item 展开。App 接到 Universal Link 后，从 URL 中抽出 tag 值（[05:42](https://developer.apple.com/videos/play/wwdc2025/221/?time=342)）：
+
+```swift
+func retrieveConversionTag(fromURL url: URL) -> String? {
+    guard let components = URLComponents(url: url, resolvingAgainstBaseURL: true) else {
+        print("Could not get components for URL.")
+        return nil
+    }
+
+    guard let queryItems = components.queryItems else {
+        print("URL does not contain query items.")
+        return nil
+    }
+
+    for item in queryItems {
+        guard item.name == Postback.reengagementOpenURLParameter else {
+            continue
+        }
+        return item.value
+    }
+    return nil
+}
+```
+
+关键点：
+
+- `URLComponents(url:resolvingAgainstBaseURL:)` 解析 deep link，失败直接返回 nil。
+- `queryItems` 拿到 URL 上所有的查询参数，没有就视为非召回链接。
+- 比对 `Postback.reengagementOpenURLParameter`，AdAttributionKit 在 re-engagement 打开时一定会附上这个参数。
+- 找到即刻返回 value，这就是后续用于更新的 conversion tag。
+
+拿到 tag 之后，业务侧在用户产生有效行为时调用更新 API（[06:55](https://developer.apple.com/videos/play/wwdc2025/221/?time=415)）：
+
+```swift
+func updateConversionValue(_ conversionValue: Int, conversionTag: String) async {
+    do {
+        let update = PostbackUpdate(fineConversionValue: conversionValue,
+                                    lockPostback: false,
+                                    conversionTag: conversionTag)
+        try await Postback.updateConversionValue(update)
+    }
+    catch {
+        print("An error occurred while updating the conversion value: \(error)")
+    }
+}
+```
+
+关键点：
+
+- `PostbackUpdate` 同时接收 `fineConversionValue`、`lockPostback`、`conversionTag` 三个字段。
+- `lockPostback: false` 表示后续仍允许进一步更新，适合多步漏斗的场景。
+- `conversionTag` 是定向更新的关键，缺省时系统只会更新最近一次转化。
+- `Postback.updateConversionValue` 是 async throws，调用方需要在并发上下文里处理错误。
+
+第二条主线是 attribution window 与 cooldown 的可配置化。`Info.plist` 里新增 `AdAttributionKitConfigurations` 字段，按 ad network 维度声明窗口长度（[10:14](https://developer.apple.com/videos/play/wwdc2025/221/?time=614)）：
+
+```
+{
+  "AdAttributionKitConfigurations": {
+    "AttributionWindows": {
+      "com.example.adNetwork": {
+        "install": {
+          "click": 2,
+          "ignoreInteractionType": "view"                     
+        }
+      }
+    }
+ }
+```
+
+关键点：
+
+- `AttributionWindows` 下用 ad network identifier 作 key，可对每家网络单独配置。
+- `install` 子节点描述 install 类型的归因；re-engagement 不存在窗口配置，因为转化紧贴交互发生。
+- `click` 指定点击型广告的归因窗口天数；默认 30 天，可缩短也可延长。
+- `ignoreInteractionType` 设为 `"view"` 或 `"click"` 之一，让某一类交互完全不参与该网络的归因。
+- 若需要批量配置，可以再加一个 `global` key 作为兜底，特定 ad network 的配置覆盖全局值（[10:46](https://developer.apple.com/videos/play/wwdc2025/221/?time=646)）。
+
+cooldown 用同一套配置入口表达"转化后封锁期"（[13:52](https://developer.apple.com/videos/play/wwdc2025/221/?time=832)）。把 `install-cooldown-hours` 设为 6、`reengagement-cooldown-hours` 设为 1，就能避免 install 转化刚发生几分钟后就被一次 re-engagement 抢走归因。
+
+postback 这次还多了一项 `country-code`（[17:05](https://developer.apple.com/videos/play/wwdc2025/221/?time=1025)），值是符合 ISO 3166 的两位国家码，比如 `"MT"`。Marketplace 场景下，install verification token payload 中也对应多了 `ccode` 字段（[16:26](https://developer.apple.com/videos/play/wwdc2025/221/?time=986)），让广告网络可以按地区拆分预算效果。
+
+---
+
+## 核心启发
+
+- **打开 overlapping conversions 并接入 conversion tag**：为什么值得做：多个 re-engagement 同时跑是促销季常态，旧规则会让早期广告的真实价值被系统性低估。怎么开始：在 `Info.plist` 加 `EligibleForAdAttributionKitOverlappingConversions=YES`，在 Universal Link 处理函数里读取 `Postback.reengagementOpenURLParameter` 并把 tag 与本地订单上下文绑定。
+
+- **按 ad network 单独裁剪归因窗口**：为什么值得做：默认 30 天的 click 窗口对短促销根本不合理，会把无关流量计入归因；缩短窗口能让数据反映真实购买动机。怎么开始：先用 App Analytics 数据看出每家网络的实际转化时间分布，再为典型转化时间偏短的网络在 `AttributionWindows` 里设定 2–7 天的 click 窗口，对纯展示型网络用 `ignoreInteractionType: "view"` 直接剔除。
+
+- **为关键转化路径设置 cooldown**：为什么值得做：install 完成几分钟内被 re-engagement 截胡是真实存在的误归因，会让买量团队和召回团队的数据互相打架。怎么开始：先观察 IAP 与 install 的时间间隔分布，设 `install-cooldown-hours` 为大多数首购完成的时长（例如 6 小时），`reengagement-cooldown-hours` 设为 1 小时，再用 iOS Settings 里的 AdAttributionKit 测试入口走通端到端。
+
+- **消费 postback 时纳入 country-code 维度**：为什么值得做：同一个 ROAS 数字在不同国家的含义差异很大，把地区拆开后才能定位真正赚钱的市场。怎么开始：在 postback 入库脚本里新增 `country-code` 字段；Marketplace 流程额外解析 token payload 中的 `ccode`，作为合规与对账的双重凭据。
+
+---
+
+## 关联 Session
+
+- [Automate your development process with the App Store Connect API](/articles/wwdc2025-324) — App Store Connect Webhook 实时推送的入门，配合 AdAttributionKit 闭环数据流。
+- [Optimize your monetization with App Analytics](/articles/wwdc2025-252) — 新版变现与订阅分析，用来反推归因窗口该设多长。
+- [What’s new in App Store Connect](/articles/wwdc2025-328) — App Store Connect 后台更新，包含归因相关的报表入口。
+- [What’s new in StoreKit and In-App Purchase](/articles/wwdc2025-241) — IAP 与订阅 API 更新，conversion value 的上游数据来源。

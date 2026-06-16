@@ -24,34 +24,268 @@ relatedSessions:
 
 ## Highlight
 
-> 三件大事。
+> WWDC25 的 Widget 更新做了三件事：扩展到 visionOS 与 CarPlay、为 watchOS 引入按相关时间段出现的 Relevance Widget、用 APNs 推送直接刷新 Widget。
 
 ---
 
 ## 核心内容
 
-三件大事。
+过去几年，Widget 一直被两个问题卡住。第一，平台覆盖不全：visionOS 没有原生 Widget，CarPlay 也只能干瞪眼。第二，刷新机制只有 Timeline，开发者要么提前预测好几个小时的数据，要么等系统按节流节奏轮到自己——服务端有新数据时，没办法主动告诉 Widget。
 
-第一，Widget 跑到了新平台。visionOS 26 原生支持 Widget，iOS/iPadOS 上的已有 Widget 自动可用，还新增了 systemExtraLargePortrait 竖向尺寸。Widget 在 visionOS 里可以钉在墙面上，支持 elevated 和 recessed 两种样式，还有 paper 纹理选项。远距离查看时会切换到 simplified levelOfDetail，简化布局提升可读性。CarPlay 上 Widget 以 StandBy 样式显示在仪表盘左侧，Live Activity 也可以在 CarPlay 桌面展示了。macOS Tahoe 的菜单栏可以直接放 Control，Live Activity 从 iPhone 自动同步到 macOS 菜单栏。
-
-第二，watchOS 26 引入了 Relevance Widget。不同于传统 Timeline Widget 在 Smart Stack 里被动等待被推荐，Relevance Widget 可以主动声明自己的相关时间段——在这个时间段内才出现在 Smart Stack 里，过了就消失。多个相关配置还能同时展示多个实例。
-
-第三，也是开发者最关心的：Push Widget Updates。服务端可以通过 APNs 直接告诉 WidgetKit "数据变了，该刷新了"。配合 WidgetPushHandler 协议，Widget 注册自己的 push token，服务端发一个 content-available 推送就能触发 Widget 刷新。预算机制和 Timeline 调度一致——系统节流以省电。
-
-
-### 最佳实践
-
-Accented mode 适配应该在 Widget 开发早期就考虑，不要等产品出来再改。特别是包含照片或品牌色彩图片的 Widget——accident mode 下用户体验差异极大。建议每种 Widget 都用模拟器的 accented mode 预览一遍。
-
-Push Widget Updates 的服务端实现要注意节流。如果你的数据每秒都在变（比如计步器），不要每秒都推——用 Timeline 的定时刷新反而更合理。Push 适合"偶尔但需要及时"的场景。
-
-Live Activity 在 CarPlay 上的适配只需要加一行 supplementalActivityFamilies(.small)，收益很大——同时改善了 CarPlay 和 Apple Watch 的展示效果。
+这次 WWDC25 把这两个问题一起处理。Widget、Live Activity、Control 同时落地 visionOS 26、CarPlay、macOS Tahoe 菜单栏。visionOS 上的 Widget 可以贴墙、可以嵌进木质桌面，远看时切换到简化版本布局；CarPlay 用 StandBy 样式把 Widget 摆在仪表盘左边。watchOS 26 增加了 Relevance Widget——它声明"我在 happy hour 的 17:00–19:00 才相关"，过了这段时间就从 Smart Stack 自动消失。最重要的是 WidgetKit Push Notifications：服务端发一个 `content-changed: true` 的静默推送，Widget 立刻刷新，不再受 Timeline 调度时间表的限制。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Bring Swift Charts to the third dimension](/articles/wwdc2025-313) — learn how to bring your 2d swift charts to the third dimension with chart3d and 
-- [Build an AppKit app with the new design](/articles/wwdc2025-310) — update your appkit app to take full advantage of the new design system. we
-- [Create icons with Icon Composer](/articles/wwdc2025-361) — learn how to use icon composer to make updated app icons for ios, ipados, macos,
-- [Elevate the design of your iPad app](/articles/wwdc2025-208) — make your app look and feel great on ipados. learn best practices for designing 
+### Accented Rendering Mode
+
+iOS 26 主屏幕新增 clear glass 与单色 tint 两种主题。系统先把 Widget 内容用 accented rendering mode 渲染（所有内容统一染白），再去掉背景换成玻璃或纯色。普通 Widget 不需要改动，但带照片或品牌色的 Widget 会出问题——图片整张变白，没法看。
+
+Apple 给的解法是观察 `widgetRenderingMode` 环境变量，按当前模式分支布局（[02:44](https://developer.apple.com/videos/play/wwdc2025/278/?time=164)）：
+
+```swift
+struct MostFrequentBeverageWidgetView: View {
+    @Environment(\.widgetRenderingMode) var renderingMode
+    
+    var entry: Entry
+    
+    var body: some View {
+        ZStack {
+            if renderingMode == .fullColor {
+                Image(entry.beverageImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            
+                LinearGradient(gradient: Gradient(colors: [.clear, .clear, .black.opacity(0.8)]), startPoint: .top, endPoint: .bottom)
+            }
+            
+            VStack {
+                if renderingMode == .accented {
+                    Image(entry.beverageImage)
+                        .resizable()
+                        .widgetAccentedRenderingMode(.desaturated)
+                        .aspectRatio(contentMode: .fill)
+                }
+                
+                BeverageTextView()
+            }
+        }
+    }
+}
+```
+
+**关键点：**
+
+- `@Environment(\.widgetRenderingMode)`：读取系统当前用哪种渲染模式，值为 `.fullColor` 或 `.accented`。
+- `if renderingMode == .fullColor`：full-color 模式下显示大图加渐变蒙版。
+- `if renderingMode == .accented`：accented 模式下换一套布局，把图片放回文字上方。
+- `.widgetAccentedRenderingMode(.desaturated)`：让图片在 accented 模式下保留灰阶细节而非整张染白。该 modifier 还支持 `.accented` `.accentedDesaturated` `.fullColor` `nil` 四种值，专辑封面、书籍封面建议用 `.fullColor`。
+
+### visionOS Widget 配置
+
+visionOS 26 上 Widget 可以钉墙、嵌桌（[06:08](https://developer.apple.com/videos/play/wwdc2025/278/?time=368)）：
+
+```swift
+struct CaffeineTrackerWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(
+            kind: "BaristaWidget",
+            provider: Provider()
+        ) { entry in
+            CaffeineTrackerWidgetView(entry: entry)
+        }
+        .configurationDisplayName("Caffeine Tracker")
+        .description("A widget tracking your caffeine intake during the day.")
+        .supportedMountingStyles([.elevated])
+        .widgetTexture(.paper)
+        .supportedFamilies([.systemExtraLargePortrait])
+    }
+}
+```
+
+**关键点：**
+
+- `.supportedMountingStyles([.elevated])`：声明只支持"凸出于墙面"的安装方式，另一个可选值是 `.recessed`（嵌入木桌）。该 modifier 在 iOS 上也可用。
+- `.widgetTexture(.paper)`：visionOS 专属，把默认的玻璃质感换成海报纸质。
+- `.supportedFamilies([.systemExtraLargePortrait])`：visionOS 26 新增的纵向超大尺寸，原来的 `systemExtraLarge` 是横向版本。
+
+### Level of Detail：远距离自动简化
+
+visionOS 上 Widget 可以钉在房间另一头的墙上，远看时字小按钮难按。新增 `levelOfDetail` 环境变量解决这个问题（[08:56](https://developer.apple.com/videos/play/wwdc2025/278/?time=536)）：
+
+```swift
+struct CaffeineTrackerWidgetView : View {
+    @Environment(\.levelOfDetail) var levelOfDetail
+    
+    var entry: CaffeineLogEntry
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            TotalCaffeineView(entry: entry)
+
+            if let log = entry.log {
+                LastDrinkView(log: log)
+            }
+
+            if levelOfDetail == .default {
+                LogDrinkView()
+            }
+        }
+    }
+}
+```
+
+**关键点：**
+
+- `levelOfDetail` 取值 `.default` 或 `.simplified`，由系统按距离自动切换。
+- 远距离时隐藏 `LogDrinkView`——按钮在远处难以点击，先去掉。
+- 远距离时配合放大 `TotalCaffeineView` 的字体（见下一段），把"咖啡因总量"这个核心信息变得更易读。
+- level of detail 切换会带过渡动画，和 Timeline 切换的动画规则一致。
+
+```swift
+struct TotalCaffeineView: View {
+    @Environment(\.levelOfDetail) var levelOfDetail
+    
+    let entry: CaffeineLogEntry
+
+    var body: some View {
+        VStack {
+            Text("Total Caffeine")
+                .font(.caption)
+
+            Text(totalCaffeine.formatted())
+                .font(caffeineFont)
+        }
+    }
+    
+    var caffeineFont: Font {
+        if levelOfDetail == .simplified {
+            .largeTitle
+        } else {
+            .title
+        }
+    }
+    
+    var totalCaffeine: Measurement<UnitMass> {
+        entry.totalCaffeine
+    }
+}
+```
+
+**关键点：**
+
+- `caffeineFont` 计算属性按 `levelOfDetail` 返回不同字号——简化模式下用 `.largeTitle`，默认模式下用 `.title`。
+- 这种"按距离换布局而非按尺寸换布局"的思路，是 visionOS Widget 设计的核心。
+
+### Live Activity 上 CarPlay
+
+Live Activity 想出现在 CarPlay 主屏需要主动声明（[11:49](https://developer.apple.com/videos/play/wwdc2025/278/?time=709)）：
+
+```swift
+struct ShopOrderLiveActivity: Widget {
+    var body: some WidgetConfiguration {
+        ActivityConfiguration(for: Attributes.self) { context in
+            ActivityView(context: context)
+        } dynamicIsland: { context in
+            DynamicIsland {
+                DynamicIslandExpandedRegion(.leading) {
+                    ExpandedView(context: context)
+                }
+            } compactLeading: {
+                LeadingView(context: context)
+            } compactTrailing: {
+                TrailingView(context: context)
+            } minimal: {
+                MinimalView(context: context)
+            }
+        }
+        .supplementalActivityFamilies([.small])
+    }
+}
+```
+
+**关键点：**
+
+- `.supplementalActivityFamilies([.small])`：声明这个 Live Activity 还要支持 `.small` 这个补充家族，CarPlay 主屏和 Apple Watch 上会用这个家族渲染。
+- 加这一行的同时还要在视图层用 `@Environment(\.activityFamily)` 分支，给 `.small` 单独写一套精简视图。
+
+### Relevance Widget：按时间段出现
+
+watchOS 26 引入 RelevanceKit。和 Timeline Widget 不同，Relevance Widget 自己声明"我在哪段时间相关"，系统才在 Smart Stack 中展示（[16:20](https://developer.apple.com/videos/play/wwdc2025/278/?time=980)）：
+
+```swift
+struct HappyHourRelevanceWidget: Widget {
+    var body: some WidgetConfiguration {
+        RelevanceConfiguration(
+            kind: "HappyHour",
+            provider: Provider()
+        ) { entry in
+            WidgetView(entry: entry)
+        }
+    }
+}
+```
+
+**关键点：**
+
+- `RelevanceConfiguration` 是与 `StaticConfiguration` `AppIntentConfiguration` 并列的第三种 Widget 配置类型。
+- Provider 实现 `RelevanceEntriesProvider` 协议，在 `relevance()` 方法里返回 `WidgetRelevance`，告诉系统当前有哪些"相关时间段"。
+- 多个 attribute 可以同时返回——比如三家咖啡店的 happy hour，可以在 Smart Stack 里同时出现三个实例。
+
+### WidgetKit Push：服务端主动刷新
+
+最大的工程改动。Widget 注册一个 `WidgetPushHandler`，拿到 push token 后回传服务端（[21:13](https://developer.apple.com/videos/play/wwdc2025/278/?time=1273)）：
+
+```swift
+struct CaffeineTrackerPushHandler: WidgetPushHandler {
+    func pushTokenDidChange(_ pushInfo: WidgetPushInfo, widgets: [WidgetInfo]) {
+        // Send push token and subscription info to server
+    }
+}
+```
+
+**关键点：**
+
+- `WidgetPushHandler` 是一个新协议，专门给 Widget 用——和应用本身的 push token 是分开的。
+- `pushTokenDidChange` 在 token 变更时被调用，参数包含当前所有装上这个 Widget 的位置（home screen / lock screen / Smart Stack 等）。
+- 拿到 token 后由 App 自己负责回传到服务端并保存。
+
+服务端推送 payload 极简（[22:29](https://developer.apple.com/videos/play/wwdc2025/278/?time=1349)）：
+
+```json
+{
+    "aps": {
+        "content-changed": true
+    }
+}
+```
+
+**关键点：**
+
+- `content-changed: true` 是 WidgetKit 专用字段，告诉系统"数据变了，去拉一次新 timeline"。
+- 推送本身不带数据，触发的是 Provider 的下一次 timeline 请求——服务端只通知"该刷了"，不直接传内容。
+- 推送有预算限制，和 Timeline 调度共享系统节流策略；高频变化（每秒）的数据不要走 push，应该用 Timeline 自带的定时刷新。
+
+---
+
+## 核心启发
+
+1. **给现有 Widget 加 accented mode 适配**：当用户切到 clear glass 主题时，没适配的 Widget 会变成一坨白。为什么值得做：iOS 26 主屏定制是面向所有用户的功能，覆盖率会快速铺开。怎么开始：把 Widget 的图片资源加上 `.widgetAccentedRenderingMode(.desaturated)`，再用 `@Environment(\.widgetRenderingMode)` 分支隐藏不必要的渐变和装饰。模拟器里直接预览 accented mode。
+
+2. **把高时效服务端事件改成 Push Widget Updates**：航班状态、订单状态、比赛比分这类"变化点稀疏但需要立即可见"的数据。为什么值得做：Timeline 调度有最小间隔限制，过去只能提前预测，事件触发时显示已经滞后。怎么开始：实现 `WidgetPushHandler`，回传 token 到现有 APNs 服务，在事件触发点发 `content-changed: true` 静默推送即可——payload 几乎不用写代码。
+
+3. **给营业类 App 接 Relevance Widget**：餐厅 happy hour、健身房课程时间、电影场次。为什么值得做：用户不必手动加 Widget，系统在相关时段自动推到 Smart Stack 表盘上。怎么开始：用 `RelevanceConfiguration` 替代 `StaticConfiguration`，在 `RelevanceEntriesProvider.relevance()` 里返回 `WidgetRelevance`，附上时间段。多个营业点可以并存为多个 attribute。
+
+4. **复用 iPad Widget 上 visionOS**：成本最低的扩展。为什么值得做：visionOS 26 自动支持 iPad Widget，零代码就有了空间设备的入口。怎么开始：先在 visionOS 模拟器跑一遍现有 Widget，发现需要远距离适配的页面再加 `@Environment(\.levelOfDetail)`。如果是相册类、海报类内容，开 `.widgetTexture(.paper)` 立刻获得截然不同的呈现。
+
+5. **给 Live Activity 加一行 `.supplementalActivityFamilies(.small)`**：为什么值得做：一行代码同时拿到 CarPlay 主屏与 Apple Watch 的展示位。怎么开始：在 `ActivityConfiguration` 后面追加 modifier，再在视图层用 `@Environment(\.activityFamily)` 给 `.small` 写一套精简视图，文字大、图标少、不放按钮。
+
+---
+
+## 关联 Session
+
+- [Bring Swift Charts to the third dimension](/articles/wwdc2025-313) — Swift Charts 引入 3D 图表，与 visionOS Widget 一起构成空间计算的可视化栈。
+- [Build an AppKit app with the new design](/articles/wwdc2025-310) — macOS Tahoe 的新设计语言，Widget 与菜单栏 Control 的来源。
+- [Create icons with Icon Composer](/articles/wwdc2025-361) — Liquid Glass 设计体系下的图标制作，与 Widget 的 accented mode 同源。
+- [Elevate the design of your iPad app](/articles/wwdc2025-208) — iPad 应用设计指南，Widget 在 iPad 大屏上的呈现重要参考。

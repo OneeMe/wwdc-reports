@@ -21,37 +21,111 @@ relatedSessions:
 
 ## Highlight
 
-> 五个独立但互补的更新，覆盖了 passkey 生命周期的每个阶段。
+> iOS、iPadOS、macOS、visionOS 26 在 passkey 生命周期的注册、维护、升级、发现、迁移五个阶段各推出一组 API。
 
 ---
 
 ## 核心内容
 
-五个独立但互补的更新，覆盖了 passkey 生命周期的每个阶段。
+旧的注册流程让人难受。用户点"用邮箱注册"，要先填邮箱，再填名字、姓氏，再生成强密码，再点继续，至少四步。FIDO 联盟 2025 年的调研里，69% 的人已经至少有一个 passkey；Google 公布密码用户的登录成功率只有 passkey 用户的四分之一；TikTok 的 passkey 登录成功率到了 97%。可即便如此，注册仍然要走一遍密码表单——passkey 是后补的，不是起点。
 
-Account Creation API 是注册环节的重做。用户点"用邮箱注册"后，系统弹出一个 Sheet，预填了姓名、邮箱和 passkey 信息，Face ID 一扫就完成注册——不需要填表单、不需要设密码。实现上只需要初始化 ASCredentialProvider、创建 passkey registration request、通过 ASAuthorizationController 执行。三个特有错误需要处理：deviceNotConfiguredForPasskeyCreation（设备未配置 passkey）、canceled（用户关闭 Sheet）、preferSignInWithApple（已有 Apple 登录账户，防止重复注册）。
+Account Creation API 把注册环节重做。用户点注册之后，系统直接弹一个 Sheet，姓名、邮箱、即将创建的 passkey 全部预填好，Face ID 一扫就完成（[03:43](https://developer.apple.com/videos/play/wwdc2025/279/?time=223)）。预填字段可改，点字段会出 picker，里面是系统建议的几个值，也能手动输入。整个交互对接的是系统密码 App 或第三方凭证管理器，账户从第一秒就有 passkey，不需要先建一个密码账户再"升级"。
 
-Signal API 解决的是凭证维护问题。当用户在 App 里改了用户名、吊销了 passkey 或彻底移除了密码，用 ASCredentialUpdater 的 report 方法通知凭证管理器。凭证管理器（比如系统密码 App）会立即更新显示信息。Web 端有对应的 WebAuthn 标准方法。
+剩下四个更新围绕 passkey 的后续阶段。Signal API 让 App 在改用户名、吊销 passkey、删除密码后通知凭证管理器，避免凭证管理器显示过期信息。Automatic Passkey Upgrade 让已有密码账户在密码登录后静默生成 passkey，没有弹窗。Passkey Management Endpoints 是 well-known URL 标准，凭证管理器可以读取 enroll/manage URL，主动提示用户升级。Import/Export 让凭证在不同凭证管理器间直传，不落地中间文件。
 
-Automatic Passkey Upgrades 是零摩擦的密码到 passkey 迁移。用户用密码登录后，App 把 registration request 的 style 设成 conditional，系统会在后台静默创建 passkey 并推送通知。没有弹窗、没有中断。如果条件不满足（比如设备不支持），静默失败。
+## 详细内容
 
-Passkey Management Endpoints 是一个 well-known URL 标准。服务端在 /.well-known/passkey-endpoints 返回 JSON，指定 enroll 和 manage 的 URL。凭证管理器可以读取这个端点，在 App 还用密码登录时就提示"可以升级 passkey"。
+注册的核心代码只有一段（[06:33](https://developer.apple.com/videos/play/wwdc2025/279/?time=393)）。新建一个 `ASAuthorizationAccountCreationProvider`，调用 `createPlatformPublicKeyCredentialRegistrationRequest` 生成 request，再交给 `ASAuthorizationController` 执行。
 
-Import/Export 是凭证在不同凭证管理器之间迁移的能力。整个过程在 App 之间直传，Face ID 保护，不生成中间文件——比传统的 CSV 导出安全得多。
+```swift
+@Environment(\.authorizationController) var authorizationController
 
+func performPasskeySignUp() async throws {
+    let provider = ASAuthorizationAccountCreationProvider()
+    let request = provider.createPlatformPublicKeyCredentialRegistrationRequest(
+        acceptedContactIdentifiers: [.email, .phoneNumber],
+        shouldRequestName: true,
+        relyingPartyIdentifier: "example.com",
+        challenge: try await fetchChallenge(),
+        userID: try await fetchUserID()
+    )
 
-### 最佳实践
+    do {
+        let result = try await authorizationController.performRequest(request)
+        if case .passkeyAccountCreation(let account) = result {
+            // Register new account on backend
+        }
+    } catch ASAuthorizationError.deviceNotConfiguredForPasskeyCreation {
+        showPasswordSignUpForm = true
+    } catch ASAuthorizationError.canceled {
+        showPasswordSignUpForm = true
+    } catch ASAuthorizationError.preferSignInWithApple {
+        await performSignInWithApple()
+    } catch { ... }
+}
+```
 
-Account Creation API 应该作为新用户注册的首选路径。当它失败（deviceNotConfiguredForPasskeyCreation 或 canceled）时，降级到传统注册表单。不要反过来——先展示表单再建议 passkey，那样会失去速度优势。
+关键点：
 
-Passkey 吊销后，调用 reportAllAcceptedPublicKeyCredentials 传入仍然有效的 credential ID 集合。凭证管理器会删除不在集合里的 passkey。建议每次登录后也周期性调用这个方法做健康检查。
+- `acceptedContactIdentifiers` 声明 App 接受哪些联系人标识符，传 `.email` 和 `.phoneNumber` 两个；用户最后只会回传一个，那个值同时充当 passkey 的 user name 标签。
+- `shouldRequestName` 控制是否要姓名；非必要别开，能少一个字段就少一个字段。
+- `relyingPartyIdentifier`、`challenge`、`userID` 与标准 passkey 注册一致：域名、服务端一次性 challenge、稳定唯一的账户 ID。
+- 三个特定错误必须各自处理：`deviceNotConfiguredForPasskeyCreation` 表示设备没设密码、不能建 passkey，降级到传统表单；`canceled` 表示用户关掉了系统 Sheet，同样降级；`preferSignInWithApple` 仅在 App 支持 Sign in with Apple 时才会抛出，意味着用户已有 Sign in with Apple 账户，这时应直接发起 Sign in with Apple 请求，让用户落到已有账户。
+- `performRequest` 返回的 `ASAuthorizationResult` 里 unwrap 出 `.passkeyAccountCreation(let account)`，拿到 contact identifier、姓名（若请求过）和 passkey 对象。
 
-对于还在用密码的已有用户，把 automatic upgrade 设成每次密码登录都尝试。条件不满足就静默跳过，没有任何成本。一旦成功，用户下次登录就能用 passkey，体验质的飞跃。
+第二段是 Signal API（[12:30](https://developer.apple.com/videos/play/wwdc2025/279/?time=750) 与 [13:07](https://developer.apple.com/videos/play/wwdc2025/279/?time=787)）。用户在 App 改了邮箱后，调用 `ASCredentialUpdater().reportPublicKeyCredentialUpdate` 把新名字推给凭证管理器；吊销 passkey 时调用 `reportAllAcceptedPublicKeyCredentials` 传入仍然有效的 credential ID 集合，凭证管理器会删除不在集合里的 passkey。Web 端有对应的 `PublicKeyCredential.signalCurrentUserDetails` 与 `signalAllAcceptedCredentials`。
 
----
+第三段是 Automatic Passkey Upgrade（[15:36](https://developer.apple.com/videos/play/wwdc2025/279/?time=936)）。
 
-## 相关 Session
+```swift
+func signIn() async throws {
+    let accountDetails = try await signInWithPassword()
+    guard !accountDetails.hasPasskey else { return }
 
-- [Integrate privacy into your development process](/articles/wwdc2025-246) — learn how to build privacy into your apps from the planning stages through deplo
-- [Supercharge device connectivity with Wi-Fi Aware](/articles/wwdc2025-228) — learn how to create peer-to-peer network connections with wi-fi aware. we
-- [What’s new in UIKit](/articles/wwdc2025-243) — modernize your app with the latest apis in uikit, including enhanced menu bar su
+    let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(
+        relyingPartyIdentifier: "example.com")
+
+    let request = provider.createCredentialRegistrationRequest(
+        challenge: try await fetchChallenge(),
+        name: accountDetails.userName,
+        userID: accountDetails.userID,
+        requestStyle: .conditional
+    )
+
+    do {
+        let passkey = try await authorizationController.performRequest(request)
+        // Save new passkey to the backend
+    } catch { ... }
+}
+```
+
+关键点：
+
+- 入口在密码登录成功之后；先确认账户没有 passkey，再发起注册请求，避免重复创建。
+- `requestStyle: .conditional` 是开关——加了它系统才会走静默路径；条件不满足（比如设备不支持 passkey）会静默失败，没有 UI、没有干扰。
+- 成功后系统会推送通知告知用户已添加 passkey；失败什么也不显示，下次登录可以再尝试，没有任何成本。
+
+## 核心启发
+
+- **做什么**：把所有新注册路径切到 Account Creation API，把传统表单作为 fallback。
+  - 为什么值得做：注册步骤从四步压缩到一步 Face ID，用户拿到的是带 passkey 的账户而非密码账户，登录成功率会显著提升。
+  - 怎么开始：实现 `ASAuthorizationAccountCreationProvider` 流程，处理 `deviceNotConfiguredForPasskeyCreation` 和 `canceled` 时回落到表单；若 App 支持 Sign in with Apple，再处理 `preferSignInWithApple` 走原账户。
+
+- **做什么**：在所有改用户名、删账户、吊销 passkey 的入口接 Signal API，让凭证管理器始终显示最新状态。
+  - 为什么值得做：凭证管理器显示旧用户名或已吊销的 passkey 会让用户登录卡住，是 passkey 体验里最常见的隐性失败点。
+  - 怎么开始：账户设置里改邮箱后调用 `reportPublicKeyCredentialUpdate`；吊销列表更新后调用 `reportAllAcceptedPublicKeyCredentials` 传当前合法 ID 集合；用户改用全 passkey 后调用 `reportUnusedPasswordCredential` 让旧密码从凭证管理器消失。
+
+- **做什么**：给现有密码用户加 Automatic Passkey Upgrade，每次密码登录都试一次。
+  - 为什么值得做：存量密码账户是 passkey 推广最大的阻力，静默升级让用户在毫无感知的情况下迁移到 passkey，下一次登录就能享受 Face ID。
+  - 怎么开始：在密码登录成功的回调里检查 `hasPasskey`，没有就发起 `requestStyle: .conditional` 的 registration 请求，失败什么也不做。
+
+- **做什么**：服务端实现 `/.well-known/passkey-endpoints`，公开 enroll 与 manage 的 URL。
+  - 为什么值得做：凭证管理器可以读取这个端点，在用户还在用密码时主动引导升级 passkey，等于服务方多了一个免费的获客入口。
+  - 怎么开始：在 well-known 路径下返回 JSON，列出 enroll 和 manage 两个 URL；登录页接受这些深链接，落到对应的注册或管理流程。
+
+## 关联 Session
+
+- [Integrate privacy into your development process](/articles/wwdc2025-246) — 把隐私设计前置到产品规划阶段，与 passkey 的隐私默认值同源。
+- [Supercharge device connectivity with Wi-Fi Aware](/articles/wwdc2025-228) — Wi-Fi Aware 的设备发现与 passkey 跨设备同步是配套能力。
+- [What’s new in UIKit](/articles/wwdc2025-243) — UIKit 26 的新菜单栏与文本控件，配合系统级 passkey Sheet 改善登录页。
+- [Meet Passkeys (WWDC22)](/articles/wwdc2022-10092) — 本场视频前置阅读，介绍 passkey 的基础 API 与 prefer immediately available credentials。

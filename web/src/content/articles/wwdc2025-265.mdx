@@ -24,40 +24,191 @@ relatedSessions:
 
 ## Highlight
 
-> Dongyuan 从四个方面深入讲解：
+> Writing Tools 今年新增 Writing Tools Coordinator API，让自定义文本引擎也能获得原地重写、动画和行内校对的完整体验。
 
 ---
 
 ## 核心内容
 
-Dongyuan 从四个方面深入讲解：
+去年 Apple 推出 Writing Tools，原生 `UITextView`、`NSTextView` 一接就能用，但凡是自己写文本引擎的 app（笔记、代码编辑器、富文本编辑器）只能拿到一个面板式的体验：选中文字、出结果、按 Replace 替换。结果展示在悬浮面板里，没有动画，没有行内校对下划线，和原生 Mail、Notes 的体验差了一档。
 
-**新特性概览**：ChatGPT 集成支持内容生成和图片创建。支持 visionOS。描述修改后可追加 Follow Up 请求（比如"再温暖一点"）。Writing Tools 可作为 Shortcuts 使用。新增 API：工具栏按钮、标准菜单项、presentation intents、Writing Tools Coordinator。
+今年 iOS、iPadOS、macOS 26 给出了答案：`UIWritingToolsCoordinator` 与 `NSWritingToolsCoordinator`。Coordinator 把你的文本视图和 Writing Tools 之间的交互管起来——你提供 context（文本 + 选区），Coordinator 调用 delegate 完成替换、动画预览、校对下划线绘制、状态变化响应。最终效果是：Rewrite 时文字直接在原视图里动画替换，Proofread 时下划线画在原文字上，点下划线弹出建议。
 
-**原生文本视图自定义**：工具栏按钮用 UIBarButtonItem（UIKit）或 NSToolbarItem（AppKit）。菜单项可通过 `automaticallyInsertsWritingToolsItems = false` 关闭自动插入，用 `writingToolsItems` 获取标准项手动放置。Result Options 决定文本视图支持的格式级别——plainText（纯文本，忽略所有属性）、richText（显示属性如加粗/斜体）、richText + list + table（支持列表和表格）、richText + presentationIntent（语义样式）。
-
-**Display Attributes vs Presentation Intents**：这是本 Session 最核心的概念。Display attributes 是具体的样式信息（具体字号、颜色），TextEdit 用这种模式。Presentation intents 是语义信息（标题、子标题、引用块、代码块），Notes 用这种模式。Writing Tools 在 presentation intent 模式下尽可能用语义形式表达样式，但某些样式（下划线、上标、下标）无法用 intent 表示，仍会回落为 display attribute。Presentation intents 没有默认样式——你的 app 负责将 intent 转换为具体的显示样式。
-
-**自定义文本引擎集成**：通过 Writing Tools Coordinator 实现完整体验（原地重写、动画、行内校对标记）。Coordinator 是 UIKit 的 UIInteraction / AppKit 的 NSView 属性。Delegate 方法都是 async 的——因为大文本视图处理底层文本存储可能耗时。关键 delegate 方法：提供 context（文本 + 选区范围，可包含前后段落）、替换文本、返回校对下划线的贝塞尔路径、生成动画预览（macOS 用 NSTextPreview，iOS 用 UITargetedPreview）、响应状态变化。
-
-
-### 最佳实践
-
-1. **先判断你的文本视图属于哪个级别**。纯文本 → plainText。简单富文本 → richText。有列表/表格 → 加 list + table。有语义样式（heading 等）→ 用 presentationIntent。不要过度使用 presentationIntent，如果你的 app 没有对应的语义样式系统。
-
-2. **用 presentationIntent 时实现 requestContexts**。如果你的文本视图中有语义样式（比如标题段落），覆写 `requestContexts` 方法，提供包含 presentation intents 的 context，让 Writing Tools 理解你的文本结构。
-
-3. **自定义菜单项时使用标准 API**。`writingToolsItems` 会自动跟随系统更新——今年菜单项从 Proofread/Rewrite/Summary 更新了结构，用 API 的 app 自动获得新布局。
-
-4. **Coordinator 的 delegate 方法都是 async 的**。大文档的文本替换和预览生成可能耗时，确保在 delegate 方法内部正确处理异步操作，不要阻塞主线程。
-
-5. **文本变更后通知 Coordinator**。外部修改文本后调用 `updateRange:withText` 保持同步，布局变化后调用 `updateForReflowedText` 请求新的预览和校对标记。
+除了 Coordinator，今年还把 Writing Tools 带到了 visionOS，加上了 ChatGPT 集成（生成内容、生成图片）、改写后的 Follow Up 追问（"再温暖一点"、"更口语一点"），以及 Shortcuts 自动化入口。原生文本视图也补齐了 API：标准工具栏按钮、标准菜单项 `writingToolsItems`、富文本的 `presentationIntent` 结果选项。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — building on background assets, this session will introduce the new capability to
-- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — discover the latest updates for the app store server api, app store server notif
-- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — discover how permissionkit helps you enhance communication safety for children i
-- [Explore enhancements to your spatial business app](/articles/wwdc2025-223) — discover how the latest enhancements and apis in visionos 26 expand access and e
+### 自定义文本引擎接入：Coordinator 三步走
+
+第一步是把 Coordinator 挂到视图上。UIKit 是 `UIInteraction`，AppKit 是 `NSView` 的实例属性（[11:46](https://developer.apple.com/videos/play/wwdc2025/265/?time=706)）：
+
+```swift
+// Attach a coordinator to the view
+// AppKit
+
+func configureWritingTools() {
+    guard NSWritingToolsCoordinator.isWritingToolsAvailable else { return }
+       
+    let coordinator = NSWritingToolsCoordinator(delegate: self)
+
+    coordinator.preferredBehavior = .complete
+    coordinator.preferredResultOptions = [.richText, .list]
+    writingToolsCoordinator = coordinator
+}
+```
+
+关键点：
+
+- `isWritingToolsAvailable` 用作可用性兜底——设备不支持 Apple Intelligence 时直接返回，避免后续配置无效。
+- `preferredBehavior = .complete` 表示完整体验（原地重写 + 动画 + 行内校对），与 `.limited` 仅面板模式相对。
+- `preferredResultOptions` 声明视图能消费的格式：`.richText` 可显示加粗斜体，加 `.list` 表示支持列表，加 `.table` 支持表格，加 `.presentationIntent` 用语义意图。
+
+第二步是提供 context（[13:06](https://developer.apple.com/videos/play/wwdc2025/265/?time=786)）：
+
+```swift
+// Prepare the context
+
+func writingToolsCoordinator(_ writingToolsCoordinator: NSWritingToolsCoordinator,
+        requestsContextsFor scope: NSWritingToolsCoordinator.ContextScope,
+        completion: @escaping ([NSWritingToolsCoordinator.Context]) -> Void) {
+
+    var contexts = [NSWritingToolsCoordinator.Context]()
+                
+    switch scope {
+    case .userSelection:
+        let context = getContextObjectForSelection()
+        contexts.append(context)
+        break
+        // other cases…
+    }
+        
+    // Save references to the contexts for later delegate calls.
+    storeContexts(contexts)
+    completion(contexts)
+}
+```
+
+关键点：
+
+- delegate 方法是 async 形式（completion handler），因为大文档处理底层文本存储可能耗时。
+- Context 由两部分组成：一段 `NSAttributedString` 文本 + 一个选区 `NSRange`。
+- 至少要包含当前选中的文字。可选择把选区前后的段落也带上，让 Writing Tools 理解上下文。
+- 没有选区时，返回整个文档作为 context，range 设为光标位置——Writing Tools 就能对全文操作。
+- `storeContexts(contexts)` 把 context 引用存下来，因为后续的替换、预览、校对回调都会带着同一个 context 对象回来。
+
+第三步是响应文本替换（[13:48](https://developer.apple.com/videos/play/wwdc2025/265/?time=828)）：
+
+```swift
+// Respond to text changes from Writing Tools
+
+func writingToolsCoordinator(_ writingToolsCoordinator: NSWritingToolsCoordinator,
+        replace range: NSRange,
+        in context: NSWritingToolsCoordinator.Context,
+        proposedText replacementText: NSAttributedString,
+        reason: NSWritingToolsCoordinator.TextReplacementReason,
+        animationParameters: NSWritingToolsCoordinator.AnimationParameters?,
+        completion: @escaping (NSAttributedString?) -> Void) {
+}
+
+// Update selected range
+
+func writingToolsCoordinator(_ writingToolsCoordinator: NSWritingToolsCoordinator,
+        select ranges: [NSValue],
+        in context: NSWritingToolsCoordinator.Context,
+        completion: @escaping () -> Void) {
+}
+```
+
+关键点：
+
+- `replace` 方法把 Writing Tools 的建议结果写回视图的文本存储。同一个 context 可能多次回调，每次对应一个独立的 range 修改。
+- `range` 是相对 context 内文本的范围，需要换算到你视图的文本存储坐标。
+- `select` 方法在替换完成后调用，让你更新选区到新文本。
+
+### 动画预览：让替换"动起来"
+
+Writing Tools 在处理时希望显示动画效果（比如发光、流动）。它不会去操作你的真实视图，而是问你要预览图，把效果叠加在预览图上（[14:41](https://developer.apple.com/videos/play/wwdc2025/265/?time=881)）：
+
+```swift
+// Generate preview for animation (macOS)
+
+func writingToolsCoordinator(_ writingToolsCoordinator: NSWritingToolsCoordinator,
+        requestsPreviewFor textAnimation: NSWritingToolsCoordinator.TextAnimation,
+        of range: NSRange,
+        in context: NSWritingToolsCoordinator.Context,
+        completion: @escaping ([NSTextPreview]?) -> Void) {
+}
+    
+func writingToolsCoordinator(_ writingToolsCoordinator: NSWritingToolsCoordinator,
+        requestsPreviewFor rect: NSRect,
+        in context: NSWritingToolsCoordinator.Context,
+        completion: @escaping (NSTextPreview?) -> Void) {
+}
+```
+
+关键点：
+
+- macOS 上有两个 delegate 方法：按 range 出预览数组（至少一个，也可以一行一个让动画更顺），按 rect 出单张预览。
+- 渲染预览时背景必须透明——动画过程中 Writing Tools 会把预览图叠在原位置。
+- iOS 用 `UITargetedPreview`（[14:58](https://developer.apple.com/videos/play/wwdc2025/265/?time=898)），只有一个 delegate 方法。
+- 动画前后还有 `prepareFor` / `finish` 配对回调（[15:08](https://developer.apple.com/videos/play/wwdc2025/265/?time=908)）：开始前隐藏对应 range 的真实文字，结束后再显示，避免预览图和真实文字叠在一起重影。
+
+### 行内校对：返回贝塞尔路径
+
+Proofread 模式要在原视图上画下划线。Writing Tools 也不自己算坐标，而是问你要路径（[15:39](https://developer.apple.com/videos/play/wwdc2025/265/?time=939)）：
+
+```swift
+// Create proofreading marks
+
+func writingToolsCoordinator(_ writingToolsCoordinator: NSWritingToolsCoordinator,
+        requestsUnderlinePathsFor range: NSRange,
+        in context: NSWritingToolsCoordinator.Context,
+        completion: @escaping ([NSBezierPath]) -> Void) {
+}
+
+func writingToolsCoordinator(_ writingToolsCoordinator: NSWritingToolsCoordinator,
+        requestsBoundingBezierPathsFor range: NSRange,
+        in context: NSWritingToolsCoordinator.Context,
+        completion: @escaping ([NSBezierPath]) -> Void) {
+}
+```
+
+关键点：
+
+- `requestsUnderlinePathsFor` 返回下划线路径，Writing Tools 用它画出校对标记。
+- `requestsBoundingBezierPathsFor` 返回围住该 range 的命中区域，用于响应点击/触摸——用户点中某个建议时弹出修改详情。
+- 视图布局变化（窗口缩放、字体改变）后调用 `updateForReflowedText` 通知 Coordinator 重新请求路径和预览。
+- 外部修改了文本（撤销、外部同步）调用 `updateRange:withText` 让 Writing Tools 状态同步。
+
+### Display Attributes vs Presentation Intents
+
+富文本场景要做选择题（[06:48](https://developer.apple.com/videos/play/wwdc2025/265/?time=408)）。`.richText` 单独使用时，Writing Tools 用 display attribute 表达样式——具体的字体大小、加粗、斜体直接写到 `NSAttributedString` 的属性上，TextEdit 是这种模式。
+
+加上 `.presentationIntent` 后，Writing Tools 改用语义意图：标题段落带 header intent，没有具体字号；列表带 list intent；代码段带 code block intent。Notes 用这种模式，再把 intent 转换为 Notes 自己的语义样式系统。
+
+要点：presentation intent 不带默认样式，渲染由你的 app 负责；某些样式（下划线、上标、下标）无法用 intent 表示，仍然回落到 display attribute；启用了 presentation intent，要重写 `requestContexts` 把已有段落的 intent 也传给 Writing Tools。
+
+---
+
+## 核心启发
+
+- **给 text-heavy app 加 Writing Tools 工具栏按钮**：为什么值得做——选中再唤起的路径用户不一定知道；像 Notes、Mail 那样在工具栏放一个明显入口能显著提升使用率。怎么开始：UIKit 用 `UIBarButtonItem`，AppKit 用 `NSToolbarItem`，标准 API 自带图标和本地化。
+
+- **菜单项改用 `writingToolsItems` API 手动放置**：为什么值得做——今年 Proofread / Rewrite / Summary 的菜单结构变了，自动插入位置可能不符合你的菜单设计。用 API 拿到标准项后自己摆，今年 / 明年的更新自动跟随。怎么开始：把 `automaticallyInsertsWritingToolsItems` 设为 `false`，调用 `writingToolsItems` 取标准项，按你的菜单结构插入即可。
+
+- **自定义文本引擎升级到 Coordinator 完整体验**：为什么值得做——基础适配只能拿到面板模式，体验差距明显；Coordinator 给的是原地重写动画 + 行内校对，和系统 app 一致。怎么开始：照着 Apple 的 sample code "Enhancing your custom text engine with Writing Tools" 实现 6 个核心 delegate（context、replace、select、preview、underline path、state change）。
+
+- **富文本编辑器评估 `.presentationIntent`**：为什么值得做——如果你的 app 已经有自己的语义样式系统（标题、子标题、引用块），用 intent 拿到的是结构化结果，转换到内部样式比解析具体字号更可靠。怎么开始：在 `preferredResultOptions` 里加 `.presentationIntent`，重写 `requestContexts` 把现有段落的 intent 传出去，再写一层 intent → 内部样式的映射函数。
+
+- **delegate 方法都写成真异步**：为什么值得做——大文档生成预览、计算下划线路径都是耗时操作；阻塞 completion handler 会让动画卡顿。怎么开始：preview 渲染放到后台队列，算完再回调主线程；replace 操作用文本存储自己的批量编辑接口，避免逐字符触发布局。
+
+---
+
+## 关联 Session
+
+- [Get started with Writing Tools](/articles/wwdc2024-10168) — 去年的入门 session，讲 `WritingToolsBehavior`、`AllowedInputOptions`（即今年的 Result Options）和基础适配。
+- [Bring your machine learning and AI models to Apple silicon](/articles/wwdc2025-313) — 把自己的 ML 模型搬到端上，与 Writing Tools 形成"系统 AI + 自有 AI"互补。
+- [Meet the Foundation Models framework](/articles/wwdc2025-286) — 今年新增的端侧 LLM 框架，Writing Tools 之外还能直接调用基座模型。
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — Foundation Models 实战 code-along，理解端侧 AI 在 Writing Tools 之外的玩法。

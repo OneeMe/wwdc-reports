@@ -8,38 +8,151 @@ videoUrl: "https://developer.apple.com/videos/play/wwdc2025/203/"
 sessionId: "wwdc2025-203"
 year: "2025"
 relatedSessions:
-  - title: "What’s new in Apple device management and identity"
+  - title: "What's new in Apple device management and identity"
     code: "258"
     description: "designed for it administrators, mdm developers, and identity providers, this ses"
 ---
 
 ## Highlight
 
-> 深入了解 Get to know the ManagedApp Framework 的技术细节和最佳实践。
+> ManagedApp 框架在 iOS/iPadOS 18.4 与 visionOS 2.4 引入，允许 MDM 直接向托管 app 投递配置、密码、证书和支持硬件绑定密钥的 ACME 身份，并通过 async sequence 在变更时实时通知 app。
 
 ---
 
 ## 核心内容
 
-过去十年，企业 iOS 应用获取组织配置的方式几乎没有变过：MDM 服务器往设备推一份 Configuration Profile，应用拿到一堆 key-value，自己去解析。配置格式没有标准，安全性各凭本事，敏感信息明文躺在 UserDefaults 里的例子比比皆是。ManagedApp 框架把这些脏活一次性收编了——你用 Swift 声明配置 schema，框架负责安全传递、持久化、变更通知，甚至帮你把配置表单同步到 ABM/ASM 的管理界面。
+企业里第一次启动一个新装的 app，往往是体验最糟糕的一刻。员工要输服务器地址、用户名、密码、二次验证码，然后进设置页一项项勾选，对齐组织的合规要求。Bob Whiteman 在演讲开场就把这个痛点摆了出来（[00:51](https://developer.apple.com/videos/play/wwdc2025/203/?time=51)）：步骤一多就容易出错，员工放弃使用，IT 接到工单，组织最后干脆把这个 app 从清单里删掉。开发者想自己解决，意味着要做身份联邦、搭配置网站、对接证书颁发机构、维护组织定制版本——全是和核心功能无关的活。
 
-这个框架最聪明的设计决策是强制要求"双模式运行"。每个配置项都必须有默认值，你的应用在没有 MDM 的个人设备上必须完整可用。这不是限制，而是逼你做正确的事：一套代码同时服务企业和个人用户，不用维护两个版本。对企业 IM、教育、金融合规类应用来说，这个框架直接解决了过去需要跟每家 MDM 厂商分别适配的痛点。
+ManagedApp 框架的思路是把这些活全部交给系统。管理员在 MDM 端配置好，app 一启动就拿到一份现成的配置和密钥，不再需要任何首次设置流程（[02:25](https://developer.apple.com/videos/play/wwdc2025/203/?time=145)）。框架统一承担四类数据的安全分发：app 自定义配置、密码、证书、身份（支持 PKCS #12、SCEP 和 ACME，后者还能绑定硬件密钥并做远程证明）。整套机制要求 MDM 使用 declarative device management，从 app 被管理那一刻开始生效，覆盖所有 MDM 注册类型。
 
-安全方面，证书类型配置走 Keychain 存储，API 密钥在内存中受保护，不会落盘。开发者调一个 API 读配置，底层的安全细节全部由框架接管。这大幅降低了"开发者一不小心把 token 存到 plist 里"这类事故的概率。
-
-
-### 最佳实践
-
-维护企业应用时，建议先不动现有代码。花半天时间把 ManagedApp 框架引进来，定义一个最小的配置 schema——比如就三个字段：服务器地址、一个功能开关、一个证书。跑通从"定义 schema → ABM 看到配置表单 → 设备收到配置 → 应用读取"的完整链路。
-
-确认链路通了之后，再逐步把旧的 App Config 解析代码迁过来。每迁移一个配置项就删掉对应的旧代码，不要留两套读取逻辑共存的中间状态。
-
-配置项数量控制在 15 个以内。超过这个数，IT 管理员在 ABM 界面里翻配置表单会很痛苦。如果确实需要更多配置，考虑把相关配置打包成一个 JSON 字符串字段，应用端自己解析。
-
-最后，`isManaged` 状态变化时做一次完整的配置重载，而不是逐字段响应变更。这能避免"配置 A 更新了但配置 B 还是旧值"的中间状态问题。
+最关键的设计是配置 schema 由 app 开发者自己定义，而不是 Apple 或 MDM 厂商定一套通用格式。Bob 反复强调这一点（[06:44](https://developer.apple.com/videos/play/wwdc2025/203/?time=404)）：你比任何人都懂自己的 app，只有你能给出最合适的可配置面。框架不是方案，是构建方案的平台。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [What’s new in Apple device management and identity](/articles/wwdc2025-258) — designed for it administrators, mdm developers, and identity providers, this ses
+ManagedApp 框架由四个独立的 provider 组成，分别对应密码、证书、身份、自定义配置（[12:20](https://developer.apple.com/videos/play/wwdc2025/203/?time=740)）。前三个返回系统内建类型，自定义配置则由 app 决定数据结构。
+
+第一步是把自定义配置的 schema 写成一个 `Decodable` 类型。Landmarks 示例里只有一个字段 `collection`：
+
+```swift
+// Your app's managed configuration
+
+struct LandmarksManagedConfig: Decodable {
+
+    private(set) var collection: LandmarkCollection?
+
+    private enum CodingKeys: String, CodingKey {
+        case collection
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        collection = try values.decode(LandmarkCollection.self, forKey: .collection)
+    }
+}
+```
+
+关键点：
+
+- `LandmarksManagedConfig` 实现 `Decodable`，框架会用它把 MDM 投递的字典反序列化成 Swift 类型。
+- `collection` 用 `private(set)` 暴露只读视图，配置只能由框架更新。
+- `CodingKeys` 显式声明键名，避免依赖属性名隐式匹配。
+- `init(from:)` 里用 `decode` 而不是 `decodeIfPresent`，意味着缺字段就抛错——schema 不匹配时让 app 早失败。
+
+第二步是把配置注入 app 的运行时。`ManagedAppConfigurationProvider` 返回的是一个 `AsyncSequence`，配置变更时循环体会再次进入（[0:02](https://developer.apple.com/videos/play/wwdc2025/203/?time=2)）：
+
+```swift
+// Receiving the current configuration
+
+import ManagedApp
+
+// [...]
+
+var managedCollection: LandmarkCollection?
+
+// [...]
+
+func loadCollections() {
+    // [...]
+    Task {
+        let configProvider = ManagedAppConfigurationProvider()
+
+        for await config in await configProvider.configurations(LandmarksManagedConfig.self) {
+            // config's type is LandmarksManagedConfig?
+            managedCollection = config?.collection
+        } // Loops forever
+    }
+}
+```
+
+关键点：
+
+- `import ManagedApp` 引入框架，模块名就叫这个。
+- `configurations(_:)` 接受 schema 类型，返回的元素是 `LandmarksManagedConfig?`，没有配置或 app 处于非托管状态时为 `nil`。
+- `for await` 循环永不结束，MDM 每次推新配置都会触发一次迭代，省掉手写 KVO 或通知中心。
+- 把 `Task` 放在数据加载逻辑里，让配置生效和数据加载在同一个生命周期。
+
+第三步处理身份认证。VPN 扩展和企业服务调用经常需要客户端证书，框架把 `SecIdentity` 直接喂给 URLSession 委托：
+
+```swift
+// Using an identity
+
+final class MyURLSessionDelegate: NSObject, URLSessionDelegate {
+
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge)
+        async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        switch challenge.protectionSpace.authenticationMethod {
+        case NSURLAuthenticationMethodClientCertificate:
+
+            // Look up the identity
+            let provider = ManagedAppIdentitiesProvider()
+            let id = "AssetDownloadClient"
+            guard let identity = try? await provider.identity(withIdentifier: id) else {
+                // No identity, cancel the challenge
+                return (.cancelAuthenticationChallenge, nil)
+            }
+
+            // Use the identity to authenticate.
+            return (.useCredential, URLCredential(identity: identity,
+                                                  certificates: nil,
+                                                  persistence: .forSession))
+        default:
+            return (.performDefaultHandling, nil)
+        }
+    }
+}
+```
+
+关键点：
+
+- `URLSessionDelegate` 的 async 版本在 challenge 到来时挂起，等身份取回来再回调。
+- `ManagedAppIdentitiesProvider().identity(withIdentifier:)` 按 schema 里约定的标识符取身份，标识符由 app 自己定义。
+- 取不到身份就调用 `cancelAuthenticationChallenge`，让请求直接失败而不是回退到弱认证。
+- `URLCredential` 的 `persistence` 用 `.forSession`，私钥不会被复制到 Keychain 之外。
+
+许可证场景是这个框架最直观的升级。Bob 在 [09:00](https://developer.apple.com/videos/play/wwdc2025/203/?time=540) 对比了旧方案：分发字符串 token 会面临泄漏风险，而 ManagedApp 框架可以分发由组织 CA 签发的加密身份，私钥在设备上生成，永远不出设备。VPN 扩展走得更远，可以拿到带硬件证明的 ACME 身份（[10:46](https://developer.apple.com/videos/play/wwdc2025/203/?time=646)），从根上挡住中间人接管 VPN 凭据的攻击路径。
+
+---
+
+## 核心启发
+
+- **把旧的 ManagedAppConfiguration 迁到 ManagedApp 框架**：为什么值得做——旧方案不支持 app 扩展、不支持证书和身份，且没有变更通知；新框架在 iOS/iPadOS 18.4 之后是更完整的替代品（[09:46](https://developer.apple.com/videos/play/wwdc2025/203/?time=586)）。怎么开始——先定义一个最小 schema，跑通"MDM 推送 → app 收到"的链路，再把旧 `UserDefaults` 读取逻辑逐项搬过去，每搬一项就删掉旧代码。
+
+- **给 VPN 扩展接入硬件绑定的 ACME 身份**：为什么值得做——VPN 是攻击面最高的入口之一，把私钥钉在 Secure Enclave 上并附带远程证明，能让组织的 VPN 准入策略真正可信（[10:30](https://developer.apple.com/videos/play/wwdc2025/203/?time=630)）。怎么开始——在 schema 里声明一个身份字段，要求 MDM 用 ACME 颁发；在 `NEVPNManager` 的认证回调里复用上面那段 `ManagedAppIdentitiesProvider` 的代码。
+
+- **用许可证身份替换许可证 token**：为什么值得做——token 一旦泄漏组织就要继续付费，而设备生成的密钥对永远不离开设备，泄漏面接近零（[08:30](https://developer.apple.com/videos/play/wwdc2025/203/?time=510)）。怎么开始——服务端先支持 mTLS，发证流程接组织 CA；客户端用 `ManagedAppIdentitiesProvider` 拿身份做客户端证书认证。
+
+- **为 SSO 扩展接收一次性密码和初始凭据**：为什么值得做——身份提供商通常自己设计认证协议，过去只能让用户手输凭据；现在可以让管理员通过 MDM 直接预置初始密码或绑定令牌（[11:42](https://developer.apple.com/videos/play/wwdc2025/203/?time=702)）。怎么开始——在 SSO 扩展里加 `ManagedAppPasswordsProvider`，启动时尝试读取，存在则跳过手动输入流程。
+
+- **配置变更走 async sequence 做整体重载**：为什么值得做——`for await` 循环天然处理多次更新，避免逐字段监听导致的中间不一致状态（[06:00](https://developer.apple.com/videos/play/wwdc2025/203/?time=360)）。怎么开始——在 `Task` 内迭代 `configurations(_:)`，每次收到新值就走一遍完整的"应用配置"流程，而不是 diff 单个字段。
+
+---
+
+## 关联 Session
+
+- [What's new in Apple device management and identity](/articles/wwdc2025-258) — 设备管理与身份新特性的总览，配合 ManagedApp 框架看部署侧的全貌。
+- [Discover the Enterprise APIs for iOS](/articles/wwdc2025-302) — 企业 API 的扩展能力，和 ManagedApp 框架在权限模型上互补。
+- [What's new in privacy](/articles/wwdc2025-265) — 隐私边界的变化，理解托管配置如何在隐私框架下安全分发。
+- [Streamline sign-in with passkey upgrades and credential managers](/articles/wwdc2025-279) — 认证侧的演进，与 ManagedApp 提供的身份能力组合使用。

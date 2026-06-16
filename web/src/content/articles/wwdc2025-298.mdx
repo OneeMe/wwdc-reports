@@ -24,44 +24,174 @@ relatedSessions:
 
 ## Highlight
 
-> Angelos 展示了 MLX 在 Apple Silicon 上运行大语言模型的完整工作流。
-
----
+> 在 M3 Ultra 512GB 统一内存上，MLX LM 一行命令就能跑起 4.5-bit 量化、权重约 380GB 的 DeepSeek 670B 模型。
 
 ## 核心内容
 
-Angelos 展示了 MLX 在 Apple Silicon 上运行大语言模型的完整工作流。
+要在本地跑大模型，过去通常意味着一台带独立显卡的 PC、CUDA 工具链、HuggingFace 转换脚本、量化插件，外加显存不够时的各种 offload 折腾。Mac 用户长期被排除在外，因为没有 NVIDIA 卡，也没有几十 GB 显存可用。
 
-**MLX LM 是核心工具包。** `pip install mlx-lm` 就能用。CLI 工具让你不用写代码就能生成文本、量化模型、微调模型。Python API 给你细粒度控制。
+Apple 在 WWDC 2025 推出 MLX LM，把这条链路压成两步：`pip install mlx-lm`，然后一条命令。MLX 是基于 Metal 加速、利用统一内存的开源机器学习库，CPU 和 GPU 共享同一份数据，不需要在显存与内存之间反复拷贝。MLX LM 在它之上封装出一套 CLI 工具和 Python API，覆盖文本生成、模型量化、LoRA 微调、adapter 融合的全流程，并直接对接 Hugging Face。Angelos 在演示里用 M3 Ultra 跑通了 670B 参数、4.5-bit 量化的 DeepSeek V3，权重约 380GB，生成速度超过阅读速度——这是消费级硬件第一次能本地交互这种规模的模型。
 
-**文本生成：** CLI 用 `mlx_lm.generate --model <model> --prompt <text>`，支持 temperature、top-p、max tokens 等参数。Python API 用 `load` + `generate` 两个函数。模型从 Hugging Face 自动下载。
+## 详细内容
 
-**KV Cache 管理多轮对话。** `make_prompt_cache()` 创建缓存对象，跨多次 generate 调用复用，避免重复计算 attention。可以在运行中编辑历史、保存/恢复对话状态。
+**最简文本生成（[03:51](https://developer.apple.com/videos/play/wwdc2025/298/?time=231)）。** CLI 一条命令解决下载、加载、推理：
 
-**模型量化：** `mlx_lm.convert --model <model> --quantize --mlx-path <output>` 一步完成下载 + 量化 + 保存。Python API 支持按层设置不同量化精度——embedding 和 projection 层用 6-bit，其他层用 4-bit，平衡质量和效率。
+```bash
+mlx_lm.generate --model "mlx-community/Mistral-7B-Instruct-v0.3-4bit" \
+                --prompt "Write a quick sort in Swift"
+```
 
-**微调：** 支持 full fine-tuning 和 LoRA adapter training。`mlx_lm.lora --model <model> --train --data <dataset>` 启动 LoRA 微调。可以在 4-bit 量化模型上训练 adapter，内存占用降 3.5 倍。训练完成后 `mlx_lm.fuse` 把 adapter 合并回基座模型，保持量化精度不变。
+关键点：
+- `--model` 接受 Hugging Face 仓库 ID 或本地路径，模型不在本地时自动下载。
+- `--prompt` 为输入文本，工具内部会套上 chat template。
+- 还可加 `--top-p`、`--temp`、`--max-tokens` 调节采样行为，与主流推理工具的参数一致。
 
-**Swift 集成：** 完整示例 28 行代码。创建 ModelContainer actor 管理并发访问，tokenize prompt，运行生成循环。多轮对话只需额外加一行 KV Cache 代码。
+**Python API 拿到完整模型对象（[05:26](https://developer.apple.com/videos/play/wwdc2025/298/?time=326)）。** `load` 返回的是真正的 MLX 神经网络，可以打印结构、读取参数：
 
-**大模型演示：** 在 M3 Ultra（512GB 统一内存）上跑了 DeepSeek 670B 参数模型（4.5-bit 量化，权重约 380GB），实时交互速度超过阅读速度。
+```python
+from mlx_lm import load, generate
 
+model, tokenizer = load("mlx-community/Mistral-7B-Instruct-v0.3-4bit")
 
-### 最佳实践
+prompt = "Write a quick sort in Swift"
+messages = [{"role": "user", "content": prompt}]
+prompt = tokenizer.apply_chat_template(
+    messages, add_generation_prompt=True
+)
 
-**选择模型大小要匹配硬件。** 模型权重（GB）≈ 参数量 × 量化位数 / 8。70B 4-bit 模型约需 35GB，128GB 的 M4 Max 跑得动。670B 需要 380GB+，得上 M3 Ultra 512GB。
+text = generate(model, tokenizer, prompt=prompt, verbose=True)
+```
 
-**生成时用 KV Cache 避免重复计算。** 第一次 prompt 处理是 compute-bound（预填充 KV），后续 token 生成是 memory-bound（逐 token 读取 KV cache）。多轮对话必须用 cache 否则每次都要重新处理全部历史。
+关键点：
+- `load` 同时返回模型与 tokenizer，自动从 HF 拉取并缓存。
+- `apply_chat_template` 把 messages 渲染成模型期望的 prompt 字符串。
+- `generate` 是阻塞调用，`verbose=True` 会边生成边打印 token 与吞吐速度。
+- 拿到的 `model` 可直接 `print(model.layers[0].self_attn)` 检查结构，方便做 layer swap 或低层手术。
 
-**微调数据集格式用 Hugging Face 标准格式。** MLX LM 直接兼容，不需要特殊转换。数据集放在本地目录，通过 `--data` 参数指定路径。
+**KV Cache 维持多轮对话（[08:01](https://developer.apple.com/videos/play/wwdc2025/298/?time=481)）。** 长 prompt 和多轮场景下，attention 重算成本极高：
 
-**Profiling 用 `mlx_lm.generate --time`。** CLI 内置了 token 生成速度和首次 token 延迟的计时，快速判断你的模型+硬件组合是否达到预期性能。
+```python
+from mlx_lm import load, generate
+from mlx_lm.models.cache import make_prompt_cache
 
----
+model, tokenizer = load("mlx-community/Mistral-7B-Instruct-v0.3-4bit")
 
-## 相关 Session
+prompt = "Write a quick sort in Swift"
+messages = [{"role": "user", "content": prompt}]
+prompt = tokenizer.apply_chat_template(
+    messages, add_generation_prompt=True
+)
 
-- [Bring advanced speech-to-text to your app with SpeechAnalyzer](/articles/wwdc2025-277) — discover the new speechanalyzer api for speech to text. we
-- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — develop generative ai features for your swiftui apps using the foundation models
-- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — level up with the foundation models framework. learn how guided generation works
-- [Design interactive snippets](/articles/wwdc2025-281) — snippets are compact views invoked from app intents that display information fro
+cache = make_prompt_cache(model)
+
+text = generate(model, tokenizer, prompt=prompt, prompt_cache=cache, verbose=True)
+```
+
+关键点：
+- `make_prompt_cache(model)` 创建可复用的 KV cache 对象。
+- 把 cache 通过 `prompt_cache=` 传入 `generate`，每次调用从上次 token 位置继续。
+- cache 可被原地编辑、保存、在多个会话之间切换，适合聊天机器人或 agent 场景。
+
+**按层混合精度量化（[10:33](https://developer.apple.com/videos/play/wwdc2025/298/?time=633)）。** Embedding 层和 lm_head 对量化更敏感，可单独保留更高精度：
+
+```python
+from mlx_lm.convert import convert
+
+def mixed_quantization(layer_path, layer, model_config):
+    if "lm_head" in layer_path or "embed_tokens" in layer_path:
+        return {"bits": 6, "group_size": 64}
+    elif hasattr(layer, "to_quantized"):
+        return {"bits": 4, "group_size": 64}
+    else:
+        return False
+
+convert(
+    hf_path="mistralai/Mistral-7B-Instruct-v0.3",
+    mlx_path="./mistral-7b-v0.3-mixed-4-6-bit",
+    quantize=True,
+    quant_predicate=mixed_quantization
+)
+```
+
+关键点：
+- `quant_predicate` 是一个针对每层调用的函数，返回该层的量化参数或 `False`（跳过）。
+- `lm_head` 与 `embed_tokens` 用 6-bit、group_size 64，其余层走 4-bit。
+- `convert` 一步完成下载、转换、保存，可加 `upload_repo` 推回 Hugging Face。
+
+**LoRA 微调（[13:37](https://developer.apple.com/videos/play/wwdc2025/298/?time=817)）。** 直接在 4-bit 量化模型上训练 adapter：
+
+```bash
+mlx_lm.lora --model "mlx-community/Mistral-7B-Instruct-v0.3-4bit" \
+            --train \
+            --data /path/to/our/data/folder \
+            --iters 300 \
+            --batch-size 16
+```
+
+关键点：
+- 在量化模型上训练 adapter，内存占用比训练全精度模型显著降低。
+- `--data` 指向本地数据目录，使用 Hugging Face 标准数据集格式。
+- 训练结束后 adapter 文件单独保存，推理时通过 `--adapter` 加载。
+- 之后用 `mlx_lm.fuse`（[16:29](https://developer.apple.com/videos/play/wwdc2025/298/?time=989)）把 adapter 合回基座，部署时只剩一个量化好的模型文件。
+
+**Swift 端集成（[17:14](https://developer.apple.com/videos/play/wwdc2025/298/?time=1034)）。** 把 LLM 推理放进 Mac/iOS 应用：
+
+```swift
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXLLM
+
+@main
+struct LLM {
+    static func main() async throws {
+        let modelId = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+        let modelFactory = LLMModelFactory.shared
+        let configuration = ModelConfiguration(id: modelId)
+        let model = try await modelFactory.loadContainer(configuration: configuration)
+
+        try await model.perform({context in
+            let prompt = "Write a quicksort in Swift"
+            let input = try await context.processor.prepare(input: UserInput(prompt: prompt))
+
+            let params = GenerateParameters(temperature: 0.0)
+            let tokenStream = try generate(input: input, parameters: params, context: context)
+            for await part in tokenStream {
+                print(part.chunk ?? "", terminator: "")
+            }
+        })
+    }
+}
+```
+
+关键点：
+- `LLMModelFactory.shared.loadContainer(configuration:)` 返回 `ModelContainer`，是 Swift 6 的 actor，天然处理并发安全。
+- `context.processor.prepare(input:)` 完成 tokenize 与 chat template 套用。
+- `generate(...)` 返回 `AsyncSequence`，可用 `for await` 流式消费 token。
+- 多轮对话只需在 `generate` 之前调用 `context.model.newCache(parameters:)` 创建 KV cache 并传入 `TokenIterator`（[18:00](https://developer.apple.com/videos/play/wwdc2025/298/?time=1080)）。
+
+## 核心启发
+
+- **做什么：在 Mac 上自建本地推理服务，替代云 API 处理隐私敏感数据**
+  - 为什么值得做：M-series Mac 的统一内存让 70B 4-bit 模型在 64–128GB 设备上可跑，敏感数据无需出本机；推理成本归零。
+  - 怎么开始：`pip install mlx-lm`，先用 `mlx_lm.generate --model "mlx-community/Mistral-7B-Instruct-v0.3-4bit"` 跑通，再用 Python API 包装成 HTTP 接口。
+
+- **做什么：用 LoRA 微调把私域知识注入到一个量化基座模型**
+  - 为什么值得做：4-bit 模型上训练 adapter，内存占用低，能在 32GB Mac 上完成；adapter 体积只有几十 MB，便于按客户/场景分发。
+  - 怎么开始：把数据整理成 Hugging Face 标准 jsonl，跑 `mlx_lm.lora --train --data ./data --iters 300`，再用 `mlx_lm.fuse` 合并部署。
+
+- **做什么：把 MLX Swift 直接嵌入 Mac/iOS 应用，做端侧 chat 或代码补全**
+  - 为什么值得做：Foundation Models 框架的内置模型受规模限制，自带 MLX 可挑选 7B–70B 任意模型，质量上限更高。
+  - 怎么开始：在 Xcode 工程加 MLXLLM 依赖，参照 17:14 的 28 行示例搭起 ModelContainer，再加 KV cache 支持多轮对话。
+
+- **做什么：按层混合精度量化，给质量敏感场景一个折中方案**
+  - 为什么值得做：纯 4-bit 偶尔会显著掉分，特别是数学和代码任务；embedding/lm_head 提到 6-bit 通常能挽回大部分损失，体积只增加几个百分点。
+  - 怎么开始：套用文中 `mixed_quantization` 函数，调 `convert(quant_predicate=...)`，对比量化前后在自家评测集上的得分。
+
+## 关联 Session
+
+- [Get started with MLX for Apple silicon](/articles/wwdc2025-315) — MLX 框架入门，介绍统一内存与 Metal 加速基础。
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — 用 Apple 自带 Foundation Models 框架做端侧 AI，与 MLX 自托管模型形成对照。
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — 深入 Foundation Models 的 guided generation 与 tool use。
+- [Bring advanced speech-to-text to your app with SpeechAnalyzer](/articles/wwdc2025-277) — 端侧另一个核心 ML 能力：新的 SpeechAnalyzer 语音转文字 API。
+- [Design interactive snippets](/articles/wwdc2025-281) — App Intents snippets 设计指南，可与本地 LLM 输出结合做交互式呈现。
