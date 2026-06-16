@@ -1,53 +1,413 @@
 ---
 title: "Explore in-app purchase integration and migration"
-description: "learn how you can migrate to the latest app store server apis and incorporate app store server notifications. we"
-date: 2026-06-10
-tags: ["WWDC 2022"]
+description: "learn how you can migrate to the latest app store server apis and incorporate app store server notifications. we'll help you get started with these tools and provide best practices to make the most of managing in-app purchases on your server. discover how you can sign json web tokens, verify signed transactions, and migrate from verifyreceipt."
+date: "2026-06-10"
+tags: ["StoreKit", "App Store", "In-App Purchase"]
 thumbnail: "/images/sessions/2022/10040.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10040/"
 sessionId: "wwdc2022-10040"
 year: "2022"
 relatedSessions:
-  - title: "Discover Benchmarks in App Analytics"
-    code: "10044"
-    description: "learn how app store app analytics can provide unique insights and help you measu"
+  - title: "What's new with in-app purchase"
+    code: "10007"
+    description: "介绍 StoreKit 2、App Transaction、App Store Server API 和 App Store Server Notifications 的年度更新。"
+  - title: "What's new in StoreKit testing"
+    code: "10039"
+    description: "讲解如何在 Xcode、StoreKit Testing 和 Sandbox 中测试内购与订阅边界状态。"
   - title: "Implement proactive in-app purchase restore"
     code: "110404"
-    description: "learn how you can restore someone"
-  - title: "Q&A: App Store Connect"
-    code: "110751"
-    description: "connect with app store connect engineers during this 2 hour q&a. stop in to requ"
-  - title: "Q&A: StoreKit and in-app purchases"
-    code: "110758"
-    description: "ask apple engineers about storekit and in-app purchases during this 2 hour text-"
+    description: "讲解如何在 App 启动时主动恢复用户已有的内购权益。"
 ---
 
 ## Highlight
 
-> Session 分两个部分，分别由 Gabriel 和 Alex 主讲。Gabriel 聚焦 App Store Server API 的采用和迁移，覆盖了 JWT 签名、JWS 交易验证、verifyReceipt 迁移策略。Alex 部分（transcript 被截断）讨论 App Store Server Notifications V2 的迁移。
+> App Store Server API 和 App Store Server Notifications V2 用 JWS 签名数据、originalTransactionId 查询、通知历史和测试通知，帮助服务端从 verifyReceipt 迁移到可验证、可恢复的内购状态同步流程。
 
 ---
 
 ## 核心内容
 
-Session 分两个部分，分别由 Gabriel 和 Alex 主讲。Gabriel 聚焦 App Store Server API 的采用和迁移，覆盖了 JWT 签名、JWS 交易验证、verifyReceipt 迁移策略。Alex 部分（transcript 被截断）讨论 App Store Server Notifications V2 的迁移。
+内购服务端最怕两类问题。
 
-核心主题是：Apple 在 2021 年推出的 App Store Server API 提供了一种基于 JWS（JSON Web Signature）的安全数据交换方式，取代了旧的 verifyReceipt 接口。配合 Notifications V2，你可以在服务端实时追踪订阅的所有状态变化，而不需要主动轮询。
+第一类是数据来源分散。旧的流程依赖 `verifyReceipt`，服务端拿到收据后要自己解析 `in_app`、`latest_receipt_info`、`pending_renewal_info`，再从 `expiration_intent`、`grace_period_expires_date` 等字段推断订阅状态。
 
+第二类是状态变化发生在 App 外。订阅续订、退款、用户关闭自动续订，都可能在用户没有打开 App 时发生。只靠客户端上报，服务端很容易落后。
 
-### 最佳实践
+这场 session 给出的迁移路径分两段。Gabriel 讲 App Store Server API：用 `originalTransactionId` 调 Get Transaction History、Get All Subscription Statuses 等端点，返回的数据是 JWS（JSON Web Signature，JSON Web 签名）格式。Alex 讲 App Store Server Notifications V2：订阅状态变化时，Apple 主动把签名通知发到你的服务器。
 
-- 迁移策略：先在服务端采用 App Store Server API，客户端保持不变，验证稳定后再逐步升级客户端到 StoreKit 2
-- 使用 Get Transaction History 端点的过滤和排序功能，可以精确获取指定范围的交易记录
-- 结合 Notifications V2 实现实时订阅状态追踪，减少对 API 的主动轮询
-- 在客户端使用 transaction listener 监听续订、退款、优惠兑换等事件，及时同步到服务端
-- JWT 签名的有效期管理很重要，避免使用过期的 token 调用 API
+重点是迁移可以拆开做。App Store Server API 不绑定 StoreKit 2。Original StoreKit、StoreKit 2、通知 V1、通知 V2 可以按系统现状逐步接入。老客户端继续发收据，新客户端发签名交易，服务端都能用同一个 `originalTransactionId` 进入新的查询和验证流程。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Discover Benchmarks in App Analytics](/articles/wwdc2022-10044) — learn how app store app analytics can provide unique insights and help you measu
-- [Implement proactive in-app purchase restore](/articles/wwdc2022-110404) — learn how you can restore someone
-- [Q&A: App Store Connect](/articles/wwdc2022-110751) — connect with app store connect engineers during this 2 hour q&a. stop in to requ
-- [Q&A: StoreKit and in-app purchases](/articles/wwdc2022-110758) — ask apple engineers about storekit and in-app purchases during this 2 hour text-
+### 从 originalTransactionId 进入新服务端 API
+
+（[02:39](https://developer.apple.com/videos/play/wwdc2022/10040/?time=159)）App Store Server API 的多个端点使用 `originalTransactionId` 作为 path parameter。这个 ID 可以来自旧收据、签名交易、签名续订信息和通知。这样，服务端不用等所有客户端升级到 StoreKit 2，就能先迁移查询逻辑。
+
+（[03:28](https://developer.apple.com/videos/play/wwdc2022/10040/?time=208)）Original StoreKit 的迁移流程是：拿到 app receipt，调用 `verifyReceipt`，从解码后的收据收集 `originalTransactionId`，再调用 Get Transaction History 或 Get All Subscription Statuses。
+
+```text
+概念流程：Original StoreKit 客户端迁移
+
+appReceipt
+  -> verifyReceipt(appReceipt)
+  -> decodedReceipt.in_app / latest_receipt_info / pending_renewal_info
+  -> collect originalTransactionId
+  -> Get Transaction History(originalTransactionId)
+  -> signed transactions
+  -> Get All Subscription Statuses(originalTransactionId)
+  -> latest signed transaction + signed renewal information
+```
+
+关键点：
+
+- `appReceipt` 是原始客户端已经会上传到服务端的数据。
+- `verifyReceipt(appReceipt)` 仍然存在于迁移第一步，用来把旧收据解码。
+- `in_app`、`latest_receipt_info`、`pending_renewal_info` 是 transcript 中点名的 `originalTransactionId` 来源。
+- Get Transaction History 返回这个用户的交易历史，结果是 signed transactions。
+- Get All Subscription Statuses 返回指定订阅的最新 signed transaction 和 signed renewal information。
+
+（[04:52](https://developer.apple.com/videos/play/wwdc2022/10040/?time=292)）StoreKit 2 的入口更直接。客户端拿到 verified transaction 后，读取 `originalID`，服务端收到签名交易后也能在 JWS 的顶层字段里读到 `originalTransactionId`。
+
+```swift
+// 概念代码：StoreKit 2 客户端从已验证交易读取 originalTransactionId
+let verificationResult = transactionResult
+
+switch verificationResult {
+case .verified(let transaction):
+    let originalTransactionId = transaction.originalID
+    sendSignedTransactionToServer(transaction)
+case .unverified:
+    break
+}
+```
+
+关键点：
+
+- 这段是根据 transcript 的流程整理的概念代码，session 没有提供官方 code snippets。
+- `.verified` 对应已验证、已解码的 StoreKit 2 transaction。
+- `transaction.originalID` 是 transcript 中提到的属性，用来取得 `originalTransactionId`。
+- `sendSignedTransactionToServer(transaction)` 表示把签名交易交给服务端保存和校验，函数名是示意。
+- `.unverified` 分支不能作为权益依据。
+
+### 为 App Store Server API 签 JWT
+
+（[08:18](https://developer.apple.com/videos/play/wwdc2022/10040/?time=498)）调用 App Store Server API 时，每个服务端请求都要在 Authorization header 带 JWT（JSON Web Token，JSON Web 令牌）。JWT 由 header、payload、signature 三段组成，用句点分隔。
+
+header 里有 `keyId`，它必须匹配 App Store Connect 中的私钥 ID。payload 里放与你的 App 相关的信息。Apple 在资源里给了两篇文档：Creating API keys to authorize API requests 和 Generating JSON Web Tokens for API requests。
+
+```text
+概念伪代码：生成 App Store Server API JWT
+
+privateKey = loadPrivateKey(for: keyId)
+header = {
+  keyId: keyId,
+  algorithm: signingAlgorithm
+}
+payload = {
+  issuer: issuerId,
+  audience: appStoreConnectAudience,
+  bundleId: appBundleId,
+  issuedAt: now,
+  expiration: shortLivedExpiration
+}
+
+token = jwtLibrary.sign(
+  privateKey: privateKey,
+  header: header,
+  payload: payload
+)
+```
+
+关键点：
+
+- `loadPrivateKey(for: keyId)` 对应 transcript 中“private key must correspond to the key id”的要求。
+- `header` 保存签名元数据，其中 `keyId` 要和 App Store Connect 的私钥匹配。
+- `payload` 保存应用相关声明；具体字段以 Apple 的 JWT 文档为准。
+- `jwtLibrary.sign(...)` 对应 transcript 中“call the signing function that your JWT library exposes”。
+- `token` 要放进每次 App Store Server API 请求的 Authorization header。
+
+（[10:27](https://developer.apple.com/videos/play/wwdc2022/10040/?time=627)）session 还展示了用 token 调 Get All Subscription Statuses 的 cURL 示例。官方片段没有出现在本地 Code tab，这里只保留调用结构。
+
+```bash
+# 概念命令：把生成的 JWT 放入 Authorization header
+curl \
+  --header "Authorization: Bearer ${token}" \
+  "<Get All Subscription Statuses endpoint URL with ${originalTransactionId}>"
+```
+
+关键点：
+
+- `${token}` 是前一步签出的 JWT。
+- `${originalTransactionId}` 是收据、签名交易或通知中的原始交易 ID。
+- URL 使用占位符，避免把文档里的具体 endpoint 形态写错。
+- 这个请求用于获取订阅的最新状态、最新签名交易和签名续订信息。
+
+### 校验 JWS，确认数据来自 App Store
+
+（[10:41](https://developer.apple.com/videos/play/wwdc2022/10040/?time=641)）App Store Server API 和 Notifications V2 都会返回 JWS。JWS 的价值是防篡改：服务端验证通过后，才能相信数据来自 App Store，且传输过程中没有被改过。
+
+（[11:20](https://developer.apple.com/videos/play/wwdc2022/10040/?time=680)）验证从 header 开始。先 base64 decode header，读取 `alg` 确认签名算法，再读取 `x5c` 证书链。`x5c` 链由 Apple 颁发，链上的最后一个 leaf certificate 用来签 JWS。
+
+```text
+概念流程：验证 signed transaction
+
+jws = receiveSignedTransaction()
+header = base64Decode(jws.header)
+algorithm = header.alg
+certificateChain = header.x5c
+
+verify certificateChain against Apple root certificate
+verify jws signature with leaf certificate
+
+if verification succeeds:
+  store validated transaction data
+else:
+  reject the JWS
+```
+
+关键点：
+
+- `jws` 是 App Store Server API 或 Notifications V2 返回的签名数据。
+- `header.alg` 指明签名算法。
+- `header.x5c` 是证书链，transcript 强调证书顺序有意义。
+- `certificateChain` 要和 Apple Certificate Authority 的 root certificate 建立信任关系。
+- 验证失败时不要使用 JWS，因为它可能被篡改，或并非 App Store 发出。
+
+（[13:35](https://developer.apple.com/videos/play/wwdc2022/10040/?time=815)）session 给出过一个 OpenSSL 验证思路：信任 Apple Root CA，用它验证 WWDR certificate，再用链条继续验证 leaf certificate。成功时使用解码数据，失败时根据错误码排查。
+
+```bash
+# 概念命令：用 OpenSSL 验证 x5c 证书链
+openssl verify \
+  -trusted AppleRootCA.pem \
+  -untrusted AppleWWDRCA.pem \
+  LeafCertificate.pem
+```
+
+关键点：
+
+- `AppleRootCA.pem` 对应从 Apple Certificate Authority 获取的 root certificate。
+- `-trusted` 表示把 root certificate 作为信任锚。
+- `AppleWWDRCA.pem` 对应 transcript 中提到的 WWDR certificate。
+- `LeafCertificate.pem` 是证书链最后的 leaf certificate，用来签 JWS。
+- 命令成功后，只说明证书链验证通过；JWS 签名仍要用 JWS library 按对应算法验证。
+
+### 用新 API 替代 verifyReceipt 的典型查询
+
+（[16:04](https://developer.apple.com/videos/play/wwdc2022/10040/?time=964)）迁移可以分阶段推进，不需要一次性删除所有旧逻辑。session 列了几个高频场景，用新端点替代旧的字段推断。
+
+```text
+概念映射：verifyReceipt 迁移到 App Store Server API
+
+旧流程：
+verifyReceipt
+  -> expiration_intent / grace_period_expires_date / latest_receipt_info
+  -> 推断订阅状态和最新交易
+
+新流程：
+Get All Subscription Statuses(originalTransactionId)
+  -> status
+  -> latest signed transaction
+  -> latest signed renewal information
+
+Get Transaction History(originalTransactionId)
+  -> filtered, sorted, paginated signed transactions
+```
+
+关键点：
+
+- `expiration_intent` 和 `grace_period_expires_date` 是旧收据里用于推断状态的字段。
+- Get All Subscription Statuses 直接返回 `status` 字段，以及最新签名交易和续订信息。
+- Get Transaction History 返回完整购买历史，并支持过滤、排序和分页。
+- 两个新端点仍然以 `originalTransactionId` 为入口。
+
+（[18:06](https://developer.apple.com/videos/play/wwdc2022/10040/?time=1086)）`appAccountToken` 也进入迁移范围。StoreKit 2 中，开发者可以提供一个 UUID 把交易和用户关联起来。Apple 同时给 Original StoreKit 的 `applicationUsername` 增加兼容支持：如果这里传入 UUID，它会具备 `appAccountToken` 的功能，并出现在 verifyReceipt、App Store Server API 和 Notifications 里。
+
+```text
+概念流程：用 UUID 关联 App 用户和交易
+
+userId
+  -> generate UUID for purchase association
+  -> StoreKit 2: provide UUID as appAccountToken
+  -> Original StoreKit: provide UUID as applicationUsername
+  -> signed transactions / signed renewals / notifications include appAccountToken
+  -> server maps appAccountToken back to the app account
+```
+
+关键点：
+
+- UUID 用来把 App 内用户和 App Store 交易关联起来。
+- StoreKit 2 使用 `appAccountToken`。
+- Original StoreKit 使用 `applicationUsername` 传入 UUID。
+- 这个值会出现在签名交易、签名续订信息和通知中。
+- 服务端可以用它减少只靠设备或登录状态关联交易的脆弱性。
+
+### 接入 Notifications V2，从被动查询变成主动同步
+
+（[19:37](https://developer.apple.com/videos/play/wwdc2022/10040/?time=1177)）App Store Server Notifications 是 Apple 在用户执行某些行为时发给服务端的消息。常见类别包括订阅更新和退款更新。它补的是 App 不在线时的空白，例如订阅续订发生时，交易信息会直接到达你的服务器。
+
+（[21:20](https://developer.apple.com/videos/play/wwdc2022/10040/?time=1280)）配置从 App Store Connect 开始。Production 和 Sandbox 可以分别设置 URL 和通知版本。Apple 建议 V1 用户先在 Sandbox 试 V2，确认 HTTPS certificate 和 Apple public IP 访问都正常。
+
+```text
+概念检查清单：第一次接入 Notifications V2
+
+App Store Connect
+  -> open App Store Server Notifications section
+  -> configure Sandbox URL
+  -> select Version 2 Notifications
+  -> confirm HTTPS certificate
+  -> allow Apple public IPs
+  -> Request a Test Notification
+  -> Get Test Notification Status if delivery fails
+```
+
+关键点：
+
+- Sandbox URL 和 Production URL 可以分开配置。
+- HTTPS certificate 与防火墙是 transcript 中点名的常见失败原因。
+- Request a Test Notification 用于自动触发测试通知。
+- Get Test Notification Status 会返回失败线索，例如 `SSL_ISSUE`。
+- 每次改通知配置后，都应该触发一次测试通知。
+
+（[23:32](https://developer.apple.com/videos/play/wwdc2022/10040/?time=1412)）通知本身也是 JWS。服务端收到 JSON body 后，先取 `signedPayload`，按前面 signed transaction 的同一套步骤验证。验证后，还要检查目标 App 和环境。
+
+```text
+概念流程：处理 Notifications V2 请求
+
+requestBody
+  -> signedPayload
+  -> verify JWS signature
+  -> decode notification body
+  -> check appAppleId / bundleId
+  -> check environment
+  -> store notification
+  -> enqueue asynchronous processing
+  -> return HTTP 200 quickly
+```
+
+关键点：
+
+- `signedPayload` 是通知 JSON body 中要验证的字段。
+- JWS 验证步骤和 signed transaction 相同。
+- `appAppleId` 与 `bundleId` 用来确认通知属于你的 App。
+- `environment` 要和 Production 或 Sandbox 的预期一致。
+- 耗时处理应该异步执行，避免 App Store 记录 timeout 后重发通知。
+
+### 用 notificationUUID、signedDate 和 History 处理重试与漏收
+
+（[25:19](https://developer.apple.com/videos/play/wwdc2022/10040/?time=1519)）Notifications V2 的 body 有 `notificationType`、可选 `subtype`、`notificationUUID`、`signedDate`、`appAppleId`、`bundleId`、`environment`、`signedTransactionInfo` 和可选 `signedRenewalInfo`。
+
+其中 `notificationUUID` 用来去重。Apple 重试同一条通知时，UUID 不变。服务端如果已经处理过这个 UUID，就不应该重复发权益、重复记账或重复触发用户触达。
+
+```text
+概念伪代码：通知去重和异步处理
+
+notification = decodeAndVerify(signedPayload)
+
+if notificationUUID already exists:
+  return HTTP 200
+
+store notificationUUID
+store signedDate, notificationType, subtype
+enqueue work with signedTransactionInfo and signedRenewalInfo
+return HTTP 200
+```
+
+关键点：
+
+- `decodeAndVerify(signedPayload)` 表示先完成 JWS 验证再解码。
+- `notificationUUID already exists` 对应 transcript 中的 duplicate notification detection。
+- `signedDate` 可以帮助识别延迟到达的重试通知。
+- `enqueue work` 把耗时逻辑移到异步队列。
+- `return HTTP 200` 要尽快执行，避免触发不必要的重试。
+
+（[30:37](https://developer.apple.com/videos/play/wwdc2022/10040/?time=1837)）服务端宕机后，Apple 会按文档策略重试 V2 通知：第一次失败后 1 小时，然后 12 小时、24 小时、48 小时、72 小时。短故障可以等重试。长故障需要主动补。
+
+（[33:39](https://developer.apple.com/videos/play/wwdc2022/10040/?time=2019)）Get Notification History 提供六个月通知历史。恢复时记录 outage 的 start 和 end timestamps，只查询这段时间。通知很多时可以先按 type 过滤，例如 `DID_RENEW` 和 `EXPIRED`；排查单个用户时可以用 `originalTransactionId` 过滤。
+
+```text
+概念流程：宕机后补回可能漏收的通知
+
+outageStart, outageEnd = incident window
+
+Get Notification History(
+  startDate: outageStart,
+  endDate: outageEnd,
+  notificationType: highImpactTypes,
+  originalTransactionId: optionalUserScope
+)
+  -> notificationHistory[]
+  -> signedPayload
+  -> firstSendAttemptResult
+```
+
+关键点：
+
+- `outageStart` 和 `outageEnd` 缩小查询范围，减少重复处理。
+- `notificationType` 可先选影响权益的类型，例如 `DID_RENEW`、`EXPIRED`。
+- `originalTransactionId` 可用于客户支持场景，检查某个用户的通知轨迹。
+- `notificationHistory[]` 中每一项代表一条通知。
+- `firstSendAttemptResult` 提供首次投递结果，例如 `SUCCESS` 或 `SSL_ISSUE`。
+
+### 用 subtype 理解订阅生命周期
+
+（[27:06](https://developer.apple.com/videos/play/wwdc2022/10040/?time=1626)）Notifications V2 改了通知模型。V1 倾向于每条通知带近期完整历史；V2 只发送最新信息：最新 transaction information，以及订阅场景下的 pending renewal information。多条通知合起来，形成订阅状态时间线。
+
+（[28:45](https://developer.apple.com/videos/play/wwdc2022/10040/?time=1725)）session 用一个订阅生命周期举例：首次订阅发 `SUBSCRIBED` + `INITIAL_BUY`，续订发 `DID_RENEW`，用户关闭自动续订发 `DID_CHANGE_RENEWAL_STATUS` + `AUTO_RENEW_DISABLED`，到期后发 `EXPIRED` + `VOLUNTARY`。
+
+```text
+概念时间线：订阅从购买到自愿到期
+
+SUBSCRIBED / INITIAL_BUY
+  -> user enters renewing state
+
+DID_RENEW
+  -> subscription renews
+
+DID_CHANGE_RENEWAL_STATUS / AUTO_RENEW_DISABLED
+  -> user turns off auto-renewal
+
+EXPIRED / VOLUNTARY
+  -> subscription period ends without renewal
+```
+
+关键点：
+
+- `notificationType` 表示发生了哪类事件。
+- `subtype` 补充原因或细分场景。
+- `DID_CHANGE_RENEWAL_STATUS` 不一定要立刻撤销权益，但它是召回用户的窗口。
+- `EXPIRED` 表示订阅已到期，通常需要撤销访问权限。
+- V2 覆盖订阅生命周期中的更多转移状态，服务端可以从少量关键类型开始接入。
+
+---
+
+## 核心启发
+
+1. **做什么：把 verifyReceipt 状态判断迁移成双轨查询。**
+   **为什么值得做：** Original StoreKit 客户端还在使用收据时，服务端仍能从收据取 `originalTransactionId`，再用 App Store Server API 查询最新状态。
+   **怎么开始：** 保留现有 `verifyReceipt` 解码入口，新增 Get All Subscription Statuses 查询，把旧字段推断和新 `status` 结果并行记录一段时间。
+
+2. **做什么：为所有 App Store Server API 请求加 JWT 签名层。**
+   **为什么值得做：** session 明确要求每次服务端请求都用 JWT 认证，header 的 `keyId` 要匹配 App Store Connect 私钥。
+   **怎么开始：** 在服务端封装 token 生成模块，只暴露“生成短期 JWT”和“带 Authorization header 调用 API”两个能力。
+
+3. **做什么：把 JWS 验证做成统一入口。**
+   **为什么值得做：** signed transaction 和 Notifications V2 的 `signedPayload` 使用同一类 JWS 验证流程。
+   **怎么开始：** 先实现证书链校验，再用 leaf certificate 验 JWS 签名；验证失败的数据直接丢弃，不进入权益系统。
+
+4. **做什么：建立 Notifications V2 的快速 ACK + 异步处理队列。**
+   **为什么值得做：** Apple 会把处理超时视为投递失败并重试，重复通知会增加幂等压力。
+   **怎么开始：** 请求入口只做 JWS 校验、App/环境检查、`notificationUUID` 去重和入队，然后立刻返回 HTTP 200。
+
+5. **做什么：给订阅服务端加“宕机补偿”工具。**
+   **为什么值得做：** Get Notification History 提供六个月历史，并带 `firstSendAttemptResult`，可以在事故后补回漏收通知并定位 SSL 或投递问题。
+   **怎么开始：** 事故恢复时记录起止时间，按时间段、通知类型和可选 `originalTransactionId` 查询历史，再用现有 JWS 验证和去重逻辑重放。
+
+---
+
+## 关联 Session
+
+- [What's new with in-app purchase](/articles/wwdc2022-10007) — 本场提到 Get Transaction History 的过滤、排序、测试通知和通知历史等年度更新来自这场概览。
+- [What's new in StoreKit testing](/articles/wwdc2022-10039) — 讲解如何在 Xcode 和 Sandbox 中测试订阅、退款、价格上涨、计费失败等内购边界状态。
+- [Implement proactive in-app purchase restore](/articles/wwdc2022-110404) — 讲解如何在客户端启动时识别用户已有内购权益，并与服务端状态同步配合。
