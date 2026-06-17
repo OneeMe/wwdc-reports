@@ -1,57 +1,300 @@
 ---
 title: "Meet distributed actors in Swift"
-description: "discover distributed actors — an extension of swift"
-date: 2026-06-10
-tags: ["WWDC 2022"]
+description: "Discover distributed actors — an extension of Swift's actor model that simplifies development of distributed systems. We'll explore how distributed actor isolation and location transparency can help you avoid the accidental complexity of networking, serialization, and other transport concerns when working with distributed apps and systems."
+date: "2022-06-07"
+tags: ["Swift", "Concurrency", "Distributed", "Actor"]
 thumbnail: "/images/sessions/2022/110356.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110356/"
 sessionId: "wwdc2022-110356"
 year: "2022"
 relatedSessions:
+  - title: "What's new in Swift"
+    code: "110354"
+    description: "Swift 5.7 新特性总览，包含 distributed actor 介绍"
+  - title: "Meet Swift Async Algorithms"
+    code: "110355"
+    description: "Swift 异步算法库，可与分布式 actor 配合处理流式数据"
   - title: "Design protocol interfaces in Swift"
     code: "110353"
-    description: "learn how you can use swift 5.7 to design advanced abstractions using protocols."
-  - title: "Meet the presenter: Meet Swift Async Algorithms"
-    code: "110938"
-    description: "meet the presenter behind “meet swift async algorithms” and join a text-based wa"
-  - title: "Q&A: Swift Standard Library"
-    code: "110921"
-    description: "ask apple engineers about the swift standard library during this 2 hour text-bas"
-  - title: "Q&A: Swift concurrency"
-    code: "110480"
-    description: "ask apple engineers about swift concurrency during this 2 hour text-based q&a. s"
+    description: "Swift 5.7 协议与泛型改进，distributed actor 受益于语言特性"
 ---
 
 ## Highlight
 
-> Swift Actor 通过编译时检查防止数据竞争，但只限于同一进程内。Distributed Actors 将这个模型扩展到跨进程（多设备、集群、服务器）场景。
-
----
+> Swift 5.7 的 distributed actor 把 actor 模型从单进程扩展到多进程场景，通过编译器检查的序列化要求和位置透明性，让远程调用和本地调用写法完全一致。
 
 ## 核心内容
 
-Swift Actor 通过编译时检查防止数据竞争，但只限于同一进程内。Distributed Actors 将这个模型扩展到跨进程（多设备、集群、服务器）场景。
+### 从本地 Actor 到分布式 Actor
 
-核心概念是"位置透明性"：无论 Distributed Actor 在本地还是远程，交互方式完全一样。这意味着你可以在本地测试完整的分布式逻辑，部署时不需要修改实现代码。
+你的井字棋游戏目前只有单机模式。人类玩家和 AI 对手都是本地 actor，通过异步消息通信。你想加入多人对战功能，让两个设备上的玩家互相连线。
 
-Session 用一个井字棋游戏（Tic Tac Fish）演示了从普通 Actor 迁移到 Distributed Actor 的过程。关键步骤包括：添加 `distributed` 关键字、指定 ActorSystem 类型、处理 ID 属性的自动生成、以及理解 `distributed` 方法的序列化要求。
+以前的做法是手动处理 WebSocket 连接、消息序列化、状态同步。代码里充斥着 `encode`/`decode`、重连逻辑、心跳检测，游戏逻辑被网络代码淹没。
 
-Swift 5.7 引入了 `Distributed` 模块，包含 `DistributedActor` 协议和相关类型。目前提供了 `LocalTestingDistributedActorSystem` 用于本地开发和测试。
+（[00:30](https://developer.apple.com/videos/play/wwdc2022/110356/?time=30)）Distributed actor 的核心思路是：actor 已经通过消息传递来通信了，为什么不能把这些消息发送到另一台设备上？
 
+Swift actor 的"并发之海"模型里，每个 actor 是一座孤岛，通过异步消息交换数据。Distributed actor 把这个模型扩展到"分布式之海"：每座孤岛可以位于不同的设备、服务器或进程中。
 
-### 最佳实践
+### 迁移第一步：把 Actor 变成 Distributed Actor
 
-- 先用 LocalTesting 系统开发和测试，确认逻辑正确后再接入真实的 ActorSystem
-- 所有需要远程调用的方法标记 `distributed`，内部辅助方法不要标记
-- Distributed Actor 的参数和返回值必须遵循 Codable
-- ID 是全局唯一标识符，可以用于路由和查找 Actor
-- 在同一进程内使用 Distributed Actor 的开销极低，不要因为担心性能而避免使用
+（[04:47](https://developer.apple.com/videos/play/wwdc2022/110356/?time=287)）先看原来的本地 actor：
 
----
+```swift
+public actor BotPlayer: Identifiable {
+    nonisolated public let id: ActorIdentity = .random
 
-## 相关 Session
+    var ai: RandomPlayerBotAI
+    var gameState: GameState
 
-- [Design protocol interfaces in Swift](/articles/wwdc2022-110353) — learn how you can use swift 5.7 to design advanced abstractions using protocols.
-- [Meet the presenter: Meet Swift Async Algorithms](/articles/wwdc2022-110938) — meet the presenter behind “meet swift async algorithms” and join a text-based wa
-- [Q&A: Swift Standard Library](/articles/wwdc2022-110921) — ask apple engineers about the swift standard library during this 2 hour text-bas
-- [Q&A: Swift concurrency](/articles/wwdc2022-110480) — ask apple engineers about swift concurrency during this 2 hour text-based q&a. s
+    public init(team: CharacterTeam) {
+        self.gameState = .init()
+        self.ai = RandomPlayerBotAI(playerID: self.id, team: team)
+    }
+
+    public func makeMove() throws -> GameMove {
+        return try ai.decideNextMove(given: &gameState)
+    }
+
+    public func opponentMoved(_ move: GameMove) async throws {
+        try gameState.mark(move)
+    }
+}
+```
+
+（[06:11](https://developer.apple.com/videos/play/wwdc2022/110356/?time=371)）改成 distributed actor 只需要几步：
+
+```swift
+import Distributed
+
+public distributed actor BotPlayer: Identifiable {
+    typealias ActorSystem = LocalTestingDistributedActorSystem
+
+    var ai: RandomPlayerBotAI
+    var gameState: GameState
+
+    public init(team: CharacterTeam, actorSystem: ActorSystem) {
+        self.actorSystem = actorSystem
+        self.gameState = .init()
+        self.ai = RandomPlayerBotAI(playerID: self.id, team: team)
+    }
+
+    public distributed func makeMove() throws -> GameMove {
+        return try ai.decideNextMove(given: &gameState)
+    }
+
+    public distributed func opponentMoved(_ move: GameMove) async throws {
+        try gameState.mark(move)
+    }
+}
+```
+
+关键点：
+- `distributed actor` 替代 `actor`，自动符合 `DistributedActor` 协议
+- `ActorSystem` 类型别名声明这个 actor 使用的分布式系统
+- `actorSystem` 是编译器合成的属性，必须在初始化器中赋值
+- `id` 属性由 actor system 自动分配，不能手动声明
+- `distributed func` 标记可以远程调用的方法
+
+### 位置透明性
+
+（[03:41](https://developer.apple.com/videos/play/wwdc2022/110356/?time=221)）Distributed actor 最重要的特性是位置透明性（location transparency）。无论 actor 在本地还是远程，调用代码完全一样：
+
+```swift
+// 本地 actor
+let localBot = BotPlayer(team: .fish, actorSystem: system)
+let move = try await localBot.makeMove()
+
+// 远程 actor（通过 resolve 获取引用）
+let remoteBot = try BotPlayer.resolve(id: opponentID, using: webSocketSystem)
+let move = try await remoteBot.makeMove()  // 语法完全相同！
+```
+
+关键点：
+- `resolve(id:using:)` 获取远程 actor 的引用，不是创建实例
+- 返回的引用和本地实例使用完全相同的 API
+- 网络、序列化、传输细节全部由 actor system 处理
+
+### 服务器端实现
+
+（[13:35](https://developer.apple.com/videos/play/wwdc2022/110356/?time=815)）把 BotPlayer 移到服务器上运行，客户端通过 WebSocket 连接：
+
+```swift
+import Distributed
+import TicTacFishShared
+
+@main struct Boot {
+    static func main() {
+        let system = try! SampleWebSocketActorSystem(
+            mode: .serverOnly(host: "localhost", port: 8888)
+        )
+
+        system.registerOnDemandResolveHandler { id in
+            if system.isBotID(id) {
+                return system.makeActorWithID(id) {
+                    OnlineBotPlayer(team: .rodents, actorSystem: system)
+                }
+            }
+            return nil
+        }
+
+        try await server.terminated
+    }
+}
+```
+
+关键点：
+- `registerOnDemandResolveHandler` 实现按需创建 actor
+- 客户端发来的消息指向的 ID 可能还没有对应实例
+- 服务器根据 ID 特征判断是否需要创建新的 BotPlayer
+
+### 本地网络对战：Receptionist 模式
+
+（[16:32](https://developer.apple.com/videos/play/wwdc2022/110356/?time=992)）除了客户端/服务器模式，distributed actor 也支持点对点（peer-to-peer）通信。在本地 Wi-Fi 环境下，两个设备直接发现对方并建立游戏。
+
+发现远程 actor 使用 receptionist 模式：
+
+```swift
+let opponentTeam = model.team == .fish ? CharacterTeam.rodents : CharacterTeam.fish
+
+let listing = await localNetworkSystem.receptionist.listing(
+    of: OpponentPlayer.self,
+    tag: opponentTeam.tag
+)
+
+for try await opponent in listing where opponent.id != self.player.id {
+    model.foundOpponent(opponent, myself: self.player, informOpponent: true)
+    return
+}
+```
+
+关键点：
+- `receptionist.listing(of:tag:)` 返回一个 AsyncSequence
+- 新设备加入网络时，listing 会自动产生新值
+- 用 `for try await` 遍历发现的对手
+
+（[20:23](https://developer.apple.com/videos/play/wwdc2022/110356/?time=1223)）人类玩家作为 distributed actor 时，需要处理远程调用本地 UI 的情况：
+
+```swift
+public distributed actor LocalNetworkPlayer: GamePlayer {
+    public typealias ActorSystem = SampleLocalNetworkActorSystem
+
+    let team: CharacterTeam
+    let model: GameViewModel
+
+    public distributed func makeMove() async -> GameMove {
+        let field = await model.humanSelectedField()
+        movesMade += 1
+        let move = GameMove(
+            playerID: self.id,
+            position: field,
+            team: team,
+            teamCharacterID: movesMade % 2
+        )
+        return move
+    }
+}
+```
+
+关键点：
+- `makeMove()` 被远程调用时，需要等待人类玩家在本地 UI 上操作
+- `await model.humanSelectedField()` 挂起远程调用，直到用户点击
+- 返回的 `GameMove` 通过 actor system 自动序列化传回远程调用方
+
+## 详细内容
+
+### Distributed Actor 的编译器检查
+
+Distributed actor 比普通 actor 多了三层编译器检查：
+
+```swift
+// 1. 只有 distributed 方法可以远程调用
+public distributed func makeMove() throws -> GameMove  // OK
+public func helper() { }  // 不能在远程引用上调用
+
+// 2. 参数和返回值必须满足序列化要求
+distributed func sendMessage(_ text: String)  // OK，String 是 Codable
+distributed func sendImage(_ image: UIImage)  // 编译错误！UIImage 不是 Codable
+
+// 3. Actor system 类型必须匹配
+let bot: BotPlayer  // BotPlayer 的 ActorSystem 是 LocalTestingDistributedActorSystem
+let remoteBot = try BotPlayer.resolve(id: id, using: otherSystem)  // 类型不匹配会报错
+```
+
+关键点：
+- `distributed` 关键字显式标记远程 API 边界
+- 默认序列化要求是 `Codable`，actor system 可以自定义
+- 编译器在编译期就保证了远程调用的类型安全
+
+### Actor System 的职责
+
+Actor system 是 distributed actor 的核心抽象，负责：
+
+1. **分配 ID**：每个 actor 创建时分配全局唯一标识符
+2. **序列化/反序列化**：把方法调用编码为网络消息
+3. **路由**：根据 ID 找到目标 actor 的位置
+4. **传输**：通过网络发送消息
+
+```swift
+// Swift 5.7 内置的本地测试系统
+typealias ActorSystem = LocalTestingDistributedActorSystem
+
+// 自定义 WebSocket 系统
+typealias ActorSystem = SampleWebSocketActorSystem
+
+// 开源的集群系统（SwiftNIO 实现）
+// https://github.com/apple/swift-distributed-actors/
+```
+
+### 序列化要求
+
+（[10:21](https://developer.apple.com/videos/play/wwdc2022/110356/?time=621)）Distributed actor 的所有 `distributed func` 的参数和返回值类型必须满足 actor system 的序列化要求。默认是 `Codable`：
+
+```swift
+struct GameMove: Codable {
+    let playerID: ActorIdentity
+    let position: Int
+    let team: CharacterTeam
+    let teamCharacterID: Int
+}
+```
+
+如果 actor system 使用其他序列化方案（如 Protocol Buffers），可以声明不同的要求：
+
+```swift
+distributed actor BotPlayer {
+    typealias ActorSystem = ProtobufActorSystem
+    // 此时参数/返回值需要符合 ProtobufSerializable
+}
+```
+
+## 核心启发
+
+**1. 用 distributed actor 替代手动网络层**
+
+如果你正在用 WebSocket、URLSession 或第三方库实现设备间通信，考虑用 distributed actor 重构。游戏状态同步、协作编辑、实时聊天等场景特别适合。从 `LocalTestingDistributedActorSystem` 开始，本地测试通过后再接入真实网络。
+
+入口：`import Distributed`，`distributed actor`
+
+**2. 构建本地多人游戏体验**
+
+利用 Network 框架 + distributed actor 实现零服务器成本的本地多人游戏。Receptionist 模式自动发现附近设备，不需要用户手动输入 IP 或扫码。
+
+入口：`receptionist.listing(of:tag:)`，`SampleLocalNetworkActorSystem`
+
+**3. 用 actor system 抽象不同的部署模式**
+
+同一套游戏逻辑可以用不同的 actor system 部署：本地测试用 `LocalTestingDistributedActorSystem`，局域网对战用自定义 Network 框架系统，在线对战用 WebSocket 系统，大规模集群用 Swift Distributed Actors 库。业务代码完全不用改。
+
+入口：`typealias ActorSystem = ...`，`resolve(id:using:)`
+
+**4. 服务器端 Swift 的新选择**
+
+Distributed actor 为服务器端 Swift 提供了类型安全的 RPC 抽象。相比 Vapor 的路由处理器，distributed actor 让客户端和服务器共享接口定义，编译器保证两端类型一致。
+
+入口：`SampleWebSocketActorSystem(mode: .serverOnly)`，`registerOnDemandResolveHandler`
+
+## 关联 Session
+
+- [What's new in Swift](/articles/wwdc2022-110354) — Swift 5.7 新特性总览，包含 distributed actor 的语言级支持
+- [Meet Swift Async Algorithms](/articles/wwdc2022-110355) — 异步算法库，可与 distributed actor 配合处理实时数据流
+- [Design protocol interfaces in Swift](/articles/wwdc2022-110353) — Swift 5.7 的 `some`/`any` 语法和主关联类型，distributed actor 的 API 设计受益于这些改进
