@@ -39,6 +39,21 @@ function isAslSession(title: string): boolean {
   return /\(ASL\)\s*$/i.test(title);
 }
 
+function isDubDubDaily(title: string): boolean {
+  return /^Dub Dub Daily:/i.test(title);
+}
+
+function isExcludedGeneratedSession(session: Pick<Session, "year" | "contentId" | "title">): boolean {
+  const contentId = Number.parseInt(session.contentId, 10);
+  return (
+    isAslSession(session.title) ||
+    (session.year === "2026" && (
+      isDubDubDaily(session.title) ||
+      (Number.isFinite(contentId) && contentId >= 8000)
+    ))
+  );
+}
+
 export const years = DATA.y;
 export const topics = DATA.t;
 export const sessions: Session[] = DATA.s
@@ -52,7 +67,7 @@ export const sessions: Session[] = DATA.s
     resources: s[6],
     codeSnippets: s[7],
   }))
-  .filter((s) => !isAslSession(s.title));
+  .filter((s) => !isExcludedGeneratedSession(s));
 
 export const yearCounts: Record<string, number> = Object.fromEntries(
   years.map((year) => [year, sessions.filter((s) => s.year === year).length]),
