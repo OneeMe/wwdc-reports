@@ -36,12 +36,27 @@ function isAslSession(title) {
   return /\(ASL\)\s*$/i.test(title ?? '');
 }
 
+function isDubDubDaily(title) {
+  return /^Dub Dub Daily:/i.test(title ?? '');
+}
+
+function shouldSkipGeneratedArticle(year, contentId, title) {
+  const numericId = Number.parseInt(contentId, 10);
+  return (
+    isAslSession(title) ||
+    (year === '2026' && (
+      isDubDubDaily(title) ||
+      (Number.isFinite(numericId) && numericId >= 8000)
+    ))
+  );
+}
+
 function getRelatedSessions(year, topicId, excludeId) {
   const dataPath = path.join(DATA_DIR, `wwdc${year.slice(2)}`, 'raw_data.json');
   if (!fs.existsSync(dataPath)) return [];
   const data = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
   return Object.values(data.videos)
-    .filter(v => v.primaryTopicID === topicId && v.eventContentId !== excludeId && !isAslSession(v.title))
+    .filter(v => v.primaryTopicID === topicId && v.eventContentId !== excludeId && !shouldSkipGeneratedArticle(year, v.eventContentId, v.title))
     .slice(0, 4)
     .map(v => ({
       title: v.title,
