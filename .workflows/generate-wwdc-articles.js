@@ -10,99 +10,71 @@ export const meta = {
 
 const ARTICLES_DIR = 'web/src/content/articles'
 
-// Phase 1: 格式检查，识别需要处理的文件
-phase('检查')
+// 主执行函数
+async function main() {
+  // 参数验证
+  const year = args?.year || 2023
+  const yy = String(year).slice(-2)
 
-log(`检查 WWDC${args.year} 现有文章格式...`)
+  // Phase 1: 格式检查，识别需要处理的文件
+  phase('检查')
 
-const checkResult = await agent(
-  `运行格式检查，统计 WWDC${args.year} 文章的通过/失败情况：
+  log(`检查 WWDC${year} 现有文章格式...`)
 
-\`\`\`bash
-node scripts/check-article-format.mjs ${ARTICLES_DIR} 2>&1 | grep -E 'wwdc${args.year.slice(-2)}-'
-\`\`\`
+  // 使用 agent 读取失败文件列表
+  const checkResult = await agent(
+    `读取文件 /tmp/wwdc${year}-failed.txt 的内容，每行是一个数字代码。
 
-输出格式：
-- 如果全部通过：输出"全部通过，数量：N"
-- 如果有失败：输出"需要修复：N 个"，然后列出文件名（每行一个，格式：wwdc${args.year.slice(-2)}-101.mdx）
-
-**注意：**
-- 如果目录为空（没有该年份文章），输出"目录为空"
-- 只统计 WWDC${args.year} 的文件`
-)
-
-// 解析检查结果
-let targetCodes = []
-let isFullGeneration = false
-
-if (checkResult.includes('目录为空')) {
-  isFullGeneration = true
-  log('目录为空，需要生成所有文章')
-
-  // 获取所有 session code
-  const listResult = await agent(
-    `列出 WWDC${args.year} 所有 session 的 code 编号：
-
-\`\`\`bash
-node skills/wwdc-quick-look/scripts/query.mjs list-sessions --year ${args.year}
-\`\`\`
-
-只输出 code 列表，每行一个数字，如：
+只输出数字代码列表，每行一个，如：
 101
 102
+103
 
-排除 code >= 8000（Group Lab）。`
+如果文件不存在或为空，输出"空"。`
   )
 
-  targetCodes = listResult
-    .split('\n')
-    .map(line => line.match(/^(\d+)/)?.[1])
-    .filter(Boolean)
-    .map(code => parseInt(code, 10))
-    .filter(code => code < 8000)
+  // 解析检查结果
+  let targetCodes = []
+  let isFullGeneration = false
 
-} else if (checkResult.includes('全部通过')) {
-  const match = checkResult.match(/数量：(\d+)/)
-  const count = match ? parseInt(match[1]) : 0
-  log(`现有 ${count} 篇文章，格式检查全部通过，无需重新生成`)
-  return { skipped: count, year: args.year, status: 'already-ok' }
-
-} else if (checkResult.includes('需要修复')) {
-  // 解析失败文件列表
-  const fileMatch = checkResult.match(/(wwdc${args.year.slice(-2)}-\d+\.mdx)/g)
-  if (fileMatch) {
-    targetCodes = fileMatch
-      .map(f => parseInt(f.match(/-(\d+)\.mdx/)?.[1] || '0', 10))
-      .filter(code => code < 8000)
+  if (checkResult !== '空' && checkResult.trim().length > 0) {
+    targetCodes = checkResult
+      .split('\n')
+      .map(line => line.match(/^\d+/)?.[0])
+      .filter(Boolean)
+      .map(code => parseInt(code, 10))
+      .filter(code => code > 0 && code < 8000)
     log(`需要重新生成 ${targetCodes.length} 篇文章`)
+  } else {
+    log(`没有需要处理的文件`)
+    return { skipped: 0, year: year, status: 'no-work' }
   }
-}
 
-if (targetCodes.length === 0) {
-  log('没有需要处理的文件')
-  return { skipped: 0, year: args.year, status: 'no-work' }
-}
+  // Phase 2: 读取 prompt 模板
+  phase('读取模板')
 
-// Phase 2: 读取 prompt 模板
-phase('读取模板')
-
-const templateResult = await agent(
-  `读取文件 scripts/agent-prompt-template.md 的完整内容。
+  const templateResult = await agent(
+    `读取文件 scripts/agent-prompt-template.md 的完整内容。
 
 只输出文件原文，不要解释或修改。`
-)
+  )
 
-const promptBase = templateResult
-  .replaceAll('{YEAR}', args.year)
-  .replaceAll('{YY}', args.year.slice(-2))
+  const promptBase = templateResult
+    .replaceAll('{YEAR}', year)
+    .replaceAll('{YY}', yy)
 
-// Phase 3: 并行生成文章
-phase('生成')
+  // Phase 3: 并行生成文章（限制并发为 2）
+  phase('生成')
 
-const results = await pipeline(
-  targetCodes,
-  code => agent(
-    `为 WWDC${args.year} session ${code} 生成/重新生成中文技术文章。
+  const results = []
+  const CONCURRENCY = 2
+
+  for (let i = 0; i < targetCodes.length; i += CONCURRENCY) {
+    const batch = targetCodes.slice(i, i + CONCURRENCY)
+    const batchResults = await pipeline(
+      batch,
+      code => agent(
+        `为 WWDC${year} session ${code} 生成/重新生成中文技术文章。
 
 **写作要求：**
 
@@ -112,56 +84,63 @@ ${promptBase.replaceAll(/\{CODE\}/g, code)}
 
 \`\`\`bash
 # session 元数据
-node skills/wwdc-quick-look/scripts/query.mjs show-session --year ${args.year} --code ${code}
+node skills/wwdc-quick-look/scripts/query.mjs show-session --year ${year} --code ${code}
 
 # 代码片段
-node skills/wwdc-quick-look/scripts/query.mjs code --year ${args.year} --code ${code}
+node skills/wwdc-quick-look/scripts/query.mjs code --year ${year} --code ${code}
 
 # Resources
-node skills/wwdc-quick-look/scripts/query.mjs resources --year ${args.year} --code ${code}
+node skills/wwdc-quick-look/scripts/query.mjs resources --year ${year} --code ${code}
 
 # 逐字稿
-node skills/wwdc-quick-look/scripts/query.mjs transcript --year ${args.year} --code ${code} --limit 100
+node skills/wwdc-quick-look/scripts/query.mjs transcript --year ${year} --code ${code} --limit 100
 \`\`\`
 
 **任务：**
 
 1. 运行上述命令获取数据
 2. 生成 .mdx 文件
-3. 写入 ${ARTICLES_DIR}/wwdc${args.year.slice(-2)}-${code}.mdx
+3. 写入 ${ARTICLES_DIR}/wwdc${yy}-${code}.mdx
 4. 确保通过格式检查（检查脚本已能识别 Keynote/Overview/Design 等无代码 session）
 
-完成后只输出"已生成：wwdc${args.year.slice(-2)}-${code}.mdx"。`,
-    { label: `${code}` }
-  )
-).filter(Boolean)
+完成后只输出"已生成：wwdc${yy}-${code}.mdx"。`,
+        { label: `${code}` }
+      )
+    )
+    const filteredResults = batchResults.filter(r => r)
+    results.push(...filteredResults)
+  }
 
-log(`已处理 ${results.length} 篇文章`)
+  log(`已处理 ${results.length} 篇文章`)
 
-// Phase 4: 最终验证
-if (args.verify !== false) {
-  phase('验证')
+  // Phase 4: 最终验证
+  if (args.verify !== false) {
+    phase('验证')
 
-  const recheckResult = await agent(
-    `运行格式检查验证 WWDC${args.year} 文章：
+    const recheckResult = await agent(
+      `运行格式检查验证 WWDC${year} 文章：
 
 \`\`\`bash
 node scripts/check-article-format.mjs ${ARTICLES_DIR} 2>&1 | tail -5
 \`\`\`
 
 只输出统计信息。`
-  )
+    )
 
-  if (recheckResult.includes('失败: 0') || recheckResult.includes('失败：0')) {
-    log('格式验证：全部通过')
-  } else {
-    log(`验证结果：${recheckResult.trim()}`)
+    if (recheckResult.includes('失败: 0') || recheckResult.includes('失败：0')) {
+      log('格式验证：全部通过')
+    } else {
+      log(`验证结果：${recheckResult.trim()}`)
+    }
+  }
+
+  return {
+    processed: results.length,
+    year: year,
+    mode: isFullGeneration ? 'full' : 'incremental',
+    status: 'done'
   }
 }
 
-return {
-  processed: results.length,
-  year: args.year,
-  mode: isFullGeneration ? 'full' : 'incremental',
-  status: 'done'
-}
+// 执行主函数
+main()

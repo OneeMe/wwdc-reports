@@ -1,67 +1,333 @@
 ---
 title: "Update Live Activities with push notifications"
-description: "discover how you can remotely update live activities in your app when you push content through apple push notification service (apns). we"
-date: 2026-06-10
-tags: ["WWDC 2023"]
+description: "Discover how you can remotely update Live Activities in your app when you push content through Apple Push Notification service (APNs). We'll show you how to configure your first Live Activity push locally so you can quickly iterate on your implementation."
+date: "2023-06-06"
+tags: ["ActivityKit", "Push Notifications", "APNs", "Live Activities"]
 thumbnail: "/images/sessions/2023/10185.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10185/"
 sessionId: "wwdc2023-10185"
 year: "2023"
 relatedSessions:
-  - title: "Animate symbols in your app"
-    code: "10258"
-    description: "bring delight to your app with animated symbols. explore the new symbols framewo"
-  - title: "Build better document-based apps"
-    code: "10056"
-    description: "discover how you can use the latest features in ipados to improve your document-"
-  - title: "Create a more responsive camera experience"
-    code: "10105"
-    description: "discover how avcapture and photokit can help you create more responsive and deli"
-  - title: "Create animated symbols"
-    code: "10257"
-    description: "discover animation presets and learn how to use them with sf symbols and custom "
+  - title: "Meet ActivityKit"
+    code: "10184"
+    description: "Live Activity 基础入门"
+  - title: "Bring widgets to life"
+    code: "277"
+    description: "WidgetKit 交互性"
+  - title: "Sending notification requests to APNs"
+    code: "226"
+    description: "APNs 推送通知"
 ---
 
 ## Highlight
 
-> 这场 Session 详细介绍了如何使用 APNs（Apple Push Notification service）远程更新 Live Activities。
-
----
+> Apple Push Notification service 新增了 `liveactivity` 推送类型，让服务器可以直接向 Live Activity 发送更新，无需 app 前台运行，大幅降低了对电池的影响。
 
 ## 核心内容
 
-这场 Session 详细介绍了如何使用 APNs（Apple Push Notification service）远程更新 Live Activities。
+本地更新 Live Activity 有个局限：app 需要在后台运行才能更新数据。对于需要实时同步多用户状态的场景（比如组队游戏、多人配送），这意味着要么频繁唤醒 app，要么数据不同步。
 
-核心工作流程分三步：
+远程推送更新解决了这个问题。服务器通过 APNs 直接向设备的 Live Activity 发送内容更新，widget extension 被唤醒渲染新 UI，整个过程不需要主 app 参与。
 
-1. **准备工作**：App 在创建 Live Activity 时指定 `pushType: .token`，ActivityKit 向 APNs 请求一个 push token。App 通过 `pushTokenUpdates` async sequence 监听 token 变化，并将 token 发送给服务端。
-2. **发送推送更新**：服务端向 APNs 发送 HTTP/2 请求，headers 中指定 `apns-push-type: liveactivity`，payload 包含 `timestamp`、`event`（update 或 end）、`content-state`（JSON 格式的内容状态）。
-3. **更新优先级与提醒**：推送请求有 priority 5（低）和 10（高）两个级别。还可以通过 `alert` 字段在更新 Live Activity 的同时发送锁屏提醒。
+实现路径分为三步：app 启动 Live Activity 时获取推送 token 并上报服务器；服务器在状态变化时构造 APNs 请求发送更新；设备收到推送后自动更新 Live Activity UI。
 
-Session 用 Emoji Rangers 游戏的多人组队冒险功能作为示例——服务端追踪所有玩家的冒险状态，通过推送更新每个人的 Live Activity，App 端完全不需要前台运行。
+推送更新支持两种优先级：低优先级（5）适合不紧急的更新，无数量限制；高优先级（10）适合需要立即送达的更新，有系统预算限制。还可以添加 alert 对象在 Apple Watch 上触发通知，支持本地化字符串和自定义声音。
 
-关键技术细节：
-- push token 是每个 Live Activity 独有的，一个 App 的多个 Live Activity 有不同的 token。
-- token 可能会被系统更新，App 必须持续监听 `pushTokenUpdates`。
-- `content-state` 的 JSON 编码必须使用默认的 JSONEncoder 策略，不能设置自定义的 key encoding strategy。
-- 推送更新可以附带 `alert`，包含标题、正文和默认声音，让用户注意到 Live Activity 的变化。
+## 详细内容
 
+### 启用推送更新
 
-### 最佳实践
+（[03:53](https://developer.apple.com/videos/play/wwdc2023/10185/?time=233)）首先在 Xcode 的 Signing & Capabilities 中添加 Push Notifications 能力，然后在代码中设置 `pushType`：
 
-- push token 必须用 async for loop 持续监听，不要假设 token 只在创建时获取一次。系统可能在任何时候更新它。
-- 服务端的 timestamp 必须严格单调递增。如果发了一个旧 timestamp 的更新，系统会忽略它。
-- 开发阶段用命令行工具直接发推送请求来调试，效率比搭建完整后端高得多。
-- content-state 的 JSON key 必须用 camelCase，因为系统用默认的 JSONDecoder 解码。不要和服务端的其他 API 混用 snake_case。
-- 结束 Live Activity 时用 `event: "end"`，不要发 update 后再在 App 端调用 end——那样会有竞态条件。
-- 推送更新频率要有节制。Live Activity 不是实时数据流，过于频繁的更新会消耗电量和用户耐心。
-- 保留 staleDate 机制作为推送失败的兜底——如果推送长时间未到达，系统可以显示内容已过时。
+```swift
+func startActivity(hero: EmojiRanger) throws {
+    let adventure = AdventureAttributes(hero: hero)
+    let initialState = AdventureAttributes.ContentState(
+        currentHealthLevel: hero.healthLevel,
+        eventDescription: "Adventure has begun!"
+    )
 
----
+    let activity = try Activity.request(
+        attributes: adventure,
+        content: .init(state: initialState, staleDate: nil),
+        pushType: .token  // 启用推送更新
+    )
 
-## 相关 Session
+    Task {
+        for await pushToken in activity.pushTokenUpdates {
+            let pushTokenString = pushToken.reduce("") {
+                $0 + String(format: "%02x", $1)
+            }
+            Logger().log("New push token: \(pushTokenString)")
+            try await self.sendPushToken(hero: hero, pushTokenString: pushTokenString)
+        }
+    }
+}
+```
 
-- [Animate symbols in your app](/articles/wwdc2023-10258) — bring delight to your app with animated symbols. explore the new symbols framewo
-- [Build better document-based apps](/articles/wwdc2023-10056) — discover how you can use the latest features in ipados to improve your document-
-- [Create a more responsive camera experience](/articles/wwdc2023-10105) — discover how avcapture and photokit can help you create more responsive and deli
-- [Create animated symbols](/articles/wwdc2023-10257) — discover animation presets and learn how to use them with sf symbols and custom 
+关键点：
+- `pushType: .token` 告诉 ActivityKit 为这个 Live Activity 申请推送 token
+- 不要同步访问 `activity.pushToken`，刚创建时大概率是 nil
+- 使用 `pushTokenUpdates` async sequence 监听 token 变化
+- token 可能在生命周期内更新，新 token 到来时要通知服务器废弃旧 token
+- 系统给 app 前台运行时间来处理 token 更新
+
+### APNs 推送 payload
+
+（[06:54](https://developer.apple.com/videos/play/wwdc2023/10185/?time=414)）更新 Live Activity 的推送 payload 格式：
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "content-state": {
+            "currentHealthLevel": 0.941,
+            "eventDescription": "Power Panda found a sword!"
+        }
+    }
+}
+```
+
+关键点：
+- `timestamp`：Unix 时间戳，系统用它判断最新内容
+- `event`：`update` 或 `end`
+- `content-state`：JSON 对象，必须能解码为 `ContentState` 类型
+- 使用默认 `JSONDecoder` 解码，不要用自定义 decoding strategy
+
+### 生成 content-state JSON
+
+（[07:37](https://developer.apple.com/videos/play/wwdc2023/10185/?time=457)）在 app 中用 `JSONEncoder` 生成正确的格式：
+
+```swift
+let contentState = AdventureAttributes.ContentState(
+    currentHealthLevel: 0.941,
+    eventDescription: "Power Panda found a sword!"
+)
+
+let encoder = JSONEncoder()
+encoder.outputFormatting = .prettyPrinted
+
+let json = try! encoder.encode(contentState)
+Logger().log("\(String(data: json, encoding: .utf8)!)")
+```
+
+关键点：
+- 输出是 camelCase 键名
+- 服务器发送的 JSON 键名必须与 `ContentState` 的 property 名一致
+- 不要用自定义 encoding strategy
+
+### 用 curl 测试推送
+
+（[09:18](https://developer.apple.com/videos/play/wwdc2023/10185/?time=558)）开发阶段可以直接从终端发送测试推送：
+
+```bash
+curl \
+  --header "apns-topic: com.example.app.push-type.liveactivity" \
+  --header "apns-push-type: liveactivity" \
+  --header "apns-priority: 10" \
+  --header "authorization: bearer $AUTHENTICATION_TOKEN" \
+  --data '{
+      "aps": {
+          "timestamp": '$(date +%s)',
+          "event": "update",
+          "content-state": {
+              "currentHealthLevel": 0.941,
+              "eventDescription": "Power Panda found a sword!"
+          }
+      }
+  }' \
+  --http2 https://api.sandbox.push.apple.com/3/device/$ACTIVITY_PUSH_TOKEN
+```
+
+关键点：
+- `apns-topic`：app bundle ID + `.push-type.liveactivity`
+- `apns-push-type`：必须是 `liveactivity`
+- `apns-priority`：`5`（低）或 `10`（高）
+- `authorization`：JWT bearer token
+- URL 必须使用 HTTP/2
+- 用 `date +%s` 自动生成当前时间戳
+
+### 带 Alert 的推送
+
+（[14:21](https://developer.apple.com/videos/play/wwdc2023/10185/?time=861)）重要更新可以触发 alert：
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "content-state": {
+            "currentHealthLevel": 0.0,
+            "eventDescription": "Power Panda has been knocked down!"
+        },
+        "alert": {
+            "title": "Power Panda is knocked down!",
+            "body": "Use a potion to heal Power Panda!",
+            "sound": "default"
+        }
+    }
+}
+```
+
+关键点：
+- alert 在 Apple Watch 上显示为通知
+- iPhone/iPad 上只播放 sound，不显示弹窗
+- title 和 body 只在 Apple Watch 使用
+
+### 本地化 Alert
+
+（[14:56](https://developer.apple.com/videos/play/wwdc2023/10185/?time=896)）支持多语言：
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "content-state": {
+            "currentHealthLevel": 0.0,
+            "eventDescription": "Power Panda has been knocked down!"
+        },
+        "alert": {
+            "title": {
+                "loc-key": "%@ is knocked down!",
+                "loc-args": ["Power Panda"]
+            },
+            "body": {
+                "loc-key": "Use a potion to heal %@!",
+                "loc-args": ["Power Panda"]
+            },
+            "sound": "HeroDown.mp4"
+        }
+    }
+}
+```
+
+关键点：
+- `loc-key` 对应 app 本地化文件中的键
+- `loc-args` 是插入到本地化字符串中的参数
+- 设备根据用户 locale 自动选择语言
+- `sound` 可以是自定义音频文件名
+
+### 结束 Live Activity
+
+（[15:52](https://developer.apple.com/videos/play/wwdc2023/10185/?time=952)）通过推送结束活动：
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "end",
+        "dismissal-date": 1685959200,
+        "content-state": {
+            "currentHealthLevel": 0.23,
+            "eventDescription": "Adventure over! Power Panda is taking a nap."
+        }
+    }
+}
+```
+
+关键点：
+- `event: "end"` 表示结束活动
+- `dismissal-date` 指定何时从锁屏移除（Unix 时间戳）
+- 省略 `dismissal-date` 让系统决定
+- 可以传最终 content-state 给用户一个总结
+
+### Stale Date 和过期 UI
+
+（[16:44](https://developer.apple.com/videos/play/wwdc2023/10185/?time=1004)）标记内容何时过期：
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "stale-date": 1685959200,
+        "content-state": {
+            "currentHealthLevel": 0.79,
+            "eventDescription": "Egghead is in the woods and lost connection."
+        }
+    }
+}
+```
+
+在 SwiftUI 中响应过期状态：
+
+```swift
+ActivityConfiguration(for: AdventureAttributes.self) { context in
+    AdventureLiveActivityView(
+        hero: context.attributes.hero,
+        isStale: context.isStale,  // 过期时变为 true
+        contentState: context.state
+    )
+    .activityBackgroundTint(Color.gameWidgetBackground)
+}
+```
+
+关键点：
+- `stale-date` 到达后 `context.isStale` 变为 `true`
+- UI 应该给出过期提示（如变灰、添加"可能已过期"标签）
+
+### Relevance Score
+
+（[17:19](https://developer.apple.com/videos/play/wwdc2023/10185/?time=1039)）控制多个 Live Activity 的排序：
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "relevance-score": 100,
+        "content-state": {
+            "currentHealthLevel": 0.941,
+            "eventDescription": "Power Panda found a sword!"
+        }
+    }
+}
+```
+
+关键点：
+- 分数越高，在锁屏排序越靠前
+- 最高分的活动会占据灵动岛
+- 可以在推送中动态调整分数
+
+### 推送优先级和预算
+
+（[11:18](https://developer.apple.com/videos/play/wwdc2023/10185/?time=678)）两种优先级：
+
+| 优先级 | 值 | 特点 |
+|--------|-----|------|
+| 低 | 5 |  opportunistic 投递，省电，无数量限制 |
+| 高 | 10 | 立即投递，适合紧急更新，有系统预算限制 |
+
+大部分更新应该用低优先级。高优先级适合英雄被击倒、比赛结束等需要立即关注的事件。
+
+如果 app 频繁需要高优先级更新，可以在 Info.plist 中添加 `NSSupportsLiveActivitiesFrequentUpdates` 设为 YES，获得更高的更新预算。用户可以在设置中关闭这个功能，通过 `ActivityAuthorizationInfo.frequentPushesEnabled` 检测状态。
+
+## 核心启发
+
+**1. 多人实时游戏状态同步**
+- **做什么**：组队游戏中，每个队员的 Live Activity 实时显示全队状态和事件
+- **为什么值得做**：服务器计算状态并推送，不需要每个客户端频繁轮询或保持连接
+- **怎么开始**：游戏服务器在事件发生时构造 APNs payload，通过 `liveactivity` push type 发送到每个队员的 token
+
+**2. 外卖/物流实时追踪**
+- **做什么**：配送状态变化时（取餐、出发、到达）自动更新用户锁屏上的 Live Activity
+- **为什么值得做**：骑手端上报位置后，服务器计算 ETA 并推送给用户，用户全程不需要打开 app
+- **怎么开始**：骑手 GPS 上报 → 服务器计算 → APNs 推送 `content-state` 更新 ETA 和距离
+
+**3. 赛事/比分直播推送**
+- **做什么**：关注的比赛有进球、红黄牌等事件时，Live Activity 立即更新并播放提示音
+- **为什么值得做**：比传统推送通知更沉浸，用户扫一眼就能看到完整比分和事件时间线
+- **怎么开始**：赛事数据供应商推送事件 → 服务器构造 alert payload → APNs 高优先级推送
+
+**4. 航班/火车动态信息**
+- **做什么**：登机口变更、延误、开始登机等重要信息通过推送实时更新 Live Activity
+- **为什么值得做**：旅客不需要反复查看机场屏幕或打开 app，锁屏上始终有最新信息
+- **怎么开始**：与航班数据 API 对接，状态变化时推送更新，延误时提高 relevance-score 让它排在最前
+
+## 关联 Session
+
+- [Meet ActivityKit](/articles/wwdc2023-10184) — Live Activity 基础实现
+- [Bring widgets to life](/articles/wwdc2023-277) — WidgetKit 交互性
+- [Sending notification requests to APNs](/articles/wwdc2023-226) — APNs 推送通知基础
