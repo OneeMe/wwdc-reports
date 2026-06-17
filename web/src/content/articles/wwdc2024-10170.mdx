@@ -30,24 +30,389 @@ relatedSessions:
 
 ## 核心内容
 
-Swift 去年引入了 noncopyable 类型（用 `~Copyable` 标记），让你可以定义"不能被复制的类型"。今年 Session 的重点是"如何在实际项目中消费（consume）noncopyable 类型"——也就是当你的泛型参数、协议、extension 遇到 noncopyable 类型时该怎么处理。
+Swift 默认假设所有类型都可以被复制。这是合理的默认值，因为值类型让代码更容易理解——你可以自由传递值，不用担心某个地方的修改会影响其他地方。但在某些场景下，复制会带来问题。
 
-Session 从值类型和引用类型的复制行为回顾开始，用银行转账（`BankTransfer`）的例子展示了为什么复制有时是危险的：转账被意外执行两次，或者因为某个地方持有了副本导致 deinit 不执行。然后用 `~Copyable` 解决了这个问题——编译器在编译时就阻止你复制一个不应该被复制的值。
+Session 用银行转账（`BankTransfer`）的例子展示了复制带来的风险。假设你有一个 class 类型的 `BankTransfer`，它有 `run()` 方法执行转账。在 schedule 函数中，如果 delay 小于 1 秒就立即执行，但开发者忘记 return，导致转账被运行两次。更糟的是，如果 sleep 的 task 被取消，抛出的错误可能被忽略，导致转账没有被取消。即使你在 deinit 里加了 cancel 逻辑，也因为调用方持有副本而无法执行。
 
-今年新增的关键能力包括：泛型参数可以声明为 `~Copyable`、noncopyable 类型可以有 extension、noncopyable 类型可以遵循协议（有条件限制）。这些补全了 noncopyable 类型体系的基础设施，让它在真实项目中可用。
+去年的 Swift 5.9 引入了 `~Copyable` 来解决这个问题。把 `BankTransfer` 改成 noncopyable struct 后，编译器会阻止你复制它。`run()` 方法标记为 `consuming`，意味着调用后这个值就不存在了。这样编译器能直接发现 schedule 函数里的 bug——没有 return 会导致 transfer 被消费两次。
 
+今年的重点是让 noncopyable 类型能在泛型代码中工作。之前的限制是：泛型参数默认要求类型是 `Copyable` 的，协议也默认继承 `Copyable`，这导致 noncopyable 类型无法参与泛型编程。Swift 6 做了三个关键改动：泛型参数可以声明为 `~Copyable`、noncopyable 类型可以有 extension、noncopyable 类型可以遵循协议。这让 `~Copyable` 从一个实验性特性变成了可以在生产代码中使用的工具。
 
-### 最佳实践
-
-**新项目**：如果你的代码涉及"独占所有权"的资源管理——文件句柄、网络连接、数据库事务、加密密钥——考虑用 `~Copyable` 类型来包装它们。这比手动添加 `isClosed` 标志和 assertion 更安全，因为编译器在你写出"使用已关闭的资源"这类 bug 时直接报错。
-
-**已有项目**：`~Copyable` 是渐进式的。你不需要一次性把所有类型都标记为 noncopyable。建议从资源管理类开始：把你的 FileHandle、DatabaseConnection 这类类型标记为 `~Copyable`，加上 deinit 做清理。调用方代码需要改成 consume/borrowing 语义，但这是有限范围的重构。泛型代码的改动更少——只要把 `<T>` 改成 `<T: ~Copyable>` 就能同时接受两种类型。
+Session 还演示了条件复制（conditional copyable）——一个泛型类型可以根据其参数类型是否 Copyable 来决定自己是否 Copyable。比如 `Job<Action>` 可以是 Copyable，只要 Action 是 Copyable。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Analyze heap memory](/articles/wwdc2024-10173) — dive into the basis for your app
-- [Explore Swift performance](/articles/wwdc2024-10217) — discover how swift balances abstraction and performance. learn what elements of 
-- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — swift is a great language for writing your server applications, and powers criti
-- [Go further with Swift Testing](/articles/wwdc2024-10195) — learn how to write a sweet set of (test) suites using swift testing
+### 复制机制回顾
+
+Swift 中有两种复制：值复制（value copy）和引用复制（reference copy）。用 Player 例子说明（[0:52](https://developer.apple.com/videos/play/wwdc2024/10170/?time=52)）：
+
+```swift
+struct Player {
+  var icon: String
+}
+
+func test() {
+  let player1 = Player(icon: "🐸")
+  var player2 = player1
+  player2.icon = "🚚"
+  assert(player1.icon == "🐸")
+}
+```
+
+**关键点**：
+- struct 是值类型，`player2 = player1` 复制了整个数据
+- 修改 `player2.icon` 不会影响 `player1`，因为它们是独立的副本
+
+如果是 class（[1:55](https://developer.apple.com/videos/play/wwdc2024/10170/?time=115)）：
+
+```swift
+class PlayerClass {
+  var icon: String
+  init(_ icon: String) { self.icon = icon }
+}
+
+func test() {
+  let player1 = PlayerClass("🐸")
+  let player2 = player1
+  player2.icon = "🚚"
+  assert(player1.icon == "🐸")
+}
+```
+
+**关键点**：
+- class 是引用类型，`player2 = player1` 只复制了引用（浅拷贝）
+- 两个变量指向同一个对象，修改 `player2.icon` 会影响 `player1`
+
+### 为什么需要 Noncopyable
+
+复制有时是危险的。Session 用银行转账示例（[5:10](https://developer.apple.com/videos/play/wwdc2024/10170/?time=310)）：
+
+```swift
+class BankTransfer {
+  var complete = false
+
+  func run() {
+    assert(!complete)
+    // .. do it ..
+    complete = true
+  }
+
+  deinit {
+    if !complete { cancel() }
+  }
+
+  func cancel() { /* ... */ }
+}
+
+func schedule(_ transfer: BankTransfer,
+              _ delay: Duration) async throws {
+
+  if delay < .seconds(1) {
+    transfer.run()
+  }
+
+  try await Task.sleep(for: delay)
+  transfer.run()
+}
+
+func startPayment() async {
+  let payment = BankTransfer()
+  log.append(payment)
+  try? await schedule(payment, .seconds(3))
+}
+
+let log = Log()
+
+final class Log: Sendable {
+  func append(_ transfer: BankTransfer) { /* ... */ }
+}
+```
+
+**关键点**：
+- `schedule` 函数在 delay < 1 秒时会立即运行，但忘记 return，导致转账运行两次
+- 即使有 `complete` 标志和断言，运行时可能不会触发
+- `log.append(payment)` 持有了 transfer 的副本，导致 deinit 不会执行
+- 如果 sleep 被取消，transfer 没有被 cancel
+
+### Noncopyable 类型基础
+
+用 `~Copyable` 声明一个不可复制的类型（[7:46](https://developer.apple.com/videos/play/wwdc2024/10170/?time=466)）：
+
+```swift
+struct FloppyDisk: ~Copyable {}
+
+func copyFloppy() {
+  let system = FloppyDisk()
+  let backup = consume system
+  load(system)
+  // ...
+}
+
+func load(_ disk: borrowing FloppyDisk) {}
+```
+
+**关键点**：
+- `~Copyable` 抑制了默认的 Copyable conformance
+- `consume` 关键字会消费变量的值，留下一个未初始化的状态
+- 尝试读取被 consume 的变量是编译错误
+
+noncopyable 类型的参数必须声明所有权（[8:18](https://developer.apple.com/videos/play/wwdc2024/10170/?time=498)）：
+
+```swift
+struct FloppyDisk: ~Copyable { }
+
+func newDisk() -> FloppyDisk {
+  let result = FloppyDisk()
+  format(result)
+  return result
+}
+
+func format(_ disk: consuming FloppyDisk) {
+  // ...
+}
+```
+
+**关键点**：
+- `consuming` 表示函数会拿走参数的所有权
+- format 不返回任何值，所以 `newDisk` 会编译失败
+
+三种所有权修饰符（[9:00](https://developer.apple.com/videos/play/wwdc2024/10170/?time=540)）：
+
+```swift
+// consuming: 拿走所有权
+func format(_ disk: consuming FloppyDisk) {
+  // ...
+}
+
+// borrowing: 只读借用
+func format(_ disk: borrowing FloppyDisk) {
+  var tempDisk = disk
+  // ...
+}
+
+// inout: 可变借用
+func format(_ disk: inout FloppyDisk) {
+  var tempDisk = disk
+  // ...
+  disk = tempDisk
+}
+```
+
+**关键点**：
+- `consuming` 拿走所有权，调用方不能再使用这个值
+- `borrowing` 提供只读访问，类似 let 绑定
+- `inout` 提供可写访问，但必须在返回前重新初始化参数
+
+### Noncopyable BankTransfer
+
+用 noncopyable 重写 BankTransfer（[10:28](https://developer.apple.com/videos/play/wwdc2024/10170/?time=628)）：
+
+```swift
+struct BankTransfer: ~Copyable {
+  consuming func run() {
+    // .. do it ..
+    discard self
+  }
+
+  deinit {
+    cancel()
+  }
+
+  consuming func cancel() {
+    // .. do the cancellation ..
+    discard self
+  }
+}
+```
+
+**关键点**：
+- `consuming func run()` 表示调用 run 会消费掉这个值
+- `discard self` 销毁 self 但不调用 deinit
+- 编译器保证 run 不能被调用两次
+
+schedule 函数（[11:10](https://developer.apple.com/videos/play/wwdc2024/10170/?time=670)）：
+
+```swift
+func schedule(_ transfer: consuming BankTransfer,
+              _ delay: Duration) async throws {
+
+  if delay < .seconds(1) {
+    transfer.run()
+    return
+  }
+
+  try await Task.sleep(for: delay)
+  transfer.run()
+}
+```
+
+**关键点**：
+- `consuming BankTransfer` 表示 schedule 会拿走 transfer 的所有权
+- 如果忘记 return，编译器会报错——transfer 被消费两次
+- 如果 sleep 被取消，transfer 会被销毁，deinit 会执行 cancel
+
+### Noncopyable 泛型
+
+Swift 6 之前，泛型参数默认要求 Copyable。现在可以用 `~Copyable` 来移除这个约束（[15:50](https://developer.apple.com/videos/play/wwdc2024/10170/?time=950)）：
+
+```swift
+protocol Runnable: ~Copyable {
+  consuming func run()
+}
+
+struct Command: Runnable {
+  func run() { /* ... */ }
+}
+
+struct BankTransfer: ~Copyable, Runnable {
+  consuming func run() { /* ... */ }
+}
+
+func execute2<T>(_ t: T)
+  where T: Runnable {
+  t.run()
+}
+
+func execute3<T>(_ t: consuming T)
+  where T: Runnable,
+        T: ~Copyable {
+  t.run()
+}
+
+func test() {
+  execute2(Command())
+  execute2(BankTransfer()) // expected error: 'execute2' requires that 'BankTransfer' conform to 'Copyable'
+
+  execute3(Command())
+  execute3(BankTransfer())
+}
+```
+
+**关键点**：
+- `execute2` 的泛型参数 T 默认要求 Copyable，所以无法接受 BankTransfer
+- `execute3` 用 `T: ~Copyable` 移除了这个约束，可以同时接受两种类型
+- `~Copyable` 约束"放宽"了类型空间，而不是收紧
+
+### 条件 Copyable
+
+一个类型可以根据其泛型参数是否 Copyable 来决定自己是否 Copyable（[18:05](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1085)）：
+
+```swift
+struct Job<Action: Runnable & ~Copyable>: ~Copyable {
+  var action: Action?
+}
+
+func runEndlessly(_ job: consuming Job<Command>) {
+  while true {
+    let current = copy job
+    current.action?.run()
+  }
+}
+
+extension Job: Copyable where Action: Copyable {}
+
+protocol Runnable: ~Copyable {
+  consuming func run()
+}
+
+struct Command: Runnable {
+  func run() { /* ... */ }
+}
+```
+
+**关键点**：
+- `Job` 本身是 `~Copyable`，因为它需要存储 noncopyable 的 Action
+- `extension Job: Copyable where Action: Copyable` 让 Job 在 Action 是 Copyable 时也变成 Copyable
+- `Job<Command>` 是 Copyable，`Job<BankTransfer>` 则不是
+
+### Extension 的默认约束
+
+noncopyable 类型的 extension 默认只适用于泛型参数是 Copyable 的情况（[19:27](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1167)）：
+
+```swift
+extension Job {
+  func getAction() -> Action? {
+    return action
+  }
+}
+
+func inspectCmd(_ cmdJob: Job<Command>) {
+  let _ = cmdJob.getAction()
+  let _ = cmdJob.getAction()
+}
+
+func inspectXfer(_ transferJob: borrowing Job<BankTransfer>) {
+  let _ = transferJob.getAction() // expected error: method 'getAction' requires that 'BankTransfer' conform to 'Copyable'
+}
+```
+
+**关键点**：
+- 普通 extension 默认假设泛型参数是 Copyable
+- `getAction()` 返回 action 需要复制，所以只能用于 Copyable 的 Action
+- 对 `Job<BankTransfer>` 调用 `getAction()` 会报错
+
+如果要让 extension 适用于所有情况，需要显式声明（[20:14](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1214)）：
+
+```swift
+protocol Cancellable {
+  mutating func cancel()
+}
+
+extension Job: Cancellable {
+  mutating func cancel() {
+    action = nil
+  }
+}
+```
+
+**关键点**：
+- 这个 extension 默认只适用于 Action 是 Copyable 的情况
+- 如果要让 Cancellable 适用于所有 Job，协议本身也需要是 `~Copyable`
+
+让 extension 适用于所有情况（[21:00](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1260)）：
+
+```swift
+protocol Cancellable: ~Copyable {
+  mutating func cancel()
+}
+
+extension Job: Cancellable where Action: ~Copyable {
+  mutating func cancel() {
+    action = nil
+  }
+}
+```
+
+**关键点**：
+- 协议声明为 `~Copyable` 后，conformance 不再要求类型是 Copyable
+- `where Action: ~Copyable` 让这个 extension 适用于所有 Action，不管是否 Copyable
+
+---
+
+## 核心启发
+
+1. **用 `~Copyable` 包装独占资源**
+   - 文件句柄、网络连接、数据库事务、加密密钥这些资源，天然适合用 noncopyable 类型包装
+   - 编译器能保证资源不会被意外复制，deinit 总是会在"最后一个用户"离开时执行
+   - 开始时选一个资源管理类型（如 `FileHandle`），把它改成 `~Copyable struct`，在 deinit 里做清理
+
+2. **渐进式引入泛型支持**
+   - 不需要一次性把所有泛型代码改成支持 noncopyable
+   - 从新增的泛型函数开始：直接用 `<T: ~Copyable>` 而不是 `<T>`，这样两种类型都能用
+   - 已有的泛型代码保持不变，等确实需要支持 noncopyable 类型时再改
+
+3. **用条件 Copyable 保持灵活性**
+   - 如果你的泛型类型只是一个"容器"，考虑条件 Copyable
+   - `extension MyType: Copyable where T: Copyable` 让你的类型在 T 是 Copyable 时也能被复制
+   - 这样只写 Copyable 代码的调用者不需要改动，同时 noncopyable 类型也能用
+
+---
+
+## 关联 Session
+
+- [Analyze heap memory](/articles/wwdc2024-10173) — 深入分析堆内存，理解值类型和引用类型的内存布局
+- [Explore Swift performance](/articles/wwdc2024-10217) — 了解 Swift 如何平衡抽象和性能，包括复制语义的性能影响
+- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Swift 在服务端的应用场景，noncopyable 类型对服务器资源管理很有用
+- [Go further with Swift Testing](/articles/wwdc2024-10195) — Swift Testing 框架，测试 noncopyable 类型时可以借助 consuming 语义

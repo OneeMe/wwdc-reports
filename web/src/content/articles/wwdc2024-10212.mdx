@@ -21,25 +21,107 @@ relatedSessions:
 
 ## 核心内容
 
-Core Location 的授权一直是个复杂的话题。用户可能授予了"使用期间"但只是"近似位置"，你的某个功能突然需要"精确位置"，就得调用 `requestTemporaryFullAccuracy`。如果用户之前选了"允许一次"然后切到别的 App，授权就丢了，你又得重新请求。不同授权状态的排列组合让代码变得很脆弱。
+用 CLLocationManager 管理位置授权，代码很容易变得脆弱。用户选了"允许一次"，切到别的 App 再回来，授权就丢了，你又得重新调 `requestWhenInUseAuthorization`。用户给了近似位置，你的导航功能需要精确位置，又要调 `requestTemporaryFullAccuracy(withPurposeKey:)`，但临时授权会过期。整个过程是过程式的：你得自己判断当前状态、自己决定下一步调哪个方法，稍有遗漏就会卡在某个分支上。
 
-iOS 18 引入的 `CLServiceSession` 是一个声明式的授权模型。你创建一个 session 并告诉系统你需要什么（比如 `.whenInUse`），系统负责在合适的时机向用户弹出请求。如果你还需要精确位置，就再创建一个带 `fullAccuracyPurposeKey` 的 session——注意是"叠加"而不是"替换"。
+iOS 18 引入的 `CLServiceSession` 把这个模型从"过程式"翻转为"声明式"。你创建一个 session，告诉系统你需要什么授权等级（比如 `.whenInUse`），系统负责在合适的时机向用户弹出请求。如果某个功能需要精确位置，你再创建一个带 `fullAccuracyPurposeKey` 的 session——是叠加，不是替换。每个功能模块独立声明自己的授权需求，Core Location 统一处理。另外，当你迭代 `CLLocationUpdate.liveUpdates` 或 `CLMonitor.events` 这些 AsyncSequence 时，系统会自动认为你有一个 `.whenInUse` 的隐式 session，很多场景下只需要删掉旧的手动授权代码就够了。
 
-Session 还介绍了隐式 Service Session 的概念：当你迭代 `CLLocationUpdate.liveUpdates` 或 `CLMonitor.events` 这些 AsyncSequence 时，系统自动认为你有一个 `.whenInUse` 的隐式 session。这意味着很多场景下你只需要删除旧的手动授权代码就行。
+## 详细内容
 
-Diagnostic Properties 是另一个新特性，帮你理解当前的授权状态和 API 运行状况。
+**CLServiceSession 的基本用法**（[01:07](https://developer.apple.com/videos/play/wwdc2024/10212/?time=67)）
 
+以前要获取位置授权，需要写一大段 CLLocationManager + delegate 代码。现在用 CLServiceSession 只需几行：
 
-### 最佳实践
+```swift
+// CLServiceSession in action
 
-- 将 `CLServiceSession` 理解为"目标声明"而非"动作指令"，不要试图控制弹窗时机
-- 用叠加（layering）的方式管理不同功能模块的授权需求，每个模块独立创建和释放 session
-- 优先利用隐式 session（迭代 liveUpdates/events 时），只删除旧的手动授权代码
-- `fullAccuracyPurposeKey` 要写得具体，让用户理解为什么这个功能需要精确位置
-- CLServiceSession 是 Sendable 的不可变对象，可以安全地在并发环境中使用
+Task {
+    let session = CLServiceSession(authorization: .whenInUse)
 
----
+    for try await update in CLLocationUpdate.liveUpdates {
+        // Process update.location or update.authorizationDenied
+    }
+}
+```
 
-## 相关 Session
+关键点：
+- `CLServiceSession(authorization: .whenInUse)` 声明你的授权目标是"使用期间"，系统会自动在合适时机请求授权
+- session 的生命周期由你持有它的时长决定：持有期间系统知道你的目标，释放后系统不再为该目标维护授权
+- `CLLocationUpdate.liveUpdates` 的迭代本身也会创建隐式的 `.whenInUse` session（[07:15](https://developer.apple.com/videos/play/wwdc2024/10212/?time=435)）
 
-- [What’s new in privacy](/articles/wwdc2024-10123) — at apple, we believe privacy is a fundamental human right. learn about new and i
+**叠加 fullAccuracy 的 session**（[04:08](https://developer.apple.com/videos/play/wwdc2024/10212/?time=248)）
+
+当用户启动导航功能时，需要精确位置。做法是叠加一个带 `fullAccuracyPurposeKey` 的 session，而不是替换原来的：
+
+```swift
+// 基础 session：只需要近似位置
+let baseSession = CLServiceSession(authorization: .whenInUse)
+
+// 导航功能需要精确位置，叠加一个 session
+let navSession = CLServiceSession(
+    authorization: .whenInUse,
+    fullAccuracyPurposeKey: "Nav"
+)
+```
+
+关键点：
+- `fullAccuracyPurposeKey: "Nav"` 对应 Info.plist 中的本地化字符串，向用户解释为什么需要精确位置
+- 叠加（layering）而不是替换：基础 session 保持不变，新 session 额外声明精确位置需求
+- 每个功能模块独立创建和释放自己的 session，不需要模块间协调
+
+**隐式 Service Session**（[07:34](https://developer.apple.com/videos/play/wwdc2024/10212/?time=454)）
+
+迭代 `liveUpdates` 本身就隐含了 `.whenInUse` 的授权目标，可以省去显式创建 session：
+
+```swift
+Task {
+    for try await update in CLLocationUpdate.liveUpdates {
+        // Process update.location or update.authorizationDenied
+    }
+}
+```
+
+关键点：
+- 隐式 session 默认启用，迭代 `liveUpdates` 或 `monitor.events` 时自动生效
+- 如果不需要隐式行为，在 Info.plist 中设置 `NSLocationRequireExplicitServiceSession` 即可关闭
+- 隐式 session 不包含 `.always` 或 `fullAccuracy` 需求，这些必须显式声明
+
+**Diagnostic Properties**（[13:37](https://developer.apple.com/videos/play/wwdc2024/10212/?time=817)）
+
+CLServiceSession 暴露一个 `diagnostics` AsyncSequence，让你实时了解授权状态：
+
+```swift
+// Following the progress of location authorization with CLServiceSession
+Task {
+    let mySession = CLServiceSession(authorization:.whenInUse)
+
+    for try await diagnostic in mySession.diagnostics {
+        if (!diagnostic.authorizationRequestInProgress) {
+            reactToChanges(authorized:!diagnostic.authorizationDenied)
+        }
+    }
+}
+```
+
+关键点：
+- `diagnostic.authorizationRequestInProgress` 为 false 时，表示用户已做出选择（或之前已有授权）
+- `diagnostic.authorizationDenied` 表示授权被拒绝
+- `diagnostic.authorizationDeniedGlobally` 表示系统级位置服务被关闭，可以据此给出不同的引导
+- `diagnostic.insufficientlyInUse` 表示当前状态不足以让系统弹出授权请求
+- CLLocationUpdate 和 CLMonitor.Event 也新增了 Diagnostic Properties：`.accuracyLimited`（近似位置每 15-20 分钟才更新一次）、`.locationUnavailable`（Core Location 暂时无法确定位置）
+
+## 核心启发
+
+- **做什么**：用 CLServiceSession 替换所有 CLLocationManager 的手动授权请求代码。为什么值得做：声明式模型消除了"当前在哪个状态、下一步该调什么方法"的判断逻辑，系统自动处理授权恢复（比如 App 被 suspend 后重新回到前台）。怎么开始：找到项目中所有 `requestWhenInUseAuthorization()` 和 `requestTemporaryFullAccuracy(withPurposeKey:)` 调用，替换为对应功能模块中创建的 CLServiceSession。
+
+- **做什么**：为需要精确位置的功能独立创建带 `fullAccuracyPurposeKey` 的叠加 session。为什么值得做：用户可能愿意给近似位置但不想给精确位置，叠加 session 让每个功能的授权需求自包含，不会因为一个功能的需求影响其他功能。怎么开始：列出 App 中所有需要精确位置的功能点，每个功能在激活时创建 `CLServiceSession(authorization: .whenInUse, fullAccuracyPurposeKey: "YourKey")`，功能结束时释放。
+
+- **做什么**：用 Diagnostic Properties 替换项目中的超时和猜测逻辑。为什么值得做：以前无法区分"等待位置更新中"和"授权被拒绝"，只能设超时；现在可以直接检查 `.authorizationDenied`、`.accuracyLimited` 等属性，给出准确的 UI 反馈。怎么开始：在迭代 `liveUpdates` 或 `diagnostics` 的循环中，检查每个 update/event 的 Diagnostic Properties，根据不同属性值展示对应的 UI 状态（比如"位置精度受限，导航可能不准确"）。
+
+- **做什么**：确保 App 启动时重建之前的 session。为什么值得做：Core Location 在 App 被 terminate 后只保留 session 状态几秒钟，App 重新启动后必须尽快重新创建 session，否则后台位置更新会中断。怎么开始：在 App 的启动逻辑中，根据持久化的功能状态（比如"正在记录运动轨迹"）立即重建对应的 CLServiceSession 或恢复 liveUpdates 的迭代。
+
+## 关联 Session
+
+- [What’s new in privacy](/articles/wwdc2024-10123) — iOS 18 隐私框架更新，与位置授权的新声明式模型相配合
+- [Meet Core Location](/articles/wwdc2023-10180) — 2023 年引入 CLLocationUpdate 和 CLMonitor 的基础 session
+- [Discover streamlined location updates](/articles/wwdc2023-10179) — CLLocationUpdate.liveUpdates 的详细用法，隐式 session 的来源
+- [Meet CLMonitor](/articles/wwdc2023-10185) — CLMonitor 的地理围栏和条件监控，事件迭代触发隐式 session

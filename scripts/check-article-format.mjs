@@ -5,7 +5,12 @@
  */
 
 import { readFileSync, readdirSync, statSync } from "fs";
-import { join, extname } from "path";
+import { join, extname, dirname, basename } from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PROJECT_ROOT = dirname(__dirname);
 
 const AI_PHRASES = [
   /不是.+而是/,
@@ -41,8 +46,8 @@ function checkFile(filePath) {
   const lines = content.split("\n");
 
   // 判断 session 类型
-  const basename = filePath.split("/").pop().replace(".mdx", "").replace(".md", "");
-  const sessionCode = basename.match(/\d+$/)?.[0] || "";
+  const filename = basename(filePath).replace(".mdx", "").replace(".md", "");
+  const sessionCode = filename.match(/\d+$/)?.[0] || "";
   const isASL = content.includes('title:') && content.match(/title:\s*".*ASL.*"/);
   const isRecap = content.includes("recapOf:") || content.includes('title:') && content.match(/title:\s*".*Recap.*"/i);
   const isGroupLab = parseInt(sessionCode) >= 8000;
@@ -51,8 +56,9 @@ function checkFile(filePath) {
   const isBusiness = content.includes('"Business');
   const isGraphics = content.includes('Graphics');
   const isKeynote = content.includes('"Keynote"') || (content.includes('title:') && content.match(/title:\s*".*Keynote.*"/));
-  const isSpecialNoCode = ["121", "280"].includes(sessionCode);
-  const isNoCodeSession = isASL || isRecap || isGroupLab || isGetReady || isDesign || isBusiness || isGraphics || isKeynote || isSpecialNoCode;
+  const isStateOfTheUnion = content.includes('title:') && content.match(/title:\s*".*State of the Union.*"/i);
+  const isOverview = content.includes('title:') && content.match(/title:\s*".*Overview.*"/i);
+  const isNoCodeSession = isASL || isRecap || isGroupLab || isGetReady || isDesign || isBusiness || isGraphics || isKeynote || isStateOfTheUnion || isOverview;
 
   // 1. 检查 frontmatter
   if (!content.startsWith("---")) {
@@ -156,7 +162,7 @@ function main() {
   const args = process.argv.slice(2);
   const target =
     args.find((a) => !a.startsWith("-")) ||
-    "/Users/onee/Code/onee-workspace/projects/learning/wwdc/src/content/wwdc2026";
+    join(PROJECT_ROOT, "web/src/content/articles");
 
   const files = findFiles(target);
   console.log(`检查 ${files.length} 个文件...\n`);
@@ -167,12 +173,12 @@ function main() {
 
   for (const file of files) {
     const result = checkFile(file);
-    const basename = file.split("/").pop();
+    const displayName = basename(file);
     if (result.ok) {
-      console.log(`✅ ${basename}`);
+      console.log(`✅ ${displayName}`);
       okCount++;
     } else {
-      console.log(`❌ ${basename}:`);
+      console.log(`❌ ${displayName}:`);
       for (const issue of result.issues) {
         console.log(`   - ${issue}`);
       }

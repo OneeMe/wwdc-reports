@@ -30,26 +30,182 @@ relatedSessions:
 
 ## 核心内容
 
-去年 visionOS 1 的 Metal 渲染只支持 Full Immersion 模式（完全遮挡真实环境），今年新增了 Mixed Immersion 模式——用户可以同时看到真实环境和你的虚拟内容。这场 Session 由 Pooya 主讲，聚焦在三个核心技术点。
+去年 visionOS 1 里，用 Compositor Services + Metal + ARKit 自建渲染管线的开发者只能跑 Full Immersion——真实环境被完全遮挡，用户眼前只有你的虚拟世界。这在游戏和影视体验里没问题，但大量场景需要虚拟物体和真实环境共存：在桌面上放一个 3D 模型、让虚拟球和真实桌面碰撞、用手指直接抓取虚拟物体。这些需求在 Full Immersion 下根本无法实现。
 
-第一，渲染混合。Mixed Immersion 模式下你的渲染内容需要跟真实环境无缝融合，这要求你正确处理 clear color（全零而非黑色）、颜色空间（Display P3）、alpha 混合（pre-multiplied alpha）和深度值（reverse Z）。
+今年 visionOS 2 新增了 Mixed Immersion 模式。在 `.immersionStyle(selection: $style, in: .mixed, .full)` 里加上 `.mixed`，你的 Metal 渲染内容就会跟 passthrough 画面合成到一起。Compositor Services 负责把你的 color/depth texture 跟摄像头画面做混合，ARKit 提供 scene understanding 数据帮你把虚拟物体锚定到真实世界，你只需要确保渲染管线输出的颜色和深度值符合系统约定。
 
-第二，空间定位。利用 ARKit 的 scene understanding 数据，把虚拟内容锚定到真实物体和表面上，执行物理模拟，处理遮挡关系。
-
-第三，手部可见性。Mixed Immersion 下用户的手和你的虚拟内容会同时出现在视野中，你需要决定手的可见性策略——Visible（始终可见）、Hidden（始终被虚拟内容遮挡）还是 Automatic（根据深度自动切换）。
-
-
-### 最佳实践
-
-**新项目**：从一开始就以 Mixed Immersion 为默认开发模式，Full Immersion 作为可选降级。Mixed Immersion 的技术约束更严格（pre-multiplied alpha、正确的 clear color、准确的 depth 值），满足这些约束后切到 Full Immersion 是零成本的反向操作。
-
-**已有项目**：如果你的 App 已经用 Full Immersion 模式渲染 Metal，迁移到 Mixed Immersion 的 checklist 很清晰：1) clear color 改全零；2) 所有 shader 检查 pre-multiplied alpha；3) 深度值确保 reverse Z 约定且 alpha 为 0 的像素 depth 也为 0；4) 选择 upper limb visibility 策略。
+Session 围绕三个技术点展开：渲染混合（clear color、pre-multiplied alpha、reverse Z）、空间定位（scene-aware projection matrix）、以及 trackable anchor prediction（用不同的时间戳查询设备锚点和手部锚点，减少延迟误差）。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Bring your iOS or iPadOS game to visionOS](/articles/wwdc2024-10093) — discover how to transform your ios or ipados game into a uniquely visionos exper
-- [Create custom environments for your immersive apps in visionOS](/articles/wwdc2024-10087) — discover how to create visually rich and performant customized app environments 
-- [Create enhanced spatial computing experiences with ARKit](/articles/wwdc2024-10100) — learn how to create captivating immersive experiences with arkit
-- [Design interactive experiences for visionOS](/articles/wwdc2024-10096) — learn how you can design a compelling interactive narrative experience for apple
+### 1. Mixed Immersion 的渲染约定
+
+启用 Mixed Immersion 只需在 SwiftUI 的 ImmersiveSpace 里声明样式（[03:07](https://developer.apple.com/videos/play/wwdc2024/10092/?time=187)）：
+
+```swift
+@main
+struct MyApp: App {
+    var body: some Scene {
+        ImmersiveSpace {
+            CompositorLayer(configuration: MyConfiguration()) { layerRenderer in
+                 let engine = my_engine_create(layerRenderer)
+                 let renderThread = Thread {
+                     my_engine_render_loop(engine)
+                 }
+                 renderThread.name = "Render Thread"
+                 renderThread.start()
+            }
+            .immersionStyle(selection: $style, in: .mixed, .full)
+        }
+    }
+}
+```
+
+关键点：
+
+- `.immersionStyle(selection:in:)` 同时声明 `.mixed` 和 `.full`，用户可以在运行时切换
+- `CompositorLayer` 是 Metal 渲染的入口，你在这里拿到 `layerRenderer` 并启动自己的渲染线程
+- 如果希望 App 启动就进入 Mixed Immersion，在 Info.plist 里设置 `InitialImmersionStyle` 为 `UIImmersionStyleMixed`，`PreferredDefaultSceneSessionRole` 设为 `CPSceneSessionRoleImmersiveApplication`
+
+Mixed Immersion 下 clear color 必须是全零（[04:43](https://developer.apple.com/videos/play/wwdc2024/10092/?time=283)）：
+
+```swift
+let renderPassDescriptor = MTLRenderPassDescriptor()
+
+renderPassDescriptor.colorAttachments[0].texture = drawable.colorTextures[0]
+renderPassDescriptor.colorAttachments[0].loadAction = .clear
+renderPassDescriptor.colorAttachments[0].storeAction = .store
+renderPassDescriptor.colorAttachments[0].clearColor = .init(red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0)
+
+renderPassDescriptor.depthAttachment.texture = drawable.depthTextures[0]
+renderPassDescriptor.depthAttachment.loadAction = .clear
+renderPassDescriptor.depthAttachment.storeAction = .store
+renderPassDescriptor.depthAttachment.clearDepth = 0.0
+```
+
+关键点：
+
+- Full Immersion 的 clear color 是 `(0, 0, 0, 1)`（不透明黑色），Mixed Immersion 是 `(0, 0, 0, 0)`（全透明）
+- alpha 为 0 的像素不会显示在屏幕上，因为 Compositor Services 的合成规则是：alpha > 0 且 depth 有效才绘制
+- depth 必须用 reverse Z 约定，clearDepth 为 0.0（对应最远处）
+- alpha 为 0 的像素，depth 也应为 0.0，这能提升系统合成性能
+
+颜色方面，visionOS 的合成管线使用 pre-multiplied alpha 和 Display P3 色彩空间。你的 shader 输出前需要把 RGB 乘以 alpha；素材也应该在 Display P3 空间下制作，这样虚拟内容跟 passthrough 画面的色彩才一致。
+
+### 2. Upper Limb Visibility（上肢可见性）
+
+Mixed Immersion 下用户的手和你的虚拟内容同时出现在视野中。通过 `.upperLimbVisibility()` 修饰符控制手的可见性策略（[09:08](https://developer.apple.com/videos/play/wwdc2024/10092/?time=548)）：
+
+```swift
+@main
+struct MyApp: App {
+    var body: some Scene {
+        ImmersiveSpace {
+            CompositorLayer(configuration: MyConfiguration()) { layerRenderer in
+                 let engine = my_engine_create(layerRenderer)
+                 let renderThread = Thread {
+                     my_engine_render_loop(engine)
+                 }
+                 renderThread.name = "Render Thread"
+                 renderThread.start()
+            }
+            .immersionStyle(selection: $style, in: .mixed, .full)
+            .upperLimbVisiblity(.automatic)
+        }
+    }
+}
+```
+
+关键点：
+
+- `.visible`：手始终渲染在虚拟内容前面，忽略深度
+- `.hidden`：手始终被虚拟内容遮挡
+- `.automatic`：Compositor Services 根据你提交的 depth texture 自动判断——手在物体前方就可见，在物体后方就淡出
+
+### 3. Scene-aware Projection Matrix
+
+今年新增了 `computeProjection()` API，返回一个结合了相机内参和实时场景理解因素的投影矩阵。如果你的 App 使用 Mixed Immersion，必须用这个新 API（[13:37](https://developer.apple.com/videos/play/wwdc2024/10092/?time=817)）：
+
+```swift
+func renderLoop {
+    //...
+
+    let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTime)
+    drawable.deviceAnchor = deviceAnchor
+
+    for viewIndex in 0...drawable.views.count {
+        let view = drawable.views[viewIndex]
+        let originFromDevice = deviceAnchor?.originFromAnchorTransform
+        let deviceFromView = view.transform
+        let viewMatrix = (originFromDevice * deviceFromView).inverse
+        let projection = drawable.computeProjection(normalizedDeviceCoordinatesConvention:
+                                                    .rightUpBack,
+                                                    viewIndex: viewIndex)
+
+        let projectionViewMatrix = projection * viewMatrix;
+
+        //...
+    }
+}
+```
+
+关键点：
+
+- `originFromDevice` 来自 ARKit 的 `queryDeviceAnchor`，表示设备在原点坐标系中的变换
+- `deviceFromView` 来自 Compositor Services 的 `view.transform`
+- viewMatrix = `(originFromDevice * deviceFromView).inverse`，即从原点出发的观察矩阵
+- `computeProjection` 的 NDC 约定必须传 `.rightUpBack`（X 右、Y 上、Z 后），这是 Compositor Services 期望的约定
+- 每帧都必须重新查询，不能缓存旧帧的变换矩阵
+
+### 4. Trackable Anchor Prediction
+
+当你用 trackable anchor（比如手部追踪）来定位虚拟内容时，需要用不同的时间戳查询设备锚点和 trackable 锚点，以减少预测误差（[18:27](https://developer.apple.com/videos/play/wwdc2024/10092/?time=1107)）：
+
+```swift
+func renderFrame() {
+    //...
+
+    // Get the trackable anchor and presentation time.
+    let presentationTime = drawable.frameTiming.presentationTime
+    let trackableAnchorTime = drawable.frameTiming.trackableAnchorTime
+
+    // Convert the timestamps into units of seconds
+    let devicePredictionTime = LayerRenderer.Clock.Instant.epoch.duration(to:    presentationTime).timeInterval
+    let anchorPredictionTime = LayerRenderer.Clock.Instant.epoch.duration(to:    trackableAnchorTime).timeInterval
+
+    let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: devicePredictionTime)
+    let leftAnchor = handTracking.handAnchors(at: anchorPredictionTime)
+
+    if (leftAnchor.isTracked) {
+        //...
+    }
+```
+
+关键点：
+
+- `presentationTime`：帧呈现到屏幕的时间，用于查询设备锚点（device anchor）
+- `trackableAnchorTime`：摄像头看到环境的时间，用于查询 trackable 锚点（如手部）
+- 两个时间不同：摄像头采样和屏幕呈现之间有延迟，对 trackable anchor 用 `trackableAnchorTime` 可以减少约一帧的预测误差
+- 先完成非关键计算（如物理模拟），再在 optimal input time 之后查询锚点，预测精度更高
+- 不依附于 trackable anchor 的静态物体（如桌上的方块），只需要 `presentationTime` 查询设备锚点
+
+---
+
+## 核心启发
+
+1. **做一个 Mixed Immersion 的 3D 工具类 App**：利用 passthrough 让用户在真实桌面上摆放和操作 3D 模型，手部交互用 `.automatic` 可见性模式。为什么值得做：Mixed Immersion 比 Full Immersion 门槛更低，用户不需要完全与现实隔绝就能使用。怎么开始：从 Compositor Layer 模板出发，设置 `.mixed` immersionStyle，用 ARKit 的 plane anchor 把模型锚定到桌面。
+
+2. **用 trackable anchor prediction 做手部抓取交互**：虚拟物体跟随手的位置移动时，用 `trackableAnchorTime` 查询手部锚点，比用 `presentationTime` 减少约一帧的延迟。为什么值得做：手抓物体的场景对延迟极其敏感，少一帧误差就能让体验从"能用"变成"好用"。怎么开始：在渲染循环的 update 阶段，分别用 `frameTiming.trackableAnchorTime` 和 `frameTiming.presentationTime` 查询手部和设备锚点。
+
+3. **把已有的 Full Immersion Metal 项目迁移到 Mixed Immersion**：检查清单——clear color 改全零、shader 输出 pre-multiplied alpha、depth 用 reverse Z 且 alpha=0 的像素 depth=0、选择 upper limb visibility 策略。为什么值得做：满足 Mixed Immersion 的约束后，同一个渲染管线可以同时支持两种模式，用户按需切换。怎么开始：先改 clear color，再逐个检查 shader 的 alpha 输出，最后在 SwiftUI 里声明 `.mixed` 样式和 `.upperLimbVisibility(.automatic)`。
+
+---
+
+## 关联 Session
+
+- [Bring your iOS or iPadOS game to visionOS](/articles/wwdc2024-10093) — 将 iOS/iPadOS 游戏迁移到 visionOS 的完整指南
+- [Create custom environments for your immersive apps in visionOS](/articles/wwdc2024-10087) — 为沉浸式 App 创建自定义环境
+- [Create enhanced spatial computing experiences with ARKit](/articles/wwdc2024-10100) — ARKit 在空间计算中的深度应用
+- [Design interactive experiences for visionOS](/articles/wwdc2024-10096) — 设计 visionOS 上的交互叙事体验
