@@ -8,12 +8,18 @@ videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10060/"
 sessionId: "wwdc2024-10060"
 year: "2024"
 relatedSessions:
+  - title: "What's new in StoreKit and In-App Purchase"
+    code: "10061"
+    description: "learn how to build and deliver even better purchase experiences using the app store in-app purchase system."
   - title: "Explore App Store server APIs for In-App Purchase"
     code: "10062"
-    description: "learn how to leverage your server to build great in-app purchase experiences wit"
-  - title: "What’s new in App Store Connect"
-    code: "10063"
-    description: "explore new features for discovery, testing, and marketing. find out how to nomi"
+    description: "learn how to leverage your server to build great in-app purchase experiences with the latest updates to the app store s"
+  - title: "Implement App Store Offers"
+    code: "10110"
+    description: "learn how to engage customers with app store offers using app store connect, as well as the latest storekit features an"
+  - title: "What's new in privacy"
+    code: "10123"
+    description: "at apple, we believe privacy is a fundamental human right. learn about new and improved permission flows and other feat"
 ---
 
 ## Highlight
@@ -24,20 +30,177 @@ relatedSessions:
 
 ## 核心内容
 
-Apple 在 iOS 和 iPadOS 上推出了全新的广告归因框架 AdAttributionKit，它是基于 SKAdNetwork 的基础构建的。和 SKAdNetwork 一样，它基于 crowd anonymity（人群匿名性）机制：当转化数量少时返回少量数据，随着人群规模增大，返回更多数据。
+做广告归因的开发者对 SKAdNetwork 不会陌生——Apple 从 2018 年起用它替代设备级标识符做隐私归因，但 SKAdNetwork 的能力一直有限：没有 view-through 归因，没有 re-engagement 追踪，postback 返回的数据受 crowd anonymity 限制时粒度很粗。
 
-AdAttributionKit 的核心变化包括：新的 compact JWS 格式的广告展示数据（ad impression）、三种广告展示方式（custom click、view-through、SKOverlay/SKStoreProductViewController）、改进的 postback 机制（包含更丰富的 conversion 信息），以及全新的 re-engagement 归因（可以追踪用户重新打开已安装 App 的广告效果）。Session 还介绍了如何使用 Xcode 的 AdAttributionKit testing framework 来本地测试归因流程。
-
-
-### 最佳实践
-
-**已有项目**：如果你在使用 SKAdNetwork，AdAttributionKit 的迁移路径是平滑的。SKOverlay 和 SKStoreProductViewController 的接入方式几乎不变，只是多了 `appImpression` 参数。Custom click 广告的接入方式也类似。建议先添加 view-through 支持，因为这是 SKAdNetwork 缺失的功能。
-
-**新项目**：直接使用 AdAttributionKit 而不是 SKAdNetwork。新的 JWS 格式、re-engagement 归因、view-through 支持都是 SKAdNetwork 没有的。利用 Xcode 的 AdAttributionKit testing framework 在本地测试完整归因流程，不要等到线上才发现问题。
+AdAttributionKit 就是 Apple 的回答。它保留了 SKAdNetwork 的 crowd anonymity 核心设计（转化少时少返回数据，转化多时多返回），同时补上了三个关键缺口：第一种广告展示方式是 custom click，广告网络可以用自己的 UI 展示广告，用户点击后跳转安装页；第二种是 view-through，只要广告被展示 2 秒以上就算一次有效曝光，这个 SKAdNetwork 完全不支持；第三种是 SKOverlay 和 SKStoreProductViewController，沿用了 SKAdNetwork 的模式，但新增了 `appImpression` 参数。更重要的变化是 re-engagement 归因——当目标 App 已经安装在用户设备上，点击广告不再触发安装，而是直接打开 App 并携带 universal link，这让广告主可以衡量「把流失用户拉回来」的效果。postback 也换成了 compact JWS 格式，携带 `conversion-type`（download / redownload / re-engagement）、`source-identifier`（2–4 位，受 crowd anonymity 控制）等字段。AdAttributionKit 和 SKAdNetwork 完全互操作，已注册的 SKAdNetwork 广告网络无需额外申请即可使用。
 
 ---
 
-## 相关 Session
+## 详细内容
 
-- [Explore App Store server APIs for In-App Purchase](/articles/wwdc2024-10062) — learn how to leverage your server to build great in-app purchase experiences wit
-- [What’s new in App Store Connect](/articles/wwdc2024-10063) — explore new features for discovery, testing, and marketing. find out how to nomi
+### 广告展示数据的 JWS 格式
+
+AdAttributionKit 的广告展示（ad impression）使用 compact JWS 格式。关键字段包括：
+
+- `advertised-item-identifier`：被推广 App 的 App ID
+- `publisher-item-identifier`：展示广告的 App 的 App ID
+- `source-identifier`：4 位整数，表示广告活动信息，行为与 SKAdNetwork 4.0 一致
+
+从 JWS 创建 AppImpression 实例的代码如下（[03:27](https://developer.apple.com/videos/play/wwdc2024/10060/?time=207)）：
+
+```swift
+// 从广告网络获取 compact JWS 字符串
+let jwsString = fetchAdImpressionJWS()
+// 用 JWS 初始化 AppImpression
+let appImpression = AppImpression(jwsRepresentation: jwsString)
+```
+
+关键点：
+- `fetchAdImpressionJWS()` 是开发者自行实现的，取决于你如何与广告网络集成
+- `AppImpression` 实例在创建后 15 分钟内有效，超过 15 分钟需要重新创建
+- 这个 `appImpression` 实例后续会用于展示广告和处理点击
+
+### Custom click 广告实现
+
+Custom click 是 AdAttributionKit 支持的第一种广告展示方式（[05:03](https://developer.apple.com/videos/play/wwdc2024/10060/?time=303)）：
+
+```swift
+// 创建自定义广告视图
+let customAdView = UIView()
+// 创建 UIEventAttributionView 并添加为子视图
+let attributionView = UIEventAttributionView()
+customAdView.addSubview(attributionView)
+// attributionView 必须在最上层，以接收用户交互
+
+// 处理点击
+func handleAdTap() {
+    appImpression.handleTap()
+}
+```
+
+关键点：
+- `UIEventAttributionView` 必须放在所有接收用户交互的视图之上
+- `handleTap()` 必须在 `AppImpression` 初始化后 15 分钟内调用
+- 调用 `handleTap()` 后，AdAttributionKit 自动将用户导航到可以安装广告 App 的市场页面
+
+### View-through 广告实现
+
+View-through 是 SKAdNetwork 缺失的功能，AdAttributionKit 补上了（[06:07](https://developer.apple.com/videos/play/wwdc2024/10060/?time=367)）：
+
+```swift
+// 视频开始播放
+appImpression.beginView()
+// 视频播放结束
+appImpression.endView()
+```
+
+关键点：
+- `beginView()` 和 `endView()` 必须在同一个 `AppImpression` 实例上调用
+- 两次调用之间的时间间隔至少 2 秒，这是行业标准
+- 同一广告网络不能同时为同一被推广 App 开启多个 view-through 展示
+- 每个 `beginView()` 必须配对一个 `endView()`
+
+### Conversion value 更新
+
+Conversion value 用来衡量广告效果和 ROAS（广告支出回报率）（[11:46](https://developer.apple.com/videos/play/wwdc2024/10060/?time=706)）：
+
+```swift
+// 场景1：用户注册账号 — 低价值事件
+let update1 = PostbackUpdate(
+    fineConversionValue: 10,
+    lockPostback: false,
+    coarseConversionValue: .low
+)
+Postback.updateConversionValue(update1)
+
+// 场景2：用户观看视频 — 中等价值事件
+let update2 = PostbackUpdate(
+    fineConversionValue: 38,
+    lockPostback: false,
+    coarseConversionValue: .medium
+)
+Postback.updateConversionValue(update2)
+
+// 场景3：用户上传视频 — 高价值事件，锁定 postback
+let update3 = PostbackUpdate(
+    fineConversionValue: 42,
+    lockPostback: true,
+    coarseConversionValue: .high
+)
+Postback.updateConversionValue(update3)
+```
+
+关键点：
+- `fineConversionValue` 是 0–63 的整数，具体语义由广告主、广告网络和 MMP 共同约定
+- `lockPostback` 设为 `true` 表示此转化窗口内不再更新，AdAttributionKit 会冻结并调度该 postback
+- 锁定不会立即发送 postback，仍有延迟以保护隐私
+- `coarseConversionValue`（low / medium / high）是 crowd anonymity 不允许发送 fine value 时的降级方案
+
+### Re-engagement 归因
+
+Re-engagement 是 AdAttributionKit 最核心的新能力，用于追踪「把流失用户拉回 App」的广告效果（[16:32](https://developer.apple.com/videos/play/wwdc2024/10060/?time=992)）：
+
+广告展示的 JWS 需要额外添加 `"eligible-for-re-engagement"` 字段。代码实现如下：
+
+```swift
+// 用已启用 re-engagement 的 JWS 创建 AppImpression
+let appImpression = AppImpression(jwsRepresentation: jwsString)
+
+// 在点击处理中传入 re-engagement URL
+func handleAdTap() {
+    let reengagementURL = URL(string: "https://example.com/offer")!
+    appImpression.handleTap(reengagementURL: reengagementURL)
+}
+```
+
+关键点：
+- `handleTap(reengagementURL:)` 会打开已安装的目标 App，并将 URL 传递给它
+- AdAttributionKit 会自动在 re-engagement URL 后追加一个查询参数，App 可以检查此参数判断打开是否由 re-engagement 触发
+- re-engagement 的 postback 中 `conversion-type` 为 `"re-engagement"`，且 ad interaction type 只能是 `"click"`（不支持 view-through re-engagement）
+- 首次更新 conversion value 必须在转化后 48 小时内
+
+Re-engagement 的 conversion value 可以与安装的分开更新（[20:25](https://developer.apple.com/videos/play/wwdc2024/10060/?time=1225)）：
+
+```swift
+// 只更新 re-engagement postback
+let update = PostbackUpdate(
+    fineConversionValue: 20,
+    lockPostback: false,
+    coarseConversionValue: .medium
+)
+Postback.updateConversionValue(update, conversionTypes: .reengagement)
+
+// 只更新 install postback
+Postback.updateConversionValue(update, conversionTypes: .install)
+
+// 更新所有 postback
+Postback.updateConversionValue(update, conversionTypes: [.install, .reengagement])
+```
+
+关键点：
+- `conversionTypes` 参数控制更新哪类 postback：`.reengagement`、`.install` 或两者
+- 传 `nil` 等同于更新所有类型
+- 这意味着 re-engagement 和 install 的转化逻辑可以独立管理
+
+### Developer Mode 测试
+
+由于归因流程异步且有时间随机化，测试困难。AdAttributionKit 提供了 Developer Mode（[21:27](https://developer.apple.com/videos/play/wwdc2024/10060/?time=1287)）：在 iOS Settings > Developer 中打开 AdAttributionKit Developer Mode 开关，系统会移除时间随机化、缩短转化窗口、加速 postback 传输，方便本地测试。
+
+---
+
+## 核心启发
+
+1. **为已安装 App 做召回广告归因**：如果你的 App 有用户流失问题，可以用 re-engagement 归因追踪「广告拉回流失用户」的效果。在广告展示 JWS 中加上 `"eligible-for-re-engagement"` 字段，处理点击时传入 universal link，App 端检查 AdAttributionKit 追加的查询参数来判断是否由召回广告触发。为什么值得做：SKAdNetwork 完全没有这个能力，而召回是许多 App 增长的关键环节。怎么开始：在 App 中支持 universal link，然后在广告网络侧为 JWS 加上 re-engagement 字段。
+
+2. **用 view-through 归因补全曝光归因链路**：之前 SKAdNetwork 只支持 click 归因，视频类等纯展示广告的效果无法衡量。AdAttributionKit 的 view-through 只要展示 2 秒就算有效曝光，postback 中 `ad-interaction-type` 为 `"view"`。为什么值得做：很多广告投放以展示为主而非点击，缺少 view-through 归因意味着大量广告支出无法被正确评估。怎么开始：在视频或横幅广告的展示/隐藏回调中分别调用 `beginView()` 和 `endView()`。
+
+3. **用 Developer Mode 本地走通完整归因流程**：AdAttributionKit 的归因流程在生产环境有随机的延迟和等待窗口，直接上线很难验证。Developer Mode 可以缩短所有时间窗口，让你在几分钟内跑完「展示 → 点击 → 安装 → 更新 conversion value → 收到 postback」的完整链路。为什么值得做：广告归因的 bug 往往在上线后才发现，修复成本极高。怎么开始：在测试设备的 Settings > Developer 中开启 AdAttributionKit Developer Mode，然后用 Xcode 运行测试。
+
+---
+
+## 关联 Session
+
+- [What's new in StoreKit and In-App Purchase](/articles/wwdc2024-10061) — StoreKit 和内购的最新更新，与 AdAttributionKit 同属 App Store 生态
+- [Explore App Store server APIs for In-App Purchase](/articles/wwdc2024-10062) — 服务端接收 App Store 通知，与归因 postback 的服务端解析互补
+- [Implement App Store Offers](/articles/wwdc2024-10110) — App Store 优惠码和促销优惠的实现，与 re-engagement 召回场景配合
+- [What's new in privacy](/articles/wwdc2024-10123) — Apple 隐私框架的整体更新，AdAttributionKit 的 crowd anonymity 是其中一环

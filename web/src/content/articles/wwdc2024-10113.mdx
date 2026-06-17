@@ -8,9 +8,6 @@ videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10113/"
 sessionId: "wwdc2024-10113"
 year: "2024"
 relatedSessions:
-  - title: "Customize spatial Persona templates in SharePlay"
-    code: "10201"
-    description: "learn how to use custom spatial persona templates in your visionos shareplay exp"
   - title: "Enhance ad experiences with HLS interstitials"
     code: "10114"
     description: "explore how hls interstitials can help you seamlessly insert advertisements into"
@@ -20,36 +17,97 @@ relatedSessions:
   - title: "Use HDR for dynamic image experiences in your app"
     code: "10177"
     description: "discover how to read and write hdr images and process hdr content in your app. e"
+  - title: "What's new in HLS authoring"
+    code: "10250"
+    description: "learn about the latest updates and best practices for hls authoring"
 ---
 
 ## Highlight
 
-> 媒体播放最让人头疼的两个问题：启动太慢、播放中途卡顿。在 iOS 18 之前，你能拿到的客户端指标很有限——access log、error log 和 AVPlayer 的各种通知。这些数据不够细，很难定位问题的根因。
-
----
+> iOS 18 的 AVMetrics 把 AVPlayerItem 播放生命周期中的每一步——playlist 请求、segment 下载、content key 获取、stall、variant 切换——都变成了可订阅的事件流，让你能从客户端直接定位启动慢和播放卡顿的根因。
 
 ## 核心内容
 
-媒体播放最让人头疼的两个问题：启动太慢、播放中途卡顿。在 iOS 18 之前，你能拿到的客户端指标很有限——access log、error log 和 AVPlayer 的各种通知。这些数据不够细，很难定位问题的根因。
+播放启动耗时 2 秒，播放到第 7 分钟突然卡住——这是媒体 app 最常见的两个投诉。在 iOS 18 之前，你能拿到的是 access log、error log 和 AVPlayer 的各种通知。这些数据粒度太粗：你知道发生了 stall，但不知道 stall 之前哪一步出了问题；你知道启动慢，但不知道时间花在了 content key 请求还是 segment 下载上。
 
-iOS 18 引入了 AVMetrics，一个基于事件流的性能指标系统。AVPlayerItem 现在可以作为事件发布者，把播放过程中发生的每一件有意义的事情都变成一个事件：multi-variant playlist 请求、media playlist 请求、segment 下载、content key 获取、stall 发生、variant 切换、播放结束时的 summary。每个事件都带有时间戳和详细上下文。
+iOS 18 引入了 AVMetrics，一个基于发布者/订阅者模型的事件流系统。AVPlayerItem 遵循 `AVMetricEventStreamPublisher` 协议后，播放过程中每完成一项活动就产生一个事件：multi-variant playlist 请求完成、media segment 下载完成、content key 获取完成、stall 发生、variant 切换。每个事件自带时间戳和上下文，你可以把它们串联成完整的事件链。Session 用两个真实场景演示了它的诊断能力：启动慢的场景中，事件链显示大部分时间花在了 content key 请求，解决方案是预加载 key 或优化 key server；卡顿的场景中，segment 事件显示服务器返回了 HTTP 404，导致 variant 从 20Mbps 降到 15Mbps，新 variant 再次 404，buffer 耗尽后卡顿。这些信息在旧方案下几乎无法从客户端数据中定位。
 
-Session 用两个真实场景演示了 AVMetrics 的价值。第一个场景：播放启动耗时 2 秒，通过回溯事件链发现大部分时间花在了 content key 请求上——解决方案是预加载 key 或优化 key server。第二个场景：播放到第 7 分钟时发生 stall，通过查看 segment 事件发现服务器返回了 HTTP 404，导致 variant 从 20Mbps 降到 15Mbps，新 variant 又是 404，buffer 耗尽后卡顿。这种问题在以前几乎不可能从客户端数据中定位到。
+## 详细内容
 
+AVMetrics 的核心协议定义（[6:27](https://developer.apple.com/videos/play/wwdc2024/10113/?time=387)）：
 
-### 最佳实践
+```swift
+public protocol AVMetricEventStreamPublisher
+{
+    func metrics<MetricType: AVMetricEvent>(forType metricType: MetricType.Type) -> AVMetrics<MetricType>
 
-**新项目：** 从第一天就接入 AVMetrics。播放质量问题越早监控越好，等到用户投诉再查就晚了。最低限度：订阅 summary 事件，把 stall count 和 switch count 上报到你的分析系统。这只需要十几行代码。
+    func allMetrics() -> AVMetrics<AVMetricEvent>
+}
 
-**已有项目：** 如果你正在用 access log 和 error log 做播放质量监控，AVMetrics 是它们的升级替代品，而不是补充。新 API 提供的信息粒度远超旧方案。建议先在一个小比例用户上灰度 AVMetrics，对比和旧方案的数据一致性，确认没问题后全量切换。
+extension AVPlayerItem : AVMetricEventStreamPublisher
+```
 
-**与 CDN 厂商协作：** media segment 事件中的 NSURLSessionTaskMetrics 包含完整的网络事务详情（DNS、TCP、TLS、TTFB 等）。当你发现某个 region 的用户频繁遇到 segment 下载失败时，把这些数据（特别是 session identifier 和 response headers）发给 CDN 厂商，他们能快速定位边缘节点的问题。
+关键点：
 
----
+- `metrics(forType:)` 返回强类型的 `AVMetrics<MetricType>` 异步序列，只包含你指定的事件类型
+- `allMetrics()` 返回所有事件类型的合并序列
+- `AVPlayerItem` 直接遵循协议，无需额外包装
 
-## 相关 Session
+Swift 端订阅"likely to keep up"和"summary"两种事件的写法（[6:50](https://developer.apple.com/videos/play/wwdc2024/10113/?time=410)）：
 
-- [Customize spatial Persona templates in SharePlay](/articles/wwdc2024-10201) — learn how to use custom spatial persona templates in your visionos shareplay exp
-- [Enhance ad experiences with HLS interstitials](/articles/wwdc2024-10114) — explore how hls interstitials can help you seamlessly insert advertisements into
-- [Migrate your TVML app to SwiftUI](/articles/wwdc2024-10207) — swiftui helps you build great apps on all apple platforms and is the preferred t
-- [Use HDR for dynamic image experiences in your app](/articles/wwdc2024-10177) — discover how to read and write hdr images and process hdr content in your app. e
+```swift
+let playerItem : AVPlayerItem = ...
+
+let ltkuMetrics = item.metrics(forType: AVMetricPlayerItemLikelyToKeepUpEvent.self)
+let summaryMetrics = item.metrics(forType: AVMetricPlayerItemPlaybackSummaryEvent.self)
+
+for await (metricEvent, publisher) in ltkuMetrics.chronologicalMerge(with: summaryMetrics)
+{
+    // send metricEvent to server
+}
+```
+
+关键点：
+
+- `metrics(forType:)` 传入事件类型的 `.self`，获取对应的异步序列
+- `chronologicalMerge(with:)` 把多个事件流按时间顺序合并成一个，无需手动排序
+- `for await` 逐条消费事件，序列化后发送到分析服务器
+- 事件在对应活动结束时生成（如 media playlist 请求完成后才产生事件），而非开始时
+
+Objective-C 端写法（[7:26](https://developer.apple.com/videos/play/wwdc2024/10113/?time=446)）：
+
+```objc
+AVPlayerItem *item = ...
+
+AVMetricEventStream *eventStream = [AVMetricEventStream eventStream];
+id<AVMetricEventStreamSubscriber> subscriber = [[MyMetricSubscriber alloc] init];
+[eventStream setSubscriber:subscriber queue:mySerialQueue]
+
+[eventStream subscribeToMetricEvent:[AVMetricPlayerItemLikelyToKeepUpEvent class]];
+[eventStream subscribeToMetricEvent:[AVMetricPlayerItemPlaybackSummaryEvent class]];
+
+[eventStream addPublisher:item];
+```
+
+关键点：
+
+- 先创建 `AVMetricEventStream` 实例，再设置 subscriber 和 queue
+- `subscribeToMetricEvent:` 逐个注册感兴趣的事件类型
+- `addPublisher:` 把 AVPlayerItem 绑定到事件流，subscriber 随即开始接收事件
+
+AVMetrics 支持的事件类型覆盖了播放全生命周期：playlist 事件（multi-variant playlist、media playlist）、media segment 事件（含 NSURLSessionTaskMetrics）、content key 事件、stall 事件、variant switch 事件、likely to keep up 事件、rate change 事件、seek 事件、error 事件，以及最后的 summary 事件。Summary 事件提供 stall count、switch count 等 KPI，适合大规模监控（[4:44](https://developer.apple.com/videos/play/wwdc2024/10113/?time=284)）。
+
+## 核心启发
+
+- **做什么**：为新播放项目从第一天接入 AVMetrics。**为什么值得做**：播放质量问题越早监控越好，等用户投诉再查就晚了。**怎么开始**：最低限度订阅 summary 事件，把 stall count 和 switch count 上报到分析系统，十几行代码即可完成。
+
+- **做什么**：用 AVMetrics 替换现有的 access log / error log 方案。**为什么值得做**：AVMetrics 事件自带时间戳和上下文关联，能还原完整事件链，粒度远超旧方案。**怎么开始**：先在小比例用户上灰度 AVMetrics，对比和旧方案的数据一致性，确认没问题后全量切换。
+
+- **做什么**：把 media segment 事件中的 NSURLSessionTaskMetrics 数据与 CDN 厂商共享。**为什么值得做**：NSURLSessionTaskMetrics 包含 DNS、TCP、TLS、TTFB 等完整网络事务详情和 response headers，CDN 厂商能据此快速定位边缘节点问题。**怎么开始**：当某个 region 的用户频繁遇到 segment 下载失败时，提取事件中的 session identifier 和 response headers 发给 CDN 厂商。
+
+## 关联 Session
+
+- [Enhance ad experiences with HLS interstitials](/articles/wwdc2024-10114) — HLS 广告插桩，同属 HLS 生态的新能力
+- [Migrate your TVML app to SwiftUI](/articles/wwdc2024-10207) — 从 TVML 迁移到 SwiftUI，适合正在重构媒体 app 的团队
+- [Use HDR for dynamic image experiences in your app](/articles/wwdc2024-10177) — HDR 图像处理，媒体体验的另一个维度
+- [What's new in HLS authoring](/articles/wwdc2024-10250) — HLS 作者端最新更新，与客户端指标互补
