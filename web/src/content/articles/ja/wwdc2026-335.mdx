@@ -1,0 +1,529 @@
+---
+title: "Evaluations で hill-climbing しながら prompt を改善する"
+description: "学習"
+date: "2026-06-10"
+tags: []
+thumbnail: "/images/sessions/2026/335.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/335/"
+sessionId: "wwdc2026-335"
+year: "2026"
+relatedSessions:
+  - title: "298. Evaluations 概要"
+    code: "298"
+    description: "Evaluations フレームワーク入門と評価 pipeline の構築"
+  - title: "299. 堅牢な evaluations を作成する"
+    code: "299"
+    description: "より多くのユースケースをカバーする堅牢な評価を作成する"
+  - title: "241. Foundation Models"
+    code: "241"
+    description: "Apple 基盤モデルの能力と選択"
+  - title: "324. Core AI"
+    code: "324"
+    description: "Core AI フレームワークとモデル統合"
+  - title: "242. Agentic apps"
+    code: "242"
+    description: "エージェント型アプリのツール呼び出し設計"
+---
+
+## ハイライト
+
+> AI 機能の最適化では、まず Cohen's kappa 係数を使ってモデル裁判官と人間の専門家の一致度を校正し、評価の物差しが正確であることを確認してから、業務 prompt を反復改善します。
+
+## 主要内容
+
+App に AI 機能を統合するとき、よくある難題があります。モデルが生成した結果は一見悪くないのに、どこか違和感があり、その問題を具体的に言語化しにくいのです。
+
+Apple の Book Tracker アプリもこの問題に直面しました。このアプリでは読者が書評を記録し、書籍に自動でタグを生成して、後から検索や閲覧をしやすくします。しかし生成されるタグにはよく 2 種類の問題がありました。1 つは、読者の個人的な感想（たとえば "poignant"）を書籍タグとして扱ってしまうこと。もう 1 つは、書評から直接フレーズ（たとえば "quiet-steadiness"）を抜き出してタグにしてしまい、検索にはまったく役立たないことです。
+
+開発者はまず、タグ生成 prompt を直接変更したくなるかもしれません。しかしこの方法には 2 つの問題があります。第 1 に、prompt を変更した後、結果が本当に良くなったかを客観的に判断する方法が必要です。第 2 に、タグ生成 prompt が改善しても、そのタグを評価する「モデル裁判官」自体が歪んだ物差しである可能性があります。つまり、その採点基準が人間の専門家と一致していないかもしれません。
+
+Apple が提示する解法は hill-climbing（山登り法）です。評価 pipeline を作り、毎回 1 つの変数だけを変え、評価結果をもとに次の改善へ進みます。ただし有効に hill-climbing するためには、評価ツール自体が信頼できなければなりません。
+
+ここで「裁判官の alignment」という問題が出てきます。データセットが小さいうちは、人間の専門家とモデル裁判官の採点差は目立たないかもしれません。しかしデータセットが大きくなると、その drift（ズレ）は大きくなり、最終的に評価結果が参考にならなくなります。
+
+さらに厄介なのは、従来よく使われる Accuracy（正解率）指標がここでは機能しないことです。データセットの 80% が高品質な出力であれば、人間の専門家もモデル裁判官も高得点を付けがちです。モデルが当てずっぽうでも正解率は高く見えてしまい、両者の採点基準が一致していない事実を隠してしまいます。
+
+Apple はこの問題を解くために Cohen's kappa 係数を導入します。この統計指標は、正解率から「偶然一致した」確率を差し引き、2 人の採点者の一致度をより正確に反映します。kappa 値が 0.6 以上になって初めて、モデル裁判官と人間の専門家が意味のある水準で aligned していると考えられます。
+
+裁判官の校正プロセス自体も hill-climbing です。裁判官の prompt を変更し、採点次元の詳細説明を追加し、少数の例を提示します。毎回 1 つの変数だけを変え、kappa 値で効果を判断します。裁判官の校正が完了したら、それを使って業務機能の改善を評価できます。たとえば、ツール呼び出しを追加してモデルがより多くのコンテキストを取得できるようにする、といった改善です。
+
+この方法論により、AI 機能の最適化は「感覚による prompt 錬金術」から、定量化できる科学実験へ変わります。
+
+## 詳細
+
+### Evaluations フレームワークの基本コンポーネント
+
+[03:54](https://developer.apple.com/videos/play/wwdc2026/335/?time=234)
+
+Evaluations フレームワークの中心は `Evaluation` protocol です。完全な評価は 4 つのコンポーネントで構成されます。
+
+**データセット（Dataset）**: テストサンプルを提供します。各サンプルは入力と期待出力を含みます。
+
+**対象（Subject）**: `subject(from:)` メソッドで評価対象の機能を呼び出し、モデル出力を取得します。
+
+**評価器（Evaluators）**: 出力品質の判定方法を定義します。ヒューリスティック評価器とモデル裁判官評価器を含みます。
+
+**集計（Aggregation）**: `aggregateMetrics` メソッドで各指標の平均、標準偏差などを計算します。
+
+```swift
+struct BookTaggingEvaluation: Evaluation {
+    func subject(from sample: ModelSample<BookTags>) async throws -> ModelSubject<BookTags> {
+        let result = try await BookTaggingService.generateTags(for: sample.promptDescription)
+        return ModelSubject(value: result)
+    }
+
+    var dataset = ArrayLoader(samples:
+        Book.sampleBooks.map { book in
+            ModelSample(prompt: book.review, expected: BookTags(tags: book.tags))
+        }
+    )
+
+    var evaluators: Evaluators {
+        // ヒューリスティック評価器
+        Evaluator { _, subject in
+            let count = subject.value.tags.count
+            if (count >= 3 && count <= 8) {
+                return tagCount.passing(rationale: "\(count) tags")
+            }
+            return tagCount.failing(rationale: "取得したタグ数は \(count) 件、期待値は 3〜8 件")
+        }
+        // ... さらに多くの評価器
+    }
+
+    func aggregateMetrics(using aggregator: inout MetricsAggregator) {
+        aggregator.group("Heuristics") { group in
+            group.computeMean(of: tagCount)
+        }
+    }
+}
+```
+
+**ポイント**:
+- `dataset` は `Loader` 型です。配列、JSON ファイル、その他のデータソースにできます。
+- `subject` メソッドは非同期で、API やローカルモデルを呼び出せます。
+- `evaluators` には複数の評価器を含められ、それぞれが異なる指標を返します。
+- `aggregateMetrics` では指標をグループ化して集計できます。
+
+### 採点次元の精密な設計
+
+[04:05](https://developer.apple.com/videos/play/wwdc2026/335/?time=245)
+
+`ScoreDimension` は定性的評価の基準を定義します。設計時には曖昧な説明を避け、各点数レベルの具体的な意味を示します。
+
+```swift
+let relevance = ScoreDimension(
+    "Relevance",
+    description: """
+        各タグが書籍そのものを説明しているかを評価します。具体的にはジャンル、主題、基調、舞台設定などです。
+        読者の反応、書評へのメタコメント、作者に関する事実は対象外です。
+        書籍は "suspenseful"（作品の属性）であり得ますが、
+        読者が "exhausted"（読者の反応）であることとは別です。
+        タグの種類が間違っている場合は重大な失敗です。
+        """,
+    scale: .numeric([
+        4: "すべてのタグが書籍そのものを説明している",
+        3: "大半のタグは書籍を説明しているが、1 つが読者反応または些細な詳細を拾っている",
+        2: "大半のタグが表面的な詳細または個人的反応であり、書籍の記述子ではない",
+        1: "タグが書籍を意味のある形で説明していない"
+    ])
+)
+
+let usefulness = ScoreDimension(
+    "Usefulness",
+    description: """
+        タグが本棚上の分類ラベルとして機能するかを評価します。
+        複数の本で共有できるほど広く、
+        検索範囲を絞れるほど具体的である必要があります。
+        標準的なジャンルやテーマのタグは有効です。作られたフレーズ、登場人物名、
+        過度に具体的な記述子、"interesting" のような汎用語は不適切です。
+        """,
+    scale: .numeric([
+        4: "すべてのタグが複数の本をグループ化でき、同時に検索範囲も絞れる",
+        3: "大半のタグは適切な粒度だが、1 つが広すぎるか狭すぎる",
+        2: "大半のタグが広すぎて絞り込みに使えない、または狭すぎてグループ化できない",
+        1: "タグが閲覧に役立たない"
+    ])
+)
+```
+
+**ポイント**:
+- `description` は何が良く、何が悪いかを明確にします。
+- `scale` は 1 から 4 の数値尺度で、各点数に具体的な説明を対応させます。
+- 次元名は英語でも、説明は日本語にできます。
+- 「面白い」「強力」などの主観的な語を避けます。
+
+### Cohen's kappa による裁判官 alignment 評価
+
+[12:31](https://developer.apple.com/videos/play/wwdc2026/335/?time=751)
+
+モデル裁判官が人間の専門家と一致しているかを検証するには、専用の評価を作成します。この評価のデータセットは以前の評価実行の出力で、モデルが生成したタグと専門家の手動採点を含みます。
+
+```swift
+struct BookTagJudgmentCalibration: Evaluation {
+    static let samples: [ModelSample<BookTagJudgmentValue>] = {
+        guard let url = Bundle(for: BundleToken.self).url(
+                forResource: "BookTaggingEvaluation-extracted", withExtension: "json"),
+              let data = try? Data(contentsOf: url) else { return [] }
+        // JSON から ModelSample 配列を構築し、専門家スコアを含める
+        // ...
+    }()
+
+    var dataset: some Loader { ArrayLoader(samples: Self.samples) }
+
+    func subject(from sample: ModelSample<BookTagJudgmentValue>) async throws -> ModelSubject<BookTagJudgmentValue> {
+        // タグはすでに生成済みなので、そのまま返す
+        ModelSubject(value: sample.expected ?? BookTagJudgmentValue(
+            tags: [], expertRelevanceScore: 0, expertUsefulnessScore: 0))
+    }
+
+    var evaluators: Evaluators {
+        ModelJudgeEvaluator(
+            judge: .default,
+            dimensions: [relevance, usefulness],
+            prompt: ModelJudgePrompt(
+                instructions: "あなたは Book Tracker のために自動生成されたタグを評価しています...",
+                evaluationTarget: { output in output.tags.joined(separator: ", ") },
+                reference: { input, _ in
+                    ["Expected Tags": input.expected?.tags.joined(separator: ", ") ?? ""]
+                }
+            )
+        )
+    }
+}
+```
+
+**ポイント**:
+- データセットは以前の評価の JSON 添付ファイルから作られ、専門家スコアを含みます。
+- `subject` メソッドはタグを再生成せず、生成済みの結果をそのまま返します。
+- 同じ `relevance` と `usefulness` 次元を使います。
+- 評価対象は、モデル裁判官の採点と専門家採点の一致度です。
+
+### Cohen's kappa のカスタム集計
+
+[13:00](https://developer.apple.com/videos/play/wwdc2026/335/?time=780)
+
+集計段階で Cohen's kappa 係数を計算し、alignment の程度を定量化します。
+
+```swift
+func aggregateMetrics(using aggregator: inout MetricsAggregator) {
+    let expertRelevance = Self.samples.map { Double($0.expected?.expertRelevanceScore ?? 0) }
+    let expertUsefulness = Self.samples.map { Double($0.expected?.expertUsefulnessScore ?? 0) }
+
+    aggregator.group("Relevance") { group in
+        group.computeMean(of: relevance.metric)
+        group.computeStandardDeviation(of: relevance.metric)
+        group.custom(of: relevance.metric, label: "Relevance Alignment Score") { judge in
+            cohensKappa(ratings1: expertRelevance, ratings2: judge) ?? 0
+        }
+    }
+    aggregator.group("Usefulness") { group in
+        group.computeMean(of: usefulness.metric)
+        group.computeStandardDeviation(of: usefulness.metric)
+        group.custom(of: usefulness.metric, label: "Usefulness Alignment Score") { judge in
+            cohensKappa(ratings1: expertUsefulness, ratings2: judge) ?? 0
+        }
+    }
+}
+```
+
+**ポイント**:
+- サンプルから専門家スコアを抽出し、基準とします。
+- `custom` メソッドでカスタム集計指標を追加します。
+- Cohen's kappa の戻り値は -1 から 1 で、0.6 以上なら意味のある一致を示します。
+- `?? 0` で nil が返る可能性を処理します。
+
+### 裁判官校正テスト
+
+[13:24](https://developer.apple.com/videos/play/wwdc2026/335/?time=804)
+
+Swift Testing でテストを書き、alignment スコアが基準を満たすか検証します。
+
+```swift
+@Suite("Book Tag Judge Calibration")
+struct BookTagJudgmentCalibrationTests {
+    static let evaluation = BookTagJudgmentCalibration()
+
+    @Test("Judge Calibration", .evaluates(evaluation))
+    func evaluateJudgeCalibration() async throws {
+        let result = EvaluationContext.current.result
+
+        let usefulnessMetric = BookTagJudgmentCalibrationTests.evaluation.usefulness.metric
+        let relevanceMetric = BookTagJudgmentCalibrationTests.evaluation.relevance.metric
+
+        #expect(result.aggregateValue(.custom(label: "Relevance: Judge vs Expert")) > 0.6)
+        #expect(result.aggregateValue(.custom(label: "Usefulness: Judge vs Expert")) > 0.6)
+    }
+}
+```
+
+**ポイント**:
+- `.evaluates(evaluation)` 注釈で評価設定を関連付けます。
+- `EvaluationContext.current.result` から評価結果を取得します。
+- `#expect` で alignment スコアが 0.6 を超えることを検証します。
+- テストが失敗した場合、裁判官にはさらなる校正が必要です。
+
+### 裁判官 prompt の反復改善
+
+[16:33](https://developer.apple.com/videos/play/wwdc2026/335/?time=993)
+
+裁判官の校正も hill-climbing です。対照群と実験群を作り、毎回 1 つの変数だけを変更します。
+
+対照群は元の prompt を使い、実験群はより詳細な prompt を使います。
+
+```swift
+struct BookTagJudgmentCalibrationExperimental: Evaluation {
+    var evaluators: Evaluators {
+        ModelJudgeEvaluator(
+            judge: .default,
+            dimensions: [relevance, usefulness],
+            prompt: ModelJudgePrompt(
+                instructions: """
+                    あなたは経験豊富な読者であり図書館員です。
+                    Book Tracker のために自動生成されたタグを評価しています...
+                    タグ集合を、関連性と有用性という 2 つの独立した次元で採点してください。
+
+                    ## 良いタグの特徴
+                    - ジャンル/形式、主題/テーマ、基調/雰囲気、舞台/時代
+
+                    ## よくある失敗パターン
+                    - 読者反応、メタコメント、作者に関する事実、ジャンル矛盾
+                    """,
+                evaluationTarget: { output in output.tags.joined(separator: ", ") },
+                reference: { input, _ in
+                    ["Book Review": input.promptDescription,
+                     "Tags Generated for the Review": input.expected?.tags.joined(separator: ", ") ?? ""]
+                }
+            )
+        )
+    }
+}
+```
+
+**ポイント**:
+- より多くのコンテキストを与え、裁判官の役割とタスクを伝えます。
+- 「良いタグ」と「悪いタグ」の特徴を明確に列挙します。
+- 評価対象と参照情報の形式は一貫させます。
+- テストスイートで対照群と実験群を同時に実行します。
+
+### 少数例による校正
+
+[20:12](https://developer.apple.com/videos/play/wwdc2026/335/?time=1212)
+
+説明的な prompt だけでは不十分な場合、少数の worked example を与えて、モデルに採点パターンを学ばせます。
+
+```swift
+struct ExperimentalBookTagJudgmentCalibration: Evaluation {
+    var evaluators: Evaluators {
+        ModelJudgeEvaluator(
+            judge: SystemLanguageModel(),
+            dimensions: [relevance, usefulness],
+            prompt: ModelJudgePrompt(
+                instructions: """
+                    あなたは、Book Tracker のために自動生成されたタグを採点した
+                    専門図書館員と校正を行っています...
+                    目標は、その図書館員の採点方法に合わせることです。worked example を使って校正してください。
+
+                    ## Worked examples
+                    ### 例 A - 完全一致（高慢と偏見）
+                    タグ: romance, historical-fiction, love, redemption, passion
+                    図書館員スコア: 関連性 4, 有用性 4
+
+                    ### 例 E - 明らかなジャンル矛盾（フランケンシュタイン）
+                    タグ: horror, science-fiction, ... self-help, self-improvement
+                    図書館員スコア: 関連性 2, 有用性 3
+                    """,
+                evaluationTarget: { output in output.tags.joined(separator: ", ") },
+                reference: { input, _ in
+                    ["Book Review": input.promptDescription,
+                     "Tags Generated for the Review": input.expected?.tags.joined(separator: ", ") ?? ""]
+                }
+            )
+        )
+    }
+}
+```
+
+**ポイント**:
+- 例は、完全一致、明らかな失敗、境界ケースなど、異なる状況をカバーします。
+- 例の数は少なく保ち、過学習を避けます。
+- 各例には入力、出力、専門家スコアを含めます。
+- 例の形式を統一し、モデルがパターンを理解しやすくします。
+
+### ツール呼び出しと比較評価
+
+[22:03](https://developer.apple.com/videos/play/wwdc2026/335/?time=1323)
+
+裁判官の校正が完了したら、ツール呼び出しの追加など、業務機能の改善評価に使えます。
+
+```swift
+struct BookLookupTool: Tool {
+    let name = "lookupBook"
+    let description = "読者の書評から抽出した識別用の詳細、たとえば登場人物名、舞台設定、引用文、重要な筋書きから、書籍のタイトルと作者を検索します。"
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "書評から抽出した識別用の詳細。登場人物名、舞台設定、引用文、重要な筋書きなど、書籍を識別するために使います。")
+        var details: String
+    }
+
+    @Generable
+    struct Output {
+        @Guide(description: "識別された書籍タイトル。該当がない場合は空文字列を返します。")
+        var title: String
+
+        @Guide(description: "識別された書籍作者。該当がない場合は空文字列を返します。")
+        var author: String
+    }
+
+    func call(arguments: Arguments) async throws -> Output {
+        let needles = arguments.details
+            .lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { $0.count >= 4 }
+
+        let best = Book.sampleBooks
+            .map { book -> (book: Book, score: Int) in
+                let review = book.review.lowercased()
+                let score = needles.reduce(0) { partial, needle in
+                    partial + (review.contains(needle) ? 1 : 0)
+                }
+                return (book, score)
+            }
+            .max(by: { $0.score < $1.score })
+
+        guard let match = best, match.score > 0 else {
+            return Output(title: "", author: "")
+        }
+        return Output(title: match.book.title, author: match.book.author)
+    }
+}
+```
+
+**ポイント**:
+- ツール名は説明的にし、モデルがいつ呼び出すべきか分かるようにします。
+- `description` はツールの用途と入力の由来を明確に説明します。
+- `Arguments` と `Output` は `@Generable` と `@Guide` を使い、モデルが schema を理解しやすくします。
+- `call` メソッドは非同期で、任意のロジックを実行できます。
+
+[22:36](https://developer.apple.com/videos/play/wwdc2026/335/?time=1356)
+
+業務サービスを変更し、ツールをサポートします。
+
+```swift
+struct BookTaggingService {
+    static func generateTags(for review: String, tools: [any Tool] = []) async throws -> BookTags {
+        let prompt = tagsPrompt(review: review)
+        let session = LanguageModelSession(
+            model: SystemLanguageModel(guardrails: .permissiveContentTransformations),
+            tools: tools,
+            instructions: instructions
+        )
+        let response = try await session.respond(to: prompt, generating: BookTags.self)
+        return response.content
+    }
+}
+```
+
+[22:57](https://developer.apple.com/videos/play/wwdc2026/335/?time=1377)
+
+ツール付きの評価を作成し、元の評価と比較します。
+
+```swift
+struct BookTaggingWithLookupEvaluation: Evaluation {
+    func subject(from sample: ModelSample<BookTags>) async throws -> ModelSubject<BookTags> {
+        let result = try await BookTaggingService.generateTags(
+            for: sample.promptDescription,
+            tools: [BookLookupTool()]
+        )
+        return ModelSubject(value: result)
+    }
+    // ... データセット、評価器、集計は BookTaggingEvaluation と同じ
+}
+```
+
+[23:09](https://developer.apple.com/videos/play/wwdc2026/335/?time=1389)
+
+テストスイートで 2 つの評価を比較します。
+
+```swift
+@Suite("Book Tag Evaluations")
+struct BookTagEvaluationTests {
+    static let evaluation = BookTaggingEvaluation()
+    static let lookupEvaluation = BookTaggingWithLookupEvaluation()
+
+    @Test("Book Tag Evaluations", .evaluates(evaluation, info: evaluationInfo))
+    func evaluateBookTagging() async throws {
+        let result = EvaluationContext.current.result
+        let rangeMetric = BookTagEvaluationTests.evaluation.tagCount
+        let dupeMetric = BookTagEvaluationTests.evaluation.noDuplicates
+        #expect(result.aggregateValue(.mean(of: rangeMetric)) >= 0.8)
+        #expect(result.aggregateValue(.mean(of: dupeMetric)) == 1)
+    }
+
+    @Test("Book Tag Evaluations (with BookLookupTool)", .evaluates(lookupEvaluation, info: lookupEvaluationInfo))
+    func evaluateBookTaggingWithLookup() async throws {
+        let result = EvaluationContext.current.result
+        let rangeMetric = BookTagEvaluationTests.lookupEvaluation.tagCount
+        let dupeMetric = BookTagEvaluationTests.lookupEvaluation.noDuplicates
+        #expect(result.aggregateValue(.mean(of: rangeMetric)) >= 0.8)
+        #expect(result.aggregateValue(.mean(of: dupeMetric)) == 1)
+    }
+}
+```
+
+**ポイント**:
+- 2 つの評価は同じデータセットと評価器を共有します。
+- 違うのは `subject` メソッドだけです。片方はツールなし、もう片方はツールを渡します。
+- Xcode の評価レポートで、2 つの評価結果を横並びで確認できます。
+- スコア差分により、ツール呼び出しがもたらす改善を確認できます。
+
+## 重要な示唆
+
+**1. 生成 AI 機能に評価 pipeline を追加する**
+
+何を作るか: LLM でコンテンツを生成するあらゆる機能には評価 pipeline を用意します。まずタグ数、関連性、有用性などの評価指標を定義し、50〜100 件の実サンプルを集めて期待出力を手動で注釈付けします。
+
+なぜ価値があるか: 評価 pipeline がなければ、prompt を変えたりモデルを切り替えたりするたびに感覚で良し悪しを判断するしかありません。評価により反復が定量化され、「出力形式が違う」のか「内容品質が下がった」のかを正確に切り分けられます。
+
+始め方: `Evaluation` protocol を実装し、`ModelSample` でサンプルデータを包み、重要指標を確認する `Evaluator` を書き、`@Test(.evaluates)` で Swift Testing に登録します。入口: `Evaluation` protocol + `ModelSample` + `Evaluator`。
+
+**2. 業務 prompt を最適化する前にモデル裁判官を校正する**
+
+何を作るか: 業務 prompt を変更する前に、モデル裁判官の信頼性を検証します。一部サンプルを人間の専門家に採点してもらい、Cohen's kappa 係数を計算します。
+
+なぜ価値があるか: 裁判官自体が「歪んだ物差し」なら、そのスコアは改善を導けません。Accuracy 指標は採点基準の不一致を隠しますが、Cohen's kappa は「偶然一致した」確率を差し引くため、alignment の程度をより正確に反映します。
+
+始め方: 既存の評価実行結果からサンプルと専門家スコアを抽出し、`BookTagJudgmentCalibration` 評価を作ります。集計段階で `custom` メソッドを使って kappa を計算し、スコアが 0.6 を超えることを assert します。入口: `custom` 集計 + `cohensKappa(ratings1:expert, ratings2:judge)`。
+
+**3. 変数を制御して反復改善する**
+
+何を作るか: prompt、採点次元、ツール呼び出しなど、毎回 1 つの変数だけを変え、評価比較で効果を判断します。
+
+なぜ価値があるか: 複数の変数を同時に変えると、どの変更が効果を生んだのか分かりません。変数制御により因果関係が明確になり、Xcode の比較ビューで対照群と実験群のスコア差分を横並びに確認できます。
+
+始め方: データセットと評価器を共有し、`subject` メソッドだけが異なる対照群と実験群の `Evaluation` 構造体を作ります。テストスイートで同時に実行し、集計指標を比較します。入口: 対照群/実験群の 2 つの `Evaluation` + Xcode 比較ビュー。
+
+**4. 評価 drift を監視する**
+
+何を作るか: データセットが増えるにつれて、Cohen's kappa 係数を定期的に再計算します。裁判官校正テストを CI/CD に組み込みます。
+
+なぜ価値があるか: データセットが拡大すると、モデル裁判官と人間の専門家の採点差がより目立つ可能性があります。自動監視により drift を早期に検出し、失効した評価に基づいて誤った判断をすることを避けられます。
+
+始め方: Swift Testing で `#expect` を使い、kappa スコアがしきい値を超えることを assert します。そのテストを CI に追加し、データセット更新ごとに校正テストを自動実行します。入口: `#expect(result.aggregateValue(.custom(label: "Relevance: Judge vs Expert")) > 0.6)`。
+
+**5. 少数例で裁判官 alignment を高める**
+
+何を作るか: 説明的な prompt だけでは不十分な場合、裁判官モデルに少量の worked example を与え、専門家の採点パターンを学ばせます。
+
+なぜ価値があるか: 採点基準の中には、言葉だけで精密に説明しにくいものがあります。しかし具体例がいくつかあれば、モデルは素早く理解できます。完全一致、明らかな失敗、境界ケースなどを含む例は、長い説明より効果的なことがあります。
+
+始め方: `ModelJudgePrompt` の instructions に「Worked examples」セクションを追加します。各例は入力、出力、専門家スコアを含めます。過学習を避けるため、例は 3〜5 個程度に絞ります。入口: `ModelJudgePrompt(instructions: "## Worked examples\n...")`。
+
+## 関連 Session
+
+- [298. Evaluations 概要](/articles/wwdc2026-298) - Evaluations フレームワーク入門と評価 pipeline の構築
+- [299. 堅牢な evaluations を作成する](/articles/wwdc2026-299) - より多くのユースケースをカバーする堅牢な評価を作成する
+- [241. Foundation Models](/articles/wwdc2026-241) - Apple 基盤モデルの能力と選択
+- [324. Core AI](/articles/wwdc2026-324) - Core AI フレームワークとモデル統合
+- [242. Agentic apps](/articles/wwdc2026-242) - エージェント型アプリのツール呼び出し設計

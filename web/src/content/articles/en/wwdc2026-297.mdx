@@ -1,0 +1,410 @@
+---
+title: "Best practices for integrating visual intelligence in your app"
+description: "Learn how to integrate Visual Intelligence image search with App Intents, Vision, and system data stores so users can jump from camera captures or screenshots into your app."
+date: "2026-06-10"
+tags: ["Visual Intelligence", "App Intents", "Vision", "Image Search"]
+thumbnail: "/images/sessions/2026/297.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/297/"
+sessionId: "wwdc2026-297"
+year: "2026"
+relatedSessions:
+  - title: "Bring your app to Siri"
+    code: "344"
+    description: "An introduction to App Intents basics. If you have not worked with App Entity or Intent yet, start here."
+  - title: "What's new in App Intents"
+    code: "345"
+    description: "Learn about new App Intents features, including more ways to use UnionValue."
+  - title: "What's new in Vision"
+    code: "237"
+    description: "Explore Vision framework image-processing capabilities, including feature prints, text recognition, and barcode scanning."
+  - title: "Build agentic apps with App Intents"
+    code: "242"
+    description: "Explore advanced uses of App Intents in intelligent apps."
+  - title: "What's new in SwiftUI"
+    code: "269"
+    description: "Visual Intelligence result pages need SwiftUI navigation and state management to land on the right screen."
+---
+
+## Highlight
+
+> Apple opens Visual Intelligence image search integration across iOS, iPadOS, and macOS. Developers can define business entities with App Intents and perform on-device image similarity matching with Vision, letting users select content in a camera view or screenshot, see app search results directly, and jump into the matching page with one tap.
+
+## Core Content
+
+### From something that can only observe to something that can participate
+
+Visual Intelligence used to be a system-only capability. Users could photograph plants or look up products, but the result page only contained system-provided information; third-party apps could not participate. WWDC26 opens this capability so your app can become one source of Visual Intelligence search results.
+
+Imagine a friend sends you a screenshot of an album cover and you want to find that album in your collection immediately. Previously, you had to save the image, open the app, and search manually. Now the user only needs to select the cover in the screenshot, and your app can return matching results directly. One tap starts playback.
+
+This flow works through three cooperating pieces: App Entity defines what content can be returned, IntentValueQuery receives the image and returns results, and OpenIntent takes the user to the right page.
+
+### Cross-platform with one code path
+
+([10:08](https://developer.apple.com/videos/play/wwdc2026/297/?time=608))
+
+Visual Intelligence expands this year to iPadOS and macOS. The good news is that the code for IntentValueQuery, entities, and OpenIntent is shared across all three platforms. You do not need to write a separate implementation for each one.
+
+Pay attention to the differences in use cases, though. On iOS, users mostly capture the physical world with the camera, such as album covers or concert posters. On macOS and iPad, the input is more often a screenshot and a selected piece of digital content on screen. A Mac screenshot may have far more pixels than an iPhone image, so processing the original pixels directly can consume all available memory. Scale the image down first.
+
+### Return more than one kind of result
+
+([11:47](https://developer.apple.com/videos/play/wwdc2026/297/?time=707))
+
+When users select a poster, they might want to listen to an album and also learn about related concerts. `@UnionValue` allows a single query to return multiple entity types. You can mix albums and concerts in one result list. Each type has its own OpenIntent, and tapping a result opens a different page.
+
+### Data flowing back through system stores
+
+([14:27](https://developer.apple.com/videos/play/wwdc2026/297/?time=867))
+
+Visual Intelligence is not only about your app providing results to the system. The system can also write extracted data into shared stores, and your app can read it from there.
+
+For example, if users use Visual Intelligence to recognize concert information from social media and add it to Calendar, your app can listen for EventKit calendar changes and automatically show that record in an "upcoming concerts" list. Contacts and HealthKit follow the same pattern.
+
+## Details
+
+### Define an App Entity
+
+([03:21](https://developer.apple.com/videos/play/wwdc2026/297/?time=201))
+
+The first step is to define the entity your app can return with the App Intents framework. The following is a complete album entity definition for a music app:
+
+```swift
+import AppIntents
+
+struct AlbumEntity: AppEntity {
+    var id: String
+    @Property var name: String
+    @Property var artistName: String
+    var coverArtData: Data
+
+    var displayRepresentation: DisplayRepresentation {
+        DisplayRepresentation(
+            title: "\(name)",
+            subtitle: "\(artistName)",
+            image: .init(data: coverArtData)
+        )
+    }
+
+    static let defaultQuery = AlbumEntityQuery()
+    static var typeDisplayRepresentation: TypeDisplayRepresentation { "Album" }
+}
+
+struct AlbumEntityQuery: EntityQuery {
+    @Dependency var catalog: AlbumCatalog
+
+    func entities(for identifiers: [String]) async throws -> [AlbumEntity] {
+        catalog.albums(for: identifiers)
+    }
+}
+```
+
+Key points:
+
+- `DisplayRepresentation` controls how results appear. The system gives you roughly three lines of text plus a thumbnail, so put the most important identifying information in the title and subtitle.
+- If you return multiple results, thumbnails appear in a two-column layout. Apple recommends providing small images around 200x200 instead of original image URLs.
+- If you return only one result, the image fills the full width of the result page, so a somewhat higher-resolution image can be appropriate.
+
+### Implement IntentValueQuery to receive image input
+
+([05:39](https://developer.apple.com/videos/play/wwdc2026/297/?time=339))
+
+Visual Intelligence passes the captured image to your app through the `IntentValueQuery` protocol. The input type is `SemanticContentDescriptor`, which contains a `pixelBuffer`:
+
+```swift
+import AppIntents
+import VisualIntelligence
+
+struct SearchHandler: IntentValueQuery {
+    @Dependency var catalog: AlbumCatalog
+    @Dependency var concertFinder: ConcertFinder
+
+    func values(for input: SemanticContentDescriptor) async throws -> [VisualSearchResult] {
+        guard let pixelBuffer = input.pixelBuffer else {
+            return []
+        }
+
+        let albums = try await catalog.search(matching: pixelBuffer)
+
+        return albums.map { VisualSearchResult.album($0) }
+    }
+}
+```
+
+Key points:
+
+- `values(for:)` receives `SemanticContentDescriptor` and extracts `pixelBuffer` from it.
+- Queries have strict execution time limits, so do not perform network requests or heavy computation.
+- If there are no matches, return an empty array. The system handles the empty state presentation.
+
+### Use Vision for local image matching
+
+([06:24](https://developer.apple.com/videos/play/wwdc2026/297/?time=384))
+
+The core of on-device search is `GenerateImageFeaturePrintRequest`. It converts an image into a compact feature vector, or feature print, and determines similarity by calculating vector distance:
+
+```swift
+import Vision
+
+@Observable
+class AlbumCatalog {
+    static let shared = AlbumCatalog()
+
+    struct CatalogEntry: Sendable {
+        let album: AlbumEntity
+        let featurePrint: FeaturePrintObservation
+    }
+
+    private(set) var entries: [CatalogEntry] = []
+
+    private func generateFeaturePrint(for image: CGImage) async throws -> FeaturePrintObservation {
+        let request = GenerateImageFeaturePrintRequest()
+        let result = try await request.perform(on: image)
+        return result
+    }
+}
+```
+
+When searching, first generate a feature print for the input image, then compare it against the precomputed catalog:
+
+```swift
+func search(matching pixelBuffer: CVReadOnlyPixelBuffer, limit: Int = 10, maxDistance: Double = 1.0) async throws -> [AlbumEntity] {
+    var cgImage: CGImage?
+    _ = pixelBuffer.withUnsafeBuffer {
+        VTCreateCGImageFromCVPixelBuffer($0, options: nil, imageOut: &cgImage)
+    }
+    guard let cgImage else { return [] }
+
+    let queryPrint = try await generateFeaturePrint(for: cgImage)
+
+    return try entries.compactMap { entry -> (album: AlbumEntity, distance: Double)? in
+        let distance = try queryPrint.distance(to: entry.featurePrint)
+        guard distance <= maxDistance else { return nil }
+        return (entry.album, distance)
+    }
+    .sorted { $0.distance < $1.distance }
+    .prefix(limit)
+    .map { $0.album }
+}
+```
+
+Key points:
+
+- Use `VTCreateCGImageFromCVPixelBuffer` to convert a `CVPixelBuffer` into a `CGImage`.
+- `FeaturePrintObservation.distance(to:)` calculates the distance between two feature vectors. Smaller values are more similar.
+- `maxDistance` filters out unrelated results to avoid returning noise.
+- Feature prints for the catalog must be precomputed. Query-time work should only compare distances so the response stays fast.
+- Mac screenshots can be large, so scale down before converting to `CGImage` to avoid memory spikes.
+
+### Use OpenIntent to jump to the right page
+
+([08:27](https://developer.apple.com/videos/play/wwdc2026/297/?time=507))
+
+When the user taps a search result, the system calls the corresponding `OpenIntent`:
+
+```swift
+import AppIntents
+
+struct OpenAlbumIntent: OpenIntent {
+    static let title: LocalizedStringResource = "Open Album"
+
+    @Parameter(title: "Album")
+    var target: AlbumEntity
+
+    @Dependency var appState: AppState
+
+    func perform() async throws -> some IntentResult {
+        await appState.openAlbum(id: target.id)
+        return .result()
+    }
+}
+```
+
+Key points:
+
+- `perform()` runs while the app is coming to the foreground, so keep it to lightweight navigation.
+- Leave heavy data loading until after the view appears, to avoid blocking launch.
+- If you already wrote OpenIntent for Siri integration, you can reuse it directly.
+
+### Return multiple result types
+
+([12:05](https://developer.apple.com/videos/play/wwdc2026/297/?time=725))
+
+Use `@UnionValue` to let a single query return multiple entities:
+
+```swift
+@UnionValue
+enum VisualSearchResult {
+    case album(AlbumEntity)
+    case concert(ConcertEntity)
+}
+
+struct OpenConcertIntent: OpenIntent {
+    static let title: LocalizedStringResource = "Open Concert"
+
+    @Parameter(title: "Concert")
+    var target: ConcertEntity
+
+    @Dependency var appState: AppState
+
+    func perform() async throws -> some IntentResult {
+        await appState.openConcert(id: target.id)
+        return .result()
+    }
+}
+```
+
+Then update the query logic to mix the two kinds of results:
+
+```swift
+struct SearchHandler: IntentValueQuery {
+    @Dependency var catalog: AlbumCatalog
+    @Dependency var concertFinder: ConcertFinder
+
+    func values(for input: SemanticContentDescriptor) async throws -> [VisualSearchResult] {
+        guard let pixelBuffer = input.pixelBuffer else {
+            return []
+        }
+
+        let albums = try await catalog.search(matching: pixelBuffer)
+        let artists = albums.map { $0.artistName }
+        let concerts = await concertFinder.findNearby(byArtists: artists)
+
+        return albums.map { VisualSearchResult.album($0) }
+            + concerts.map { VisualSearchResult.concert($0) }
+    }
+}
+```
+
+Key points:
+
+- Each case in a `@UnionValue` enum wraps an AppEntity.
+- Each entity type needs its own OpenIntent.
+- You control the mixed result order. Put the most relevant results first.
+
+### Provide a fallback entry point for in-app search
+
+([13:13](https://developer.apple.com/videos/play/wwdc2026/297/?time=793))
+
+If the system result page does not contain what the user wants, you can provide an entry point to "continue searching in the app":
+
+```swift
+@AppIntent(schema: .visualIntelligence.semanticContentSearch)
+struct SemanticContentSearchIntent: AppIntent {
+    static let title: LocalizedStringResource = "Search in app"
+    static let openAppWhenRun: Bool = true
+
+    var semanticContent: SemanticContentDescriptor
+    @Dependency var catalog: AlbumCatalog
+    @Dependency var concertFinder: ConcertFinder
+    @Dependency var appState: AppState
+
+    func perform() async throws -> some IntentResult {
+        guard let pixelBuffer = semanticContent.pixelBuffer else { return .result() }
+        let albums = try await catalog.search(matching: pixelBuffer)
+        let artists = albums.map { $0.artistName }
+        let concerts = await concertFinder.findNearby(byArtists: artists)
+        await appState.openSearch(albums: albums, concerts: concerts)
+        return .result()
+    }
+}
+```
+
+Key points:
+
+- Use the `.visualIntelligence.semanticContentSearch` schema, and the system automatically passes in `semanticContent`.
+- `openAppWhenRun: true` ensures the app is launched.
+- Prepopulate search results in your app so the user does not need to start over.
+
+### Receive system calendar data through EventKit
+
+([15:24](https://developer.apple.com/videos/play/wwdc2026/297/?time=924))
+
+Events that users add to Calendar through Visual Intelligence can be read by your app through EventKit:
+
+```swift
+import EventKit
+
+@Observable
+class UpcomingConcertManager {
+    private let eventStore = EKEventStore()
+    var upcomingConcerts: [EKEvent] = []
+    var authorizationStatus: EKAuthorizationStatus = .notDetermined
+
+    func requestAccessAndFetch() async throws {
+        let granted = try await eventStore.requestFullAccessToEvents()
+        guard granted else {
+            authorizationStatus = .denied
+            return
+        }
+        authorizationStatus = .fullAccess
+        await fetchUpcomingConcerts()
+
+        for await _ in NotificationCenter.default.notifications(named: .EKEventStoreChanged) {
+            await fetchUpcomingConcerts()
+        }
+    }
+
+    func fetchUpcomingConcerts() async {
+        let predicate = eventStore.predicateForEvents(
+            withStart: .now,
+            end: .now.addingTimeInterval(90 * 24 * 60 * 60),
+            calendars: nil
+        )
+
+        let events = eventStore.events(matching: predicate)
+
+        upcomingConcerts = events.filter { event in
+            AlbumCatalog.shared.entries.contains { entry in
+                event.title?.localizedCaseInsensitiveContains(entry.album.artistName) == true
+            }
+        }
+    }
+}
+```
+
+Key points:
+
+- `requestFullAccessToEvents()` requests full calendar access.
+- Listen for `.EKEventStoreChanged`; new events added by Visual Intelligence trigger refresh automatically.
+- Use `predicateForEvents` to query events in the next 90 days, then filter them according to your business logic.
+
+## Key Takeaways
+
+**1. Build a "take a photo to find a product" entry point for commerce**
+
+- **What to do**: Users photograph a product in a magazine, and the app returns matching product cards directly.
+- **Why it is worth doing**: Visual Intelligence turns the camera into a search entry point that does not require launching the app first. Users do not need to type or switch apps.
+- **How to start**: Use `GenerateImageFeaturePrintRequest` to precompute feature prints for product images and store them in a local database. Define `ProductEntity` and implement `IntentValueQuery` for similarity matching.
+
+**2. Build a "screenshot ticket information" assistant for events**
+
+- **What to do**: Users screenshot a concert poster on social media. After Visual Intelligence recognizes it and adds it to Calendar, the app automatically shows it in an "upcoming" list and recommends a warm-up playlist.
+- **Why it is worth doing**: System store integration lets data flow back automatically, so the app does not need to parse screenshots with its own OCR.
+- **How to start**: Listen for EventKit's `.EKEventStoreChanged` and filter events related to your app's domain.
+
+**3. Build a cross-app note tool for selected on-screen text**
+
+- **What to do**: Users select text or an image in any app. Your notes app receives `SemanticContentDescriptor`, extracts the content, and creates a note item.
+- **Why it is worth doing**: Screenshots are a primary input source on macOS, and cross-app information capture is a real desktop workflow pain point.
+- **How to start**: Combine Vision text recognition, `RecognizeTextRequest`, with `pixelBuffer` to extract text.
+
+**4. Build a health record tool for photographed medical devices**
+
+- **What to do**: Users photograph the screen of a blood pressure monitor or glucose meter. Visual Intelligence writes the reading into HealthKit, and the app automatically syncs it into the health record.
+- **Why it is worth doing**: WWDC26 mentions medical device logs as a new Visual Intelligence capability. Your app can read from HealthKit instead of parsing numbers by itself.
+- **How to start**: Use `HKHealthStore` to query related health data types and listen for data changes.
+
+**5. Build a multimedia discovery engine for selected posters**
+
+- **What to do**: Users select a movie poster, and the app returns movie information, soundtrack albums, and nearby theater showtimes in one mixed list.
+- **Why it is worth doing**: `@UnionValue` lets a single query return multiple entity types, so one action can trigger several business lines.
+- **How to start**: Define a `@UnionValue` enum with movie, music, and theater cases, each with its own OpenIntent.
+
+## Related Sessions
+
+- [Bring your app to Siri](/articles/wwdc2026-344) - An introduction to App Intents basics. If you have not worked with App Entity or Intent yet, start here.
+- [What's new in App Intents](/articles/wwdc2026-345) - Learn about new App Intents features, including more ways to use UnionValue.
+- [What's new in Vision](/articles/wwdc2026-237) - Explore Vision framework image-processing capabilities, including feature prints, text recognition, and barcode scanning.
+- [Build agentic apps with App Intents](/articles/wwdc2026-242) - Explore advanced uses of App Intents in intelligent apps.
+- [What's new in SwiftUI](/articles/wwdc2026-269) - Visual Intelligence result pages need SwiftUI navigation and state management to land on the right screen.

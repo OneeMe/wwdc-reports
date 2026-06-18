@@ -1,0 +1,197 @@
+---
+title: "Metal でリアルタイム neural rendering pipeline を構築する"
+description: "学習、グラフィックスとゲーム"
+date: "2026-06-10"
+tags: ["Metal", "Machine Learning", "Neural Rendering", "MetalFX", "TensorOps"]
+thumbnail: "/images/sessions/2026/359.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/359/"
+sessionId: "wwdc2026-359"
+year: "2026"
+relatedSessions:
+  - title: "What's new in Metal"
+    code: "101"
+    description: "Metal 4 の主要な新機能の概要"
+  - title: "Go further with Metal 4 games"
+    code: "388"
+    description: "MetalFX denoising の詳しい実践"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "324"
+    description: "ML Command Encoder と TensorOps の深掘り"
+  - title: "Metal tensors"
+    code: "330"
+    description: "Tensor API のパフォーマンス最適化"
+---
+
+## ハイライト
+
+> Metal 4 は 3 層の機械学習機能を提供します。MetalFX はすぐ使える neural denoising と upscaling を提供し、ML Command Encoder は rendering pipeline 内で事前学習済みモデルを直接実行し、TensorOps API は shader 内で小型 neural network を inline 実行します。これにより M5 と A19 Pro GPU の neural accelerator を十分に活用できます。
+
+## 主要内容
+
+### リアルタイム rendering の機械学習的なジレンマ
+
+リアルタイム rendering の開発者は常に矛盾に直面します。画質を上げるには sample 数を増やす必要がありますが、sample 数を増やすと frame rate が耐えられなくなります。
+
+たとえば path tracer では、noise のない画像を得るには 1 pixel あたり数百 sample が必要です。しかし realtime viewport で許容できるのは通常 1 pixel あたり 1 sample だけです。その結果、画面全体が noise だらけになります。
+
+従来の解決策はさまざまな denoising algorithm でしたが、効果が限定的だったり、計算 cost が高すぎたりしました。
+
+### Apple の 3 層ソリューション
+
+Metal 4 は段階的に使える 3 層の機械学習機能を提供します。
+
+**第 1 層: MetalFX** — そのまま呼び出して使える black-box solution
+
+**第 2 層: ML Command Encoder** — 学習済みモデルを rendering pipeline 内で実行
+
+**第 3 層: TensorOps API** — shader の中で小型 neural network を手書き
+
+### MetalFX: すぐ使える neural denoising
+
+MetalFX Denoising は neural upscaler と denoiser の組み合わせで、Apple silicon 向けに最適化されています。
+
+Maxon の Redshift Live、つまり Cinema 4D の realtime path-traced viewport ではこの方式が採用されています。有効にすると、noise の多い single-sample 画像が瞬時にきれいになり、realtime frame rate も維持できます。
+
+最高の結果を得るには 3 つの重要な実践があります。
+
+1. **入力を clean に保つ** — diffuse albedo などの auxiliary input は noise-free であるべきです。これは denoiser にとって最も強い signal です。
+
+2. **viewer が見るものを保存する** — specular reflection には反射された geometry の属性を保存し、glass は Fresnel term を使って reflection と refraction を混ぜます。
+
+3. **motion vector を正しくする** — MetalFX は subpixel offset を含まない dejittered motion vector を期待します。
+
+### ML Command Encoder: post-processing pipeline を置き換える
+
+Denoising は出発点にすぎません。Tone mapping、color grading、film simulation などの post-processing pipeline も機械学習で置き換えられます。
+
+従来の pipeline は複数 stage の直列構成で、各 stage に固有の parameter があり、全体が非常に複雑になりがちです。Neural network の考え方は、色変換全体を学習することです。
+
+HDRNet を例にすると、downsampled image を使って global と local の分析を行い、16x16 tile ごとの local transform を生成し、最後に edge-aware technique で全体画像へ適用します。
+
+Workflow は、PyTorch で network を学習し、`MTLPackage` として export し、Metal 4 で読み込んで実行する、という流れです。
+
+### TensorOps: shader inline の micro-network
+
+最も踏み込んだ方法は、shader の中で小型 neural network を直接実行することです。
+
+この種の network は数千個程度の parameter しか持たず、特定 task 向けに学習され、毎 frame online training することさえできます。
+
+例として、image-based lighting は従来 irradiance map の事前計算が必要でした。しかし scene が動的な場合、たとえば day-night cycle がある場合、事前計算結果は古くなる可能性があります。
+
+解決策は、小さな MLP にこの signal を online で学習させることです。毎 frame 数回の training iteration を実行すると、model は新しい world state に real-time で適応できます。
+
+## 詳細
+
+### MetalFX denoising の統合
+
+（[02:16](https://developer.apple.com/videos/play/wwdc2026/359/?time=136)）
+
+MetalFX Denoising の統合は直接的です。Path tracer が color といくつかの auxiliary input を生成し、MetalFX が denoised image を出力し、その後は通常の post-processing flow を続けます。
+
+必要な auxiliary input には diffuse albedo や depth などがあります。Renderer がすでにこれらを生成しているなら、そのまま使えます。
+
+### Dejittered motion vector の計算
+
+（[08:46](https://developer.apple.com/videos/play/wwdc2026/359/?time=526)）
+
+Motion vector を正しく計算することは temporal stability に不可欠です。以下は static object の camera-only motion vector を計算するコードです。
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+// Camera-only motion vector を計算
+float4 clipCurrent = viewProjCurrent * float4(worldPos, 1.0);
+float2 ndcCurrent = clipCurrent.xy / clipCurrent.w;
+
+float4 clipPrevious = viewProjPrevious * float4(worldPos, 1.0);
+float2 ndcPrevious = clipPrevious.xy / clipPrevious.w;
+
+float2 motion = ndcPrevious - ndcCurrent;
+
+// Current frame と previous frame の subpixel offset を取得
+float2 jitterCurrent = getJitter(frameIndex);
+float2 jitterPrevious = getJitter(frameIndexPrevious);
+motion -= jitterPrevious - jitterCurrent;
+```
+
+**ポイント:**
+- Current frame と previous frame の view-projection matrix で world position を変換します。
+- 2 つの NDC coordinate の差分から motion vector を計算します。
+- Jitter offset を差し引き、clean な dejittered motion vector を得ます。
+
+移動または変形する object では、各 vertex の previous frame world position を保存するか、skinning を 2 回行って、本当の motion vector を計算する必要があります。
+
+### ML Command Encoder の deployment flow
+
+（[12:03](https://developer.apple.com/videos/play/wwdc2026/359/?time=723)）
+
+Neural network の deployment には 2 つの段階があります。
+
+**Setup phase:**
+1. `MTLPackage` を読み込みます。
+2. Function descriptor で network function を指定します。
+3. Machine learning pipeline descriptor を作成します。
+
+**Execution phase:**
+1. Encoder を作成します。
+2. Argument table を作成し、input と output を bind します。
+3. Command buffer を dispatch します。
+
+更新後の rendering pipeline は、path tracing → MetalFX denoising → neural tone mapping となります。すべてが同じ command buffer に encode され、同じ frame 内で実行されます。
+
+### TensorOps で inline network を構築する
+
+（[17:56](https://developer.apple.com/videos/play/wwdc2026/359/?time=1076)）
+
+Neural network は 3 つの部分から構成されます。Input layer、hidden layer、output layer です。
+
+Sky probe を例にすると、これは 3-4-4-3 の MLP、つまり multilayer perceptron です。3 つの float input が direction を encode し、3 つの float output がその direction の average lighting color を表します。
+
+Shader 内で network を評価する流れ:
+1. Input tensor を準備します。Batch 処理のためには 2D matrix にするのが望ましいです。
+2. `matmul` 2D tensor operation で matrix multiplication を行います。
+3. Activation function を適用します。
+4. Output layer まで繰り返します。
+
+**SIMD group execution mode:**
+
+（[19:29](https://developer.apple.com/videos/play/wwdc2026/359/?time=1169)）
+
+`SIMD-group` execution scope を使うと、参加するすべての thread が同じ matrix multiplication に協調して取り組み、cooperative tensor にアクセスできます。
+
+Cooperative tensor の storage は threadgroup の複数 thread に分散されるため、高価な main memory との往復を避けられます。最初の multiplication の output として cooperative tensor を使うと、結果は高速な thread storage memory に残り、その場で activation function を適用できます。
+
+### Online training loop
+
+（[16:06](https://developer.apple.com/videos/play/wwdc2026/359/?time=966)）
+
+Online training は従来の rendering loop を変えます。
+
+1. Sampling したい direction を生成します。
+2. Model 上で inference を実行して結果を得ます。
+3. Sky lighting 問題の analytic solution を計算します。
+4. Analytic solution を使って error を計算します。
+5. Backpropagation を実行して model を少しずつ改善します。
+
+この process は各 frame で複数回繰り返せます。Model は新しい world condition に real-time で適応し、その情報をすぐ shading に使えます。
+
+## 主要な示唆
+
+1. **Dynamic irradiance probe** — Realtime renderer 向けに online learning する irradiance network を構築します。Scene lighting が変化したとき（照明の on/off、day-night cycle など）、network は再事前計算なしに自動適応します。入口: TensorOps API + custom training loop
+
+2. **Neural material approximation** — 小型 MLP を学習させ、複雑な material response を近似します。たとえば multilayer coating や subsurface scattering などの高価な計算を、shader 内で inline 実行される micro-network で近似できます。入口: ML Command Encoder による custom network deployment
+
+3. **Adaptive post-processing** — Project 内で artist が手動調色した image pair（HDR original + 調色後の結果）を集め、neural tone mapper を学習します。Deployment 後は renderer が HDR を直接出力し、network が style 化された post-processing を自動で行います。入口: PyTorch training + `MTLPackage` export
+
+4. **Realtime AI-assisted lighting** — 特定 scene の lighting preference を小さな network に学習させます。Artist がいくつかの light を調整すると、network がその style を学習し、他の scene に素早く適用したり、類似した lighting setup を自動生成したりできます。入口: TensorOps online learning
+
+5. **Adaptive denoising strength** — Scene content に応じて MetalFX の denoising strength を自動調整します。たとえば小さな network で image を分析し、region ごとに最適な denoiser strength mask を生成します。入口: TensorOps + MetalFX strength mask
+
+## 関連 Session
+
+- [What's new in Metal](/articles/wwdc2026-101) — Metal 4 の主要な新機能の概要
+- [Go further with Metal 4 games](/articles/wwdc2026-388) — MetalFX denoising の詳しい実践
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2026-324) — ML Command Encoder と TensorOps の深掘り
+- [Metal tensors](/articles/wwdc2026-330) — Tensor API のパフォーマンス最適化
+- [Metal Performance Primitives (MPP) Programming Guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf) — 完全な code example と API reference

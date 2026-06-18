@@ -1,0 +1,343 @@
+---
+title: "Expand the capabilities of your Virtualization app"
+description: "Discover new macOS 27 Virtualization capabilities for provisioning macOS guests, passing USB accessories through safely, using layered sparse disk images, and building custom Virtio devices."
+date: "2026-06-10"
+tags: ["Virtualization", "DiskImageKit", "AccessoryAccess", "Virtio", "vmnet"]
+thumbnail: "/images/sessions/2026/224.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/224/"
+sessionId: "wwdc2026-224"
+year: "2026"
+relatedSessions:
+  - title: "389 - Create and manage container machines with Virtualization"
+    code: "389"
+    description: "Container Machine is another way to use the Virtualization framework and complements the advanced capabilities in this session"
+  - title: "260 - Explore the new Device Hub in Xcode"
+    code: "260"
+    description: "Device Hub covers device management and remote debugging, which are related to device-passthrough scenarios in VMs"
+  - title: "243 - Profile and optimize your Metal app with Instruments"
+    code: "243"
+    description: "Performance analysis tools for Metal apps running inside a VM"
+  - title: "279 - What's new in RealityKit"
+    code: "279"
+    description: "Metal feature support in VMs, including argument buffers and indirect command buffers, relates to graphics rendering"
+  - title: "262 - What's new in Swift"
+    code: "262"
+    description: "The code examples in this session make heavy use of Swift async/await and structured concurrency"
+---
+
+## Highlight
+
+> The macOS 27 Virtualization framework adds four core capabilities: automated macOS guest account provisioning, secure USB device passthrough through the Accessory Access framework, layered sparse disk images with DiskImageKit, and custom Virtio devices. Together, they let third-party VM apps reach production-grade levels of automation, storage efficiency, and hardware extensibility.
+
+## Key Takeaways
+
+### Provision macOS Guests Automatically: No More Manual Setup Assistant
+
+Previously, after installing a macOS virtual machine, you had to click through Setup Assistant manually: create a user, set a password, and agree to the terms. For CI/CD pipelines or automated testing, that step was the biggest bottleneck. Every new VM required human intervention, making true unattended operation impossible.
+
+macOS 27 introduces `VZMacGuestProvisioningOptions`. When starting the VM, you can pass the username, password, and full name, and you can enable automatic login and SSH remote login. On the guest's first boot, these parameters are passed directly to Setup Assistant so setup completes automatically.
+
+([01:56](https://developer.apple.com/videos/play/wwdc2026/224/?time=117))
+
+There is one limitation: these options only take effect when the guest has not been configured before. If a user has already been created, later provisioning options passed at startup are ignored. For password handling, Apple recommends reading from Keychain or environment variables instead of hard-coding values.
+
+### USB Device Passthrough: The Accessory Access Security Model
+
+Using USB drives, dongles, and debuggers inside a virtual machine used to be a difficult problem. You either relied on low-level IOKit hacks or got an unstable experience where hot-plugging could freeze the VM.
+
+macOS 27 introduces the Accessory Access framework. Its core design is that the user always stays in control. After an app registers the device types it is interested in, macOS shows an accessory icon in the menu bar. Only when the user manually selects "Connect to App" is the device authorized for use by the virtual machine. The user can also disconnect it at any time.
+
+([04:39](https://developer.apple.com/videos/play/wwdc2026/224/?time=279))
+
+This design trades away full automation for safety and stability. Devices can be hot-plugged while the VM is running, with no restart or static VM configuration changes required. It is friendlier for consumer users and prevents malicious software from secretly reading USB devices.
+
+### Layered Disk Images: DiskImageKit Solves Storage Waste
+
+Traditional raw disk images map one-to-one. A 100 GB logical disk is a 100 GB physical file. Taking a snapshot requires copying the whole file, and cloning a VM is expensive.
+
+macOS 27's DiskImageKit framework introduces Apple Sparse Image Format (ASIF), which supports layered image stacks. The bottom is a read-only base layer that stores a clean system image. Above it, you can add a cache layer or overlay layer, both in ASIF format.
+
+([11:40](https://developer.apple.com/videos/play/wwdc2026/224/?time=700))
+
+A cache layer accelerates reads: when lower-level data lives on slow storage such as a network file system, data that has been read is cached into the cache layer and later reads come directly from the cache. An overlay layer implements copy-on-write: writes happen only in the overlay, while the base layer remains read-only. Multiple VMs can share one base layer while each has its own overlay, saving substantial disk space.
+
+ASIF is sparse. The logical size can be much larger than the data actually stored, and unused blocks consume no physical space.
+
+### Custom Virtio Devices: A High-Performance Host-Guest Channel
+
+The Virtualization framework already includes common device types, but some scenarios need a more specialized communication channel. Examples include custom protocols for high-performance Host-Guest communication or exposing a machine-learning accelerator to a Linux guest.
+
+macOS 27 opens up `VZCustomVirtioDevice`. Virtio is the industry standard for paravirtualized devices. It uses shared memory buffers and Virtio queues for Host-Guest communication, minimizing context switches by design.
+
+([15:57](https://developer.apple.com/videos/play/wwdc2026/224/?time=957))
+
+The app configures the device's Virtio device ID, PCI class and subclass, and queue count, then sets a delegate. When the guest sends data through a Virtio queue, the delegate's `didReceiveNotificationFor` method is called. The app takes elements from the queue, processes them, and returns them to the queue. The app can also notify the guest driver by triggering an interrupt.
+
+## Details
+
+### Provision macOS Guests Automatically
+
+([01:56](https://developer.apple.com/videos/play/wwdc2026/224/?time=117))
+
+```swift
+import Virtualization
+
+let provisioningOptions = VZMacGuestProvisioningOptions()
+provisioningOptions.fullName = fullName
+provisioningOptions.username = username
+provisioningOptions.password = password
+provisioningOptions.logsInAutomatically = true
+provisioningOptions.enablesRemoteLogin = true
+
+let startOptions = VZMacOSVirtualMachineStartOptions()
+try startOptions.setGuestProvisioning(provisioningOptions)
+
+try await virtualMachine.start(options: startOptions)
+```
+
+Key points:
+- `VZMacGuestProvisioningOptions` packages all parameters that need to be passed to Setup Assistant on first boot
+- `fullName`, `username`, and `password` are used to create the user account
+- `logsInAutomatically = true` logs in to that account automatically after first boot
+- `enablesRemoteLogin = true` enables SSH for remote management
+- `setGuestProvisioning` attaches the provisioning configuration to the start options
+- These parameters take effect only on the guest's first boot, before a user has been configured
+
+### Register a USB Accessory Listener
+
+([07:12](https://developer.apple.com/videos/play/wwdc2026/224/?time=432))
+
+```swift
+import AccessoryAccess
+
+let criteria: [AAUSBAccessoryMatchingCriteria] = []
+let accessories = try await AAUSBAccessoryManager.shared.registerListener(self, matchingCriteria: criteria)
+
+for accessory in accessories {
+    // Handle previously attached accessories.
+}
+```
+
+Key points:
+- `AAUSBAccessoryMatchingCriteria` filters the device types you are interested in, such as by device class, vendor ID, or product ID
+- Passing an empty array means you are interested in all USB devices
+- `registerListener` returns the list of devices already authorized for the app, and you need to iterate over them
+- The listener object must implement the `AAUSBAccessoryListener` protocol
+- Add the "Claim USB Accessory" capability to the Xcode target
+
+### Respond to USB Accessory Connections
+
+([07:39](https://developer.apple.com/videos/play/wwdc2026/224/?time=459))
+
+```swift
+import AccessoryAccess
+import Virtualization
+
+class AccessoryListener: NSObject, AAUSBAccessoryListener {
+    func usbAccessoryDidConnect(_ usbAccessory: AAUSBAccessory) {
+        virtualMachine.queue.async {
+            do {
+                let configuration = VZUSBPassthroughDeviceConfiguration(device: usbAccessory)
+                let device = try VZUSBPassthroughDevice(configuration: configuration)
+                self.virtualMachine.usbControllers.first?.attach(device: device) { error in
+                    // Handle error if necessary...
+                }
+            } catch {
+                // Handle error...
+            }
+        }
+    }
+}
+```
+
+Key points:
+- `usbAccessoryDidConnect` fires after the user authorizes the device from the menu bar
+- All VM hardware changes must run on `virtualMachine.queue`, which is a thread-safety requirement
+- `VZUSBPassthroughDeviceConfiguration` wraps an `AAUSBAccessory` into a configuration the VM can understand
+- `VZUSBPassthroughDevice` is the actual passthrough device object
+- `attach(device:)` dynamically attaches the device to the VM's USB controller
+- The user can disconnect the device from the menu bar at any time, so the app needs to implement `usbAccessoryDidDisconnect` for cleanup
+
+### Create a Custom vmnet Network
+
+([10:04](https://developer.apple.com/videos/play/wwdc2026/224/?time=604))
+
+```swift
+import Virtualization
+import vmnet
+
+var status: vmnet_return_t = .VMNET_FAILURE
+guard let networkConfiguration =
+    vmnet_network_configuration_create(.VMNET_SHARED_MODE, &status) else { ... }
+
+guard let network =
+    vmnet_network_create(networkConfiguration, &status) else { ... }
+
+let attachment = VZVmnetNetworkDeviceAttachment(network: network)
+
+let networkDeviceConfiguration = VZVirtioNetworkDeviceConfiguration()
+networkDeviceConfiguration.attachment = attachment
+
+virtualMachineConfiguration.networkDevices = [networkDeviceConfiguration]
+
+let virtualMachine = VZVirtualMachine(configuration: virtualMachineConfiguration)
+```
+
+Key points:
+- `vmnet_network_configuration_create` creates a network configuration object, and `.VMNET_SHARED_MODE` is shared mode
+- You can further configure DHCP parameters, port-forwarding rules, and more through the vmnet API
+- `vmnet_network_create` creates a network object from the configuration
+- `VZVmnetNetworkDeviceAttachment` bridges the vmnet network into the Virtualization framework
+- Multiple VMs can communicate with each other when they use the same `network` object
+- A vmnet network is a reference-counted Objective-C object. It disappears when the app exits, so you need to persist configuration yourself
+- `vmnet_network_copy_serialization` and `vmnet_network_create_with_serialization` can pass network objects across XPC
+
+### DiskImageKit Layered Images
+
+([14:54](https://developer.apple.com/videos/play/wwdc2026/224/?time=894))
+
+```swift
+import DiskImageKit
+import Virtualization
+
+let baseImage = try DiskImage(opening: .open(url: baseLayerURL, mode: .readOnly))
+let cacheImage = try baseImage.appending(.asifLayer(url: cacheLayerURL, type: .cache))
+let overlayImage = try DiskImage(opening: .open(url: overlayLayerURL))
+let stackedImage = try cacheImage.appending(overlayImage)
+
+let storageDeviceAttachment = try VZDiskImageStorageDeviceAttachment(diskImage: stackedImage)
+
+let storageDeviceConfiguration =
+    VZVirtioBlockDeviceConfiguration(attachment: storageDeviceAttachment)
+
+virtualMachineConfiguration.storageDevices = [storageDeviceConfiguration]
+
+let virtualMachine = VZVirtualMachine(configuration: virtualMachineConfiguration)
+```
+
+Key points:
+- `DiskImage(opening: .open(url:mode:))` opens the base image, and `.readOnly` ensures the base layer cannot be modified
+- `.appending(.asifLayer(url:type:))` appends an ASIF-format layer, with `.cache` used for performance caching
+- You can also append another `DiskImage` object as an overlay layer
+- On reads, DiskImageKit walks the layer stack from top to bottom and uses the first layer that contains the target block
+- If a cache layer exists, reading lower-level data automatically caches it into that layer
+- When an overlay layer is present, writes are stored in the overlay, implementing copy-on-write
+- `VZDiskImageStorageDeviceAttachment` wraps the DiskImageKit image as a VM storage device attachment
+- Shallower layer stacks perform better, so keep the number of layers minimal
+- When multiple VMs share a base layer, each VM needs its own copy of the auxiliary storage file and EFI variable storage file
+
+### Configure a Custom Virtio Device
+
+([17:41](https://developer.apple.com/videos/play/wwdc2026/224/?time=1061))
+
+```swift
+import Virtualization
+
+let deviceConfiguration = VZCustomVirtioDeviceConfiguration()
+
+deviceConfiguration.deviceID = 4
+deviceConfiguration.pciClassID = 0x10
+deviceConfiguration.pciSubclassID = 0x00
+deviceConfiguration.virtioQueueCount = 1
+
+deviceConfiguration.provider =
+    VZCustomVirtioDeviceDelegateProvider(deviceQueue: deviceQueue, delegate: provider)
+
+virtualMachineConfiguration.customVirtioDevices = [deviceConfiguration]
+
+let virtualMachine = VZVirtualMachine(configuration: virtualMachineConfiguration)
+```
+
+Key points:
+- `deviceID = 4` corresponds to the Virtio entropy device. Custom devices need to choose an unused ID
+- `pciClassID = 0x10` is the PCI crypto device class
+- `pciSubclassID = 0x00` is the network and computing encryption controller subclass
+- `virtioQueueCount` configures the number of Virtio queues according to device needs
+- `VZCustomVirtioDeviceDelegateProvider` binds the delegate and queue to the device configuration
+- A custom device needs a matching Virtio driver in the guest to work
+
+### Virtio Device Delegate
+
+([18:20](https://developer.apple.com/videos/play/wwdc2026/224/?time=1100))
+
+```swift
+import Virtualization
+
+class DeviceConfigurationDelegate: NSObject, VZCustomVirtioDeviceConfigurationDelegate {
+    func customVirtioConfiguration(_ deviceConfiguration: VZCustomVirtioDeviceConfiguration,
+                                   didCreateDevice device: VZCustomVirtioDevice) {
+        device.delegate = deviceDelegate
+        self.device = device
+    }
+}
+```
+
+Key points:
+- `VZCustomVirtioDeviceConfigurationDelegate` is called after the VM starts and the device is created
+- Set the device delegate here to handle later Virtio queue events
+- Keep a reference to `device` so you can actively trigger interrupts for the guest later
+
+### Handle Virtio Queue Elements
+
+([18:42](https://developer.apple.com/videos/play/wwdc2026/224/?time=1122))
+
+```swift
+import Virtualization
+
+class DeviceDelegate: NSObject, VZCustomVirtioDeviceDelegate {
+    func customVirtioDevice(_ device: VZCustomVirtioDevice,
+                            didReceiveNotificationFor queue: VZVirtioQueue) {
+        while let element = queue.nextElement() {
+            // Process element...
+            element.returnToQueue()
+        }
+    }
+}
+```
+
+Key points:
+- `didReceiveNotificationFor` fires when the guest driver writes data into the queue
+- `queue.nextElement()` takes an element from the queue and returns nil when the queue is empty
+- After processing an element, you must call `element.returnToQueue()` to return it to the queue
+- A custom device requires a matching Virtio driver on the guest side
+- When designing the driver, follow Virtio best practices and make full use of queue batching
+
+## Ideas to Build
+
+**1. A zero-touch macOS test cluster for CI/CD**
+
+Use `VZMacGuestProvisioningOptions` to initialize VMs without manual setup. Combined with DiskImageKit layered images, one base image can be shared by all test nodes, and each node only needs an overlay of a few MB. Delete the overlay after the test to return to a clean state.
+
+Entry point: `VZMacGuestProvisioningOptions` + `VZDiskImageStorageDeviceAttachment`
+
+**2. A development environment with USB device passthrough**
+
+Embedded development and hardware testing often require USB debuggers, dongles, or firmware flashing tools inside a VM. Previously, that meant dual booting or buying a physical machine. Now the Accessory Access framework lets users manually authorize a device and pass it through to the VM, with stable and reliable hot-plugging.
+
+Entry point: `AAUSBAccessoryManager.shared.registerListener` + `VZUSBPassthroughDevice`
+
+**3. Local integration networking for microservices**
+
+Use the vmnet framework to create a custom network topology and forward specific host ports into the VM. For example, map host port 8080 to port 80 in the VM so a local browser can debug a web service in the VM through `localhost:8080`.
+
+Entry point: `vmnet_network_configuration_create` + DHCP configuration + port-forwarding rules
+
+**4. A layered-image snapshot-and-restore system**
+
+Use DiskImageKit overlay layers as snapshots. Before each test, create a fresh overlay on top of a clean base. After the test, either keep it as a snapshot or discard it to restore. Because overlays are sparse files, creation is extremely cheap.
+
+Entry point: `DiskImage` + `.appending(.asifLayer)` + overlay layer management
+
+**5. Custom hardware acceleration inside a Linux VM**
+
+Expose specialized host hardware such as an NPU, FPGA, or custom coprocessor to a Linux guest through `VZCustomVirtioDevice`. Write the corresponding Linux Virtio driver to build low-latency Host-Guest communication.
+
+Entry point: `VZCustomVirtioDeviceConfiguration` + `VZCustomVirtioDeviceDelegate`
+
+## Related Sessions
+
+- [389 - Create and manage container machines with Virtualization](/articles/wwdc2026-389) - Container Machine is another way to use the Virtualization framework and complements the advanced capabilities in this session
+- [260 - Explore the new Device Hub in Xcode](/articles/wwdc2026-260) - Device Hub covers device management and remote debugging, which are related to device-passthrough scenarios in VMs
+- [243 - Profile and optimize your Metal app with Instruments](/articles/wwdc2026-243) - Performance analysis tools for Metal apps running inside a VM
+- [279 - What's new in RealityKit](/articles/wwdc2026-279) - Metal feature support in VMs, including argument buffers and indirect command buffers, relates to graphics rendering
+- [262 - What's new in Swift](/articles/wwdc2026-262) - The code examples in this session make heavy use of Swift async/await and structured concurrency

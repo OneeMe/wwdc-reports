@@ -1,0 +1,477 @@
+---
+title: "Create robust evaluations for agentic apps"
+description: "Learning"
+date: "2026-06-10"
+tags: ["Evaluations", "Agentic Apps", "Synthetic Data", "Tool Calling", "Swift"]
+thumbnail: "/images/sessions/2026/299.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/299/"
+sessionId: "wwdc2026-299"
+year: "2026"
+relatedSessions:
+  - title: "Improve your prompts by hill climbing with Evaluations"
+    code: "335"
+    description: "Iterate on prompts with hill climbing in the Evaluations framework. Together with this session's synthetic data and tool evaluation workflow, it forms a complete evaluation loop."
+  - title: "Build agentic app experiences with Foundation Models"
+    code: "242"
+    description: "The foundation for building agentic apps. This session's tool-calling evaluations are designed for exactly these kinds of experiences."
+  - title: "Meet the Evaluations framework"
+    code: "298"
+    description: "An introduction to the Evaluations framework, covering core concepts and the hill-climbing flow. Watch it first if you are new to the framework."
+  - title: "Foundation Models on device"
+    code: "241"
+    description: "Understand the capability boundaries of on-device models so you can design realistic evaluation strategies and choose appropriate generation models."
+  - title: "Swift Testing"
+    code: "267"
+    description: "The Evaluations framework integrates with Swift Testing. Learn how to write and run evaluation test cases."
+---
+
+## Highlight
+
+> In Xcode 27, Apple's Evaluations framework adds synthetic data generation and tool-call trajectory validation, letting developers generate evaluation datasets in code and precisely check whether an agentic app calls tools in the expected order, with the expected arguments and intent.
+
+## Core Content
+
+### The problem with hand-written evaluation data
+
+You build an AI feature, such as automatically tagging books from reviews. You write 13 test cases, they all pass, and the score looks great. After launch, user feedback is a mess.
+
+Where did things go wrong? Thirteen samples cannot cover real-world complexity. There are thousands of kinds of books, review styles vary widely, and reviews may be short, long, or ambiguous. High scores from small datasets are often misleading. ([00:47](https://developer.apple.com/videos/play/wwdc2026/299/?time=47))
+
+Expanding a dataset by hand takes a lot of time and still does not guarantee diversity. Apple's answer is to let the model generate data, while code-based rules guard quality.
+
+### Synthetic data generation: from 13 samples to 100
+
+The Evaluations framework provides the `makeSamples` API. It only needs three inputs: a prompt, an initial dataset, and a target total count. The framework uses your seed data to generate a stream of new samples. ([03:31](https://developer.apple.com/videos/play/wwdc2026/299/?time=211))
+
+For more complex scenarios, `SampleGenerator` provides full configuration. You can choose the model, such as `PrivateCloudComputeLanguageModel` for a larger context window, customize system instructions, choose a sampling strategy such as random sampling or sliding windows, and define validation rules that reject bad samples. ([05:53](https://developer.apple.com/videos/play/wwdc2026/299/?time=353))
+
+### Validating generated data
+
+Generating data is not the same as generating good data. The model might produce reviews that are too short, the wrong number of tags, or tags with inconsistent capitalization. The `validator` closure on `SampleGenerator` lets you filter samples as they are generated. Passing samples go into `samples`, failed samples go into `invalidSamples`, and both are available at any time. ([10:37](https://developer.apple.com/videos/play/wwdc2026/299/?time=637))
+
+When you rerun evaluation with the expanded dataset, the score will often drop. That is a good thing: it reveals problems your earlier tests missed. In Xcode 27's Evaluations Report, you can compare the two runs directly and locate the failures. ([11:12](https://developer.apple.com/videos/play/wwdc2026/299/?time=672))
+
+### Tool-call evaluation: checking how the app worked, not only what it returned
+
+In agentic apps, the model often does not return the final answer directly. It uses a series of tools: search, fetch details, find similar items. The final answer may look correct while the intermediate path is wrong. For example, the model might never call the search tool and instead hallucinate an answer. ([13:44](https://developer.apple.com/videos/play/wwdc2026/299/?time=824))
+
+Apple introduces `TrajectoryExpectation` to solve this. It checks the order of tool calls, argument values, and intent matches recorded in a model session. You can require ordered calls with `ordered`, allow calls in any order with `unordered`, or explicitly forbid certain calls with `disallowed`. ([16:04](https://developer.apple.com/videos/play/wwdc2026/299/?time=964))
+
+Argument matching supports several modes: exact matching (`.exact`), natural-language intent matching (`.naturalLanguage`), containment checks (`.contains`), range matching (`.range`), and more. That gives evaluations the rigor of code while still tolerating the fuzziness of large-model output. ([17:07](https://developer.apple.com/videos/play/wwdc2026/299/?time=1027))
+
+## Details
+
+### Quickly expand a dataset with `makeSamples`
+
+([05:16](https://developer.apple.com/videos/play/wwdc2026/299/?time=316))
+
+The simplest synthetic data generation only takes a few lines:
+
+```swift
+let prompt = Prompt("""
+    Generate diverse range of book reviews and corresponding tags.
+    Cover a wide range of genres, time periods, cultures, and
+    reader personas. Do not repeat books already in the dataset.
+    """)
+
+let dataset = Book.sampleBooks.map { book in
+    ModelSample(prompt: book.review, expected: BookTags(tags: book.tags))
+}
+
+let targetCount = 100
+var expandedDataset = dataset
+
+for try await sample in dataset.makeSamples(prompt, targetCount: targetCount) {
+    expandedDataset.append(sample)
+    print("Generated \(expandedDataset.count) samples so far.")
+}
+```
+
+Key points:
+
+- `prompt` describes the generation task. More specific prompts usually produce higher-quality data.
+- `dataset` is the seed data. It is wrapped in `ModelSample`, which includes the input (`prompt`) and expected output (`expected`).
+- `targetCount` is the final total dataset size, including the seed data. Here it generates 87 new samples.
+- `makeSamples` returns an `AsyncStream`, so you can process each generated sample in real time.
+
+### Customizing `SampleGenerator`
+
+([05:53](https://developer.apple.com/videos/play/wwdc2026/299/?time=353))
+
+Use `SampleGenerator` when you need finer control:
+
+```swift
+let generator = SampleGenerator<ModelSample<BookTags>>(
+    prompt,
+    samples: dataset,
+    targetCount: targetCount,
+    sessionProvider: {
+        LanguageModelSession(
+            model: PrivateCloudComputeLanguageModel(),
+            instructions: """
+                You are a synthetic data generator for a book-tracking app's evaluation suite.
+                Your job is to produce realistic, diverse book entries that will stress-test
+                a tagging system.
+
+                Rules:
+                - Review must be at least 100 characters long.
+                - Review should cover a mix of genre, mood/tone, and themes.
+                - Reviews should vary in length.
+                - Create between 3 and 8 tags.
+                - Tags must be lowercase.
+                """
+        )
+    }
+)
+```
+
+Key points:
+
+- `sessionProvider` is a closure that returns a `LanguageModelSession`, controlling which model and system instructions are used.
+- The framework handles batch size automatically, but it reuses the same session. If the context window is exhausted, it calls `sessionProvider` again to get a new session.
+- System instructions must be self-contained. Do not rely on context-dependent phrasing such as "keep the same style as before."
+- The default uses the on-device model, but you can switch to `PrivateCloudComputeLanguageModel` for a larger context window.
+
+### Validating generated samples
+
+([10:37](https://developer.apple.com/videos/play/wwdc2026/299/?time=637))
+
+```swift
+let generator = SampleGenerator<ModelSample<BookTags>>(
+    prompt,
+    samples: dataset,
+    targetCount: targetCount,
+    sessionProvider: { /* ... */ },
+    validator: { sample in
+        guard let book = sample.expected else { return false }
+
+        // Review must be at least 100 characters
+        guard sample.promptDescription.count >= 100 else { return false }
+
+        // Must have between 3 and 8 tags
+        guard (3...8).contains(book.tags.count) else { return false }
+
+        // All tags must be lowercase
+        guard book.tags.allSatisfy({ $0 == $0.lowercased() }) else { return false }
+
+        return true
+    }
+)
+```
+
+Key points:
+
+- `validator` runs independently for every generated sample and has no cross-sample context.
+- It is well suited to hard-coded rules: length checks, count ranges, and format constraints.
+- It is not well suited to rules that need cross-sample judgment, such as "diversity." Put those rules in the system instructions to guide generation.
+
+### Accessing validation results
+
+([10:58](https://developer.apple.com/videos/play/wwdc2026/299/?time=658))
+
+```swift
+// During iteration
+for try await sample in generator.run() {
+    expandedDataset.append(sample)
+}
+
+// After iteration
+let allSamples = await generator.samples
+let invalidSamples = await generator.invalidSamples
+
+print("Generated \(allSamples.count) new samples. Total: \(expandedDataset.count)")
+```
+
+Key points:
+
+- `generator.run()` starts generation and returns an asynchronous stream.
+- `generator.samples` and `generator.invalidSamples` update in real time and can be accessed at any time.
+- Failed samples are not discarded. You can review them manually, adjust the rules, and regenerate.
+
+### Defining `@Generable` arguments for tools
+
+([15:30](https://developer.apple.com/videos/play/wwdc2026/299/?time=930))
+
+Tool arguments are marked with the `@Generable` macro so the model knows how to fill them:
+
+```swift
+@Generable
+struct SearchBooksArguments {
+    @Guide(description: "A freeform search term to match against titles, reviews, or tags")
+    var query: String?
+
+    @Guide(description: "Filter results to books with this specific tag")
+    var tag: String?
+
+    @Guide(description: "Filter results by mood")
+    var mood: String?
+
+    @Guide(description: "Filter results by genre")
+    var genre: String?
+
+    @Guide(description: "Maximum number of results to return. Defaults to 5.")
+    var limit: Int?
+}
+```
+
+Key points:
+
+- All arguments are optional, letting the model decide which fields to fill based on user intent.
+- `@Guide` provides argument descriptions and helps the model understand the purpose of each field.
+- Required arguments can push the model to hallucinate values under ambiguous instructions.
+
+### Basic trajectory expectations: exact argument matching
+
+([16:37](https://developer.apple.com/videos/play/wwdc2026/299/?time=997))
+
+```swift
+TrajectoryExpectation(
+    unordered: [
+        ToolExpectation(
+            "searchBooks",
+            arguments: [
+                .exact(argumentName: "tag", value: .string("gothic"))
+            ]
+        )
+    ]
+)
+```
+
+Key points:
+
+- `unordered` means the tool call can appear at any time; it only needs to appear.
+- `.exact` requires the argument value to exactly match the specified string.
+- It is useful when the argument value is clear and can be predicted exactly.
+
+### Natural-language intent matching
+
+([17:07](https://developer.apple.com/videos/play/wwdc2026/299/?time=1027))
+
+```swift
+TrajectoryExpectation(
+    "searchBooks",
+    arguments: [
+        .naturalLanguage(
+            argumentName: "mood",
+            criteria: "Should relate to uplifting, hopeful, or positive feelings"
+        )
+    ]
+)
+```
+
+Key points:
+
+- `.naturalLanguage` describes the expected intent in natural language instead of an exact value.
+- It is useful for evaluating fuzzy concepts such as mood, style, and theme.
+- It triggers additional model reasoning behind the scenes, so evaluation takes longer.
+
+### Ordered tool-call expectations
+
+([17:34](https://developer.apple.com/videos/play/wwdc2026/299/?time=1054))
+
+```swift
+TrajectoryExpectation(
+    ordered: [
+        ToolExpectation(
+            "searchBooks",
+            arguments: [
+                .exact(argumentName: "tag", value: .string("gothic"))
+            ]
+        ),
+        ToolExpectation(
+            "getBookDetails",
+            arguments: [
+                .keyOnly(argumentName: "bookId")
+            ]
+        )
+    ]
+)
+```
+
+Key points:
+
+- `ordered` requires tools to be called in the specified order.
+- Searching before fetching details is reasonable; doing it the other way around is a bug.
+- `.keyOnly` only checks whether the argument exists. It does not constrain the value.
+
+### Disallowing specific tool calls
+
+([17:55](https://developer.apple.com/videos/play/wwdc2026/299/?time=1075))
+
+```swift
+TrajectoryExpectation(
+    unordered: [
+        ToolExpectation(
+            "searchBooks",
+            arguments: [
+                .naturalLanguage(
+                    argumentName: "genre",
+                    criteria: "Should refer to science fiction")
+            ]
+        )
+    ],
+    disallowed: [
+        ToolExpectation("findSimilarBooks")
+    ]
+)
+```
+
+Key points:
+
+- `disallowed` lists tool calls that must not appear.
+- If the user says "do not look for similar books" and the model calls `findSimilarBooks`, the test should fail.
+- This tests whether the model follows negative instructions.
+
+### A complete tool-call evaluation
+
+([18:14](https://developer.apple.com/videos/play/wwdc2026/299/?time=1094))
+
+```swift
+let samples = SampleArrayLoader(samples: [
+    ModelSample(
+        prompt: "Find all the books tagged with 'gothic'.",
+        instructions: "Help the user explore their book collection.",
+        expectations: TrajectoryExpectation(
+            unordered: [
+                ToolExpectation(
+                    "searchBooks",
+                    arguments: [
+                        .exact(argumentName: "tag", value: .string("gothic"))
+                    ]
+                )
+            ]
+        )
+    )
+])
+
+struct BookLibraryToolCallEval: Evaluation {
+    var dataset = samples
+
+    let pass = Metric("All Passed")
+    let percent = Metric("Percentage Passed")
+
+    var evaluators: Evaluators {
+        ToolCallEvaluator(allPass: pass, percentagePass: percent)
+    }
+}
+```
+
+Key points:
+
+- `ModelSample` includes the user prompt, system instructions, and trajectory expectations.
+- `ToolCallEvaluator` runs the model session, captures tool-call records, and compares them with the expectations.
+- Results appear directly in Xcode's Evaluations Report.
+
+### Generating synthetic data for tool evaluations
+
+([19:20](https://developer.apple.com/videos/play/wwdc2026/299/?time=1160))
+
+```swift
+let prompt = Prompt("""
+    Generate diverse user queries for a personal book library assistant.
+    Each sample needs a prompt (what the user says), and a trajectory
+    expectation describing which tools should be called and in what order.
+    """)
+
+let instructions = """
+    AVAILABLE TOOLS:
+    - searchBooks(query?, tag?, mood?, genre?, limit?): search the library
+    - getBookDetails(bookId): full details for one book
+    - findSimilarBooks(bookId, maxResults?): find books sharing tags
+    ORDER REQUIREMENTS:
+    - searchBooks must comes before getBookDetails or findSimilarBooks
+    - Use TrajectoryExpectation(ordered:) when sequence matters, else (unordered:)
+    USE THESE ARGUMENT MATCHERS:
+    - .exact for precise values, .naturalLanguage for fuzzy matching
+    - .keyOnly when any value is acceptable, .range for numeric constraints
+    - .contains/.hasPrefix/.hasSuffix for partial string matching
+    """
+```
+
+Key points:
+
+- `TrajectoryExpectation` also conforms to `Generable`, so it can be generated automatically.
+- System instructions must clearly list available tools, ordering rules, and argument matcher usage.
+- The model does not know which tools you defined. Put all required context in `instructions`.
+
+### Validating synthetic samples for tool evaluations
+
+([19:51](https://developer.apple.com/videos/play/wwdc2026/299/?time=1191))
+
+```swift
+validator: { sample in
+    // Must have expectations defined
+    guard sample.output.expectations != nil else { return false }
+
+    let expectations = sample.output.expectations!
+
+    // Must reference at least one tool
+    let totalExpectations = expectations.ordered.count + expectations.unordered.count
+    guard totalExpectations > 0 else { return false }
+
+    // All tool names must be from the valid set
+    let validTools: Set<String> = ["searchBooks", "getBookDetails", "findSimilarBooks"]
+    let allExpectations = expectations.ordered + expectations.unordered + expectations.disallowed
+    for expectation in allExpectations {
+        guard validTools.contains(expectation.name) else { return false }
+    }
+
+    return true
+}
+```
+
+Key points:
+
+- Validate that synthetic data includes trajectory expectations.
+- Ensure at least one tool is referenced.
+- Check that every tool name is in the predefined set, preventing the model from inventing unavailable tools.
+
+## Key Ideas
+
+### 1. Add data-driven evaluations to existing AI features
+
+**What to build**: Connect your existing AI feature, such as smart replies, content classification, or recommendations, to the Evaluations framework. Use `SampleGenerator` to expand from a few dozen seed samples to a few hundred.
+
+**Why it is worth doing**: Most developers judge AI features by feel. Quantitative evaluations show how each prompt change or model swap affects scores and help avoid making the feature worse.
+
+**How to start**: Convert existing test cases into `ModelSample`, write a prompt that describes the generation task, set `targetCount` to 100, use `validator` to filter obvious junk, and run the evaluation in Xcode to inspect the score.
+
+### 2. Add trajectory checks to multi-step AI workflows
+
+**What to build**: If your app uses a model to call multiple tools for complex tasks, such as search + filter + sort + display, use `TrajectoryExpectation` to validate each step.
+
+**Why it is worth doing**: The model can bypass your business logic and return an answer directly. It may look correct while following the wrong path. Trajectory checks catch these hidden "right result, wrong route" bugs.
+
+**How to start**: List your tools and reasonable calling order. Write a `TrajectoryExpectation` for each user intent and run it with `ToolCallEvaluator`. Start with `.exact` matching, then use `.naturalLanguage` for fuzzy arguments.
+
+### 3. Use synthetic data for stress testing
+
+**What to build**: Use `SampleGenerator` to create many edge cases: very long input, empty input, mixed languages, special characters, and more.
+
+**Why it is worth doing**: Writing edge cases by hand is tedious and easy to under-cover. Letting the model generate them helps expose scenarios you did not anticipate and reveals prompt or feature fragility.
+
+**How to start**: Ask for extreme cases in the prompt, such as "generate one 5000-character book review" or "generate input that contains only emoji." Use `validator` to ensure the format is valid, then run evaluations to see whether the feature breaks.
+
+### 4. Add evaluations to CI
+
+**What to build**: Write Evaluations tests as Swift Testing cases and run them automatically on every code commit or model update.
+
+**Why it is worth doing**: Regressions in AI features are harder to notice than traditional code regressions. Model upgrades and prompt tweaks can both change behavior. Automated evaluations catch problems before they reach production.
+
+**How to start**: Define an `Evaluation` struct in Swift Testing and run it with `swift test`. Write results to a file, compare them against a baseline in CI, and block merges when the score drops beyond a threshold.
+
+### 5. Build a model-as-judge scoring system
+
+**What to build**: For outputs that are hard to score with rules, such as creative writing or conversation quality, use another model as the judge.
+
+**Why it is worth doing**: Some evaluation dimensions, such as whether a book review tag is appropriate, are difficult to judge with code. Letting a model evaluate another model can cover these subjective quality dimensions.
+
+**How to start**: See the "Scoring with model-as-judge evaluators" resource. Define scoring dimensions and criteria, then use the Evaluations framework's model-as-judge evaluator instead of a hard-coded validator.
+
+## Related Sessions
+
+- [Improve your prompts by hill climbing with Evaluations](/articles/wwdc2026-335) - Iterate on prompts with hill climbing in the Evaluations framework. Together with this session's synthetic data and tool evaluation workflow, it forms a complete evaluation loop.
+- [Build agentic app experiences with Foundation Models](/articles/wwdc2026-242) - The foundation for building agentic apps. This session's tool-calling evaluations are designed for exactly these kinds of experiences.
+- [Meet the Evaluations framework](/articles/wwdc2026-298) - An introduction to the Evaluations framework, covering core concepts and the hill-climbing flow. Watch it first if you are new to the framework.
+- [Foundation Models on device](/articles/wwdc2026-241) - Understand the capability boundaries of on-device models so you can design realistic evaluation strategies and choose appropriate generation models.
+- [Swift Testing](/articles/wwdc2026-267) - The Evaluations framework integrates with Swift Testing. Learn how to write and run evaluation test cases.

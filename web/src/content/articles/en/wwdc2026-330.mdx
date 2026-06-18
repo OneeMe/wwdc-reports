@@ -1,0 +1,322 @@
+---
+title: "Optimize custom machine learning operations with Metal tensors"
+description: "Learning operations with Metal tensors"
+date: "2026-06-10"
+tags: ["Metal", "TensorOps", "Quantization", "FlashAttention", "Core AI"]
+thumbnail: "/images/sessions/2026/330.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/330/"
+sessionId: "wwdc2026-330"
+year: "2026"
+relatedSessions:
+  - title: "Session 324: Accelerate machine learning with Core AI"
+    code: "324"
+    description: "A broad introduction to the Core AI framework, including model conversion and deployment flows"
+  - title: "Session 328: Build local AI features with MLX Swift"
+    code: "328"
+    description: "Build local AI features on Apple devices with MLX Swift, which can be combined with custom Metal kernels"
+  - title: "Session 388: Optimize Metal performance for Apple GPUs"
+    code: "388"
+    description: "General Metal performance optimization principles, including memory management and shader tuning"
+  - title: "Session 359: Enhance your game with Metal neural rendering"
+    code: "359"
+    description: "Metal neural rendering, with related GPU compute optimization ideas"
+---
+
+## Highlight
+
+> In iOS/macOS 27, the Metal Tensor API and the MPP TensorOps library add native support for quantized data types such as FP8 and 4-bit/2-bit integers, and allow Cooperative Tensor values to be used directly as matrix multiplication inputs. Developers can implement complex operators such as FlashAttention on the GPU without shuttling data through Threadgroup Memory, while automatically using the Neural Accelerator hardware built into M5/A19 chips.
+
+## Core Content
+
+The bottleneck in large-model inference has shifted from compute to memory bandwidth. A 70B-parameter model stored in 16-bit half precision needs 140 GB of GPU memory, far beyond any mobile device. Quantization is the only practical path: compress 16-bit weights down to 8-bit, 4-bit, or even 2-bit values to reduce both model size and inference-time memory traffic.
+
+But implementing quantization on the GPU has long been painful. Data and Scale Factors are usually stored in two independent buffers, and shaders must manually calculate indices, read scale values, and dequantize back to FP16 before computation. If intermediate results are written back to Threadgroup Memory and then read again, bandwidth and latency become unacceptable. Operators such as FlashAttention avoid those memory round trips by juggling data in registers, but synchronization across SIMD groups can feel like walking a tightrope.
+
+At this WWDC, Apple presents a systematic solution. First, `MTLTensor` can now package quantized data and Scale Factors into a single object managed through an Auxiliary Plane. On the shader side, after declaring the type with `tensor_blockwise`, TensorOps `matmul2d` automatically handles dequantization and invokes the M5 chip's Neural Accelerator hardware. Second, Cooperative Tensor values, whose data is distributed across SIMD group registers, can now be used directly as the input to the next matrix multiplication, eliminating round trips through Threadgroup Memory.
+
+The goal of this API is clear: make custom ML operator authoring feel as simple as calling a high-level framework, without giving up performance. Whether you are writing custom operators for Core AI or contributing kernels to MLX or llama.cpp, these APIs are immediately useful.
+
+### Native support for quantized data types
+
+([03:16](https://developer.apple.com/videos/play/wwdc2026/330/?time=196)) TensorOps added support for 4-bit and 8-bit integer types in the iOS/macOS 26 update, and iOS/macOS 27 extends this to 4-bit/8-bit floating-point types and 2-bit integer types. Developers only specify the quantized `dataType` when creating an `MTLTensor`; TensorOps then automatically uses available hardware acceleration.
+
+### Multi-plane tensors: data and Scale Factors together
+
+([04:21](https://developer.apple.com/videos/play/wwdc2026/330/?time=261)) In iOS/macOS 27, a single `MTLTensor` object can hold both quantized data and Scale Factors through Auxiliary Planes. The Scale Plane supports the common FP8 E8M0 block-wise format, where each scale element applies to one block in the data plane. After the host configures `MTLTensorAuxiliaryPlaneDescriptor`, data, scale values, and metadata are packaged into one tensor object, and the shader can read them block by block.
+
+### Cooperative Tensor directly connected to matrix multiplication
+
+([12:20](https://developer.apple.com/videos/play/wwdc2026/330/?time=740)) In earlier FlashAttention implementations, the intermediate QxK result had to be written from a Cooperative Tensor back to Threadgroup Memory, then read again for the next matrix multiplication. iOS/macOS 27 adds `get_left_input_cooperative_tensor`, which allows a Cooperative Tensor to be used directly as a `matmul2d` input. The data path changes from "registers -> shared memory -> registers" to "registers -> registers", a real multi-fold improvement for memory-intensive operators.
+
+## Details
+
+### Create a quantized tensor with Scale Factors
+
+([03:53](https://developer.apple.com/videos/play/wwdc2026/330/?time=233)) Creating a quantized tensor on the host is almost the same as creating a regular tensor. The difference is specifying the quantized `dataType` and attaching an Auxiliary Plane that describes the Scale Factors:
+
+```objc
+#define RANK 2
+
+MTLTensorDescriptor *tensorDesc = [MTLTensorDescriptor new];
+tensorDesc.dataType = MTLTensorDataTypeMetalFloat8E4M3;
+tensorDesc.usage = MTLTensorUsageCompute;
+
+NSInteger dimensions[RANK] = {NumCols, NumRows};
+tensorDesc.dimensions = [[MTLTensorExtents alloc] initWithRank:RANK values:dimensions];
+
+NSError *err = nil;
+id <MTLTensor> tensor = [device newTensorWithDescriptor:tensorDesc error:&err];
+```
+
+Key points:
+- `MTLTensorDataTypeMetalFloat8E4M3` specifies FP8 E4M3 storage for the data plane.
+- `dimensions` is wrapped with `MTLTensorExtents`, supporting arbitrary rank.
+- Errors are returned through `NSError`; if creation fails, `tensor` is nil.
+
+If the tensor needs Scale Factors, continue by configuring an Auxiliary Plane:
+
+```objc
+MTLTensorAuxiliaryPlaneDescriptor *planeDesc = [MTLTensorAuxiliaryPlaneDescriptor new];
+planeDesc.dataType = MTLTensorDataTypeMetalFloat8UE8M0;
+
+NSInteger blockFactors[RANK] = {32, 1};
+planeDesc.blockFactors = [[MTLTensorExtents alloc] initWithRank:RANK values:blockFactors];
+
+MTLTensorAuxiliaryPlaneDescriptorMap *auxiliaryPlanes =
+    [MTLTensorAuxiliaryPlaneDescriptorMap new];
+[auxiliaryPlanes setDescriptor:planeDesc forPlane:MTLTensorPlaneTypeScales];
+
+tensorDesc.auxiliaryPlanes = auxiliaryPlanes;
+
+id <MTLTensor> tensor = [device newTensorWithDescriptor:tensorDesc error:&err];
+```
+
+Key points:
+- `blockFactors` defines the block size for block-wise scaling; here, every 32 columns share one scale value.
+- `MTLTensorPlaneTypeScales` marks this auxiliary plane as storage for Scale Factors.
+- Data, scale values, and metadata are ultimately packaged into the same `MTLTensor` object.
+- Quantized data types have additional memory alignment requirements; check the Metal documentation.
+
+### Declare MXFP8 tensor types in shaders
+
+([06:07](https://developer.apple.com/videos/play/wwdc2026/330/?time=367)) In Metal Shading Language (MSL), use a type alias to declare a tensor type with a Scale Plane:
+
+```metal
+#include <metal_tensor>
+using namespace metal;
+
+using scales_plane = tensor_blockwise<tensor_plane_scales,
+                                      device metal_fp8_ue8m0_format,
+                                      32, 1>;
+
+using mxfp8_tensor = tensor<device metal_fp8_e4m3_format,
+                            dextents<int, 2>,
+                            tensor_handle,
+                            scales_plane>;
+
+kernel void matmul(mxfp8_tensor matrixA [[buffer(0)]],
+                   mxfp8_tensor matrixB [[buffer(1)]],
+                   tensor<device half, dextents<int, 2>> matrixC [[buffer(2)]])
+{
+    // ...
+}
+```
+
+Key points:
+- `tensor_blockwise` declares a block-wise Scale Plane. Its template parameters are, in order: plane type, storage location, data format, and block size.
+- The main type parameters of `mxfp8_tensor` are storage location, dimension extents (`dextents<int, 2>` means dynamic 2D dimensions), handle type, and Scale Plane.
+- `tensor_handle` means the tensor is bound from a host-side `MTLTensor`.
+- Buffer binding is exactly the same as a regular MSL kernel.
+
+If you do not need to create a full host-side `MTLTensor`, you can also construct an inline tensor directly on the shader stack:
+
+```metal
+using mxfp8_tensor_inline = tensor<device metal_fp8_e4m3_format,
+                                   dextents<int, 2>,
+                                   tensor_inline,
+                                   scales_plane>;
+
+mxfp8_tensor_inline matrixA(dataBufferA,
+                             dextents<int, 2>(K, M),
+                             array<int, 2>({ 1, K }),
+                             scales_plane(scalesBufferA));
+```
+
+Key points:
+- `tensor_inline` replaces `tensor_handle`, indicating stack allocation.
+- The constructor arguments are the data-buffer pointer, dimensions, stride array, and Scale Plane.
+- This is suitable for temporary tensors and reduces host-side object creation overhead.
+
+### Slicing and quantized matrix multiplication
+
+([07:19](https://developer.apple.com/videos/play/wwdc2026/330/?time=439)) Slice the input and output tensors by Threadgroup ID, then call TensorOps to execute matrix multiplication:
+
+```metal
+auto tA = matrixA.slice(0, tgid.y * TILEM);
+auto tB = matrixB.slice(tgid.x * TILEN, 0);
+auto tC = matrixC.slice(tgid.x * TILEN, tgid.y * TILEM);
+
+constexpr auto descriptor = matmul2d_descriptor(TILEM,
+                                                TILEN,
+                                                dynamic_length_v<int>,
+                                                false,
+                                                false);
+
+matmul2d<descriptor, execution_simdgroups<4>> op;
+op.run(tA, tB, tC);
+```
+
+Key points:
+- `slice` extracts the tile handled by each threadgroup according to the Threadgroup ID.
+- The data plane and Scale Plane are sliced together according to block size.
+- The `matmul2d_descriptor` template parameters are M, N, K (`dynamic_length_v<int>` means runtime-determined), whether the left matrix is transposed, and whether the right matrix is transposed.
+- `execution_simdgroups<4>` specifies that four SIMD groups inside the threadgroup execute in parallel.
+- TensorOps automatically dequantizes quantized tensors; no manual intervention is required.
+
+### Implement FlashAttention with Cooperative Tensor
+
+([10:27](https://developer.apple.com/videos/play/wwdc2026/330/?time=627)) FlashAttention fuses QxK, SoftMax, and multiplication by V into one kernel, avoiding writes of intermediate results back to memory. First, set up matrix multiplication at SIMD group level:
+
+```metal
+constexpr auto mul_qk_op_desc = matmul2d_descriptor(/* ... */);
+matmul2d<mul_qk_op_desc, execution_simdgroups> mul_qk_op;
+
+auto tQSlice = tQ.slice<D, ROWS_PER_SIMD>(0, sgid * ROWS_PER_SIMD);
+auto tKSlice = tK.slice<D, BK>(0, k);
+auto tVSlice = tV.slice<D, BK>(0, k);
+
+auto ctQK = mul_qk_op.get_destination_cooperative_tensor<decltype(tQSlice),
+                                                         decltype(tKSlice),
+                                                         float>();
+
+mul_qk_op.run(tQSlice, tKSlice, ctQK);
+```
+
+Key points:
+- `execution_simdgroups` lets each SIMD group compute independently, each owning a complete row of the intermediate matrix.
+- `sgid` (SIMD group ID) is used for slicing, so SoftMax does not need to exchange data across SIMD groups.
+- `get_destination_cooperative_tensor` creates a Cooperative Tensor whose data is distributed across participating threads' private registers.
+- Cooperative Tensor avoids writing intermediate results back to Threadgroup Memory.
+
+Next, compute the row-wise maximum reduction in preparation for SoftMax:
+
+([11:18](https://developer.apple.com/videos/play/wwdc2026/330/?time=678))
+
+```metal
+auto ctTileRowMax = mul_qk_op.get_row_reduction_destination_cooperative_tensor<
+                        decltype(tQSlice),
+                        decltype(tKSlice),
+                        float>();
+
+reduce_rows(ctQK, ctTileRowMax, reduction_operation::max, -INFINITY);
+```
+
+Key points:
+- `get_row_reduction_destination_cooperative_tensor` creates a Cooperative Tensor for storing reduction results.
+- `reduce_rows` computes the maximum of each row and automatically exchanges data across threads.
+- The initial value is `-INFINITY`, ensuring correct maximum calculation.
+
+Then use `map_iterator` to compute SoftMax:
+
+([11:56](https://developer.apple.com/videos/play/wwdc2026/330/?time=716))
+
+```metal
+#pragma clang loop unroll(full)
+for (auto it = ctQK.begin(); it != ctQK.end(); it++) {
+    auto row_it = ctRowMax.map_iterator(it);
+    *it = exp(*it - *row_it);
+}
+```
+
+Key points:
+- `map_iterator` maps each element in the 2D Cooperative Tensor to the corresponding row-maximum position.
+- The two Cooperative Tensors have different shapes, and `map_iterator` handles the index mapping automatically.
+- Subtract the maximum before exponentiation to prevent numerical overflow.
+
+Finally, use the Cooperative Tensor directly as the input to the next matrix multiplication:
+
+([12:33](https://developer.apple.com/videos/play/wwdc2026/330/?time=753))
+
+```metal
+constexpr auto mul_sv_op_desc = matmul2d_descriptor(/* ... */);
+matmul2d<mul_sv_op_desc, metal::execution_simdgroup> mul_sv_op;
+
+if (mul_sv_op.is_compatible_as_left_input<float, half, float>(ctQK)) {
+    auto ctQKIn = mul_sv_op.get_left_input_cooperative_tensor<float, half, float>(ctQK);
+    mul_sv_op.run(ctQKIn, tVSlice, ctO);
+} else {
+    ctQK.store(tgTensor);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto ctQKIn = mul_sv_op.get_left_input_cooperative_tensor<float, half, float>();
+    ctQKIn.load(tgTensor);
+    mul_sv_op.run(ctQKIn, tVSlice, ctO);
+}
+```
+
+Key points:
+- `is_compatible_as_left_input` checks whether the Cooperative Tensor layout can be used as the left input.
+- The template parameters `<float, half, float>` represent the left input, right input, and output data types.
+- If compatible, the data is reused directly and stays in registers end to end.
+- If not compatible, it falls back to storing into Threadgroup Memory and loading again.
+- `simdgroup_barrier` ensures every thread finishes writing before any thread reads.
+
+### Integrate into a Core AI model
+
+([13:35](https://developer.apple.com/videos/play/wwdc2026/330/?time=815)) Core AI provides a Python toolchain that can convert PyTorch models into Core AI format and inject custom Metal kernels during conversion. Using the SAM3 image segmentation model as an example, the speaker showed the complete integration flow:
+
+1. Define the custom Attention kernel's MSL code as a string in Python.
+2. Register a `TorchMetalKernel` object.
+3. Replace Hugging Face's default Attention implementation with a version that calls the custom kernel.
+4. Load the model from Hugging Face and export it as an optimized Core AI asset.
+
+The exported model can run directly on Apple devices and automatically calls the custom FlashAttention kernel during inference.
+
+## Core Takeaways
+
+### Write custom quantized operators for existing inference frameworks
+
+**What to build**: a custom Linear layer kernel with FP8 weight support for llama.cpp or MLX.
+
+**Why it is worth doing**: existing framework Metal backends may not yet support the new iOS/macOS 27 quantized types. With `MTLTensor` multi-plane tensors plus TensorOps, you can implement a hardware-accelerated quantized matrix multiplication in under 100 lines of code, with much better performance than manual bit-shift unpacking.
+
+**How to start**: create a quantized tensor with `MTLTensorPlaneTypeScales` from `MTLTensorDescriptor`, declare the type with `tensor_blockwise` in the shader, then pass it directly to `matmul2d`. Refer to the TensorOps sample code project.
+
+### Run compressed vision-language models on iPhone
+
+**What to build**: quantize a 7B-parameter vision-language model such as LLaVA to 4-bit and deploy it on iPhone for real-time image understanding.
+
+**Why it is worth doing**: 4-bit quantization compresses model size to one quarter of the original, and with the M5/A19 Neural Accelerator, dense computation in the prefill phase can be directly hardware accelerated. Large models that used to be impossible on mobile now have a plausible deployment path.
+
+**How to start**: export the PyTorch model with Core AI's Python conversion tools and specify a quantization configuration during conversion. If the model includes a custom Attention implementation, inject a Metal kernel using the FlashAttention integration approach from this session.
+
+### Write custom postprocessing operators for Core AI models
+
+**What to build**: a custom NMS (non-maximum suppression) or mask postprocessing kernel for segmentation or detection models.
+
+**Why it is worth doing**: postprocessing is often the bottleneck in an inference pipeline, especially for sorting and filtering operations that do not parallelize well on the GPU. Cooperative Tensor and `reduce_rows` can move part of this logic onto the GPU and reduce CPU-GPU round trips.
+
+**How to start**: analyze which parts of postprocessing can be parallelized, such as confidence sorting through parallel reduction. Implement that logic in the shader with Cooperative Tensor, then register it in Core AI's conversion flow through `TorchMetalKernel`.
+
+### Explore the extreme compression of 2-bit quantization
+
+**What to build**: compress model weights to 2-bit and test the accuracy/speed trade-off on Apple Silicon.
+
+**Why it is worth doing**: iOS/macOS 27 adds support for 2-bit integer types. For layers that are less sensitive to precision, such as embedding layers or parts of FFN layers, 2-bit quantization may further compress the model without obvious accuracy loss, allowing larger models to fit on mobile devices.
+
+**How to start**: begin with weight distribution analysis to identify layers with small value ranges and low precision sensitivity. Use the corresponding 2-bit type in `MTLTensorDataType` to create tensors, combine it with appropriate block-wise Scale Factors, validate accuracy on a small model, then expand. Entry point: `MTLTensorDataType` 2-bit type plus `MTLTensorAuxiliaryPlaneDescriptor`.
+
+### Write a FlashAttention kernel for an inference framework
+
+**What to build**: implement a complete FlashAttention kernel with Cooperative Tensor and TensorOps `matmul2d`, replacing a framework's default Attention implementation.
+
+**Why it is worth doing**: FlashAttention fuses QxK, SoftMax, and multiplication by V to avoid writing intermediate results back to memory, bringing multi-fold improvements for memory-intensive large-model inference. iOS/macOS 27's direct Cooperative Tensor matrix-multiply input makes the implementation simpler and keeps data in registers end to end.
+
+**How to start**: follow the code structure from the session. Use `matmul2d` to compute QxK into a Cooperative Tensor, use `reduce_rows` for row-wise maximum reduction, use `map_iterator` to compute SoftMax, then pass the Cooperative Tensor directly as the input to the next matrix multiplication. Entry point: `matmul2d` plus `get_destination_cooperative_tensor` plus `get_left_input_cooperative_tensor`.
+
+## Related Sessions
+
+- [Session 324: Accelerate machine learning with Core AI](/articles/wwdc2026-324) - A broad introduction to the Core AI framework, including model conversion and deployment flows
+- [Session 328: Build local AI features with MLX Swift](/articles/wwdc2026-328) - Build local AI features on Apple devices with MLX Swift, which can be combined with custom Metal kernels
+- [Session 388: Optimize Metal performance for Apple GPUs](/articles/wwdc2026-388) - General Metal performance optimization principles, including memory management and shader tuning
+- [Session 359: Enhance your game with Metal neural rendering](/articles/wwdc2026-359) - Metal neural rendering, with related GPU compute optimization ideas

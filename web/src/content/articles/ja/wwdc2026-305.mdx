@@ -1,0 +1,217 @@
+---
+title: "Core Image で RAW 画像処理を強化する"
+description: "tile サイズとバッファ管理を精密に制御してパフォーマンスを最適化する、新しい CIImageProcessor API を紹介します。"
+date: "2026-06-10"
+tags: ["Core Image", "RAW", "Core ML", "CIImageProcessor", "Metal"]
+thumbnail: "/images/sessions/2026/305.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/305/"
+sessionId: "wwdc2026-305"
+year: "2026"
+relatedSessions:
+  - title: "Camera app で写真とビデオをキャプチャする"
+    code: "303"
+    description: "Camera app の新しい撮影機能。RAW 処理と組み合わせて完全なワークフローになる"
+  - title: "写真キャプチャを次のレベルへ進める"
+    code: "304"
+    description: "撮影と後処理の両方を制御したい App に向いた、より低レベルの写真キャプチャ API"
+  - title: "Core Image、Metal、SwiftUI で EDR コンテンツを表示する"
+    code: "101"
+    description: "RAW 9 では Metal-backed view への直接レンダリングが推奨される。この session はその関連基礎を扱う"
+  - title: "SwiftUI graphics"
+    code: "322"
+    description: "Core Image のレンダリング結果を SwiftUI に統合する"
+  - title: "Metal performance"
+    code: "388"
+    description: "Metal レンダリング性能を深く理解し、RAW 9 の CIContext 調整を補完する"
+---
+
+## ハイライト
+
+> Apple は iOS/iPadOS/macOS/visionOS 27 で RAW 9 デコードパイプラインを導入しました。Apple Neural Engine 上で動く Core ML モデルにより、デモザイクとノイズ低減を同時に処理します。サードパーティ App は `CIRAWFilter` の `decoderVersion` を `version9` に設定するだけで大きな画質向上を得られ、さらに `CIImageProcessor` の新しい API で tile サイズと一時バッファのライフサイクルを精密に制御できます。
+
+## 主要内容
+
+### 古い写真も鮮明にできる
+
+RAW ファイルの魅力は、今日撮った写真を 5 年後により良いアルゴリズムで再処理できることです。Apple は 2006 年に 21 種類のカメラ校正から始め、現在では 784 種類まで拡張しています。パイプラインが更新されるたびに、デモザイク、ノイズ低減、色再現が進化してきました。([02:48](https://developer.apple.com/videos/play/wwdc2026/305/?time=168))
+
+しかし以前から痛点がありました。高 ISO の場面では、RAW 8 のノイズ低減と色回復はまだ一歩足りませんでした。ISO 51200 の写真では、クレヨンの色がにじんで一体化し、小さな文字はほとんど読めません。富士フイルム X-T5 のような非伝統的なセンサーレイアウトでは、色の artifact も出やすくなります。([04:27](https://developer.apple.com/videos/play/wwdc2026/305/?time=267))
+
+RAW 9 の解決策は、デモザイクとノイズ低減を 1 つの tile ベース Core ML モデルにまとめ、Apple Neural Engine で動かすことです。その結果、低ノイズ写真では文字がより鮮明になり、高ノイズ写真では色がより正確になり、クレヨン上のハイライト反射まで復元できます。([03:33](https://developer.apple.com/videos/play/wwdc2026/305/?time=213))
+
+### インタラクティブ編集とバッチ書き出しでは戦略が違う
+
+RAW 9 は画質を高めますが、より多くの性能を使います。同じ写真を繰り返しレンダリングするとき、Core Image は中間結果を cache するため、ユーザーが露出スライダーを動かしたときの反応は引き続き高速です。しかし書き出しはまったく別です。1 回限りの全解像度出力なので、cache はメモリを浪費するだけです。([08:40](https://developer.apple.com/videos/play/wwdc2026/305/?time=520))
+
+Apple は 2 種類のベストプラクティスを明確に示しています。
+
+- **インタラクティブ編集**: `scaleFactor` でダウンサンプリングし、view ごとに 1 つの `CIContext` を使い、`cacheIntermediates` を有効にして Metal-backed view へ直接レンダリングします。Extended Virtual Addressing entitlement を追加し、システムがより多くの cache メモリを割り当てられるようにします。([09:39](https://developer.apple.com/videos/play/wwdc2026/305/?time=579))
+- **バッチ書き出し**: `cacheIntermediates` を false にし、`memoryLimit` をデフォルトの 256MB から 512MB または 1024MB に増やし、`CIContext` の `heifRepresentation` または `jpegRepresentation` メソッドで直接出力します。([10:56](https://developer.apple.com/videos/play/wwdc2026/305/?time=656))
+
+この 2 つの設定を混ぜると、App はカクつくか、クラッシュします。
+
+## 詳細
+
+### RAW 9 を有効にする
+
+RAW 9 は自動では有効になりません。手動で確認して設定する必要があります。([05:50](https://developer.apple.com/videos/play/wwdc2026/305/?time=350))
+
+```swift
+let rawFilter = CIRAWFilter(imageURL: rawURL)!
+
+// 現在のデバイスが RAW 9 をサポートするか確認する
+if rawFilter.supportedDecoderVersions.contains(.version9) {
+    rawFilter.decoderVersion = .version9
+}
+
+// 特定バージョンがサポートするカメラモデル一覧を取得する
+let models = CIRAWFilter.supportedCameraModels(for: .version9)
+```
+
+重要ポイント:
+
+- `supportedDecoderVersions` は、現在の RAW ファイルで利用できるデコードバージョン一覧を返します。
+- `decoderVersion` のデフォルトは version9 ではありません。明示的に設定する必要があります。
+- `supportedCameraModels(for:)` は class method で、指定したバージョンをサポートするすべてのカメラモデル配列を返します。
+- サポート一覧はシステムの OTA 更新で継続的に拡張されます。
+- iPhone を含む、DNG をネイティブ撮影するデバイスは RAW 9 と自動的に互換になります。
+
+### CIRAWFilter の調整可能パラメータ
+
+RAW 9 はユーザーが微調整できる 20 個の校正済みパラメータを残し、古い 3 個のパラメータを廃止しました。([07:31](https://developer.apple.com/videos/play/wwdc2026/305/?time=451))
+
+残る主要パラメータ:
+
+- `exposure` - 全体の明るさを制御します。
+- `luminanceNoiseReductionAmount` - 輝度ノイズを制御します。
+- `sharpnessAmount` - エッジのシャープ化量を制御します。
+- `contrastAmount` - エッジ付近の局所コントラストを制御します。
+
+RAW 9 で効果を持たなくなるパラメータ:
+
+- `colorNoiseReductionAmount` - Core ML モデルが色ノイズ低減を自動処理します。
+- `detailAmount` - もう不要です。
+- `moireReductionAmount` - もう不要です。
+
+`isSupported` を呼ぶと、あるプロパティが現在の filter インスタンスで有効かを確認できます。
+
+### バッチ書き出し用の CIContext 設定
+
+([11:08](https://developer.apple.com/videos/play/wwdc2026/305/?time=668))
+
+```swift
+let exportCtx = CIContext(options: [
+    .cacheIntermediates: false,
+    .memoryLimit: 512
+])
+```
+
+重要ポイント:
+
+- `cacheIntermediates: false` - 書き出しは 1 回限りの操作なので、cache に意味はありません。
+- `memoryLimit` の単位は MB です。iOS のデフォルトは 256MB で、512 または 1024 に上げると書き出しを大きく高速化できます。
+- `exportCtx.heifRepresentation(of:)` または `jpegRepresentation(of:)` を使うと、Image IO を直接呼ぶよりメモリを節約できます。
+
+### CIImageProcessor で出力 Tile サイズを明示する
+
+メモリが厳しいとき、Core Image は自動的に画像を小さなブロックへ分割して処理します。RAW 9 では、開発者自身が tile サイズを制御する機能が追加されました。([12:23](https://developer.apple.com/videos/play/wwdc2026/305/?time=743))
+
+```swift
+import CoreImage
+
+class MyProcessor: CIImageProcessorKernel {
+    override class func roi(forInput input: Int32,
+                            arguments: [String : Any]?,
+                            outputRect: CGRect) -> CGRect { return outputRect }
+
+    override class func process(with inputs: [CIImageProcessorInput]?,
+                                arguments: [String : Any]?,
+                                output: CIImageProcessorOutput) throws {
+        guard let input = inputs?.first,
+              let iBuffer = input.pixelBuffer,
+              let oBuffer = output.pixelBuffer else { return }
+
+        let iRegion = input.region
+        let oRegion = output.region
+
+        // ここでピクセルデータを処理する
+    }
+}
+
+let extent = inImg.extent
+let tileSize = 512.0
+var tiles: [CIVector] = []
+for y in stride(from: extent.minY, to: extent.maxY, by: tileSize) {
+    for x in stride(from: extent.minX, to: extent.maxX, by: tileSize) {
+        let tile = CGRect(x: x, y: y,
+                          width: min(tileSize, extent.maxX - x),
+                          height: min(tileSize, extent.maxY - y))
+        tiles.append(CIVector(cgRect: tile))
+    }
+}
+
+let result = try MyProcessor.apply(withTiledExtent: tiles, inputs: [inImg], arguments: [:])
+```
+
+重要ポイント:
+
+- `roi(forInput:arguments:outputRect:)` は入力領域と出力領域の対応関係を定義します。
+- `process` callback 内の `input.region` と `output.region` は、Core Image が割り当てた実際の処理領域です。
+- 手動で tile 配列を作ったら、`apply(withTiledExtent:inputs:arguments:)` で渡します。
+- tile サイズは GPU メモリとアルゴリズム要件に応じて柔軟に調整でき、512x512 に限られません。
+
+### CIImageProcessor の一時バッファ
+
+複数の tile を処理するとき、一時バッファの作成と破棄を繰り返すとパフォーマンスに影響します。RAW 9 は Core Image が管理する一時 PixelBuffer を追加しました。([14:24](https://developer.apple.com/videos/play/wwdc2026/305/?time=864))
+
+```swift
+import CoreImage
+
+class MyProcessor: CIImageProcessorKernel {
+    override class func process(with inputs: [CIImageProcessorInput]?,
+                                arguments: [String: Any]?,
+                                output: CIImageProcessorOutput) throws {
+        guard let input = inputs?.first,
+              let srcPixelBuffer = input.pixelBuffer,
+              let dstPixelBuffer = output.pixelBuffer else { return }
+
+        // Core Image の cache pool から一時バッファを要求する
+        guard let scratch = output.temporaryPixelBuffer(
+            identifier: "myScratch",
+            format: kCVPixelFormatType_64RGBAHalf,
+            width: Int(output.region.width),
+            height: Int(output.region.height),
+            pixelBufferAttributes: nil
+        ) else { return }
+
+        // Step 1: 入力データを scratch にコピーする
+        // Step 2: scratch 内でピクセルを処理する
+        // Step 3: 結果を出力 buffer にコピーする
+    }
+}
+```
+
+重要ポイント:
+
+- `temporaryPixelBuffer(identifier:format:width:height:pixelBufferAttributes:)` は Core Image 内部の cache pool からバッファを取得します。
+- `identifier` は複数の一時バッファを区別するために使い、同じ processor 内では一意である必要があります。
+- Core Image がライフサイクルを自動管理します。現在の tile 処理後に回収し、次の tile で再利用します。
+- 典型的な用途は、Core Image の interleaved 画像データを Core ML が必要とする planar data に変換することです。
+
+## 重要な示唆
+
+- **RAW ブラウザ兼軽量編集 App を作る**: RAW 9 の画質向上と `CIRAWFilter` の 20 個の調整可能パラメータを使い、素早いプレビューとパラメータ微調整に集中した App を作れます。入口は `CIRAWFilter(imageURL:)`、中心となる操作は exposure/sharpness スライダーをドラッグしながらのリアルタイムプレビューです。([07:15](https://developer.apple.com/videos/play/wwdc2026/305/?time=435))
+
+- **バッチ RAW 変換ツール**: 写真家のワークフロー向けに、RAW を HEIF/JPEG へバックグラウンド一括書き出しするツールを作れます。重要な設定は `cacheIntermediates: false` + `memoryLimit: 1024` で、`heifRepresentation(of:colorSpace:)` による直接出力と組み合わせます。([10:56](https://developer.apple.com/videos/play/wwdc2026/305/?time=656))
+
+- **カスタム RAW 後処理フィルター**: `CIImageProcessorKernel` を使い、RAW 9 デコード後に独自の Metal または Core ML アルゴリズムを差し込めます。明示的な tile サイズで大きな画像のメモリ使用量を制御し、一時バッファで繰り返し割り当てを避けます。([12:17](https://developer.apple.com/videos/play/wwdc2026/305/?time=737))
+
+- **古い写真の再処理機能**: ユーザーの写真ライブラリ内の古い RAW ファイルをスキャンし、RAW 9 で再デコードして画質差を比較表示できます。`supportedCameraModels(for:)` を先に使い、どの写真が恩恵を受けるかを判断します。([06:27](https://developer.apple.com/videos/play/wwdc2026/305/?time=387))
+
+## 関連セッション
+
+- [Camera app で写真とビデオをキャプチャする](/articles/wwdc2026-303) - Camera app の新しい撮影機能。RAW 処理と組み合わせて完全なワークフローになる
+- [写真キャプチャを次のレベルへ進める](/articles/wwdc2026-304) - 撮影と後処理の両方を制御したい App に向いた、より低レベルの写真キャプチャ API
+- [Core Image、Metal、SwiftUI で EDR コンテンツを表示する](/articles/wwdc2026-101) - RAW 9 では Metal-backed view への直接レンダリングが推奨される。この session はその関連基礎を扱う
+- [SwiftUI graphics](/articles/wwdc2026-322) - Core Image のレンダリング結果を SwiftUI に統合する
+- [Metal performance](/articles/wwdc2026-388) - Metal レンダリング性能を深く理解し、RAW 9 の CIContext 調整を補完する

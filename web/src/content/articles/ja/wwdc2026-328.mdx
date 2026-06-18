@@ -1,0 +1,237 @@
+---
+title: "MLX で Swift の数値計算を探る"
+description: "MLX で Swift の数値計算を探る"
+date: "2026-06-10"
+tags: ["MLX", "Swift", "数値計算", "自動微分", "GPU"]
+thumbnail: "/images/sessions/2026/328.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/328/"
+sessionId: "wwdc2026-328"
+year: "2026"
+relatedSessions:
+  - title: "Session 232: MLX でローカル AI をアプリに取り込む"
+    code: "232"
+    description: "端末上 AI 推論における MLX の入門"
+  - title: "Session 233: MLX を複数デバイスへスケールする"
+    code: "233"
+    description: "複数デバイスを使った分散 MLX トレーニング"
+  - title: "Session 330: Metal tensors で機械学習を高速化する"
+    code: "330"
+    description: "Metal レイヤーの tensor 高速化プリミティブ"
+  - title: "Session 262: Swift の新機能"
+    code: "262"
+    description: "Swift 言語の新機能と MLX Swift の型システムとの連携"
+  - title: "Session 279: RealityKit の新機能"
+    code: "279"
+    description: "3D シーンのリアルタイム物理シミュレーションは MLX と組み合わせられる"
+---
+
+## ハイライト
+
+> MLX Swift は NumPy 風の n 次元配列演算と自動微分を Swift にネイティブに持ち込み、数値計算コードを数式に近い形で書き、GPU 上で並列実行できるようにします。
+
+## 主要内容
+
+### Swift における数値計算の痛点
+
+科学計算や機械学習を行う開発者は、Apple プラットフォーム上で長い間、難しい選択を迫られてきました。Accelerate で低レベルのベクトル演算を書くか、Metal Performance Shaders で GPU kernel を手書きするか、あるいは Python エコシステムへ移るかです。Swift 自体には、高レベルで表現力のある数値計算ツールが不足していました。行列乗算くらいなら対応できますが、物理シミュレーション、反復解法、モデル学習が関わると、数学とは関係のない定型コードが大量に入り込んでしまいます。
+
+MLX Swift の登場はこの状況を変えます。中心となる設計は NumPy から着想を得ています。n 次元配列（`MLXArray`）を中心抽象とし、すべての操作は個々のスカラーではなく配列全体に対して行われます。NumPy を使ったことがあれば、MLX Swift への移行にほとんど学習コストはありません。
+
+### 遅延評価: 最後の瞬間まで実行を待つ
+
+MLX Swift の重要な特性の 1 つが遅延評価（lazy evaluation）です。配列に対して行う加減乗除はすぐには実行されず、計算グラフ（compute graph）を構築します。`eval()` を呼ぶか、具体的な値を読み取るまで、グラフ全体は GPU に投入されません。
+
+この設計の利点は演算融合（operator fusion）です。GPU kernel の起動には大きなオーバーヘッドがあるため、小さな演算を複数まとめて 1 つの大きな kernel に融合すると、Apple Silicon 上で性能を大きく改善できます。その代償として、開発者は特にループ内で `eval()` の呼び出しタイミングを管理する必要があります。そうしないと計算グラフが無限に膨らみ、メモリ不足につながります。
+
+### 自動微分: loss から勾配まで 1 行
+
+モデル学習の中心は勾配降下であり、その前提は勾配の計算です。以前 Swift でこれを実装するには、導関数を手で導くか、Swift for TensorFlow のようなコンパイラレベルの大改造に頼る必要がありました。MLX Swift は関数変換 `grad()` でこの問題を解きます。順方向の loss 関数を渡すと、自動的に勾配を計算する関数を返します。導出過程は MLX が内部で処理し、開発者が導関数コードを書く必要はありません。
+
+## 詳細
+
+### 行列演算とべき乗反復（[03:04](https://developer.apple.com/videos/play/wwdc2026/328/?time=184)）
+
+Session は古典的なべき乗反復（power iteration）アルゴリズムから始まり、MLX Swift の基本的な使い方を示します。目的は、対称行列の最大固有値と対応する固有ベクトルを求めることです。
+
+```swift
+import MLX
+let n = 100
+let steps = 10
+let B = MLXRandom.normal([n, n])
+var v = MLXRandom.normal([n])
+
+// 対称行列 A = Bᵀ + B を構成する
+let A = B.T + B
+
+// べき乗反復: v ← A v / ‖A v‖
+for _ in 0 ..< steps {
+    let Av = matmul(A, v)
+    v = Av / norm(Av)
+    eval(v)  // 各ステップで強制評価し、計算グラフの膨張を防ぐ
+}
+
+// 固有値を復元する: λ = vᵀ A v
+let lambda = matmul(matmul(v.T, A), v)
+print(lambda)
+```
+
+ポイント:
+- `B.T` は転置、`+` は行列加算です。コードと数式が一対一で対応します。
+- `matmul` は行列乗算、`norm` は L2 ノルムを計算します。
+- ループ内では必ず `eval(v)` を呼びます。呼ばないと、各反復で計算グラフにノードが追加され続けます。
+- 最後に `lambda` を読むと遅延評価がトリガーされ、未実行の演算が自動的に完了します。
+
+### Mandelbrot フラクタル: スカラーのループから配列演算へ（[05:09](https://developer.apple.com/videos/play/wwdc2026/328/?time=309)）
+
+Mandelbrot 集合は、配列計算の力を示す古典的な例です。複素平面上の各点 c について、反復式 z = z² + c を計算し、絶対値が 2 を超えなければその点は集合に属します。
+
+純粋な Swift のスカラー実装では、二重のネストループでピクセルごとに計算します。
+
+```swift
+// 純粋な Swift で、スカラー単位に計算する
+var counts = Array2D<Int>(width: w, height: h)
+
+for y in 0 ..< h {
+    for x in 0 ..< w {
+        let c = Complex(xMin + Float(x) * xStep, yMin + Float(y) * yStep)
+        var z = Complex<Float>.zero
+        var limit = maxIterations
+        for i in 0 ..< maxIterations {
+            z = z * z + c
+            if z.lengthSquared > radiusSquared {
+                limit = i
+                break
+            }
+        }
+        counts[x, y] = limit
+    }
+}
+```
+
+MLX Swift 版では、グリッド全体を 1 つの配列として扱います。
+
+```swift
+import MLX
+
+let x = linspace(-2.0, 0.5, count: w)
+let y = linspace(-1.25, 1.25, count: h).reshaped(h, 1)
+let c = x + y.asImaginary()
+
+var z = MLXArray.zeros(like: c)
+var counts = MLXArray.zeros(c.shape, dtype: .int16)
+
+for _ in 0 ..< maxIterations {
+    z = z * z + c                       // グリッド全体を同時に反復する
+    counts = counts + (abs(z) .< 2)     // まだ発散していない反復回数を数える
+}
+```
+
+ポイント:
+- `linspace` は等間隔の列を生成し、`reshaped` はブロードキャストしやすいように次元を調整します。
+- `y.asImaginary()` は実数配列を虚部に変換し、`x` と足し合わせて複素数グリッドを作ります。
+- `z = z * z + c` は配列全体に一括適用され、各ピクセルを手動で巡回する必要はありません。
+- `abs(z) .< 2` は Boolean マスクを生成し、各点が境界内に残った反復回数を数えます。
+- デフォルトで GPU 実行が使われ、CPU のスカラー版より 10 倍以上速くなることがあります。
+
+### 熱伝導シミュレーション: 畳み込みと境界条件（[07:27](https://developer.apple.com/videos/play/wwdc2026/328/?time=447)）
+
+熱伝導シミュレーションは、「各セルが隣接セルと相互作用する」場面の扱い方を示します。Jacobi 反復法の中心となる考え方は、各格子の新しい温度が 4 つの隣接セルの平均値になるというものです。
+
+```swift
+// 畳み込み kernel: 四方向がそれぞれ 0.25、中心が 0
+let kernel = MLXArray(converting: [
+    0,    0.25, 0,
+    0.25, 0,    0.25,
+    0,    0.25, 0,
+]).reshaped(1, 3, 3, 1)
+
+var temperature = heatSources
+
+// 収束するまでループする
+let next = conv2d(temperature, kernel, padding: 1)
+temperature = which(heatMask, heatSources, next)
+```
+
+ポイント:
+- `conv2d` はグリッド全体に畳み込み kernel を一括適用し、手書きの隣接セル巡回を置き換えます。
+- `which` は要素単位の三項演算子です。`heatMask` が true（熱源または壁）なら固定値を保ち、それ以外なら畳み込み結果を使います。
+- `padding: 1` により、畳み込み後の出力サイズを入力と同じに保ちます。
+
+Jacobi 反復は 1 ステップの計算は速いものの、熱が各回で 1 マスずつしか伝わらないため収束が遅くなります。Session では続いて逐次過緩和法（SOR）を紹介し、過緩和パラメータ omega によって収束を速めています。
+
+```swift
+let ω: Float = 2.0 / (1.0 + sin(Float.pi / Float(max(M, N))))
+
+let redMask   = checkerboard(rows: M, cols: N, phase: 0)
+let blackMask = checkerboard(rows: M, cols: N, phase: 1)
+
+// 赤い格子を更新する（黒い隣接セルの古い値を使う）
+let sorRed = ω * conv2d(temperature, kernel, padding: 1) + (1 - ω) * temperature
+temperature = which(redMask, sorRed, temperature)
+temperature = which(heatMask, heatSources, temperature)
+
+// 黒い格子を更新する（赤い隣接セルの新しい値を使う）
+let sorBlack = ω * conv2d(temperature, kernel, padding: 1) + (1 - ω) * temperature
+temperature = which(blackMask, sorBlack, temperature)
+temperature = which(heatMask, heatSources, temperature)
+```
+
+ポイント:
+- omega はグリッドサイズから最適値を計算し、収束反復回数を O(N²) から O(N) へ減らせます。
+- 赤黒チェッカーボードのマスクにより、「ほぼインプレース更新」を実現します。赤い格子を更新するとき黒い隣接セルはまだ古い値で、黒い格子を更新するとき赤い隣接セルはすでに更新済みです。
+- Session のデモでは SOR は Jacobi よりはるかに速く、過程を見せるために 100 倍遅くする必要があるほどでした。
+
+### 曲線フィッティングと自動微分（[11:13](https://developer.apple.com/videos/play/wwdc2026/328/?time=673)）
+
+最後の例は MLX Swift の自動微分能力を示します。データ点の集合を与え、二次多項式でフィットします。中心となるコードは次のとおりです。
+
+```swift
+// 予測関数を定義する
+func f(_ θ: MLXArray) -> MLXArray {
+    θ[0] + θ[1] * x + θ[2] * x ** 2
+}
+
+// 平均二乗誤差 loss を定義する
+func loss(_ θ: MLXArray) -> MLXArray {
+    mean((f(θ) - y) ** 2)
+}
+
+var θ = zeros([numParams])
+let gradLoss = grad(loss)  // 勾配関数を自動取得する
+
+for _ in 0 ..< steps {
+    let g = gradLoss(θ)          // ∇L(θ)
+    θ = θ - learningRate * g     // パラメータ更新
+    eval(θ)                      // 強制評価し、計算グラフを切る
+}
+```
+
+ポイント:
+- `grad(loss)` は loss 関数を、勾配を返す関数へ変換します。導関数を手書きする必要はありません。
+- `gradLoss(θ)` は内部で逆伝播を行い、各パラメータの loss に対する偏導関数を自動計算します。
+- ループ末尾の `eval(θ)` は計算の実行とメモリ回収を同時に行います。書き忘れると OOM につながります。
+- この仕組みはすべての機械学習モデルの学習基盤であり、MLX Swift はそれを数行のコードに簡略化しています。
+
+### MLX の完全なツールボックス（[12:17](https://developer.apple.com/videos/play/wwdc2026/328/?time=737)）
+
+Session の最後では、MLX の機能一覧が紹介されます。線形代数、FFT、N 次元畳み込み、リダクション操作、scan と prefix sum、インデックスとスライス、乱数生成などです。これらの操作は同じ遅延評価と自動微分の基盤を共有します。
+
+## 重要な示唆
+
+- **端末上の物理シミュレーションアプリ**: `conv2d` と `which` を組み合わせ、流体、熱伝導、電場シミュレーションを実装します。MLX Swift の GPU 高速化により、スマートフォンで複雑な物理効果をリアルタイム描画できるようになります。入口 API: `MLXArray`、`conv2d`、`which`。
+
+- **カスタム画像フィルターパイプライン**: 配列レベルの演算と FFT を使い、スタイル変換や超解像など、畳み込みニューラルネットワーク風の画像処理を実現します。MLX Swift の遅延評価は、複数のフィルター操作を少数の GPU kernel に自動融合します。入口 API: `MLXArray.fft`、`conv2d`。
+
+- **端末上のモデル微調整ツール**: `mlx-swift-lm` と `grad()` を基盤に、小規模データで言語モデルを端末上で微調整します。MLX Swift の自動微分により、学習ループを Swift だけで直接書け、言語をまたぐ呼び出しは不要です。入口 API: `grad()`、`mlx-swift-lm` リポジトリ。
+
+- **リアルタイム音声信号処理**: FFT と配列演算でスペクトル分析、フィルターバンク、音声エフェクトを実装します。MLX Swift の GPU 並列能力により、複数の音声ストリームを同時に処理できます。入口 API: `MLXArray.fft`、要素ごとの演算。
+
+- **インタラクティブな数学可視化**: Mandelbrot 集合を Julia 集合や Newton フラクタルなどへ拡張し、SwiftUI でインターフェイスを作り、MLX Swift でバックグラウンド計算を行います。GPU 高速化により、リアルタイムのズームとドラッグが可能です。入口 API: `linspace`、`reshaped`、複素数演算。
+
+## 関連 Session
+
+- [Session 232: MLX でローカル AI をアプリに取り込む](/articles/wwdc2026-232) - 端末上 AI 推論における MLX の入門
+- [Session 233: MLX を複数デバイスへスケールする](/articles/wwdc2026-233) - 複数デバイスを使った分散 MLX トレーニング
+- [Session 330: Metal tensors で機械学習を高速化する](/articles/wwdc2026-330) - Metal レイヤーの tensor 高速化プリミティブ
+- [Session 262: Swift の新機能](/articles/wwdc2026-262) - Swift 言語の新機能と MLX Swift の型システムとの連携
+- [Session 279: RealityKit の新機能](/articles/wwdc2026-279) - 3D シーンのリアルタイム物理シミュレーションは MLX と組み合わせられる

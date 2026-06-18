@@ -1,0 +1,350 @@
+---
+title: "Code-along: Add persistence with SwiftData"
+description: "Learn foundational skills for managing your app's state using this expressive, declarative API."
+date: "2026-06-10"
+tags: ["SwiftData", "SwiftUI", "Data Persistence", "Observation"]
+thumbnail: "/images/sessions/2026/275.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/275/"
+sessionId: "wwdc2026-275"
+year: "2026"
+relatedSessions:
+  - title: "SwiftData"
+    code: "274"
+    description: "A complete overview of the SwiftData framework, useful before starting the hands-on work"
+  - title: "SwiftUI"
+    code: "269"
+    description: "Details of SwiftUI and SwiftData integration, including more uses of `@Query` and `.modelContainer`"
+  - title: "Swift"
+    code: "262"
+    description: "New Swift language features, including the macro system and the underlying mechanisms of the Observation framework"
+  - title: "SwiftData: Dive into inheritance and schema migration"
+    code: "275"
+    description: "A deeper look at model inheritance and schema migration; the Goal inheritance design is based on this approach"
+---
+
+## Highlight
+
+> This code-along shows how to migrate a purely in-memory SwiftUI travel wishlist app to SwiftData. With the `@Model` macro, `@Query` predicate queries, and model inheritance, the app replaces hundreds of lines of manual state-management code in under 30 minutes while gaining cross-platform persistent storage.
+
+## Core Content
+
+### From Memory to Persistence: A Real Pain Point
+
+Wishlist is a travel-planning app. Users add destinations, record todo activities, and browse by season. Before the migration, all data lived in a `DataSource` class and was managed with global variables and dictionaries. Filtering, sorting, and searching all happened in memory.
+
+For a demo project, that was enough. But after closing and reopening the app, the newly added "Northern Lights" trip disappeared. All edits reset back to the seed data. As data grew, memory usage would also keep increasing.
+
+This is exactly the kind of problem SwiftData is designed to solve: connect dynamic state to a persistent storage layer so data survives beyond the app lifecycle.
+
+### Migration Path: From Model Definitions to View Queries
+
+The migration has three steps.
+
+First, mark data structures as SwiftData models. Add the `@Model` macro to types such as `Activity` and `Trip`, replacing the previous `@Observable`. SwiftData automatically generates Observable protocol conformance for these types ([03:39](https://developer.apple.com/videos/play/wwdc2026/275/?time=219)).
+
+Second, define relationships between models. Use the `@Relationship` macro to declare the one-to-many relationship between `Trip` and `Activity`, and set a cascade delete rule. When a `Trip` is deleted, all of its `Activity` values are cleaned up automatically ([10:32](https://developer.apple.com/videos/play/wwdc2026/275/?time=632)).
+
+Third, replace manual data fetching in SwiftUI views with `@Query`. Each child view fetches only the data it needs, using predicates to filter at the database layer rather than loading everything into memory and filtering afterward ([16:27](https://developer.apple.com/videos/play/wwdc2026/275/?time=987)).
+
+### An Unexpected Bonus: Hundreds of Lines Deleted
+
+After the migration, helper types such as `DataSource` and `TripEditModel` are no longer needed. SwiftData's `ModelContext` takes over state management, storage logic, filtering, sorting, and relationship traversal. Code that previously had to be written manually is replaced by built-in framework capabilities.
+
+## Details
+
+### Mark Persistent Models with `@Model`
+
+The migration starts with the `Activity` type. The original code used the `@Observable` macro, and SwiftUI views observed changes through property bindings.
+
+```swift
+import Foundation
+import SwiftData
+
+@Model
+class Activity {
+    var name: String
+    var isComplete: Bool = false
+    var dateCreated = Date.now
+    var dateEdited = Date.now
+}
+```
+
+Key points:
+- The `@Model` macro also generates Observable protocol conformance, so views can continue binding to these properties
+- There is no need to manually write `ObservableObject` or `@Published`
+- All stored properties are persisted to the database by default
+
+In the original code, `name` and `isComplete` had `didSet` observers that updated `dateEdited` when the properties changed. The `@Model` macro does not support `didSet`, so those observers are removed first and later replaced with a new capability from the Observation framework ([03:39](https://developer.apple.com/videos/play/wwdc2026/275/?time=219)).
+
+### From Enum to Class: Modeling `Goal`
+
+In the original code, `Goal` is an enum that defines 18 fixed achievement goals. Enums are value types and cannot be persistent SwiftData models.
+
+The migration strategy is to turn `Goal` into a class, keep the `name`, `kind`, and `target` properties, and add `completedCount` and `isComplete` to store progress. Then use SwiftData model inheritance to split different kinds of goals into subclasses:
+
+```swift
+// Goal as the base class.
+class Goal {
+    var name: String
+    var target: Int
+    var completedCount: Int = 0
+    var isComplete: Bool = false
+    var dateAchieved: Date?
+    var sortOrder: Int = 0
+}
+
+// TripGoal and ActivityGoal inherit from Goal.
+class TripGoal: Goal { }
+class ActivityGoal: Goal { }
+```
+
+Key points:
+- An enum's closed-set nature does not fit persistence scenarios well, because user progress is dynamic data
+- Model inheritance is appropriate for types with a clear hierarchy, where subclasses represent more specific forms of the same concept
+- Subclasses automatically inherit every persistent property from the superclass
+
+### Define Model Relationships
+
+In Wishlist, each `Trip` contains multiple `Activity` values. The original code manually maintained this mapping with dictionaries. In SwiftData, declare it with an array and the `@Relationship` macro:
+
+```swift
+import Foundation
+import SwiftData
+
+@Model
+class Trip {
+    var name: String
+    var collection: TripCollection
+
+    var photo: TripImage
+    var thumbnailData: Data?
+
+    @Relationship(deleteRule: .cascade, inverse: \Activity.trip)
+    var activities: [Activity] = []
+
+    private(set) var creationDate = Date.now
+    var subtitle: String?
+    var isComplete: Bool = false
+}
+```
+
+Key points:
+- `inverse: \Activity.trip` establishes a bidirectional relationship, so an `Activity` can refer back to its owning `Trip` through `activity.trip`
+- `deleteRule: .cascade` means that when a `Trip` is deleted, every `Activity` in its `activities` array is also deleted
+- `thumbnailData` stores raw thumbnail bytes directly in the database as `Data?`, while full-resolution images are stored through the `TripImage` model as external file references
+
+### Configure `ModelContainer`
+
+Set up `ModelContainer` at the app entry point, and SwiftUI automatically injects it into the view environment:
+
+```swift
+import SwiftUI
+import SwiftData
+
+@main
+struct WishlistApp: App {
+    let container: ModelContainer = {
+        do {
+            let modelContainer = try ModelContainer(
+                for: Trip.self, Activity.self, TripImage.self,
+                Goal.self, TripGoal.self, ActivityGoal.self
+            )
+            try SampleData.seedIfNeeded(in: modelContainer.mainContext)
+            return modelContainer
+        } catch {
+            fatalError("Could not create model container: \(error)")
+        }
+    }()
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .preferredColorScheme(.dark)
+        }
+        .modelContainer(container)
+    }
+}
+```
+
+Key points:
+- `ModelContainer(for:)` receives every model type that needs persistence and builds the database schema
+- `SampleData.seedIfNeeded` inserts seed data on first launch
+- The `.modelContainer(container)` modifier stores the container in the SwiftUI environment, where `@Query` and `ModelContext` can retrieve it automatically
+
+### Use `@Query` for Targeted Queries
+
+Before the migration, views fetched all data from `DataSource` and filtered it themselves. After the migration, each view declares the subset of data it needs with `@Query`.
+
+Query achieved and upcoming goals separately ([16:27](https://developer.apple.com/videos/play/wwdc2026/275/?time=987)):
+
+```swift
+@Query(
+    filter: #Predicate<Goal> { $0.isAchieved },
+    sort: \Goal.dateAchieved,
+    order: .reverse
+)
+private var achievedGoals: [Goal]
+
+@Query(
+    filter: #Predicate<Goal> { !$0.isAchieved },
+    sort: \Goal.sortOrder
+)
+private var upcomingGoals: [Goal]
+```
+
+Limit recently added trips to 5 results ([16:49](https://developer.apple.com/videos/play/wwdc2026/275/?time=1009)):
+
+```swift
+@Query(FetchDescriptor<Trip>(
+    sortBy: [SortDescriptor(\Trip.creationDate, order: .reverse)],
+    fetchLimit: 5
+))
+private var trips: [Trip]
+```
+
+Key points:
+- `FetchDescriptor` controls sorting, result count, and other query parameters
+- `fetchLimit: 5` loads only the five most recent items, avoiding excessive memory usage
+- Predicates run at the database layer, which is more efficient than loading everything and filtering in memory
+
+### Build Queries Dynamically: Group by Season
+
+`TripCollectionView` only knows which season to display during initialization, so it needs to construct its `@Query` dynamically inside `init`:
+
+```swift
+init(tripCollection: TripCollection, cardSize: TripCard.Size, namespace: Namespace.ID) {
+    _trips = Query(
+        filter: #Predicate<Trip> { $0.collection == tripCollection },
+        sort: \Trip.name
+    )
+    self.tripCollection = tripCollection
+    self.cardSize = cardSize
+    self.namespace = namespace
+}
+```
+
+Key points:
+- `_trips` is the property wrapper's underlying storage; assigning to it directly in `init` allows dynamic parameters
+- `tripCollection` is captured from the initializer parameter and embedded in the predicate
+- Query results automatically drive view updates
+
+### Query-Based Search
+
+The search view dynamically switches query strategies based on the input text ([18:13](https://developer.apple.com/videos/play/wwdc2026/275/?time=1093)):
+
+```swift
+init(searchText: String, namespace: Namespace.ID) {
+    self.searchText = searchText
+    self.namespace = namespace
+
+    if searchText.isEmpty {
+        // Show the 3 most recent trips for an empty search.
+        _trips = Query(FetchDescriptor(
+            sortBy: [SortDescriptor(\Trip.creationDate, order: .reverse)],
+            fetchLimit: 3
+        ))
+        _activities = Query(filter: #Predicate<Activity> { _ in false })
+    } else {
+        // Match trips by name.
+        let tripSearchPredicate = #Predicate<Trip> {
+            $0.name.localizedStandardContains(searchText)
+        }
+        _trips = Query(filter: tripSearchPredicate, sort: \Trip.name)
+
+        // Match activities by name, and require them to belong to a trip.
+        let activitySearchPredicate = #Predicate<Activity> {
+            $0.trip != nil && $0.name.localizedStandardContains(searchText)
+        }
+        _activities = Query(filter: activitySearchPredicate, sort: \Activity.name)
+    }
+}
+```
+
+Key points:
+- `localizedStandardContains` performs localized, case-insensitive string matching
+- An empty search returns the three most recent trips as default content
+- `ContentUnavailableView` presents a friendly empty state when there are no results
+
+### Error Handling
+
+SwiftData operations can fail for reasons such as insufficient disk space. Catch and present errors in the view ([19:42](https://developer.apple.com/videos/play/wwdc2026/275/?time=1182)):
+
+```swift
+.onDisappear {
+    do {
+        try updateGoalAchievements()
+    } catch {
+        updateError = error
+        reportError(error)
+    }
+}
+.alert(error: $updateError) {
+    // Custom error presentation.
+}
+```
+
+Key points:
+- `.alert(error:)` is SwiftUI's built-in error presentation modifier
+- In production, also report errors to telemetry for debugging
+
+### Replace `didSet` with Continuous Observation
+
+After the migration, the automatic `dateEdited` update behavior needs to be restored. The Observation framework adds `withContinuousObservation` in the 2027 release:
+
+```swift
+init(activity: Activity, isLast: Bool, isEditing: Bool) {
+    activity.token = withContinuousObservation(options: .didSet) { event in
+        _ = activity.name
+        _ = activity.isComplete
+
+        if event.matches(\Activity.name) {
+            activity.dateEdited = .now
+        }
+
+        if event.matches(\Activity.isComplete) {
+            activity.dateEdited = .now
+            activity.trip?.isComplete =
+                activity.trip?.activities.isEmpty == false
+                && activity.trip?.activities.allSatisfy { $0.isComplete } == true
+        }
+    }
+    self.activity = activity
+    self.isLast = isLast
+    self.isEditing = isEditing
+}
+```
+
+Key points:
+- `withContinuousObservation(options: .didSet)` triggers the callback after a property is assigned
+- `_ = activity.name` declares observation interest in the property
+- `event.matches(\Activity.name)` precisely identifies which property changed
+- When an `Activity` completion state changes, the owning `Trip`'s `isComplete` state is updated as well
+
+## Key Takeaways
+
+**1. Convert any list-style app to persistence**
+
+Apps such as todo lists, budgeting tools, and reading lists naturally fit SwiftData. Add `@Model` to your models and `@Query` to your views, and you can finish the migration in an afternoon. Entry APIs: `@Model` plus `ModelContainer`.
+
+**2. Replace full loading with predicate queries**
+
+Many apps load all data into memory at startup. Use `FetchDescriptor` with `fetchLimit` and predicates to load only the data needed for the current screen. List scrolling performance improves noticeably. Entry APIs: `FetchDescriptor(sortBy:fetchLimit:)` plus `#Predicate`.
+
+**3. Use model inheritance for heterogeneous data**
+
+If an app has several entities that are similar but slightly different, such as different task types or membership levels, use model inheritance instead of enums or protocols. Each subclass has its own persistent table while sharing superclass properties. Entry API: `class SubModel: ParentModel`.
+
+**4. Use Continuous Observation for property-level side effects**
+
+When property changes need to trigger cascading updates, such as recalculating an order total after an order item changes, `withContinuousObservation` is more flexible than `didSet` because it supports cross-type observation and is compatible with SwiftData's persistence lifecycle. Entry API: `withContinuousObservation(options: .didSet)`.
+
+**5. Move search into the database**
+
+Move in-memory filtering logic into database predicates. `localizedStandardContains` supports localized search, and empty searches can fall back to recent data. Pair it with `ContentUnavailableView` for a good empty state. Entry API: `#Predicate { $0.name.localizedStandardContains(text) }`.
+
+## Related Sessions
+
+- [SwiftData](/articles/wwdc2026-274) — A complete overview of the SwiftData framework, useful before starting the hands-on work
+- [SwiftUI](/articles/wwdc2026-269) — Details of SwiftUI and SwiftData integration, including more uses of `@Query` and `.modelContainer`
+- [Swift](/articles/wwdc2026-262) — New Swift language features, including the macro system and the underlying mechanisms of the Observation framework
+- [SwiftData: Dive into inheritance and schema migration](/articles/wwdc2026-275) — A deeper look at model inheritance and schema migration; the Goal inheritance design is based on this approach

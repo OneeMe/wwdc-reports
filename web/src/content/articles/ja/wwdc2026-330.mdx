@@ -1,0 +1,322 @@
+---
+title: "Metal tensors でカスタム機械学習オペレーションを最適化する"
+description: "Metal tensors を使った機械学習オペレーション"
+date: "2026-06-10"
+tags: ["Metal", "TensorOps", "量子化", "FlashAttention", "Core AI"]
+thumbnail: "/images/sessions/2026/330.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/330/"
+sessionId: "wwdc2026-330"
+year: "2026"
+relatedSessions:
+  - title: "Session 324: Core AI で機械学習を高速化する"
+    code: "324"
+    description: "Core AI フレームワーク全体の紹介。モデル変換とデプロイフローを含む"
+  - title: "Session 328: MLX Swift でローカル AI 機能を構築する"
+    code: "328"
+    description: "MLX Swift で Apple デバイス上のローカル AI 機能を構築し、カスタム Metal kernel と組み合わせられる"
+  - title: "Session 388: Apple GPU 向けに Metal パフォーマンスを最適化する"
+    code: "388"
+    description: "メモリ管理とシェーダーチューニングを含む Metal パフォーマンス最適化の一般原則"
+  - title: "Session 359: Metal neural rendering でゲームを強化する"
+    code: "359"
+    description: "Metal neural rendering。類似した GPU 計算最適化の考え方を含む"
+---
+
+## ハイライト
+
+> iOS/macOS 27 では、Metal Tensor API と MPP TensorOps ライブラリが量子化データ型（FP8、4-bit/2-bit 整数）をネイティブにサポートし、Cooperative Tensor を行列乗算入力として直接使えるようになります。開発者は Threadgroup Memory を往復せずに FlashAttention のような複雑な演算子を GPU 上で実装でき、同時に M5/A19 チップ内蔵の Neural Accelerator ハードウェア高速化を自動的に利用できます。
+
+## 主要内容
+
+大規模モデル推論のボトルネックは、すでに演算能力からメモリ帯域へ移っています。70B パラメータのモデルは、16-bit 半精度で保存しても 140GB の GPU メモリを必要とします。これはどのモバイルデバイスの容量もはるかに超えています。量子化（Quantization）が唯一の現実的な道です。16-bit の重みを 8-bit、4-bit、さらには 2-bit へ圧縮し、モデルサイズと推論時のメモリトラフィックの両方を減らします。
+
+しかし GPU 上で量子化を実装するのは、長い間つらい作業でした。データと Scale Factor（スケール係数）は通常 2 つの独立した Buffer に置かれ、Shader では手動でインデックスを計算して Scale を読み、FP16 に逆量子化してから計算に使う必要があります。中間結果を Threadgroup Memory に書き戻して再度読むと、帯域とレイテンシに耐えられません。FlashAttention のような演算子はメモリ往復を省くため、レジスタ内でデータをやりくりしなければならず、SIMD group 間の同期は非常に繊細です。
+
+Apple は今回の WWDC で体系的な解決策を示しました。まず、`MTLTensor` は量子化データと Scale Factor を同じオブジェクトにパッケージし、Auxiliary Plane（補助平面）で管理できます。Shader 側で `tensor_blockwise` により型を宣言すると、TensorOps の `matmul2d` が逆量子化を自動処理し、M5 チップの Neural Accelerator ハードウェア高速化を呼び出します。次に、Cooperative Tensor（データが SIMD group のレジスタに分散している tensor）を次の行列乗算の入力として直接使えるようになり、Threadgroup Memory への往復搬送を完全に消せます。
+
+この API の目標は明確です。カスタム ML 演算子を書く体験を高レベルフレームワークの呼び出しと同じくらい簡単にしつつ、性能を犠牲にしないことです。Core AI 向けにカスタム演算子を書く場合でも、MLX や llama.cpp に kernel を貢献する場合でも、直接恩恵を受けられます。
+
+### 量子化データ型のネイティブサポート
+
+（[03:16](https://developer.apple.com/videos/play/wwdc2026/330/?time=196)）TensorOps は iOS/macOS 26 の更新で 4-bit と 8-bit 整数型のサポートを追加し、iOS/macOS 27 ではさらに 4-bit/8-bit 浮動小数点型と 2-bit 整数型へ拡張されます。開発者は `MTLTensor` 作成時に量子化 `dataType` を指定するだけで、TensorOps が利用可能なハードウェア高速化を自動的に使います。
+
+### 多平面 tensor: データと Scale Factor を一体化する
+
+（[04:21](https://developer.apple.com/videos/play/wwdc2026/330/?time=261)）iOS/macOS 27 では、単一の `MTLTensor` オブジェクトが Auxiliary Plane を通じて量子化データと Scale Factor の両方を保持できます。Scale Plane は業界でよく使われる FP8 E8M0 block-wise 形式をサポートし、各 Scale 要素はデータ平面内の 1 つのブロックに適用されます。Host 側で `MTLTensorAuxiliaryPlaneDescriptor` を設定すると、データ、Scale、メタデータが 1 つの tensor オブジェクトにパッケージされ、Shader 側はブロック単位で直接読み取れます。
+
+### Cooperative Tensor を行列乗算へ直結する
+
+（[12:20](https://developer.apple.com/videos/play/wwdc2026/330/?time=740)）以前 FlashAttention を実装する場合、QxK の中間結果は Cooperative Tensor から Threadgroup Memory へ一度書き戻し、次の行列乗算へ渡すために再度読み出す必要がありました。iOS/macOS 27 では `get_left_input_cooperative_tensor` が追加され、Cooperative Tensor を `matmul2d` の入力として直接使えます。データの流れは「レジスタ -> 共有メモリ -> レジスタ」から「レジスタ -> レジスタ」になり、メモリアクセスの多い演算子に実質的な倍数級の改善をもたらします。
+
+## 詳細
+
+### Scale Factor 付き量子化 tensor を作成する
+
+（[03:53](https://developer.apple.com/videos/play/wwdc2026/330/?time=233)）Host 側で量子化 tensor を作成する流れは、通常の tensor とほぼ同じです。違いは量子化 `dataType` を指定し、Scale Factor を記述する Auxiliary Plane を追加する点です。
+
+```objc
+#define RANK 2
+
+MTLTensorDescriptor *tensorDesc = [MTLTensorDescriptor new];
+tensorDesc.dataType = MTLTensorDataTypeMetalFloat8E4M3;
+tensorDesc.usage = MTLTensorUsageCompute;
+
+NSInteger dimensions[RANK] = {NumCols, NumRows};
+tensorDesc.dimensions = [[MTLTensorExtents alloc] initWithRank:RANK values:dimensions];
+
+NSError *err = nil;
+id <MTLTensor> tensor = [device newTensorWithDescriptor:tensorDesc error:&err];
+```
+
+ポイント:
+- `MTLTensorDataTypeMetalFloat8E4M3` はデータ平面を FP8 E4M3 形式で保存することを指定します。
+- `dimensions` は `MTLTensorExtents` でラップされ、任意の rank をサポートします。
+- エラーは `NSError` 経由で返され、作成に失敗すると `tensor` は nil になります。
+
+tensor に Scale Factor が必要な場合は、続けて Auxiliary Plane を設定します。
+
+```objc
+MTLTensorAuxiliaryPlaneDescriptor *planeDesc = [MTLTensorAuxiliaryPlaneDescriptor new];
+planeDesc.dataType = MTLTensorDataTypeMetalFloat8UE8M0;
+
+NSInteger blockFactors[RANK] = {32, 1};
+planeDesc.blockFactors = [[MTLTensorExtents alloc] initWithRank:RANK values:blockFactors];
+
+MTLTensorAuxiliaryPlaneDescriptorMap *auxiliaryPlanes =
+    [MTLTensorAuxiliaryPlaneDescriptorMap new];
+[auxiliaryPlanes setDescriptor:planeDesc forPlane:MTLTensorPlaneTypeScales];
+
+tensorDesc.auxiliaryPlanes = auxiliaryPlanes;
+
+id <MTLTensor> tensor = [device newTensorWithDescriptor:tensorDesc error:&err];
+```
+
+ポイント:
+- `blockFactors` は block-wise スケーリングのブロックサイズを定義します。ここでは 32 列ごとに 1 つの Scale を共有します。
+- `MTLTensorPlaneTypeScales` は、この補助平面が Scale Factor の保存に使われることを示します。
+- データ、Scale、メタデータは最終的に同じ `MTLTensor` オブジェクトへパッケージされます。
+- 量子化データ型には追加のメモリアラインメント要件があります。Metal ドキュメントを確認してください。
+
+### Shader 内で MXFP8 tensor 型を宣言する
+
+（[06:07](https://developer.apple.com/videos/play/wwdc2026/330/?time=367)）Metal Shading Language（MSL）では、型エイリアスで Scale Plane 付き tensor 型を宣言します。
+
+```metal
+#include <metal_tensor>
+using namespace metal;
+
+using scales_plane = tensor_blockwise<tensor_plane_scales,
+                                      device metal_fp8_ue8m0_format,
+                                      32, 1>;
+
+using mxfp8_tensor = tensor<device metal_fp8_e4m3_format,
+                            dextents<int, 2>,
+                            tensor_handle,
+                            scales_plane>;
+
+kernel void matmul(mxfp8_tensor matrixA [[buffer(0)]],
+                   mxfp8_tensor matrixB [[buffer(1)]],
+                   tensor<device half, dextents<int, 2>> matrixC [[buffer(2)]])
+{
+    // ...
+}
+```
+
+ポイント:
+- `tensor_blockwise` は block-wise Scale Plane を宣言します。テンプレート引数は順に、平面タイプ、保存場所、データ形式、ブロックサイズです。
+- `mxfp8_tensor` の主な型引数は、保存場所、次元拡張（`dextents<int, 2>` は 2D 動的次元を意味します）、ハンドルタイプ、Scale Plane です。
+- `tensor_handle` は Host 側の `MTLTensor` からバインドされた tensor であることを意味します。
+- Buffer binding は通常の MSL kernel とまったく同じです。
+
+完全な Host 側 `MTLTensor` を作成する必要がない場合は、Shader スタック上でインライン tensor を直接構築することもできます。
+
+```metal
+using mxfp8_tensor_inline = tensor<device metal_fp8_e4m3_format,
+                                   dextents<int, 2>,
+                                   tensor_inline,
+                                   scales_plane>;
+
+mxfp8_tensor_inline matrixA(dataBufferA,
+                             dextents<int, 2>(K, M),
+                             array<int, 2>({ 1, K }),
+                             scales_plane(scalesBufferA));
+```
+
+ポイント:
+- `tensor_inline` は `tensor_handle` を置き換え、スタック上に割り当てることを示します。
+- コンストラクタ引数は、データ Buffer ポインタ、次元、stride 配列、Scale Plane です。
+- 一時 tensor に適しており、Host 側オブジェクト作成のオーバーヘッドを減らせます。
+
+### スライスと量子化行列乗算
+
+（[07:19](https://developer.apple.com/videos/play/wwdc2026/330/?time=439)）Threadgroup ID に応じて入出力 tensor をスライスし、TensorOps を呼び出して行列乗算を実行します。
+
+```metal
+auto tA = matrixA.slice(0, tgid.y * TILEM);
+auto tB = matrixB.slice(tgid.x * TILEN, 0);
+auto tC = matrixC.slice(tgid.x * TILEN, tgid.y * TILEM);
+
+constexpr auto descriptor = matmul2d_descriptor(TILEM,
+                                                TILEN,
+                                                dynamic_length_v<int>,
+                                                false,
+                                                false);
+
+matmul2d<descriptor, execution_simdgroups<4>> op;
+op.run(tA, tB, tC);
+```
+
+ポイント:
+- `slice` は Threadgroup ID に基づき、各スレッドグループが担当する tile を取り出します。
+- データ平面と Scale Plane は block size に従って同時にスライスされます。
+- `matmul2d_descriptor` のテンプレート引数は M、N、K（`dynamic_length_v<int>` は実行時決定）、左行列を転置するか、右行列を転置するかです。
+- `execution_simdgroups<4>` は、スレッドグループ内で 4 つの SIMD group が並列実行することを指定します。
+- TensorOps は量子化 tensor の逆量子化を自動処理するため、手作業は不要です。
+
+### Cooperative Tensor で FlashAttention を実装する
+
+（[10:27](https://developer.apple.com/videos/play/wwdc2026/330/?time=627)）FlashAttention の核心は、QxK、SoftMax、V との乗算を 1 つの kernel に融合し、中間結果をメモリへ書き戻さないことです。まず SIMD group レベルの行列乗算を設定します。
+
+```metal
+constexpr auto mul_qk_op_desc = matmul2d_descriptor(/* ... */);
+matmul2d<mul_qk_op_desc, execution_simdgroups> mul_qk_op;
+
+auto tQSlice = tQ.slice<D, ROWS_PER_SIMD>(0, sgid * ROWS_PER_SIMD);
+auto tKSlice = tK.slice<D, BK>(0, k);
+auto tVSlice = tV.slice<D, BK>(0, k);
+
+auto ctQK = mul_qk_op.get_destination_cooperative_tensor<decltype(tQSlice),
+                                                         decltype(tKSlice),
+                                                         float>();
+
+mul_qk_op.run(tQSlice, tKSlice, ctQK);
+```
+
+ポイント:
+- `execution_simdgroups` により、各 SIMD group が独立して計算し、それぞれ中間行列の完全な行を持ちます。
+- `sgid`（SIMD group ID）はスライスに使われ、SoftMax 計算で SIMD group 間のデータ交換を不要にします。
+- `get_destination_cooperative_tensor` は Cooperative Tensor を作成し、データは参加スレッドのプライベートレジスタに分散します。
+- Cooperative Tensor は中間結果を Threadgroup Memory に書き戻す必要をなくします。
+
+次に、SoftMax の準備として行方向の最大値 reduction を計算します。
+
+（[11:18](https://developer.apple.com/videos/play/wwdc2026/330/?time=678)）
+
+```metal
+auto ctTileRowMax = mul_qk_op.get_row_reduction_destination_cooperative_tensor<
+                        decltype(tQSlice),
+                        decltype(tKSlice),
+                        float>();
+
+reduce_rows(ctQK, ctTileRowMax, reduction_operation::max, -INFINITY);
+```
+
+ポイント:
+- `get_row_reduction_destination_cooperative_tensor` は reduction 結果を保存する Cooperative Tensor を作成します。
+- `reduce_rows` は各行の最大値を計算し、スレッド間のデータ交換を自動処理します。
+- 初期値を `-INFINITY` にすることで、最大値計算が正しくなります。
+
+続いて `map_iterator` で SoftMax を計算します。
+
+（[11:56](https://developer.apple.com/videos/play/wwdc2026/330/?time=716)）
+
+```metal
+#pragma clang loop unroll(full)
+for (auto it = ctQK.begin(); it != ctQK.end(); it++) {
+    auto row_it = ctRowMax.map_iterator(it);
+    *it = exp(*it - *row_it);
+}
+```
+
+ポイント:
+- `map_iterator` は 2D Cooperative Tensor の各要素を、対応する行最大値の位置へマッピングします。
+- 2 つの Cooperative Tensor は形状が異なりますが、`map_iterator` がインデックスマッピングを自動処理します。
+- 指数を取る前に最大値を引くことで、数値オーバーフローを防ぎます。
+
+最後に、Cooperative Tensor を次の行列乗算の入力として直接使います。
+
+（[12:33](https://developer.apple.com/videos/play/wwdc2026/330/?time=753)）
+
+```metal
+constexpr auto mul_sv_op_desc = matmul2d_descriptor(/* ... */);
+matmul2d<mul_sv_op_desc, metal::execution_simdgroup> mul_sv_op;
+
+if (mul_sv_op.is_compatible_as_left_input<float, half, float>(ctQK)) {
+    auto ctQKIn = mul_sv_op.get_left_input_cooperative_tensor<float, half, float>(ctQK);
+    mul_sv_op.run(ctQKIn, tVSlice, ctO);
+} else {
+    ctQK.store(tgTensor);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto ctQKIn = mul_sv_op.get_left_input_cooperative_tensor<float, half, float>();
+    ctQKIn.load(tgTensor);
+    mul_sv_op.run(ctQKIn, tVSlice, ctO);
+}
+```
+
+ポイント:
+- `is_compatible_as_left_input` は Cooperative Tensor のレイアウトが左入力として互換かどうかを確認します。
+- テンプレート引数 `<float, half, float>` はそれぞれ左入力、右入力、出力のデータ型を表します。
+- 互換性があれば直接再利用し、データは最初から最後までレジスタ内を流れます。
+- 互換性がなければ Threadgroup Memory への保存と再読み込みへフォールバックします。
+- `simdgroup_barrier` は、すべてのスレッドの書き込み完了を保証してから読み出します。
+
+### Core AI モデルへ統合する
+
+（[13:35](https://developer.apple.com/videos/play/wwdc2026/330/?time=815)）Core AI は、PyTorch モデルを Core AI 形式に変換し、変換過程でカスタム Metal kernel を注入できる Python ツールチェーンを提供します。講演者は SAM3 画像分割モデルを例に、完全な統合フローを示しました。
+
+1. Python 内でカスタム Attention kernel の MSL コードを文字列として定義する
+2. `TorchMetalKernel` オブジェクトを登録する
+3. Hugging Face のデフォルト Attention 実装を、カスタム kernel を呼ぶバージョンに置き換える
+4. Hugging Face からモデルを読み込み、最適化済み Core AI asset として書き出す
+
+書き出されたモデルは Apple デバイス上で直接実行でき、推論時にはカスタム FlashAttention kernel が自動的に呼ばれます。
+
+## 重要な示唆
+
+### 既存推論フレームワーク向けにカスタム量子化演算子を書く
+
+**何を作るか**: llama.cpp や MLX 向けに、FP8 重みをサポートするカスタム Linear 層 kernel を作ります。
+
+**なぜ価値があるか**: 既存フレームワークの Metal backend は、iOS/macOS 27 の新しい量子化型にまだ対応していない可能性があります。`MTLTensor` の多平面 tensor と TensorOps を使えば、100 行未満のコードでハードウェア高速化された量子化行列乗算を実装でき、手作業の bit-shift 展開よりはるかに高性能です。
+
+**始め方**: `MTLTensorDescriptor` から `MTLTensorPlaneTypeScales` 付きの量子化 tensor を作成し、Shader 側で `tensor_blockwise` により型を宣言してから、そのまま `matmul2d` に渡します。TensorOps のサンプルコードプロジェクトを参照してください。
+
+### iPhone で圧縮版の視覚大規模モデルを動かす
+
+**何を作るか**: LLaVA のような 7B パラメータの視覚言語モデルを 4-bit に量子化し、iPhone にデプロイしてリアルタイム画像理解を実現します。
+
+**なぜ価値があるか**: 4-bit 量子化はモデルサイズを元の 1/4 に圧縮できます。M5/A19 の Neural Accelerator と組み合わせると、Prefill 段階の密な計算をハードウェアで直接高速化できます。以前はモバイルで動かせなかった大規模モデルに、現実的な配備可能性が出てきます。
+
+**始め方**: Core AI の Python 変換ツールで PyTorch モデルを書き出し、変換時に量子化設定を指定します。モデルにカスタム Attention 実装がある場合は、この Session の FlashAttention 統合方法を参考に Metal kernel を注入します。
+
+### Core AI モデル向けにカスタム後処理演算子を書く
+
+**何を作るか**: 分割や検出モデル向けに、カスタム NMS（非極大値抑制）や Mask 後処理 kernel を作ります。
+
+**なぜ価値があるか**: 後処理は推論 pipeline のボトルネックになりがちです。特にソートやフィルタリングのような GPU 並列化に向かない処理では顕著です。Cooperative Tensor と `reduce_rows` を使えば、一部のロジックを GPU へ移し、CPU-GPU の往復を減らせます。
+
+**始め方**: まず後処理の中で並列化できる部分を分析します。たとえば信頼度ソートは並列 reduction で扱える可能性があります。その後 Shader 内で Cooperative Tensor を使って実装し、最後に `TorchMetalKernel` を通じて Core AI の変換フローへ登録します。
+
+### 2-bit 量子化の限界圧縮を探る
+
+**何を作るか**: モデル重みを 2-bit まで圧縮し、Apple Silicon 上で精度と速度の trade-off を検証します。
+
+**なぜ価値があるか**: iOS/macOS 27 は 2-bit 整数型のサポートを追加しました。Embedding 層や一部の FFN 層など、精度にあまり敏感でない層では、明確な精度低下なしにさらに圧縮できる可能性があります。より大きなモデルをモバイルデバイスに収められるようになります。
+
+**始め方**: モデルの重み分布分析から始め、数値範囲が小さく精度に敏感でない層を見つけます。`MTLTensorDataType` の対応する 2-bit 型で tensor を作成し、適切な block-wise Scale Factor と組み合わせ、小型モデルで精度を検証してから拡張します。入口: `MTLTensorDataType` の 2-bit 型 + `MTLTensorAuxiliaryPlaneDescriptor`。
+
+### 推論フレームワーク向けに FlashAttention kernel を書く
+
+**何を作るか**: Cooperative Tensor と TensorOps の `matmul2d` を使って完全な FlashAttention kernel を実装し、フレームワークのデフォルト Attention 実装を置き換えます。
+
+**なぜ価値があるか**: FlashAttention は QxK、SoftMax、V との乗算を融合し、中間結果をメモリに書き戻さないことで、メモリアクセスの多い大規模モデル推論を倍数級に高速化します。iOS/macOS 27 の Cooperative Tensor 直結行列乗算により実装はより簡単になり、データは最初から最後までレジスタ内を流れます。
+
+**始め方**: Session のコード構造を参考にします。`matmul2d` で QxK を Cooperative Tensor に計算し、`reduce_rows` で行方向最大値 reduction を行い、`map_iterator` で SoftMax を計算し、最後に Cooperative Tensor を次の行列乗算の入力として直接渡します。入口: `matmul2d` + `get_destination_cooperative_tensor` + `get_left_input_cooperative_tensor`。
+
+## 関連 Session
+
+- [Session 324: Core AI で機械学習を高速化する](/articles/wwdc2026-324) - Core AI フレームワーク全体の紹介。モデル変換とデプロイフローを含む
+- [Session 328: MLX Swift でローカル AI 機能を構築する](/articles/wwdc2026-328) - MLX Swift で Apple デバイス上のローカル AI 機能を構築し、カスタム Metal kernel と組み合わせられる
+- [Session 388: Apple GPU 向けに Metal パフォーマンスを最適化する](/articles/wwdc2026-388) - メモリ管理とシェーダーチューニングを含む Metal パフォーマンス最適化の一般原則
+- [Session 359: Metal neural rendering でゲームを強化する](/articles/wwdc2026-359) - Metal neural rendering。類似した GPU 計算最適化の考え方を含む
