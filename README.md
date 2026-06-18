@@ -51,7 +51,8 @@ data/
 ├── wwdc22/
 ├── wwdc23/
 ├── wwdc24/
-└── wwdc25/
+├── wwdc25/
+└── wwdc26/
 ```
 
 `skills/` is the single source of truth. The playground links expose the same skill to agent runtimes that expect either `.agents/skills` or `.claude/skills`. The repository root intentionally does not keep a `.agents/skills` copy.
@@ -62,11 +63,11 @@ After installing the skill, agents call this script for you. For local testing o
 
 ```sh
 node skills/wwdc-quick-look/scripts/query.mjs list-years
-node skills/wwdc-quick-look/scripts/query.mjs search --year 2025 --keyword "visionOS"
-node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2025 --code 290
-node skills/wwdc-quick-look/scripts/query.mjs resources --year 2025 --code 290
-node skills/wwdc-quick-look/scripts/query.mjs code --year 2025 --code 290 --limit 3
-node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2025 --code 290 --limit 20
+node skills/wwdc-quick-look/scripts/query.mjs search --year 2026 --keyword "Foundation Models"
+node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2026 --code 339
+node skills/wwdc-quick-look/scripts/query.mjs resources --year 2026 --code 339
+node skills/wwdc-quick-look/scripts/query.mjs code --year 2026 --code 339 --limit 3
+node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2026 --code 339 --limit 20
 ```
 
 By default the query script reads the published CDN dataset:
@@ -84,16 +85,17 @@ WWDC_QUICK_LOOK_BASE_URL=http://127.0.0.1:8765 \
 
 ## Dataset Coverage
 
-The committed local dataset covers WWDC 2020 through WWDC 2025.
+The committed local dataset covers WWDC 2020 through WWDC 2026.
 
-| Year | Sessions | Transcript files | Sessions with Resources | Sessions with Code snippets |
-|------|----------|------------------|--------------------------|-----------------------------|
-| 2020 | 209 | 206 | 150 | 124 |
-| 2021 | 207 | 204 | 176 | 127 |
+| Year | Sessions | Available transcripts | Sessions with Resources | Sessions with Code snippets |
+|------|----------|-----------------------|--------------------------|-----------------------------|
+| 2020 | 209 | 209 | 150 | 124 |
+| 2021 | 202 | 202 | 176 | 127 |
 | 2022 | 316 | 184 | 142 | 118 |
 | 2023 | 316 | 181 | 122 | 100 |
 | 2024 | 123 | 123 | 117 | 78 |
-| 2025 | 122 | 120 | 113 | 80 |
+| 2025 | 122 | 122 | 113 | 81 |
+| 2026 | 137 | 118 | 92 | 87 |
 
 Some Apple Developer entries are Q&A, Meet the Presenter, Study Hall, keynote, ASL, or community activity pages. When Apple publishes no timestamped transcript on the page, the manifest records that entry as `missing` instead of inventing text.
 
@@ -103,7 +105,7 @@ The crawler remains available for maintaining the dataset:
 
 ```sh
 # Crawl one year into the published data directory.
-node ./bin/wwdc-quick-look.js crawl --year 2025 --locale en --out-dir data/wwdc25
+node ./bin/wwdc-quick-look.js crawl --year 2026 --locale en --out-dir data/wwdc26
 
 # Rebuild the public year catalog.
 node scripts/build-index.mjs
@@ -118,13 +120,13 @@ The combined crawl fetches public Apple Developer collection cards, enriches eac
 https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/index.json
 
 # Per-year session metadata
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/raw_data.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/raw_data.json
 
 # Transcript manifest
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/_manifest.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/transcripts-en/_manifest.json
 
 # Single transcript
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/290.txt
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/transcripts-en/339.txt
 ```
 
 jsDelivr caches paths. Use a commit-pinned URL when byte-stable archival output matters.
