@@ -51,7 +51,8 @@ data/
 ├── wwdc22/
 ├── wwdc23/
 ├── wwdc24/
-└── wwdc25/
+├── wwdc25/
+└── wwdc26/
 ```
 
 `skills/` 是唯一真源。`playground` 下的两个软链接让需要 `.agents/skills` 或 `.claude/skills` 的 Agent 运行时都能加载同一份 skill。仓库根目录不再保留 `.agents/skills` 副本。
@@ -62,11 +63,11 @@ data/
 
 ```sh
 node skills/wwdc-quick-look/scripts/query.mjs list-years
-node skills/wwdc-quick-look/scripts/query.mjs search --year 2025 --keyword "visionOS"
-node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2025 --code 290
-node skills/wwdc-quick-look/scripts/query.mjs resources --year 2025 --code 290
-node skills/wwdc-quick-look/scripts/query.mjs code --year 2025 --code 290 --limit 3
-node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2025 --code 290 --limit 20
+node skills/wwdc-quick-look/scripts/query.mjs search --year 2026 --keyword "Foundation Models"
+node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2026 --code 339
+node skills/wwdc-quick-look/scripts/query.mjs resources --year 2026 --code 339
+node skills/wwdc-quick-look/scripts/query.mjs code --year 2026 --code 339 --limit 3
+node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2026 --code 339 --limit 20
 ```
 
 查询脚本默认读取公开 CDN 数据：
@@ -84,16 +85,17 @@ WWDC_QUICK_LOOK_BASE_URL=http://127.0.0.1:8765 \
 
 ## 数据覆盖
 
-本地已提交的数据覆盖 WWDC 2020 到 WWDC 2025。
+本地已提交的数据覆盖 WWDC 2020 到 WWDC 2026。
 
-| 年份 | Sessions | Transcript 文件 | 含 Resources 的 sessions | 含 Code snippets 的 sessions |
-|------|----------|-----------------|---------------------------|------------------------------|
-| 2020 | 209 | 206 | 150 | 124 |
-| 2021 | 207 | 204 | 176 | 127 |
+| 年份 | Sessions | 可用 transcripts | 含 Resources 的 sessions | 含 Code snippets 的 sessions |
+|------|----------|------------------|---------------------------|------------------------------|
+| 2020 | 209 | 209 | 150 | 124 |
+| 2021 | 202 | 202 | 176 | 127 |
 | 2022 | 316 | 184 | 142 | 118 |
 | 2023 | 316 | 181 | 122 | 100 |
 | 2024 | 123 | 123 | 117 | 78 |
-| 2025 | 122 | 120 | 113 | 80 |
+| 2025 | 122 | 122 | 113 | 81 |
+| 2026 | 137 | 118 | 92 | 87 |
 
 部分 Apple Developer 条目是 Q&A、Meet the Presenter、Study Hall、keynote、ASL 或社区活动页面。Apple 页面没有公开 timestamp transcript 时，manifest 会把该条目标记为 `missing`，不会伪造文本。
 
@@ -103,7 +105,7 @@ WWDC_QUICK_LOOK_BASE_URL=http://127.0.0.1:8765 \
 
 ```sh
 # 爬取某一年并写入发布数据目录。
-node ./bin/wwdc-quick-look.js crawl --year 2025 --locale en --out-dir data/wwdc25
+node ./bin/wwdc-quick-look.js crawl --year 2026 --locale en --out-dir data/wwdc26
 
 # 重建年份索引。
 node scripts/build-index.mjs
@@ -118,13 +120,13 @@ node scripts/build-index.mjs
 https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/index.json
 
 # 单年 session 元数据
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/raw_data.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/raw_data.json
 
 # Transcript manifest
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/_manifest.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/transcripts-en/_manifest.json
 
 # 单个 transcript
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/290.txt
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/transcripts-en/339.txt
 ```
 
 jsDelivr 会缓存路径。需要字节级稳定归档时，请使用绑定 commit 的 URL。
