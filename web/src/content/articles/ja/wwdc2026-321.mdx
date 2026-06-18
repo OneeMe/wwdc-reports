@@ -1,0 +1,404 @@
+---
+title: "SwiftUI の lazy stacks とスクロールを深掘りする"
+description: "SwiftUI の lazy stacks の内部動作を学びます。LazyVStack と LazyHStack がサイズを推定し、サブビューを遅延読み込みし、コンテンツをプリフェッチして滑らかなスクロール体験を実現する仕組みを探ります。"
+date: "2026-06-10"
+tags: ["SwiftUI", "LazyVStack", "LazyHStack", "ScrollView", "パフォーマンス最適化"]
+thumbnail: "/images/sessions/2026/321.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/321/"
+sessionId: "wwdc2026-321"
+year: "2026"
+relatedSessions:
+  - title: "Code-along: Build powerful drag and drop in SwiftUI"
+    code: "271"
+    description: "SwiftUI のドラッグによる並べ替えと Lazy stack の連携です"
+  - title: "Compose custom layouts with SwiftUI"
+    code: "322"
+    description: "ジオメトリ変化コールバックの代わりにカスタム Layout を使います"
+  - title: "Stacks, Grids, and Outlines in SwiftUI"
+    code: "269"
+    description: "SwiftUI レイアウトの基礎であり、この session の前提知識です"
+  - title: "SwiftData"
+    code: "274"
+    description: "Query と Predicate でリストデータをデータ層でフィルタリングします"
+---
+
+## ハイライト
+
+> SwiftUI の LazyVStack と LazyHStack は、必要なサブビューだけを読み込み、プリフェッチすることで滑らかなスクロールを実現します。ただし、高さ推定、ビュー解決ルール、状態管理には固有の制約があり、開発者はデータ層でのフィルタリング、初期化時の設定、動的なビュー数を避ける設計などのベストプラクティスに従う必要があります。
+
+## 主要内容
+
+折り紙チュートリアル App を作っていると想像してください。数十ステップの図解と説明文があります。通常の `VStack` を使うと、ページを開いた瞬間にすべてのステップが一度に読み込まれ、メモリと描画コストはステップ数に比例して増えます。`LazyVStack` はこの問題を解決します。現在画面に見えている領域のビューだけを読み込み、スクロールに合わせて新しい内容を少しずつ追加し、画面外へ出たビューは取り除きます。
+
+([01:37](https://developer.apple.com/videos/play/wwdc2026/321/?time=97))
+
+このオンデマンド読み込みには代償があります。画面外のビューの高さは推定値になります。LazyVStack は、すでに配置済みのビューの平均高さと残りビュー数から全体の高さを推定するため、スクロール中に全体の高さが動的に調整されることがあります。同様に、LazyVStack の理想幅は最初の子ビューの幅になります。すべてのビューを読み込んで最大幅を計算しているわけではないからです。
+
+([02:42](https://developer.apple.com/videos/play/wwdc2026/321/?time=162))
+
+典型的な場面は縦横回転です。iPhone が縦向きから横向きに変わると、`StepView` の高さは低くなります。副題テキストが占める行数が減るからです。LazyVStack は現在一番上に見えているビューをアンカーとして維持しますが、上部へ戻るときには、上にある領域の推定高さを少しずつ修正しながら ScrollView の `contentOffset` も同期的に更新し、最終的にトップへ戻ったとき offset がゼロになるようにします。
+
+([04:02](https://developer.apple.com/videos/play/wwdc2026/321/?time=242))
+
+Lazy stack はネストに対応します。折り紙 App の下部に横スクロールの写真展示欄を追加するなら、`LazyVStack` の中に `LazyHStack` をネストできます。ユーザーが写真エリアまでスクロールしなければ、内側のビュー読み込みは発生しません。ただし注意が必要です。LazyHStack の理想高さは最初の子ビューの高さに等しいため、写真に可変行数の説明文が付いていると、長いテキストが切れてしまいます。対策は固定高さにすること、たとえばテキストに `lineLimit` を設定することです。
+
+([05:12](https://developer.apple.com/videos/play/wwdc2026/321/?time=312))
+
+写真エリアをより目立たせたい場合は、`Section` に入れて `pinnedViews: [.sectionHeaders]` でセクションヘッダーを固定できます。スクロール時にヘッダーが上部へ吸着します。
+
+([06:30](https://developer.apple.com/videos/play/wwdc2026/321/?time=390))
+
+### スクロール効果と可視性検出
+
+写真に `scrollTransition` を加えると、画面への出入りにアニメーション効果を付けられます。ただし注意してください。Lazy stack はビューの元の位置を基準に、そのビューが画面内にあるかを判断します。transform によってビューが元の frame の外へ押し出されると、Lazy stack はすでに画面外へ出たと判断して早めにアンロードし、ビューが不自然に消えることがあります。
+
+([07:04](https://developer.apple.com/videos/play/wwdc2026/321/?time=424))
+
+スクロール位置を検出するときは、`onScrollGeometryChange` で絶対的な `contentOffset` を読むべきではありません。Lazy stack の offset は推定値であり、推定が更新されるとボタンの表示・非表示の境界がずれます。代わりに `onScrollTargetVisibilityChange` を使い、子ビューの相対的な可視性から判断します。
+
+([08:20](https://developer.apple.com/videos/play/wwdc2026/321/?time=500))
+
+## 詳細
+
+### ビュー解決：1つの View struct は1つの子ビューとは限らない
+
+LazyVStack が読み込む「子ビュー」は、コード上の View struct と必ずしも一対一ではありません。`ForEach` は複数の StepView に展開されますが、StepView の body のトップレベルが2つのビューを返し、それらが VStack で包まれていない場合、LazyVStack はその2つを独立した子ビューとして別々に読み込みます。
+
+([09:29](https://developer.apple.com/videos/play/wwdc2026/321/?time=569))
+
+```swift
+struct StepView: View {
+    let step: Step
+
+    var body: some View {
+        StepDiagram(/* ... */)
+        StepInstructions(/* ... */)
+    }
+}
+```
+
+重要な点：
+- `StepView` の body のトップレベルには2つのビューがあり、`VStack` で包まれていません
+- LazyVStack は `StepDiagram` と `StepInstructions` を2つの独立した子ビューとして読み込みます
+- `StepView` 自体も評価されますが、LazyVStack が管理するのは展開後の子ビューです
+
+より見落としやすい問題は、動的なビュー数です。StepView が環境値によって1つのビューを返すかゼロ個のビューを返すかを決める場合、LazyVStack はインデックスの正しさを保つため、現在見えていないものも含めてすべての StepView をメモリに保持します。
+
+([10:52](https://developer.apple.com/videos/play/wwdc2026/321/?time=652))
+
+```swift
+struct StepView: View {
+    let step: Step
+    @Environment(\.detailLevel) var detailLevel
+
+    var body: some View {
+        if step.isVisible(in: detailLevel) {
+            VStack { /* ... */ }
+        }
+    }
+}
+```
+
+重要な点：
+- `if` 条件によって、StepView は時には1つの子ビューを返し、時にはゼロ個を返します
+- LazyVStack は可視子ビューをインデックスで参照するため、`detailLevel` が変わってインデックスがずれる場合に備え、すべての StepView インスタンスを保持する必要があります
+- これらの画面外ビューは、`writingStyle` のような無関係な環境値の変化でも不要な body 再計算を起こします
+
+正しい方法はデータ層でフィルタリングすることです。
+
+([12:15](https://developer.apple.com/videos/play/wwdc2026/321/?time=735))
+
+```swift
+struct ContentView: View {
+    @Query var steps: [Step]
+
+    init(detailLevel: DetailLevel) {
+        _steps = Query(filter: #Predicate<Step> { step in
+            step.detailLevel >= detailLevel
+        })
+    }
+
+    var body: some View { /* ... */ }
+}
+```
+
+重要な点：
+- SwiftData の `Query` + `Predicate` を使ってデータ層でフィルタリングします
+- LazyVStack は確定した数の子ビューを直接受け取り、数を計算するために View を構築する必要がありません
+- 無関係な環境値の変化が画面外ビューに影響しません
+
+Optional を `if let` でアンラップする場合にも同じ問題があります。`apiToken` 環境値が nil から値ありに変わると、すべての StepView のインデックスが変わり得ます。より良い方法は、認証状態を上位ビューに任せ、未ログイン時は `ContentUnavailableView` を直接表示し、lazy stack に入らないことです。
+
+([12:35](https://developer.apple.com/videos/play/wwdc2026/321/?time=755))
+
+### プリフェッチと状態管理
+
+Lazy stack はスクロール方向に対して、もうすぐ画面に入るビューを事前にプリフェッチします。フレームの空き時間に body 評価とレイアウトを少しずつ進め、本来1フレームに集中する大きな処理を複数フレームへ分散し、フレーム落ちを避けます。
+
+([13:19](https://developer.apple.com/videos/play/wwdc2026/321/?time=799))
+
+プリフェッチがあるため、ビューの body は `onAppear` より前に呼ばれることがあります。ユーザーが逆方向へスクロールすると、プリフェッチ済みのビューは body が評価されたにもかかわらず、`onAppear` が一度も発火しないことさえあります。そのため重要な初期化ロジックを `onAppear` に置いてはいけません。
+
+([15:53](https://developer.apple.com/videos/play/wwdc2026/321/?time=953))
+
+誤った方法：
+
+```swift
+struct StepView: View {
+    let id: Step.ID
+    @State var viewModel = StepViewModel()
+
+    var body: some View {
+        VStack {
+            if let content = viewModel.content { /* ... */ }
+        }
+        .onAppear {
+            viewModel.configure(with: id)
+        }
+    }
+}
+```
+
+重要な点：
+- `onAppear` で viewModel を設定すると、ビューが表示される前は未設定状態になります
+- プリフェッチ中に行ったレイアウト作業は、`onAppear` 発火後に破棄され再計算されます
+- スクロール性能が悪化し、実際に必要な数より多くのビューを読み込む可能性があります
+
+正しい方法は初期化子で設定することです。
+
+([16:14](https://developer.apple.com/videos/play/wwdc2026/321/?time=974))
+
+```swift
+struct StepView: View {
+    @State var viewModel: StepViewModel
+
+    init(id: Step.ID) {
+        _viewModel = State(initialValue: StepViewModel(id: id))
+    }
+
+    var body: some View { /* ... */ }
+}
+```
+
+重要な点：
+- viewModel は初期化時に設定済みなので、プリフェッチ時点で正しいデータを参照できます
+- ビューは表示前から妥当な状態にあり、プリフェッチの作業が無駄になりません
+
+非同期読み込みもプリフェッチを活用して早く始められます。たとえばネットワークから折り紙図解を読み込みます。
+
+([16:23](https://developer.apple.com/videos/play/wwdc2026/321/?time=983))
+
+```swift
+struct StepView: View {
+    let step: Step
+    @State var diagram: Diagram?
+
+    var body: some View {
+        VStack { /* ... */ }
+            .task {
+                diagram = await DiagramLoader.loadDiagram(id: step.id)
+            }
+    }
+}
+```
+
+さらに早く読み込みを始めたい場合は、`@Observable` の loader を使い、初期化時に処理を開始します。
+
+([16:40](https://developer.apple.com/videos/play/wwdc2026/321/?time=1000))
+
+```swift
+struct StepView: View {
+    let step: Step
+    @State var diagramLoader: DiagramLoader
+
+    init(step: Step) {
+        self.step = step
+        _diagramLoader = State(initialValue: DiagramLoader(id: step.id))
+    }
+
+    var body: some View { /* ... */ }
+}
+
+@Observable
+class DiagramLoader {
+    var diagram: Diagram?
+
+    init(id: Step.ID) {
+        Task {
+            diagram = await loadFromNetwork(id: id)
+        }
+    }
+}
+```
+
+重要な点：
+- `DiagramLoader` は初期化時にネットワークリクエストを開始します
+- プリフェッチ中に loader はすでに読み込みを開始しているため、ビューが画面に入る頃にはデータが用意できている可能性が高くなります
+- キャッシュと組み合わせると、体験をさらに改善できます
+
+ビューが画面外へ出ても、すぐにメモリから削除されるわけではありません。Lazy stack は素早く戻る操作に備えて、しばらく保持します。しかし状態変数（`@State`）はいずれ解放されます。永続化が必要なデータを View の state に置いてはいけません。
+
+([17:16](https://developer.apple.com/videos/play/wwdc2026/321/?time=1036))
+
+```swift
+// 誤り：ハイライト状態はビューが画面外へ出ると失われる
+struct StepView: View {
+    let step: Step
+    @State var isHighlighted = false
+    // ...
+}
+
+// 正しい：Binding で状態を外側へ持ち上げる
+struct ContentView: View {
+    @State var highlighted: Set<Step.ID> = []
+    // ...
+}
+
+struct StepView: View {
+    let step: Step
+    @Binding var highlighted: Set<Step.ID>
+    // ...
+}
+```
+
+重要な点：
+- `@State` はビューのライフサイクルとともに存在し、ビューが解放されると状態も失われます
+- 永続化が必要な状態は Model オブジェクトに置くか、`@Binding` で親ビューへ持ち上げるべきです
+
+### プログラムによるスクロール
+
+SwiftUI は `ScrollPosition` を提供し、現在画面外にあるビューへもプログラムからスクロールできます。
+
+([17:58](https://developer.apple.com/videos/play/wwdc2026/321/?time=1078))
+
+```swift
+struct ContentView: View {
+    @State var scrollPosition = ScrollPosition()
+
+    var body: some View {
+        ScrollView { /* ... */ }
+            .scrollPosition($scrollPosition)
+            .overlay(alignment: .bottom) {
+                Button {
+                    scrollToShowcase()
+                } label: { /* ... */ }
+            }
+    }
+
+    func scrollToShowcase() {
+        withAnimation {
+            scrollPosition.scrollTo(id: "showcase-header")
+        }
+    }
+}
+```
+
+重要な点：
+- `ScrollPosition` は ScrollView にバインドします
+- `scrollTo(id:)` は指定 ID のビューへ直接ジャンプできます。そのビューが現在画面外でも構いません
+- `withAnimation` と組み合わせると滑らかなスクロールになります
+
+プログラムによるスクロールの性能は、Lazy stack が対象ビューを素早く見つけられるかに左右されます。各 ForEach 要素が常に1つの子ビューへ解決されるなら、LazyVStack は ForEach に直接問い合わせて対象 ID を見つけられ、View を構築する必要がありません。動的なビュー数があると、探索効率は落ちます。
+
+### スクロール後にレイアウトを変えない
+
+よくあるアンチパターンは、`onGeometryChange` で子ビューの高さを読み取り、その値で他のビューのレイアウトを調整することです。これにより、ビューが表示された後で自身の高さが変わり、下のコンテンツを押し下げ、スクロール位置の安定性が損なわれます。
+
+([19:16](https://developer.apple.com/videos/play/wwdc2026/321/?time=1156))
+
+```swift
+// 非推奨：スクロール後にレイアウトを変える
+struct StepView: View {
+    let step: Step
+    @State var subtitleHeight: CGFloat?
+
+    var body: some View {
+        VStack {
+            StepDiagram(diagram: step.diagram)
+                .frame(height: diagramHeight(subtitleHeight: subtitleHeight))
+            Title(step.title)
+            Subtitle(step.subtitle)
+                .onGeometryChange(for: CGFloat.self, of: \.size.height) { _, value in
+                    subtitleHeight = value
+                }
+        }
+    }
+}
+```
+
+SwiftUI の組み込みレイアウトで、図文の回り込みや固定比率などの複雑な要件を満たせない場合は、`onGeometryChange` の hack ではなくカスタム `Layout` を使います。
+
+([19:17](https://developer.apple.com/videos/play/wwdc2026/321/?time=1157))
+
+```swift
+struct StepView: View {
+    let step: Step
+
+    var body: some View {
+        StepLayout {
+            StepDiagram(diagram: step.diagram)
+            Title(step.title)
+            Subtitle(step.subtitle)
+        }
+    }
+}
+
+struct StepLayout: Layout {
+    // sizeThatFits 内で、すべての子ビューのサイズと位置を一度に計算する
+    // ...
+}
+```
+
+重要な点：
+- カスタム Layout は `sizeThatFits` と `placeSubviews` の中で測定と配置を一度に完了します
+- ビュー表示後に二度目のレイアウト調整が起きません
+- スクロール位置が安定します
+
+## 重要な示唆
+
+**1. 長いリストの写真ブラウザ**
+
+何を作るか：`LazyVStack` + `Section` + `pinnedViews` で日付ごとにグループ化された写真フィードを作ります。セクションヘッダーに日付を表示し、スクロール時に上部へ吸着させます。同じ日のサムネイルプレビューには横方向の `LazyHStack` をネストします。
+
+なぜ価値があるか：写真数は数千枚に達することが珍しくありません。通常の VStack はすべてのビューを一度に読み込み、メモリと起動時間が許容できなくなります。Lazy stack のオンデマンド読み込みにより、大きなアルバムでも滑らかにスクロールでき、pinnedViews によって日付ナビゲーションも常に見えます。
+
+どう始めるか：SwiftData の `Query` でデータ層から日付別にグループ化し、View body 内の条件フィルタリングを避けます。入口：`LazyVStack(pinnedViews: [.sectionHeaders])` + `@Query`
+
+**2. 無限スクロールのコンテンツフィード**
+
+何を作るか：リスト下部に `ProgressView` を置き、`onAppear` と組み合わせて次ページの読み込みを起動します。データ読み込みロジックは初期化子または `@Observable` loader で開始します。
+
+なぜ価値があるか：Lazy stack のプリフェッチ機構は、ユーザーが下部へ近づいた時点で先にコンテンツを読み込めます。しかし読み込みロジックを `onAppear` に置くと、プリフェッチ時点では viewModel が未設定で、ユーザーが実際に下端へ到達してから読み込みが始まり、「下まで行く -> 待つ」という体験になります。初期化を構築時へ前倒しすれば、プリフェッチと読み込みが同時に進みます。
+
+どう始めるか：`DiagramLoader` パターンまたは初期化子で viewModel を設定し、`.task` で非同期読み込みを始めます。入口：`init(step: Step) { _diagramLoader = State(initialValue: DiagramLoader(id: step.id)) }`
+
+**3. スクロールアニメーション付きのカードリスト**
+
+何を作るか：カードに `scrollTransition` を追加し、画面に入るときのスケールや回転効果を付けます。
+
+なぜ価値があるか：スクロールアニメーションはリストの視覚品質を高め、コンテンツ切り替えにリズムを生みます。ただし Lazy stack はビューの元の frame を基準に画面内判定をします。transform でビューが元の境界外へ押し出されると、Lazy stack は画面外と判断して早めにアンロードし、不自然に消えることがあります。
+
+どう始めるか：`scaleEffect(1 - abs(phase.value) * 0.1)` のように、ビューを元の境界内に保つ効果を使います。入口：`.scrollTransition { effect, phase in effect.scaleEffect(1 - abs(phase.value) * 0.1) }`
+
+**4. 賢い読書進捗の保存**
+
+何を作るか：長文読書 App で、各章の読書進捗を親ビューまたは Model に保存し、`ScrollPosition` と組み合わせて「前回読んだ位置へ戻る」を実現します。
+
+なぜ価値があるか：`@State` はビューのライフサイクルに従います。ビューが画面外へ出て Lazy stack に回収されると、状態は失われます。ユーザーが第10章まで読んで目次へ戻り、再度入ったときに進捗がゼロになるのを避けるには、状態を親ビューへ持ち上げるか SwiftData に保存する必要があります。
+
+どう始めるか：`@Binding var readingProgress: Set<Chapter.ID>` で状態を親ビューへ持ち上げるか、SwiftData Model に保存します。`ScrollPosition` の `scrollTo(id:)` と組み合わせてジャンプします。入口：`@Binding var readingProgress: Set<Chapter.ID>` + `scrollPosition.scrollTo(id:)`
+
+**5. 複雑な図文混在レイアウト**
+
+何を作るか：組み込みの Stack では図文の回り込みや固定比率などの複雑なレイアウトを満たせない場合、`onGeometryChange` の hack ではなくカスタム `Layout` を使います。
+
+なぜ価値があるか：`onGeometryChange` で子ビューの高さを読み取ってから他のビューを調整すると、ビュー表示後に自身の高さが二度目に変わり、下のコンテンツを押し下げ、スクロール位置の安定性に影響します。カスタム Layout は `sizeThatFits` 段階ですべての子ビュー位置を決めるため、Lazy stack とより安定して組み合わせられます。
+
+どう始めるか：`Layout` プロトコルの `sizeThatFits` と `placeSubviews` メソッドを実装し、測定と配置を一度に完了します。入口：`struct StepLayout: Layout { func sizeThatFits(...) -> CGSize { ... } }`
+
+## 関連セッション
+
+- [Code-along: Build powerful drag and drop in SwiftUI](/articles/wwdc2026-271) - SwiftUI のドラッグによる並べ替えと Lazy stack の連携です
+- [Compose custom layouts with SwiftUI](/articles/wwdc2026-322) - ジオメトリ変化コールバックの代わりにカスタム Layout を使います
+- [Stacks, Grids, and Outlines in SwiftUI](/articles/wwdc2026-269) - SwiftUI レイアウトの基礎であり、この session の前提知識です
+- [SwiftData](/articles/wwdc2026-274) - Query と Predicate でリストデータをデータ層でフィルタリングします

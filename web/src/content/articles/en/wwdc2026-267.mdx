@@ -1,0 +1,261 @@
+---
+title: "Migrate to Swift Testing"
+description: "Learn how to adopt Swift Testing alongside your XCTests with test framework interoperability. Discover best practices and patterns for incrementally introducing advanced testing features to an existing test suite."
+date: "2026-06-10"
+tags: ["Swift Testing", "XCTest", "Interoperability", "Parameterized Tests", "Testing"]
+thumbnail: "/images/sessions/2026/267.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/267/"
+sessionId: "wwdc2026-267"
+year: "2026"
+relatedSessions:
+  - title: "Go further with Swift Testing"
+    code: "262"
+    description: "Advanced Swift Testing features, including custom traits, parallelization control, and test organization strategies"
+  - title: "Xcode 27"
+    code: "258"
+    description: "Testing UI improvements in Xcode 27 and migration help from Coding Assistant"
+  - title: "SwiftUI"
+    code: "269"
+    description: "Integration testing strategies for SwiftUI previews and Swift Testing"
+  - title: "SwiftData"
+    code: "274"
+    description: "Best practices for testing the database layer and validating persistence with Swift Testing"
+---
+
+## Highlight
+
+> Xcode 27 enables test framework interoperability by default, allowing XCTest and Swift Testing to coexist in the same test target so teams can migrate gradually instead of rewriting every test at once.
+
+## Core Ideas
+
+### From full rewrites to gradual migration
+
+When Swift Testing launched with Xcode 16 last year, many teams were interested but hesitant. A mature project can easily have thousands of lines of XCTest code. Rewriting all of it is risky and usually has a weak return on investment. Most teams chose the conservative path: use Swift Testing for new projects and keep maintaining XCTest in existing ones.
+
+([03:16](https://developer.apple.com/videos/play/wwdc2026/267/?time=196)) The core message of this session is: do not modify all old tests in one pass. Migrate only a few tests you touch often, and leave the remaining XCTest code in place. The same test target can contain test files from both frameworks, and Xcode will run them together.
+
+### Interoperability: a translation layer between two frameworks
+
+([05:48](https://developer.apple.com/videos/play/wwdc2026/267/?time=348)) Interoperability is a new Xcode 27 capability. It lets you call XCTest APIs, such as `XCTFail`, inside Swift Testing test functions. It also lets you call Swift Testing APIs, such as `#expect`, inside XCTest. Under the hood, the framework automatically reports issues to the correct test runner.
+
+For example, suppose you have a helper function named `assertUnique` that is called by dozens of XCTests and reports failures with `XCTFail`. Now you want to reuse that helper from Swift Testing. Interoperability makes that directly possible: the `XCTFail` call is translated into a Swift Testing issue report.
+
+### Four interoperability modes
+
+([07:43](https://developer.apple.com/videos/play/wwdc2026/267/?time=463)) Xcode 27 provides four modes for controlling how cross-framework issues are handled:
+
+- **Limited** (the default for projects created before Xcode 27): cross-framework issues produced by XCTest appear as warnings, and the test still passes
+- **Complete** (the default for new Xcode 27 projects): cross-framework issues stay errors, and the test fails
+- **Strict**: cross-framework issues produced by XCTest trigger a fatal error, forcing you to replace them with Swift Testing APIs
+- **None**: interoperability is fully disabled, and the two frameworks do not observe each other
+
+([09:05](https://developer.apple.com/videos/play/wwdc2026/267/?time=545)) Suggested strategy: start with Complete mode so problems surface, then replace them one by one. Once the migration is mostly done, switch CI to Strict mode to prevent new XCTest API calls from entering Swift Testing tests.
+
+### Parameterized tests replace nested loops
+
+([15:38](https://developer.apple.com/videos/play/wwdc2026/267/?time=938)) Swift Testing's parameterized tests solve a common pain from the XCTest era. Suppose you want to test how every bird behaves when flapping its wings between 40 and 100 times. In XCTest, you would write nested `for` loops:
+
+```swift
+func testBirdsFlapWings() async throws {
+    for bird in Aviary.birds {
+        for count in (40...100) {
+            try await bird.flapWings(count: count)
+        }
+    }
+}
+```
+
+The problem is obvious: when a line inside the loop fails, you know which `for` loop failed, but not the specific bird or count. Debugging requires logs or a debugger.
+
+([16:47](https://developer.apple.com/videos/play/wwdc2026/267/?time=1007)) Swift Testing parameterized tests expand the loop into independent test cases:
+
+```swift
+struct BirdTests {
+    @Test(arguments: Aviary.birds, 40...100)
+    func `Birds flap wings successfully`(bird: Bird, count: Int) async throws {
+        try await bird.flapWings(count: count)
+    }
+}
+```
+
+Each argument combination becomes an independent test case that can be expanded in Test Navigator. More importantly, these cases run in parallel by default, greatly reducing total runtime. When something fails, Xcode points directly to the bird and count that failed. There is no guessing.
+
+### Exit tests: testing crash paths
+
+([18:08](https://developer.apple.com/videos/play/wwdc2026/267/?time=1088)) Swift Testing exit tests let you test code paths that trigger `preconditionFailure` or `fatalError`. The framework runs the test body in a child process, so the main process is not affected.
+
+```swift
+extension BirdTests {
+    @Test func `Bird with empty name crashes`() async throws {
+        await #expect(processExitsWith: .failure) {
+            _ = Bird(name: "")
+        }
+    }
+}
+```
+
+([19:57](https://developer.apple.com/videos/play/wwdc2026/267/?time=1197)) After running it, the `preconditionFailure` line that was previously red in Code Coverage turns green. That crash path is now covered by a test.
+
+## Details
+
+### Add Swift Testing tests to existing XCTest files
+
+([04:18](https://developer.apple.com/videos/play/wwdc2026/267/?time=258)) The first migration step does not require creating a new file. Add `import Testing` at the end of an existing `.swift` test file, then write an `@Test` function:
+
+```swift
+import Testing
+@testable import DemoApp
+
+@Test func `Default climate: tropical`() async throws {
+    let fruit = Fruit(name: "Coconut")
+    #expect(fruit.climate == .tropical)
+}
+```
+
+Key points:
+
+- The `@Test` macro marks a Swift Testing test function
+- Backticks, or raw identifiers, allow function names to contain spaces and punctuation, so test names can be readable natural language
+- `#expect` replaces `XCTAssertEqual` and automatically expands the expression to show values on both sides when it fails
+- There is no need to inherit from `XCTestCase`; the function can live at file scope
+
+### Migrate helper functions from XCTFail to Issue.record
+
+([05:03](https://developer.apple.com/videos/play/wwdc2026/267/?time=303)) Suppose you have an XCTest-era helper function:
+
+```swift
+func assertUnique(_ fruits: [Fruit], file: StaticString = #filePath, line: UInt = #line) {
+    var uniqueNames = Set<String>()
+    for name in fruits.map(\.name) {
+        if !uniqueNames.insert(name).inserted {
+            XCTFail("Duplicate name: \(name)", file: file, line: line)
+        }
+    }
+}
+```
+
+([10:12](https://developer.apple.com/videos/play/wwdc2026/267/?time=612)) Convert it into a version that supports Swift Testing too:
+
+```swift
+import Testing
+
+func assertUnique(_ fruits: [Fruit], sourceLocation: SourceLocation = #_sourceLocation) {
+    var uniqueNames = Set<String>()
+    for name in fruits.map(\.name) {
+        if !uniqueNames.insert(name).inserted {
+            Issue.record("Duplicate name: \(name)", sourceLocation: sourceLocation)
+        }
+    }
+}
+```
+
+Key points:
+
+- Replace `XCTFail` with `Issue.record`
+- Replace `file:line:` parameters with `sourceLocation: SourceLocation`
+- When the updated helper is called from both XCTest and Swift Testing, both sides report the correct failure location
+
+### Three ways to skip tests
+
+([13:10](https://developer.apple.com/videos/play/wwdc2026/267/?time=790)) XCTest uses `XCTSkipIf` to skip tests. Swift Testing provides three equivalent forms:
+
+```swift
+let isFall = false
+
+// XCTest style
+func testSwallowFallMigration() async throws {
+    try XCTSkipIf(!isFall, "Wrong season for migration")
+}
+
+// Swift Testing: call Test.cancel inside the test body
+func testSwallowFallMigration() async throws {
+    if !isFall {
+        try Test.cancel("Wrong season for migration")
+    }
+}
+
+// Recommended Swift Testing style: move the condition into a trait
+@Test(.enabled(if: isFall, "Wrong season for migration"))
+func `Swallow fall migration`() async throws {
+    // Test logic
+}
+```
+
+Key points:
+
+- `Test.cancel` can decide dynamically inside the test body whether to skip
+- The `.enabled(if:)` trait moves skip logic out of the test body and keeps the body cleaner
+- The trait approach makes the test's "execution condition" obvious without reading the function body
+
+### Use #require instead of continueAfterFailure
+
+([13:41](https://developer.apple.com/videos/play/wwdc2026/267/?time=821)) In XCTest, `continueAfterFailure = false` stops a test at the first failed assertion. Swift Testing uses the `#require` macro for the same effect:
+
+```swift
+func testExample() async throws {
+    #expect(Fruit.banana.climate == .temperate)
+
+    try #require(Fruit.banana == Fruit.plantain)
+    // If #require fails, it throws an error and later code does not run
+}
+```
+
+Key points:
+
+- `#expect` continues executing later assertions after it fails
+- `#require` throws an error when it fails, stopping the test immediately
+- You can freely choose which assertions should "hard stop" and which should "soft collect"
+
+### Control interoperability mode in Swift packages
+
+([12:15](https://developer.apple.com/videos/play/wwdc2026/267/?time=735)) The default mode for Swift Package projects depends on the tools version:
+
+- `swift-tools-version: 6.3` and earlier: limited mode by default
+- `swift-tools-version: 6.4` and later: complete mode by default
+
+In Terminal, you can override it with an environment variable:
+
+```bash
+SWIFT_TESTING_XCTEST_INTEROP_MODE=strict swift test
+```
+
+This command is useful in CI pipelines. You can set the interoperability mode to strict to ensure team members do not quietly call XCTest APIs from Swift Testing tests.
+
+## Key Takeaways
+
+### Give your existing project's tests a health check
+
+- **What to do:** Scan XCTest helper functions in the project and gradually migrate them to Swift Testing APIs
+- **Why it is worth doing:** These helpers are often called by many tests, so every caller benefits after migration; `Issue.record` provides more detailed failure information than `XCTFail`
+- **How to start:** Pick one frequently called helper, such as a custom `assertSnapshot` or `assertUnique`, replace `XCTFail` with `Issue.record`, then run the test suite and confirm behavior is consistent
+
+### Use parameterized tests to eliminate loops in data-driven tests
+
+- **What to do:** Rewrite XCTests that iterate over test data with `for` loops as `@Test(arguments:)`
+- **Why it is worth doing:** Parallel execution reduces CI time, and failures point to the exact argument combination instead of requiring guesswork during debugging
+- **How to start:** Find a test with nested loops, extract loop variables into function parameters, and place the ranges in `arguments:`
+
+### Add tests for crash paths
+
+- **What to do:** Use exit tests to cover all `preconditionFailure`, `fatalError`, and `assertionFailure` call sites
+- **Why it is worth doing:** These paths used to be almost impossible to test. Now `#expect(processExitsWith:)` can verify them safely while improving Code Coverage
+- **How to start:** Open Code Coverage in Xcode, find red `preconditionFailure` lines, and write matching exit tests
+
+### Enforce test framework cleanliness in CI
+
+- **What to do:** Add `SWIFT_TESTING_XCTEST_INTEROP_MODE=strict` to your CI configuration
+- **Why it is worth doing:** It prevents team members from mixing XCTest APIs into newly written Swift Testing tests and avoids accumulating hybrid code
+- **How to start:** Add the environment variable before the `swift test` command in `.github/workflows/` or your Jenkins pipeline
+
+### Use raw identifiers to improve test readability
+
+- **What to do:** Rename camel-case test names such as `testDefaultClimateIsTropical` to raw identifiers such as `` `Default climate: tropical` ``
+- **Why it is worth doing:** The test name becomes documentation. A sentence with spaces is easier to read than compressed camel case, and failure logs are clearer
+- **How to start:** When creating a new Swift Testing test, wrap a natural-language description in backticks instead of abbreviating it
+
+## Related Sessions
+
+- [Go further with Swift Testing](/articles/wwdc2026-262) — Advanced Swift Testing features, including custom traits, parallelization control, and test organization strategies
+- [Xcode 27](/articles/wwdc2026-258) — Testing UI improvements in Xcode 27 and migration help from Coding Assistant
+- [SwiftUI](/articles/wwdc2026-269) — Integration testing strategies for SwiftUI previews and Swift Testing
+- [SwiftData](/articles/wwdc2026-274) — Best practices for testing the database layer and validating persistence with Swift Testing

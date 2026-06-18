@@ -1,0 +1,475 @@
+---
+title: "Code-along: アプリを Siri から使えるようにする"
+description: "学習"
+date: "2026-06-10"
+tags: ["App Intents", "Siri", "Apple Intelligence", "App Schemas", "カレンダー"]
+thumbnail: "/images/sessions/2026/344.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/344/"
+sessionId: "wwdc2026-344"
+year: "2026"
+relatedSessions:
+  - title: "104 - App Intents を知る"
+    code: "104"
+    description: "intents、entities、queries と、それらが Siri や Shortcuts とどうつながるかを紹介する App Intents の入門"
+  - title: "343 - App Intents: 高度なトピックとベストプラクティス"
+    code: "343"
+    description: "Siri との連携を深く最適化するための App Intents の高度な機能とベストプラクティス"
+  - title: "242 - Apple Intelligence で動くエージェント型アプリ"
+    code: "242"
+    description: "エージェント型アプリのアーキテクチャと、アプリがユーザーと能動的に協調する方法"
+  - title: "246 - Core Spotlight: アプリ内の LLM 対応検索"
+    code: "246"
+    description: "Core Spotlight と LLM の統合によりセマンティック検索能力を高める方法"
+  - title: "295 - App Intents を大規模にテストする"
+    code: "295"
+    description: "AppIntentsTesting フレームワークによる App Intents の自動テスト"
+---
+
+## ハイライト
+
+> App Intents フレームワークと App Schemas により、開発者はアプリの内容や操作を Siri から利用できるようにできます。ユーザーは自然言語でカレンダーイベントを問い合わせ、時間を変更し、メッセージを送信できます。開発者が独自の自然言語処理コードを書く必要はありません。
+
+## 主要内容
+
+以前、アプリを Siri と連携させるには多くの作業が必要でした。意図を定義し、トレーニングフレーズを書き、自然言語解析を処理し、新しい機能ごとに同じ手順を繰り返す必要がありました。
+
+Apple は App Schemas を導入しました。これは、事前定義された構造でアプリの内容と操作を記述する仕組みです。開発者は自然言語を処理する必要がなく、システムに「これはカレンダーイベントです」「これは予定に関する操作です」と伝えれば、Siri が理解できます。
+
+この code-along 動画では、CometCal プロジェクトを使って一連の流れを実演します。CometCal は SwiftUI 製のカレンダーアプリで、今日のイベント表示、閲覧と編集、新規イベント作成、複数カレンダーの管理に対応しています。動画では、タッチ操作だけのアプリを、Siri の音声操作に完全対応したバージョンへ段階的に変えていきます。
+
+重要なのは 3 つのステップです。Siri にアプリの内容を理解させること、つまりエンティティを定義すること。Siri が操作を実行できるようにすること、つまり intent を定義すること。そして、Siri に画面上の内容を知らせること、つまり画面認識を追加することです。
+
+## 詳細
+
+### ステップ 1: アプリエンティティを定義する ([03:12](https://developer.apple.com/videos/play/wwdc2026/344/?time=192))
+
+App Schemas は内容をドメインに整理します。カレンダードメインは予定に関するすべての内容、つまりイベント、カレンダー、参加者、それらを操作するアクションを扱います。
+
+最初のエンティティは CalendarEntity で、カレンダーそのものを表します。作り方はとても直接的です。
+
+```swift
+import AppIntents
+
+struct CalendarEntity: calendar_calendar {
+    @AppEntity(title: "カレンダー")
+    static var entityQuery = CalendarEntityQuery()
+
+    var id: UUID
+    var title: String
+
+    // DisplayRepresentation とその他の必須プロパティ
+}
+```
+
+要点:
+- `calendar_calendar` はカレンダードメイン内のカレンダー schema で、Xcode が利用可能な schema を自動補完します
+- `@AppEntity` マクロは、これが Siri が推論できるアプリエンティティであることを示します
+- `IndexedEntity` プロトコルにより、エンティティを Spotlight インデックスへ寄付し、セマンティック理解を得られます
+
+Siri がこれらのエンティティを見つけられるようにするには、`EntityQuery` プロトコルを実装します。
+
+```swift
+struct CalendarEntityQuery: EntityQuery {
+    @Dependency private var calendarManager: CalendarManager
+
+    func entities(for identifiers: [UUID]) async throws -> [CalendarEntity] {
+        // ID でカレンダーを取得する
+        return try await calendarManager.calendars(for: identifiers)
+            .map { $0.entity }
+    }
+
+    func allEntities() async throws -> [CalendarEntity] {
+        // Siri が選択肢として提示できるよう、すべてのカレンダーを返す
+        return try await calendarManager.allCalendars()
+            .map { $0.entity }
+    }
+}
+```
+
+要点:
+- `@Dependency` プロパティラッパーは共有リソースを注入し、App Intents は登録済みの同じインスタンスを提供します
+- `allEntities()` により、Siri は利用可能なカレンダーを把握し、イベント作成時に選択肢として提示できます
+
+エンティティ定義後は、`CalendarManager` でシステムインデックスへ寄付します。
+
+```swift
+func createCalendar(_ title: String) throws -> CalendarModel {
+    let calendar = CalendarModel(title: title)
+    modelContext.insert(calendar)
+
+    // エンティティを Spotlight インデックスへ寄付する
+    searchableIndex.indexAppEntities(
+        identifiers: [calendar.id],
+        type: CalendarEntity.self
+    )
+
+    return calendar
+}
+
+func updateCalendar(_ calendar: CalendarModel) throws {
+    // 更新後に再インデックスする
+    searchableIndex.indexAppEntities(
+        identifiers: [calendar.id],
+        type: CalendarEntity.self
+    )
+}
+
+func deleteCalendar(_ calendar: CalendarModel) throws {
+    modelContext.delete(calendar)
+
+    // インデックスから削除する
+    searchableIndex.deleteAppEntities(
+        identifiers: [calendar.id],
+        type: CalendarEntity.self
+    )
+}
+```
+
+### 2 つ目のエンティティ: 参加者 ([07:59](https://developer.apple.com/videos/play/wwdc2026/344/?time=479))
+
+AttendeeEntity はイベント内の参加者を表しますが、`IndexedEntity` ではなく `TransientAppEntity` プロトコルを使います。
+
+```swift
+struct AttendeeEntity: calendar_attendee {
+    var person: IntentPerson
+    var status: AttendeeStatusEntity
+    var type: AttendeeTypeEntity
+    var isOptional: Bool
+}
+```
+
+要点:
+- `TransientAppEntity` は一時的なエンティティを表し、一意の識別子を必要とせず、単独のクエリ対象にもなりません
+- 参加者はイベントに依存して存在します。同じ人が複数イベントに参加することがあり、それぞれをインデックスすると重複結果になります
+- `IntentPerson` は名前と連絡先情報を含むシステム標準型で、アプリ間共有をしやすくします
+
+参加者は 2 つの `@AppEnum` 型を使います。
+
+```swift
+enum AttendeeStatusEntity: calendar_attendeeStatus {
+    case accepted
+    case declined
+    case tentative
+    case pending
+}
+
+enum AttendeeTypeEntity: calendar_attendeeType {
+    case person
+}
+```
+
+要点:
+- App Schema は利用可能な列挙値を定義し、アプリは必要なものを選びます
+- アプリ内で違う用語を使っている場合は、既存モデルを schema の列挙値へ対応付けるだけです
+
+### 3 つ目のエンティティ: イベント ([10:22](https://developer.apple.com/videos/play/wwdc2026/344/?time=622))
+
+EventEntity はもっとも重要なエンティティで、同じく `IndexedEntity` を使います。
+
+```swift
+struct EventEntity: calendar_event {
+    var id: UUID
+    var title: String
+    var startDate: Date
+    var endDate: Date
+    var calendar: CalendarEntity
+    var attendees: [AttendeeEntity]
+    var location: EventLocation?
+    var note: String?
+    var recurrence: Calendar.RecurrenceRule?
+    var alarms: [EventAlarm]?
+    var status: EventStatusEntity
+}
+```
+
+要点:
+- プロパティは多いものの、基本パターンはこれまでと同じです
+- `title`、`startDate` などの必須プロパティを直接接続します
+- `travelTime` のように使わない optional プロパティは空のままにできます
+- `isFavorite` のような schema 外のプロパティも追加できます
+
+EventEntity は他のエンティティを組み合わせます。
+
+```swift
+var calendar: CalendarEntity  // 所属するカレンダー
+var attendees: [AttendeeEntity]  // 参加者リスト
+```
+
+Siri は App Schemas を通じて、これらの関係を理解します。
+
+繰り返しイベントには Foundation の `Calendar.RecurrenceRule` を使います。
+
+```swift
+var recurrence: Calendar.RecurrenceRule?
+
+// 変換ロジック
+recurrence: eventModel.frequency.map { frequency in
+    Calendar.RecurrenceRule(
+        frequency: frequency.toRecurrenceFrequency(),
+        interval: 1
+    )
+}
+```
+
+場所とアラームは Union Value で、複数型のうち 1 つを保持できます。
+
+```swift
+typealias EventLocation = @CalendarEventLocation.PlaceDescriptorOrString
+typealias EventAlarm = @CalendarEventAlarm.DateOrDuration
+
+location: location.map { .placeDescriptor($0) }
+alarms: alarms.map { alarm in
+    switch alarm {
+    case .date(let date): return .date(date)
+    case .duration(let duration): return .duration(duration)
+    }
+}
+```
+
+### 特定のイベントを開く ([14:40](https://developer.apple.com/videos/play/wwdc2026/344/?time=880))
+
+エンティティを定義すると Siri は内容を検索できますが、結果をタップしてもアプリのホーム画面しか開きません。具体的なイベントへ遷移するには `OpenEventIntent` が必要です。
+
+```swift
+struct OpenEventIntent: system_open {
+    static var title: LocalizedStringResource = "イベントを開く"
+    static var openProviderStyle: OpenProviderStyle = .siriAndSpotlight
+
+    @Parameter(title: "イベント")
+    var target: EventEntity?
+
+    @Dependency private var navigationManager: NavigationManager
+
+    func perform() async throws -> some IntentResult {
+        guard let event = target else { return .result() }
+        navigationManager.open(event.id)
+        return .result()
+    }
+}
+```
+
+要点:
+- `system.open` はエンティティを開くためのシステム schema です
+- `openProviderStyle` は Siri と Spotlight で利用可能であることを指定します
+- イベント結果をタップしたとき、この intent が呼ばれて詳細ビューへ遷移します
+
+### 画面認識 ([15:42](https://developer.apple.com/videos/play/wwdc2026/344/?time=942))
+
+ユーザーは完全なイベント名を言いたくないことがあります。「このイベント」「3 つ目のイベント」と言うかもしれません。必要なのは 2 つの view modifier です。
+
+リストビューでは次のようにします。
+
+```swift
+List(events) { event in
+    EventRow(event: event)
+        .appEntityIdentifier(event.entityIdentifier)
+}
+```
+
+詳細ビューでは次のようにします。
+
+```swift
+EventDetail(event: event)
+    .userActivity(.entityIdentifier(event.entityIdentifier))
+```
+
+要点:
+- `.appEntityIdentifier` は、リストにどのイベントが表示されているかをシステムに伝えます
+- `.userActivity` は、現在フォーカスされている具体的なイベントをシステムに伝えます
+- たった 2 つの modifier で、Siri は「このイベント」がどれを指すか理解できます
+
+### イベント作成 intent ([17:16](https://developer.apple.com/videos/play/wwdc2026/344/?time=1036))
+
+Siri が操作を実行できるようにするには、`calendar_createEvent` schema を使います。
+
+```swift
+struct CreateEventIntent: calendar_createEvent {
+    static var title: LocalizedStringResource = "イベントを作成"
+    static var openAppWhenRun: Bool = false
+
+    @Parameter(title: "タイトル")
+    var title: String
+
+    @Parameter(title: "開始日時")
+    var startDate: Date
+
+    @Parameter(title: "終了日時")
+    var endDate: Date
+
+    @Parameter(title: "カレンダー")
+    var calendar: CalendarEntity?
+
+    @Parameter(title: "場所")
+    var location: EventLocation?
+
+    @Parameter(title: "メモ")
+    var note: String?
+
+    @Dependency private var calendarManager: CalendarManager
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ReturnsValue<EventEntity> {
+        // パラメータを解決する
+        let resolvedLocation: String? = try location?.resolve()
+
+        // イベントを作成する
+        let event = try await calendarManager.createEvent(
+            title: title,
+            startDate: startDate,
+            endDate: endDate,
+            calendarId: calendar?.id,
+            location: resolvedLocation,
+            note: note
+        )
+
+        return .result(with: event.entity)
+    }
+}
+```
+
+要点:
+- schema がパラメータリストを定義しており、そのまま使えます
+- `@MainActor` によりメインスレッドで実行されます
+- `EventEntity` を返すことで、Siri は作成結果を把握できます
+- Siri は言語理解、確認質問、詳細確認を自動的に処理します
+
+### イベント更新 intent ([20:17](https://developer.apple.com/videos/play/wwdc2026/344/?time=1217))
+
+更新 intent は `calendar_updateEvent` schema を使います。
+
+```swift
+struct UpdateEventIntent: calendar_updateEvent {
+    @Parameter(title: "イベント")
+    var event: EventEntity?
+
+    @Parameter(title: "開始日時")
+    var startDate: Date?
+
+    @Parameter(title: "終了日時")
+    var endDate: Date?
+
+    @Parameter(title: "場所")
+    var location: EventLocation?
+
+    // ... その他の optional パラメータ
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ReturnsValue<EventEntity> & ShowsSnippetView {
+        guard let event = event else { return .result() }
+
+        var updates: EventUpdates = [:]
+
+        // optional パラメータを処理する
+        if let startDate = startDate {
+            updates[.startDate] = startDate
+        }
+
+        // 明示的に消去される可能性のあるパラメータを処理する
+        switch location.valueState {
+        case .set(let value):
+            updates[.location] = value
+        case .set(nil):
+            updates[.location] = nil  // 明示的に消去
+        case .unset:
+            break  // 更新しない
+        }
+
+        let updated = try await calendarManager.updateEvent(event.id, updates: updates)
+        return .result(with: updated.entity, snippet: EventSnippetView(event: updated.entity))
+    }
+}
+```
+
+要点:
+- 多くのパラメータは optional で、ユーザーは 1、2 項目だけを変更することがあります
+- `valueState` は、新しい値を設定する、明示的に `nil` へ消去する、まったく設定されていない、の 3 つを区別します
+- `ShowsSnippetView` はデフォルトカードではなくカスタム SwiftUI ビューを返します
+
+### イベント削除 intent ([22:30](https://developer.apple.com/videos/play/wwdc2026/344/?time=1350))
+
+削除はもっとも単純な操作 intent です。
+
+```swift
+struct DeleteEventIntent: calendar_deleteEvent {
+    @Parameter(title: "イベント")
+    var event: EventEntity?
+
+    @Parameter(title: "範囲")
+    var span: EventSpan?
+
+    @MainActor
+    func perform() async throws -> IntentResult {
+        guard let event = event else { return .result() }
+
+        if let span = span {
+            switch span {
+            case .thisEvent:
+                try calendarManager.deleteEvent(event.id)
+            case .futureEvents:
+                try calendarManager.deleteRecurringEvent(from: event.id, future: true)
+            }
+        }
+
+        return .result()
+    }
+}
+```
+
+要点:
+- Siri は確認ダイアログを自動表示します
+- 繰り返しイベントでは、今回だけ削除するか、今後すべてを削除するかに対応します
+- 複数一致した場合は自動的に曖昧性を解消します
+
+### カスタム結果ビュー ([21:21](https://developer.apple.com/videos/play/wwdc2026/344/?time=1281))
+
+デフォルトの結果カードは `DisplayRepresentation` から作られます。カスタマイズもできます。
+
+```swift
+struct EventSnippetView: SnippetView {
+    var event: EventEntity
+
+    var body: some Snippet {
+        Snippet(
+            image: event.icon,
+            title: event.title,
+            subtitle: formattedDateRange(event.startDate, event.endDate)
+        ) {
+            // カスタムレイアウト
+        }
+    }
+}
+```
+
+intent 内で次のように返します。
+
+```swift
+func perform() async throws -> some IntentResult & ReturnsValue<EventEntity> & ShowsSnippetView {
+    // ... 実行ロジック
+    return .result(with: updated.entity, snippet: EventSnippetView(event: updated.entity))
+}
+```
+
+要点:
+- SwiftUI ビューはシンプルで軽量に保ちます
+- グラデーション、アイコン、色などでアプリらしさを表現します
+- 結果を返すすべての intent に利用できます
+
+## 重要な示唆
+
+1. **知的なカレンダーアシスタント**: EventEntity のセマンティックインデックスを使うと、ユーザーは「来週、顧客に関係する会議はどれ？」「今四半期、チーム会議は何回ある？」と聞けます。Siri はイベントのタイトルやメモから直接答えを検索できます。
+
+2. **音声で素早く作成**: 作成 intent により、ユーザーは「明日の午後 3 時に Alex とのコーヒーミーティングを作成して」と言うだけで、アプリを開いてフォームを入力する必要がありません。場所の解決と組み合わせれば、近くのカフェを自動選択できます。
+
+3. **一括変更アシスタント**: 更新 intent は「今月の火曜の隔週会議をすべて水曜に移して」「今週のオンライン会議をすべて対面に変えて」のような自然言語の一括変更に対応できます。繰り返しルールとパラメータ状態の判定を活用します。
+
+4. **スマートなリマインダー統合**: アラームの Union Value はシステムリマインダーと統合できます。ユーザーが「会議資料の準備を 30 分前にリマインドして」と言えば、イベントにアラームを自動追加できます。
+
+5. **画面コンテキスト操作**: ユーザーがイベント詳細を見ているとき、「参加者に出席確認のメッセージを送って」「場所を誰かに共有して」と直接言えます。画面認識により操作がより自然になります。
+
+## 関連セッション
+
+- [104 - App Intents を知る](/articles/wwdc2026-104) - intents、entities、queries と、それらが Siri や Shortcuts とどうつながるかを紹介する App Intents の入門
+- [343 - App Intents: 高度なトピックとベストプラクティス](/articles/wwdc2026-343) - Siri との連携を深く最適化するための App Intents の高度な機能とベストプラクティス
+- [242 - Apple Intelligence で動くエージェント型アプリ](/articles/wwdc2026-242) - エージェント型アプリのアーキテクチャと、アプリがユーザーと能動的に協調する方法
+- [246 - Core Spotlight: アプリ内の LLM 対応検索](/articles/wwdc2026-246) - Core Spotlight と LLM の統合によりセマンティック検索能力を高める方法
+- [295 - App Intents を大規模にテストする](/articles/wwdc2026-295) - AppIntentsTesting フレームワークによる App Intents の自動テスト

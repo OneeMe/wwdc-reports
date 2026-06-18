@@ -1,0 +1,305 @@
+---
+title: "Core AI model authoring and optimization を深掘りする"
+description: "Learning"
+date: "2026-06-10"
+tags: ["Core AI", "PyTorch", "モデル量子化", "Metal", "デバッガ"]
+thumbnail: "/images/sessions/2026/325.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/325/"
+sessionId: "wwdc2026-325"
+year: "2026"
+relatedSessions:
+  - title: "324 - Meet Core AI"
+    code: "324"
+    description: "Core AI framework 全体の紹介であり、325 の技術的な深掘りの土台です"
+  - title: "326 - Integrate Core AI into your app"
+    code: "326"
+    description: "Core AI モデルを App に統合する具体的な実践です"
+  - title: "328 - Deploy local AI with MLX Swift"
+    code: "328"
+    description: "Apple Silicon 向けのもう1つのローカル AI framework で、Core AI と比較して選択できます"
+  - title: "330 - Optimize custom ML operations with Metal tensors"
+    code: "330"
+    description: "カスタム Metal kernel の最適化テクニックをさらに深く解説します"
+  - title: "298 - Build robust model evaluations"
+    code: "298"
+    description: "Debugger の比較機能と組み合わせて使えるモデル評価の方法論です"
+---
+
+## ハイライト
+
+> Core AI は Apple Silicon のオンデバイス AI デプロイに向けた完全な Python ツールチェーンを提供します。PyTorch モデルの書き出し、設定駆動の圧縮、可視化デバッグ、カスタム Metal kernel のパッケージ化までを、すべて1つのワークフロー内で完結できます。
+
+## 主要内容
+
+### オンデバイスモデルデプロイの古い問題
+
+深層学習モデルを iPhone や Mac に持ち込むとき、開発者は長く3つの問題に直面してきました。モデルが大きすぎて入らない、量子化後に精度が落ちても原因が分からない、カスタム演算子をモデルと一緒にパッケージして配布するのが難しい、という問題です。以前 Core ML を使う場合、モデルを変換して実機で走らせ、精度が落ちたらどの層が原因かを推測するか、大量のスクリプトで層ごとに tensor を dump して比較するしかありませんでした。カスタム演算子はさらに面倒で、Metal ライブラリファイルとコンパイルパイプラインを別途管理する必要がありました。([00:14](https://developer.apple.com/videos/play/wwdc2026/325/?time=14))
+
+### Core AI の完全なワークフロー
+
+Apple は今回、PyTorch から Apple Silicon へのデプロイ経路を端から端までつなぎました。`pip install coreai-torch` をインストールすれば、手元の PyTorch モデルをそのまま完全なパイプラインに流せます。`torch.export` で計算グラフを捕捉し、`TorchConverter` で Core AI 内部表現へ変換し、`optimize()` で `.aimodel` アセットを生成し、最後に Python から直接推論を読み込みます。全体の流れは、慣れた Python 環境から出ずに完了します。([03:27](https://developer.apple.com/videos/play/wwdc2026/325/?time=207))
+
+### 量子化による精度低下をどう調べるか
+
+圧縮は大規模モデルをデバイスへ載せる鍵です。SAM3（Segment Anything Model 3）を例にします。この 8.5 億パラメータの画像分割モデルは、元のサイズが 3GB を超えます。`coreai-opt` の `presets.w4` で 4-bit 全量子化すると 430MB まで圧縮できますが、遮られた花が検出できなくなりました。([06:02](https://developer.apple.com/videos/play/wwdc2026/325/?time=362))
+
+問題はどこにあるのでしょうか。ここで Core AI Debugger が登場します。Debugger は Mac 上で動作し、モデル構造を可視化し、実機で推論を実行し、Core AI の中間 tensor と PyTorch の参照実行結果を層ごとに比較できます。Debugger は自動で同期点を識別し、PSNR（ピーク信号対雑音比）で各層を採点します。緑は一致、黄は軽い乖離、赤は大きな差異を示します。並べ替えると、低 PSNR の層はほぼすべて detector decoder に由来していることが分かりました。この module はモデルパラメータの 4% にすぎませんが、量子化に非常に敏感でした。量子化設定からこの部分を除外すると精度は回復し、モデルサイズは依然として元のごく一部に抑えられます。([10:40](https://developer.apple.com/videos/play/wwdc2026/325/?time=640))
+
+### カスタム Metal kernel をモデルと一緒にパッケージする
+
+標準演算子ライブラリがすべての要求を満たすことはありません。Core AI では、Metal Shading Language（MSL）kernel を手書きし、PyTorch の参照実装と一緒に `TorchMetalKernel` へ登録し、変換時に `.aimodel` アセットへ直接埋め込めます。デプロイ時に App は1つのファイルだけを読み込み、追加の Metal ライブラリを管理する必要はありません。([21:12](https://developer.apple.com/videos/play/wwdc2026/325/?time=1272))
+
+### モデルを書き換えると推論が 76% 速くなる
+
+モデルを複数の独立した関数に分割することも高度なテクニックです。SAM3 の image encoder、text encoder、detection head は3つの entry point に分けられました。ユーザーが prompt を「花」から「蝶」に変えた場合、再実行が必要なのは text encoder と detection head だけです。image encoding の結果はそのまま再利用できます。2回目の推論は、全体をもう一度実行する場合より 76% 高速でした。([24:56](https://developer.apple.com/videos/play/wwdc2026/325/?time=1496))
+
+## 詳細
+
+### PyTorch モデルの書き出しと Core AI 変換
+
+([03:27](https://developer.apple.com/videos/play/wwdc2026/325/?time=207))
+
+最初のステップは `torch.export` を使い、重み、演算、形状情報を含むモデルの完全な計算グラフを捕捉することです。
+
+```python
+import torch
+import torch.nn as nn
+
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(256, 512)
+        self.fc2 = nn.Linear(512, 10)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+
+model = MLP().eval()
+example_input = (torch.randn(1, 256),)
+exported_program = torch.export.export(model, example_input)
+```
+
+重要な点：
+- `torch.export.export()` は静的計算グラフを捕捉し、重み、演算、形状をすべて `exported_program` の中に固定します
+- `example_input` は tensor 形状の推論に使われます。モデル内に入力データに依存する動的制御フローを含めることはできません
+- `.eval()` は dropout など学習専用の層を無効化し、推論時の挙動を一定にします
+
+2つ目のステップは `TorchConverter` で Core AI 表現へ変換し、最適化して `.aimodel` として保存することです。
+
+```python
+import coreai
+import coreai_torch
+from coreai.runtime import NDArray
+
+converter = coreai_torch.TorchConverter()
+converter.add_exported_program(
+    exported_program,
+    input_names=["features"], output_names=["logits"])
+core_ai_program = converter.to_coreai()
+
+core_ai_program.optimize()
+asset = core_ai_program.save_asset("mlp.aimodel")
+
+specialized_model = await AIModel.load("mlp.aimodel")
+specialized_function = specialized_model.load_function("main")
+result = await specialized_function({"features": NDArray(example[0].numpy())})
+```
+
+重要な点：
+- `TorchConverter` は PyTorch から Core AI への橋渡しで、API 設計は Core ML Tools に似ています
+- `optimize()` は対象プラットフォーム向けに演算子融合とメモリ最適化を行います
+- `save_asset()` は Apple Silicon のネイティブ実行形式である `.aimodel` ファイルを生成します
+- 推論入力は numpy 配列を `NDArray` で包み、名前付き辞書で対応付けます
+
+### 設定駆動のモデル圧縮
+
+([05:54](https://developer.apple.com/videos/play/wwdc2026/325/?time=354))
+
+`coreai-opt` は int4、int8、FP4、FP8 など複数粒度の圧縮をサポートし、設定ファイルでどの層を圧縮し、どの層を元精度のままにするかを決めます。
+
+```python
+import coreai_opt
+
+# 4-bit per-channel 対称量子化のプリセットを使う
+config = coreai_opt.presets.w4
+config.execution_mode = coreai_opt.ExecutionMode.EAGER
+
+quantizer = coreai_opt.Quantizer(config)
+quantizer.initialize(model, example_inputs)
+compressed_model = quantizer.finalize()
+```
+
+重要な点：
+- `presets.w4` は1行で使える設定ショートカットで、背後では per-channel 4-bit 対称量子化に対応しています
+- `ExecutionMode.EAGER` は重み量子化に向き、`GRAPH` モードは activation 量子化に向きます
+- `initialize()` には校正統計のための例示入力が必要です
+- 大量のデータを渡して量子化-aware training（QAT）を行うこともでき、精度損失をさらに小さくできます
+
+### Core AI Debugger で量子化問題を特定する
+
+([10:40](https://developer.apple.com/videos/play/wwdc2026/325/?time=640))
+
+Debugger の中心機能は、PyTorch 参照実行と Core AI のオンデバイス実行の中間 tensor を比較することです。まず Python で PyTorch の中間結果を保存します。
+
+```python
+# PyTorch の中間 tensor を保存する
+intermediates = coreai_torch.save_intermediates(
+    original_model,
+    quantized_model,
+    example_inputs
+)
+```
+
+次に Debugger でこのファイルを参照実行として読み込み、比較セッションを開始します。Debugger は2つの計算グラフのノードを自動で整列し、同期点を生成して PSNR を計算します。緑のノードは tensor 類似度が高く、黄は中程度の乖離、赤は大きな差異を示します。PSNR 順に並べると、問題層を素早く見つけられます。([15:00](https://developer.apple.com/videos/play/wwdc2026/325/?time=900))
+
+重要な点：
+- `save_intermediates` API は PyTorch 側で各操作の出力 tensor を捕捉します
+- Debugger は同期点を自動識別するため、手動でノードを対応付ける必要がありません
+- PSNR はデフォルトの類似度指標で、モデル種類に応じて別の指標へ切り替えられます
+- 左側ナビゲータは PyTorch module ごとにグループ化され、大型モデルでもコード構造と同じ感覚で移動できます
+
+### カスタム Metal kernel
+
+([21:12](https://developer.apple.com/videos/play/wwdc2026/325/?time=1272))
+
+SiLU（Sigmoid Linear Unit）活性化関数を例に、PyTorch 参照実装と MSL kernel の両方を提供します。
+
+```python
+import torch
+from coreai_torch.dsl import TorchMetalKernel, MetalParameter
+
+def silu_torch(x):
+    return x * torch.sigmoid(x)
+
+SILU_MSL = """
+float val = float(x[gid]);
+float sig = 1.0f / (1.0f + exp(-val));
+y[gid] = TYPE(val * sig);
+"""
+
+silu_kernel = TorchMetalKernel(
+    name="fused_silu",
+    input_names=["x"],
+    result_names=["y"],
+    src=SILU_MSL,
+    torch_defn=silu_torch,
+    metal_params=[MetalParameter("gid", "uint", "thread_position_in_grid")],
+    template_dtypes={"x": "TYPE"},
+)
+```
+
+この kernel をモデル内で使います。
+
+```python
+class MyModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(256, 256)
+
+    def forward(self, x):
+        h = self.linear(x)
+        n = h.numel()
+        return silu_kernel(
+            h,
+            threads_per_grid_size=(n, 1, 1),
+            threads_per_thread_group=(min(n, 256), 1, 1),
+            result_shapes=[h.shape],
+        )
+
+exported_program = torch.export.export(MyModel(), (torch.randn(1, 256),))
+
+converter = coreai_torch.TorchConverter()
+converter.register_custom_kernels([silu_kernel])
+converter.add_exported_program(exported_program,
+                               input_names=["x"], output_names=["y"])
+deployable = converter.to_coreai()
+```
+
+重要な点：
+- `torch_defn` は `torch.export` が見る参照実装で、形状推論と Debugger 比較に使われます
+- `src` は実際に GPU 上で実行される MSL コードで、`TYPE` マクロは `template_dtypes` によって実際のデータ型へ注入されます
+- `MetalParameter` は MSL 内の変数を `thread_position_in_grid` などの Metal 組み込み属性へバインドします
+- `result_shapes` は呼び出しごとに渡され、動的形状入力に対応します
+- MSL コードはモデルと一緒に `.aimodel` へパッケージされるため、デプロイ時に追加ファイルは不要です
+
+### モデルを複数の独立関数へ書き換える
+
+([24:56](https://developer.apple.com/videos/play/wwdc2026/325/?time=1496))
+
+SAM3 を `image_encode`、`text_encode`、`detect` の3つの entry point に分割し、それぞれ独立に圧縮・呼び出しできるようにします。
+
+```python
+# 3つの module をそれぞれ書き出す
+image_exported = torch.export.export(image_encoder, image_input)
+text_exported = torch.export.export(text_encoder, text_input)
+detect_exported = torch.export.export(detector, detect_input)
+
+converter = coreai_torch.TorchConverter()
+converter.add_exported_program(image_exported,
+                               input_names=["image"], output_names=["image_emb"],
+                               entrypoint_name="image_encode")
+converter.add_exported_program(text_exported,
+                               input_names=["text"], output_names=["text_emb"],
+                               entrypoint_name="text_encode")
+converter.add_exported_program(detect_exported,
+                               input_names=["image_emb", "text_emb"], output_names=["masks"],
+                               entrypoint_name="detect")
+
+deployable = converter.to_coreai()
+asset = deployable.save_asset("sam3_split.aimodel")
+```
+
+読み込んだ後、必要なものだけを呼び出します。
+
+```python
+model = await AIModel.load("sam3_split.aimodel")
+
+# 1回目：完全なフロー
+image_fn = model.load_function("image_encode")
+text_fn = model.load_function("text_encode")
+detect_fn = model.load_function("detect")
+
+image_emb = await image_fn({"image": image_ndarray})
+text_emb = await text_fn({"text": text_ndarray})
+masks = await detect_fn({"image_emb": image_emb, "text_emb": text_emb})
+
+# prompt 変更後：text_encode + detect だけを実行する
+text_emb_new = await text_fn({"text": new_text_ndarray})
+masks_new = await detect_fn({"image_emb": image_emb, "text_emb": text_emb_new})
+```
+
+重要な点：
+- 各 `add_exported_program` で `entrypoint_name` を使い、独立した入口を定義します
+- 1つの `.aimodel` アセットに複数の呼び出し可能な関数を含められます
+- image encoding 結果 `image_emb` はキャッシュして再利用でき、prompt を変えるときに最も重い計算をスキップできます
+- 各入口には独立した圧縮戦略を設定できます。detector は元精度のままにし、2つの encoder は 4-bit 圧縮する、といった構成が可能です
+
+## 重要な示唆
+
+**1. 既存 App にオンデバイス画像分割機能を追加する**
+
+`coreai-models` リポジトリの SAM3 例を使い、`coreai-opt` の混合精度設定と組み合わせてモデルを 500MB 未満へ圧縮します。Core AI Debugger で分割精度が製品要件を満たすことを確認したら、そのまま写真編集 App に統合できます。入口 API は `AIModel.load()` と `load_function()` で、通常のモデル読み込みと変わりません。
+
+**2. 「prompt を変えたら即再分割」のインタラクションを作る**
+
+Session の3関数分割の考え方を参考に、image encoding と text encoding を分けます。ユーザーが枠を描いたり prompt を入力したりしたら、画像は一度だけ encode し、その後 prompt を変えるたびに text encoding と detection head だけを実行します。実装の考え方は、`image_encode` の出力 tensor をキャッシュし、後続の `text_encode` + `detect` 呼び出しへ再利用することです。
+
+**3. カスタム活性化関数をモデルアセットへパッケージする**
+
+論文で提案された新しい活性化関数をモデルが使っていて、Core AI の標準演算子ライブラリがまだ対応していない場合は、`TorchMetalKernel` で MSL 実装を書きます。PyTorch 参照実装は形状推論とデバッグ比較を担当し、MSL は実行を担当します。変換後は1つの `.aimodel` ファイルだけでデプロイできます。
+
+**4. AI Skills でチームの Core AI 立ち上がりを速める**
+
+`coreai-models` リポジトリには、Cursor や Copilot にインストールできる Agent Skills が付属しています。これらの Skills には Apple エンジニアのベストプラクティスが含まれ、「SAM3 を iPhone にデプロイしたい」のような自然言語の要望を、具体的な変換、圧縮、分割スクリプトへ変換できます。チームの新メンバーは、ドキュメントを全部読む前に動くコードを作れます。
+
+**5. Debugger で量子化回帰テストパイプラインを作る**
+
+CI に `save_intermediates` + Debugger 比較を組み込みます。モデルを更新するたびに、PyTorch 参照出力と量子化後の Core AI 出力を自動比較し、PSNR 閾値で合否を判定します。これまで人間の目視に頼っていた確認を、自動化された数値ゲートへ変えられます。
+
+## 関連セッション
+
+- [324 - Meet Core AI](/articles/wwdc2026-324) - Core AI framework 全体の紹介であり、325 の技術的な深掘りの土台です
+- [326 - Integrate Core AI into your app](/articles/wwdc2026-326) - Core AI モデルを App に統合する具体的な実践です
+- [328 - Deploy local AI with MLX Swift](/articles/wwdc2026-328) - Apple Silicon 向けのもう1つのローカル AI framework で、Core AI と比較して選択できます
+- [330 - Optimize custom ML operations with Metal tensors](/articles/wwdc2026-330) - カスタム Metal kernel の最適化テクニックをさらに深く解説します
+- [298 - Build robust model evaluations](/articles/wwdc2026-298) - Debugger の比較機能と組み合わせて使えるモデル評価の方法論です

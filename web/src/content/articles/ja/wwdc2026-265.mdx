@@ -1,0 +1,630 @@
+---
+title: "gRPC と Swift でリアルタイムアプリとサービスを構築する"
+description: "gRPC Swift package が Swift concurrency 上に構築された現代的で安全な runtime をどのように提供するかを紹介します。統合ツールがワークフローを簡潔にし、リアルタイム機能を楽に届ける方法を学べます。"
+date: "2026-06-10"
+tags: ["gRPC", "Swift", "Protobuf", "Swift Concurrency", "Networking"]
+thumbnail: "/images/sessions/2026/265.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/265/"
+sessionId: "wwdc2026-265"
+year: "2026"
+relatedSessions:
+  - title: "Session 262: Swift"
+    code: "262"
+    description: "Swift 6 の厳格な concurrency model と `Sendable` protocol は、`ClientManager` 内の `Mutex` の使い方を理解する基礎になります"
+  - title: "Session 267: Swift Testing"
+    code: "267"
+    description: "Swift Testing で gRPC サーバーの unit test を書き、RPC 実装の正しさを検証します"
+  - title: "Session 268: Instruments responsiveness"
+    code: "268"
+    description: "Instruments を使って gRPC 接続の latency とメモリ使用量を分析します"
+  - title: "Session 389: Container machines"
+    code: "389"
+    description: "Apple の Containerization framework は内部で gRPC Swift を使って VM 間通信を行っており、この session の技術スタックと直接関係します"
+---
+
+## ハイライト
+
+> Apple は Swift 向けのネイティブ gRPC runtime を提供します。開発者は Xcode Build Plugin で `.proto` ファイルから強く型付けされたクライアントとサーバーコードを自動生成し、`async/await` と `AsyncSequence` で unary call と双方向 streaming を実装し、Swift サーバーをコンテナイメージとしてクラウドへデプロイできます。
+
+## 主要内容
+
+### 手書きネットワークコードの難しさ
+
+iOS 開発でバックエンド API を呼ぶとき、通常はドキュメントを読み、`URLSession` コードを手で書き、`Codable` model を定義し、シリアライズ error を処理します。ドキュメントが古いこともあれば、model の field 名を打ち間違えることもあり、結合テストまで問題に気づかないこともあります。リアルタイムの双方向通信が必要なら WebSocket を導入し、heartbeat、再接続、状態機械を自分で処理しなければなりません。この流れは時間がかかり、ミスも起きやすいものです。
+
+gRPC の考え方は、API 定義を実装から切り離すことです。Protocol Buffers (Protobuf) で `.proto` ファイルを書き、サービスインターフェイスを記述します。コードジェネレータは Swift 型と呼び出しコードを自動生成します。この `.proto` ファイルが唯一の真実の源になります。iOS 側とサーバー側は同じ定義を共有し、型安全性はコンパイル時から保証されます。
+
+### `.proto` から Xcode へ：プロジェクト体験の全面的な改善
+
+Session ではカートレースリーグ App を例に、完全な end-to-end の流れを示しました。
+
+([03:38](https://developer.apple.com/videos/play/wwdc2026/265/?time=218)) まずサービスインターフェイスを定義します。`.proto` ファイルで `SwiftKartService` を宣言し、`ListRaces` RPC を含めます。
+
+```protobuf
+edition = "2024";
+
+import "google/protobuf/timestamp.proto";
+
+service SwiftKartService {
+  rpc ListRaces(ListRacesRequest) returns (ListRacesResponse);
+}
+
+message ListRacesRequest {
+  int32 limit = 1 [default = 100];
+}
+
+message ListRacesResponse {
+  repeated Race races = 1;
+}
+
+message Race {
+  string name = 1;
+  string location = 2;
+  google.protobuf.Timestamp start_time = 3;
+  int32 laps = 4;
+  string championship = 5;
+}
+```
+
+([05:55](https://developer.apple.com/videos/play/wwdc2026/265/?time=355)) 次に Xcode で二つの Swift Package を追加します。`grpc-swift-nio-transport` は SwiftNIO ベースのネットワーク transport layer を提供し、`grpc-swift-protobuf` はコード生成用の Build Plugin を提供します。Target の Build Phases に `GRPCProtobufGenerator` plugin を追加し、client code だけを生成するよう JSON ファイルを設定します。
+
+```json
+{
+    "generate": {
+        "clients": true,
+        "servers": false,
+        "messages": true
+    }
+}
+```
+
+コンパイル時に plugin が `.proto` ファイルを自動でスキャンし、Swift コードを生成します。`protoc` コマンドを手動で実行する必要はありません。
+
+### クライアント呼び出し：リモートサービスをローカル関数のように呼ぶ
+
+([06:24](https://developer.apple.com/videos/play/wwdc2026/265/?time=384)) SwiftUI View で三つの module を import します。
+
+```swift
+import GRPCCore
+import GRPCNIOTransportHTTP2
+import SwiftProtobuf
+```
+
+([06:38](https://developer.apple.com/videos/play/wwdc2026/265/?time=398)) `withGRPCClient` でクライアントを作成し、呼び出します。
+
+```swift
+.task {
+    do {
+        try await withGRPCClient(
+            transport: .http2NIOTS(
+                address: .ipv4(host: "127.0.0.1", port: 8080),
+                transportSecurity: .tls
+            )
+        ) { client in
+            let kart = SwiftKartService.Client(wrapping: client)
+            let request = ListRacesRequest()
+            let response = try await kart.listRaces(request)
+            self.races = response.races.map { race in
+                RaceInfo(
+                    name: race.name,
+                    location: race.location,
+                    startTime: race.startTime.date,
+                    championship: race.championship,
+                    laps: Int(race.laps),
+                    drivers: race.drivers
+                )
+            }
+        }
+    } catch {
+        print("gRPC エラー: \(error)")
+    }
+}
+```
+
+重要な点：
+
+- `withGRPCClient` は接続 lifecycle を自動管理し、closure 終了時に接続を閉じます
+- `.http2NIOTS` は SwiftNIO Transport Services を使って実装され、TLS に対応します
+- `SwiftKartService.Client(wrapping: client)` は汎用 gRPC client を型安全な業務 client に包みます
+- `listRaces` は `async` method なので、`await` で直接 response を取得できます
+- `race.startTime.date` は Protobuf の `Timestamp` を Swift の `Date` に変換します
+
+### 接続の再利用と lifecycle 管理
+
+([07:55](https://developer.apple.com/videos/play/wwdc2026/265/?time=475)) View が表示されるたびに新しい接続を作ると latency が増えます。正しいやり方は、App レベルで共有の client connection pool を維持することです。
+
+([08:30](https://developer.apple.com/videos/play/wwdc2026/265/?time=510)) Session は `ClientManager` の実装を示しました。
+
+```swift
+import GRPCCore
+import GRPCNIOTransportHTTP2
+import Synchronization
+import SwiftUI
+
+@Observable
+final class ClientManager: Sendable {
+    fileprivate let state = Mutex(State.disconnected)
+
+    static func makeTransport() throws -> HTTP2ClientTransport.TransportServices {
+        try .http2NIOTS(
+            target: .ipv4(address: "127.0.0.1", port: 8080),
+            transportSecurity: .plaintext
+        )
+    }
+
+    func withClient(
+        body: (_ client: GRPCClient<HTTP2ClientTransport.TransportServices>) async throws -> Void
+    ) async throws {
+        let client = try connectIfNecessary()
+        try await body(client)
+    }
+
+    private func connectIfNecessary() throws -> GRPCClient<HTTP2ClientTransport.TransportServices> {
+        try self.state.withLock { state in
+            try state.connectIfNecessary()
+        }
+    }
+
+    func disconnect() {
+        let client = self.state.withLock { state in
+            state.disconnect()
+        }
+        client?.beginGracefulShutdown()
+    }
+}
+
+extension ClientManager {
+    enum State {
+        case connected(GRPCClient<HTTP2ClientTransport.TransportServices>, Task<Void, any Error>)
+        case disconnected
+    }
+}
+
+extension ClientManager.State {
+    mutating func connectIfNecessary() throws -> GRPCClient<HTTP2ClientTransport.TransportServices> {
+        switch self {
+        case .connected(let client, _):
+            return client
+        case .disconnected:
+            let client = try GRPCClient(transport: ClientManager.makeTransport())
+            let task = Task { try await client.runConnections() }
+            self = .connected(client, task)
+            return client
+        }
+    }
+
+    mutating func disconnect() -> GRPCClient<HTTP2ClientTransport.TransportServices>? {
+        switch self {
+        case .connected(let client, _):
+            self = .disconnected
+            return client
+        case .disconnected:
+            return nil
+        }
+    }
+}
+```
+
+重要な点：
+
+- `Synchronization` framework の `Mutex` が接続状態を保護し、Swift 6 の厳格な concurrency check を満たします
+- `connectIfNecessary()` は接続を lazy に作成し、すでに接続済みならそのまま再利用します
+- `runConnections()` は background Task で HTTP/2 接続を継続的に維持します
+- `beginGracefulShutdown()` は接続を優雅に閉じ、強制切断によるデータ損失を避けます
+
+([08:39](https://developer.apple.com/videos/play/wwdc2026/265/?time=519)) App の入口で `ClientManager` を注入します。
+
+```swift
+@main
+struct SwiftKartApp: App {
+    let manager = ClientManager()
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some Scene {
+        WindowGroup {
+            RaceScheduleView()
+                .environment(manager)
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            switch newPhase {
+            case .background:
+                manager.disconnect()
+            case .inactive, .active:
+                break
+            @unknown default:
+                break
+            }
+        }
+    }
+}
+```
+
+重要な点：
+
+- `.environment(manager)` は接続 manager を SwiftUI environment に注入します
+- `scenePhase` の変化を監視し、App が background に入るときに能動的に接続を切って resource を解放します
+
+([09:12](https://developer.apple.com/videos/play/wwdc2026/265/?time=552)) 子 View では `@Environment` で manager を取得します。
+
+```swift
+@Environment(ClientManager.self) var manager
+```
+
+([09:21](https://developer.apple.com/videos/play/wwdc2026/265/?time=561)) 呼び出し方法を `manager.withClient` に変え、既存の接続を再利用します。
+
+```swift
+.task {
+    do {
+        try await manager.withClient { client in
+            let kart = SwiftKartService.Client(wrapping: client)
+            let request = ListRacesRequest()
+            let response = try await kart.listRaces(request)
+            self.races = response.races.map { ... }
+        }
+    } catch {
+        print("gRPC エラー: \(error)")
+    }
+}
+```
+
+### Protobuf シリアライズ：JSON よりコンパクト
+
+([09:41](https://developer.apple.com/videos/play/wwdc2026/265/?time=581)) Protobuf message はシリアライズ時、field 名ではなく field 番号でデータを識別するため、同じ内容の binary payload は JSON のおよそ半分のサイズになります。
+
+```swift
+var race = Race()
+race.name = "アヒル池ダッシュ"
+race.location = "Apple Park、Cupertino"
+race.startTime = .init(roundingTimeIntervalSince1970: 1_781_198_600)
+race.laps = 6
+race.championship = "企業カップ"
+race.drivers = ["Monty", "Pepper", "Mycroft", "Pancakes", "Duke", "Kiko", "Sissi", "Bo"]
+
+try race.serializedBytes()
+```
+
+重要な点：
+
+- `SwiftProtobuf` は Protobuf message をネイティブ Swift struct に map します
+- `serializedBytes()` はコンパクトな binary data を生成します
+- field 番号が field 名を置き換え、転送サイズを減らします
+- モバイルネットワーク環境では特に有利です
+
+### 双方向 streaming RPC：リアルタイムデータ push
+
+([11:06](https://developer.apple.com/videos/play/wwdc2026/265/?time=666)) gRPC は四種類の RPC をサポートします。unary、client streaming、server streaming、bidirectional streaming です。Session はリアルタイム用途における bidirectional streaming を重点的に示しました。
+
+([13:20](https://developer.apple.com/videos/play/wwdc2026/265/?time=800)) `.proto` ファイルで双方向 streaming RPC を定義します。
+
+```protobuf
+service SwiftKartService {
+  rpc ListRaces(ListRacesRequest) returns (ListRacesResponse);
+  rpc FollowRace(stream FollowRaceRequest) returns (stream FollowRaceResponse);
+}
+
+message FollowRaceRequest {
+  string race_name = 1;
+  repeated RaceEventType event_types = 2;
+}
+
+enum RaceEventType {
+  RACE_EVENT_TYPE_UNSPECIFIED = 0;
+  RACE_EVENT_TYPE_KART_LOCATIONS = 1;
+  RACE_EVENT_TYPE_STANDINGS = 2;
+}
+
+message FollowRaceResponse {
+  oneof event {
+    KartLocations locations = 1;
+    Standings standings = 2;
+  }
+}
+```
+
+重要な点：
+
+- `stream` keyword は双方向 streaming を示します
+- `oneof` は associated value を持つ Swift enum に対応し、message は `locations` または `standings` のどちらか一つになります
+- `RaceEventType` enum により、client は関心のある event type を動的に subscribe できます
+
+([12:45](https://developer.apple.com/videos/play/wwdc2026/265/?time=765)) サーバー側で `ListRaces` を実装します。
+
+```swift
+struct Service: SwiftKartService.SimpleServiceProtocol {
+    private let database = RaceDB()
+
+    func listRaces(
+        request: ListRacesRequest,
+        context: ServerContext
+    ) async throws -> ListRacesResponse {
+        var response = ListRacesResponse()
+        response.races = await database.listRaces(atMost: request.limit)
+        return response
+    }
+}
+```
+
+重要な点：
+
+- Build Plugin が自動生成する `SimpleServiceProtocol` protocol を実装します
+- 純粋な `async` 関数で、`await` を使って database を問い合わせます
+- `ServerContext` は timeout や authentication information などの call metadata を提供します
+
+([14:38](https://developer.apple.com/videos/play/wwdc2026/265/?time=878)) サーバー側で双方向 streaming の `FollowRace` を実装します。
+
+```swift
+func followRace(
+    request: RPCAsyncSequence<FollowRaceRequest, any Error>,
+    response: RPCWriter<FollowRaceResponse>,
+    context: ServerContext
+) async throws {
+    try await withThrowingTaskGroup { group in
+        var iterator = request.makeAsyncIterator()
+        guard let first = try await iterator.next() else { return }
+        let eventTypes = Mutex(Set(first.eventTypes))
+
+        group.addTask {
+            let events = tracker.events(forRace: first.raceName).filter { event in
+                eventTypes.withLock { $0.contains(event.type) }
+            }
+
+            for await event in events {
+                var message = FollowRaceResponse()
+                switch event {
+                case .locations(let locations):
+                    message.locations.karts = locations.map { location in
+                        var kart = KartLocations.Kart()
+                        kart.number = Int32(location.number)
+                        kart.latitude = location.latitude
+                        kart.longitude = location.longitude
+                        return kart
+                    }
+                case .standings(let standings):
+                    message.standings.entries = standings.map { standing in
+                        var entry = Standings.Entry()
+                        entry.gapToLeader = .init(rounding: standing.delta, rule: .towardZero)
+                        entry.kartNumber = Int32(standing.kartNumber)
+                        entry.lap = Int32(standing.lap)
+                        entry.position = Int32(standing.position)
+                        return entry
+                    }
+                }
+
+                try await response.write(message)
+            }
+        }
+
+        while let next = try await iterator.next() {
+            eventTypes.withLock { $0 = Set(next.eventTypes) }
+        }
+
+        group.cancelAll()
+    }
+}
+```
+
+重要な点：
+
+- `RPCAsyncSequence` は client から送られてくる request stream です
+- `RPCWriter` は client へ response message を書き込むために使います
+- `withThrowingTaskGroup` は request の消費と event push を並行処理します
+- `Mutex` が `eventTypes` set を保護し、client が subscribe 内容を動的に調整できるようにします
+- client が stream を閉じると（`iterator.next()` が `nil` を返すと）、すべての task を cancel します
+
+([17:32](https://developer.apple.com/videos/play/wwdc2026/265/?time=1052)) client は双方向 stream を呼び出します。
+
+```swift
+.task {
+    do {
+        let (stream, continuation) = AsyncStream.makeStream(of: Bool.self)
+        self.continuation = continuation
+        continuation.yield(showLeaderboard)
+
+        try await manager.withClient { client in
+            let kart = SwiftKartService.Client(wrapping: client)
+            try await kart.followRace { requestStream in
+                for await showLeaderboard in stream {
+                    var message = FollowRaceRequest()
+                    message.raceName = race.name
+                    message.eventTypes = [.kartLocations]
+                    if showLeaderboard {
+                        message.eventTypes.append(.standings)
+                    }
+                    try await requestStream.write(message)
+                }
+            } onResponse: { responseStream in
+                for try await message in responseStream.messages {
+                    if let event = message.event {
+                        await handleEvent(event)
+                    }
+                }
+            }
+        }
+    } catch {
+        print("gRPC エラー: \(error)")
+    }
+}
+
+@MainActor
+private func handleEvent(_ event: FollowRaceResponse.OneOf_Event) {
+    switch event {
+    case .locations(let locations):
+        self.tracking.updateKartCoordinates(
+            locations.karts.map {
+                TrackedKart(number: $0.number, latitude: $0.latitude, longitude: $0.longitude)
+            }
+        )
+    case .standings(let standings):
+        self.standings = standings.entries.map {
+            StandingsEntry(
+                kartNumber: $0.kartNumber,
+                secondsToLeader: $0.gapToLeader.timeInterval,
+                position: $0.position,
+                lap: $0.lap
+            )
+        }
+    }
+}
+```
+
+重要な点：
+
+- `followRace` には二つの closure があります。一つ目は request を書き込み、二つ目は response を処理します
+- `AsyncStream` は UI 状態変化（`showLeaderboard`）を request stream へ bridge します
+- ユーザーが leaderboard を開くと、client は `.standings` event subscription を動的に追加します
+- `responseStream.messages` は `AsyncSequence` で、`for try await` で consume します
+- `@MainActor` は UI 更新がメインスレッドで実行されることを保証します
+
+### クラウドへデプロイする
+
+([20:55](https://developer.apple.com/videos/play/wwdc2026/265/?time=1255)) サーバーは multi-stage build でコンテナイメージとして package します。
+
+```dockerfile
+FROM swift:latest AS builder
+
+WORKDIR /app
+COPY Package.swift Package.resolved .
+COPY Sources/ Sources/
+
+RUN swift build -c release --product server
+RUN cp "$(swift build -c release --show-bin-path)/server" /usr/bin/server
+
+FROM swift:slim
+COPY --from=builder /usr/bin/server /usr/bin/server
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/bin/server"]
+```
+
+重要な点：
+
+- multi-stage build：compile 段階では完全な Swift toolchain を使い、runtime では binary と slim image だけを残します
+- 最終 image size を大きく減らせます
+- `swift build -c release` は最適化済みの release binary を生成します
+
+([21:56](https://developer.apple.com/videos/play/wwdc2026/265/?time=1316)) Google Cloud Run へデプロイします。
+
+```bash
+gcloud run deploy wwdc-demo-server \
+  --image us-central1-docker.pkg.dev/wwdc26/wwdc-demo-server/wwdc-demo-server:latest \
+  --region us-central1 \
+  --use-http2 \
+  --allow-unauthenticated
+```
+
+重要な点：
+
+- gRPC は HTTP/2 ベースなので、`--use-http2` を必ず有効にします
+- `--allow-unauthenticated` は public access を許可します
+
+([22:22](https://developer.apple.com/videos/play/wwdc2026/265/?time=1342)) client を cloud service に接続するよう更新します。
+
+```swift
+static func makeTransport() throws -> HTTP2ClientTransport.TransportServices {
+    try .http2NIOTS(
+        target: .dns(host: "wwdc-demo-server-863666503339.us-central1.run.app"),
+        transportSecurity: .tls
+    )
+}
+```
+
+重要な点：
+
+- `.dns` は `.ipv4` を置き換え、domain name resolution に対応します
+- production environment では必ず `.tls` を使います
+
+## 詳細
+
+### Xcode Build Plugin の仕組み
+
+([05:32](https://developer.apple.com/videos/play/wwdc2026/265/?time=332)) `GRPCProtobufGenerator` は Xcode の Build Tool Plugin です。compile 前に Target directory 内の `.proto` ファイルをスキャンし、JSON 設定に基づいて対応する Swift コードを生成します。初回利用時には、plugin を信頼するか確認する security prompt が表示されます。
+
+設定ファイルの三つの switch：
+
+- `clients: true` — client 呼び出しコードを生成します
+- `servers: true` — server protocol stub コードを生成します
+- `messages: true` — Protobuf message model を生成します
+
+iOS App では通常 `clients` と `messages` だけが必要で、server では三つすべてが必要です。
+
+### 四種類の RPC 比較
+
+| 種類 | Request | Response | 適した場面 |
+|------|---------|----------|------------|
+| Unary | 1件 | 1件 | 一般的な API 呼び出し。例：一覧取得 |
+| Client streaming | 複数件 | 1件 | batch upload。例：カートの telemetry data |
+| Server streaming | 1件 | 複数件 | real-time push。例：文字ライブ配信 |
+| Bidirectional | 複数件 | 複数件 | real-time 双方向通信。例：位置 tracking + leaderboard |
+
+### SwiftNIO transport layer
+
+gRPC Swift のネットワーク層は SwiftNIO ベースで、二つの transport 実装を提供します。
+
+- `http2NIOTS` — Network.framework を使い、Apple platform で推奨されます
+- `http2NIOPosix` — POSIX socket を使い、Linux server で推奨されます
+
+([12:32](https://developer.apple.com/videos/play/wwdc2026/265/?time=752)) サーバーは POSIX 実装を使います。
+
+```swift
+let server = GRPCServer(
+    transport: .http2NIOPosix(
+        address: .ipv4(host: "127.0.0.1", port: 8080),
+        transportSecurity: .plaintext
+    ),
+    services: [Service()]
+)
+try await server.serve()
+```
+
+### Protobuf Edition 2024
+
+Session 内の `.proto` ファイルは `edition = "2024"` を使っています。これは Protobuf の新しい構文版です。`proto3` と比べ、Edition 2024 は field behavior をより細かく制御でき、同時に後方互換性も保ちます。
+
+## 重要な示唆
+
+### 1. 一つの `.proto` ファイルで frontend と backend の interface を統一する
+
+**何をするか**：既存 App の REST API を gRPC へ移行し、frontend と backend が同じ `.proto` 定義を共有します。
+
+**なぜ価値があるか**：API ドキュメントと実装が同期しなくなる問題をなくせます。field 型の変更は compile time に発見でき、結合調整の時間を大きく減らせます。
+
+**どう始めるか**：ユーザープロフィールや商品一覧のようにデータ交換が多い module を一つ選び、`.proto` 定義を書き、Build Plugin でコードを生成し、既存のネットワーク層を段階的に置き換えます。
+
+### 2. IM や collaboration App で WebSocket の代わりに双方向 streaming を使う
+
+**何をするか**：gRPC の双方向 stream でリアルタイムメッセージ push と状態同期を実装します。
+
+**なぜ価値があるか**：gRPC は強く型付けされた message、自動再接続、flow control、load balancing を提供し、手書きの WebSocket 状態機械より信頼できます。`AsyncSequence` により業務コードも簡潔に保てます。
+
+**どう始めるか**：双方向 streaming RPC を定義します。client では `AsyncStream` で UI event を request stream へ bridge し、server では `TaskGroup` で複数 client 接続を並行処理します。
+
+### 3. Swift サーバーをコンテナに package して cloud へデプロイする
+
+**何をするか**：Swift で gRPC サーバーを書き、multi-stage Docker build で package し、Cloud Run、AWS ECS、Fly.io へデプロイします。
+
+**なぜ価値があるか**：server-side Swift の性能は C++ に近く、メモリ使用量は Node.js や Python より低くなります。gRPC の効率的な binary serialization と合わせて、全体の resource cost を下げられます。
+
+**どう始めるか**：Session の Containerfile を参考にし、runtime image に `swift:slim` を使い、デプロイ時に HTTP/2 が有効であることを確認します。
+
+### 4. gRPC をプロセス間通信に使う
+
+**何をするか**：macOS App と helper process、または host OS と Linux VM の間の通信に gRPC を使います。
+
+**なぜ価値があるか**：Apple の open-source Containerization framework はすでに内部で gRPC Swift を使い、virtual socket 経由で通信しています。XPC より柔軟で、自然に cross-platform に対応できます。
+
+**どう始めるか**：`.proto` でプロセス間通信 interface を定義し、`.plaintext` transport security mode で local Unix domain socket に接続します。
+
+### 5. Swift OTel と組み合わせて distributed tracing を実現する
+
+**何をするか**：gRPC call chain に OpenTelemetry を導入し、iOS 端末から server までの完全な経路を trace します。
+
+**なぜ価値があるか**：gRPC Swift は Swift OTel との統合に対応しています。production environment で latency bottleneck や error の根本原因を探すとき、distributed tracing は log より効率的です。
+
+**どう始めるか**：server 側の `ServerContext` から trace context を取り出し、client 呼び出し時に span を注入し、Jaeger または Grafana Tempo で call chain を確認します。
+
+## 関連セッション
+
+- [Session 262: Swift](/articles/wwdc2026-262) — Swift 6 の厳格な concurrency model と `Sendable` protocol は、`ClientManager` 内の `Mutex` の使い方を理解する基礎になります
+- [Session 267: Swift Testing](/articles/wwdc2026-267) — Swift Testing で gRPC サーバーの unit test を書き、RPC 実装の正しさを検証します
+- [Session 268: Instruments responsiveness](/articles/wwdc2026-268) — Instruments を使って gRPC 接続の latency とメモリ使用量を分析します
+- [Session 389: Container machines](/articles/wwdc2026-389) — Apple の Containerization framework は内部で gRPC Swift を使って VM 間通信を行っており、この session の技術スタックと直接関係します

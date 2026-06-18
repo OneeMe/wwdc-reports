@@ -1,0 +1,475 @@
+---
+title: "Code-along: Make your app available to Siri"
+description: "Learning"
+date: "2026-06-10"
+tags: ["App Intents", "Siri", "Apple Intelligence", "App Schemas", "Calendar"]
+thumbnail: "/images/sessions/2026/344.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/344/"
+sessionId: "wwdc2026-344"
+year: "2026"
+relatedSessions:
+  - title: "104 - Get to know App Intents"
+    code: "104"
+    description: "An introduction to App Intents core concepts, including intents, entities, queries, and their connection to Siri and Shortcuts"
+  - title: "343 - App Intents: Advanced topics and best practices"
+    code: "343"
+    description: "Advanced App Intents features and best practices for optimizing how your app works with Siri"
+  - title: "242 - Agentic apps: Powered by Apple Intelligence"
+    code: "242"
+    description: "Agentic app architecture and how apps can proactively collaborate with users"
+  - title: "246 - Core Spotlight: LLM-powered search in your app"
+    code: "246"
+    description: "Core Spotlight integration with LLMs to strengthen semantic search"
+  - title: "295 - Testing your App Intents at scale"
+    code: "295"
+    description: "The AppIntentsTesting framework for automated App Intents testing"
+---
+
+## Highlight
+
+> With the App Intents framework and App Schemas, developers can make app content and actions available through Siri. Users can query calendar events, change times, and send messages in natural language without developers writing custom natural language processing code.
+
+## Core Content
+
+In the past, making an app work with Siri required a lot of effort. You had to define intents, write training phrases, handle natural language parsing, and repeat the same work for every new feature.
+
+Apple introduced App Schemas, which describe app content and actions with predefined structures. Developers do not need to handle natural language directly. They only need to tell the system, "This is a calendar event" or "This is a calendar operation," and Siri can understand it.
+
+This code-along video demonstrates the full workflow with the CometCal project. CometCal is a SwiftUI calendar app that can show today's events, view and edit events, create new events, and manage different calendars. The video turns it step by step from a touch-only app into a version fully controllable with Siri voice commands.
+
+The key is three steps: let Siri understand your app content through entities, let Siri perform actions through intents, and let Siri know what is currently on screen through screen awareness.
+
+## Details
+
+### Step 1: Define app entities ([03:12](https://developer.apple.com/videos/play/wwdc2026/344/?time=192))
+
+App Schemas organize content into domains. The Calendar Domain covers all schedule-related content: events, calendars, attendees, and the actions that operate on them.
+
+The first entity is `CalendarEntity`, which represents a calendar itself. Creating it is straightforward:
+
+```swift
+import AppIntents
+
+struct CalendarEntity: calendar_calendar {
+    @AppEntity(title: "Calendar")
+    static var entityQuery = CalendarEntityQuery()
+
+    var id: UUID
+    var title: String
+
+    // DisplayRepresentation and other required properties
+}
+```
+
+Key points:
+- `calendar_calendar` is the calendar schema in the Calendar Domain, and Xcode autocompletes all available schemas
+- The `@AppEntity` macro marks this as an app entity that Siri can reason about
+- The `IndexedEntity` protocol lets the entity be donated to the Spotlight index and gain semantic understanding
+
+To let Siri find these entities, implement the `EntityQuery` protocol:
+
+```swift
+struct CalendarEntityQuery: EntityQuery {
+    @Dependency private var calendarManager: CalendarManager
+
+    func entities(for identifiers: [UUID]) async throws -> [CalendarEntity] {
+        // Fetch calendars by ID
+        return try await calendarManager.calendars(for: identifiers)
+            .map { $0.entity }
+    }
+
+    func allEntities() async throws -> [CalendarEntity] {
+        // Return all calendars so Siri can offer them as options
+        return try await calendarManager.allCalendars()
+            .map { $0.entity }
+    }
+}
+```
+
+Key points:
+- The `@Dependency` property wrapper injects shared resources, and App Intents provides the same registered instance
+- `allEntities()` lets Siri know which calendars are available and offer options when creating events
+
+After defining the entity, donate it to the system index in `CalendarManager`:
+
+```swift
+func createCalendar(_ title: String) throws -> CalendarModel {
+    let calendar = CalendarModel(title: title)
+    modelContext.insert(calendar)
+
+    // Donate the entity to the Spotlight index
+    searchableIndex.indexAppEntities(
+        identifiers: [calendar.id],
+        type: CalendarEntity.self
+    )
+
+    return calendar
+}
+
+func updateCalendar(_ calendar: CalendarModel) throws {
+    // Re-index after updates
+    searchableIndex.indexAppEntities(
+        identifiers: [calendar.id],
+        type: CalendarEntity.self
+    )
+}
+
+func deleteCalendar(_ calendar: CalendarModel) throws {
+    modelContext.delete(calendar)
+
+    // Delete from the index
+    searchableIndex.deleteAppEntities(
+        identifiers: [calendar.id],
+        type: CalendarEntity.self
+    )
+}
+```
+
+### Second entity: Attendees ([07:59](https://developer.apple.com/videos/play/wwdc2026/344/?time=479))
+
+`AttendeeEntity` represents an attendee in an event, but it uses the `TransientAppEntity` protocol instead of `IndexedEntity`:
+
+```swift
+struct AttendeeEntity: calendar_attendee {
+    var person: IntentPerson
+    var status: AttendeeStatusEntity
+    var type: AttendeeTypeEntity
+    var isOptional: Bool
+}
+```
+
+Key points:
+- `TransientAppEntity` represents a temporary entity that does not need a unique identifier and is not used for independent queries
+- Attendees exist as part of events; the same person may attend many events, and indexing each one would create duplicate results
+- `IntentPerson` is a system standard type that includes name and contact information, making cross-app sharing easier
+
+Attendees use two `@AppEnum` types:
+
+```swift
+enum AttendeeStatusEntity: calendar_attendeeStatus {
+    case accepted
+    case declined
+    case tentative
+    case pending
+}
+
+enum AttendeeTypeEntity: calendar_attendeeType {
+    case person
+}
+```
+
+Key points:
+- App Schema defines the possible enum values, and the app chooses the ones it supports
+- If your app uses different terminology, map your existing model to the schema's enum values
+
+### Third entity: Events ([10:22](https://developer.apple.com/videos/play/wwdc2026/344/?time=622))
+
+`EventEntity` is the core entity and also uses `IndexedEntity`:
+
+```swift
+struct EventEntity: calendar_event {
+    var id: UUID
+    var title: String
+    var startDate: Date
+    var endDate: Date
+    var calendar: CalendarEntity
+    var attendees: [AttendeeEntity]
+    var location: EventLocation?
+    var note: String?
+    var recurrence: Calendar.RecurrenceRule?
+    var alarms: [EventAlarm]?
+    var status: EventStatusEntity
+}
+```
+
+Key points:
+- It has more properties, but the pattern is the same as before
+- Required properties such as `title` and `startDate` connect directly
+- Optional properties you do not use, such as `travelTime`, can stay empty
+- You can also add non-schema properties such as `isFavorite`
+
+`EventEntity` composes other entities:
+
+```swift
+var calendar: CalendarEntity  // Calendar that owns the event
+var attendees: [AttendeeEntity]  // Attendee list
+```
+
+Siri understands these relationships through App Schemas.
+
+Recurring events use Foundation's `Calendar.RecurrenceRule`:
+
+```swift
+var recurrence: Calendar.RecurrenceRule?
+
+// Conversion logic
+recurrence: eventModel.frequency.map { frequency in
+    Calendar.RecurrenceRule(
+        frequency: frequency.toRecurrenceFrequency(),
+        interval: 1
+    )
+}
+```
+
+Locations and alarms are Union Values, which can store one of several types:
+
+```swift
+typealias EventLocation = @CalendarEventLocation.PlaceDescriptorOrString
+typealias EventAlarm = @CalendarEventAlarm.DateOrDuration
+
+location: location.map { .placeDescriptor($0) }
+alarms: alarms.map { alarm in
+    switch alarm {
+    case .date(let date): return .date(date)
+    case .duration(let duration): return .duration(duration)
+    }
+}
+```
+
+### Open a specific event ([14:40](https://developer.apple.com/videos/play/wwdc2026/344/?time=880))
+
+After defining entities, Siri can query content, but tapping a result still opens only the app's home screen. You need `OpenEventIntent` to navigate to a specific event:
+
+```swift
+struct OpenEventIntent: system_open {
+    static var title: LocalizedStringResource = "Open Event"
+    static var openProviderStyle: OpenProviderStyle = .siriAndSpotlight
+
+    @Parameter(title: "Event")
+    var target: EventEntity?
+
+    @Dependency private var navigationManager: NavigationManager
+
+    func perform() async throws -> some IntentResult {
+        guard let event = target else { return .result() }
+        navigationManager.open(event.id)
+        return .result()
+    }
+}
+```
+
+Key points:
+- `system.open` is a system schema for opening an entity
+- `openProviderStyle` specifies that it is available in Siri and Spotlight
+- When the user taps an event result, this intent is called and navigates to the detail view
+
+### Screen awareness ([15:42](https://developer.apple.com/videos/play/wwdc2026/344/?time=942))
+
+Users may not want to say the full event title. They may say "this event" or "the third event." Two view modifiers are needed.
+
+In the list view:
+
+```swift
+List(events) { event in
+    EventRow(event: event)
+        .appEntityIdentifier(event.entityIdentifier)
+}
+```
+
+In the detail view:
+
+```swift
+EventDetail(event: event)
+    .userActivity(.entityIdentifier(event.entityIdentifier))
+```
+
+Key points:
+- `.appEntityIdentifier` tells the system which events are shown in the list
+- `.userActivity` tells the system which specific event is currently focused
+- With just two modifiers, Siri can understand which event "this event" refers to
+
+### Create event intent ([17:16](https://developer.apple.com/videos/play/wwdc2026/344/?time=1036))
+
+To let Siri perform actions, use the `calendar_createEvent` schema:
+
+```swift
+struct CreateEventIntent: calendar_createEvent {
+    static var title: LocalizedStringResource = "Create Event"
+    static var openAppWhenRun: Bool = false
+
+    @Parameter(title: "Title")
+    var title: String
+
+    @Parameter(title: "Start Date")
+    var startDate: Date
+
+    @Parameter(title: "End Date")
+    var endDate: Date
+
+    @Parameter(title: "Calendar")
+    var calendar: CalendarEntity?
+
+    @Parameter(title: "Location")
+    var location: EventLocation?
+
+    @Parameter(title: "Note")
+    var note: String?
+
+    @Dependency private var calendarManager: CalendarManager
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ReturnsValue<EventEntity> {
+        // Resolve parameters
+        let resolvedLocation: String? = try location?.resolve()
+
+        // Create the event
+        let event = try await calendarManager.createEvent(
+            title: title,
+            startDate: startDate,
+            endDate: endDate,
+            calendarId: calendar?.id,
+            location: resolvedLocation,
+            note: note
+        )
+
+        return .result(with: event.entity)
+    }
+}
+```
+
+Key points:
+- The schema defines the parameter list, and you use it directly
+- `@MainActor` ensures execution on the main thread
+- Returning `EventEntity` tells Siri about the created result
+- Siri automatically handles language understanding, asks clarification questions, and confirms details
+
+### Update event intent ([20:17](https://developer.apple.com/videos/play/wwdc2026/344/?time=1217))
+
+The update intent uses the `calendar_updateEvent` schema:
+
+```swift
+struct UpdateEventIntent: calendar_updateEvent {
+    @Parameter(title: "Event")
+    var event: EventEntity?
+
+    @Parameter(title: "Start Date")
+    var startDate: Date?
+
+    @Parameter(title: "End Date")
+    var endDate: Date?
+
+    @Parameter(title: "Location")
+    var location: EventLocation?
+
+    // ... Other optional parameters
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ReturnsValue<EventEntity> & ShowsSnippetView {
+        guard let event = event else { return .result() }
+
+        var updates: EventUpdates = [:]
+
+        // Handle optional parameters
+        if let startDate = startDate {
+            updates[.startDate] = startDate
+        }
+
+        // Handle parameters that may be cleared
+        switch location.valueState {
+        case .set(let value):
+            updates[.location] = value
+        case .set(nil):
+            updates[.location] = nil  // Explicitly clear
+        case .unset:
+            break  // Do not update
+        }
+
+        let updated = try await calendarManager.updateEvent(event.id, updates: updates)
+        return .result(with: updated.entity, snippet: EventSnippetView(event: updated.entity))
+    }
+}
+```
+
+Key points:
+- Most parameters are optional, because the user may change only one or two fields
+- `valueState` distinguishes three cases: set a new value, explicitly clear to `nil`, or not set at all
+- `ShowsSnippetView` returns a custom SwiftUI view instead of the default card
+
+### Delete event intent ([22:30](https://developer.apple.com/videos/play/wwdc2026/344/?time=1350))
+
+Deletion is the simplest action intent:
+
+```swift
+struct DeleteEventIntent: calendar_deleteEvent {
+    @Parameter(title: "Event")
+    var event: EventEntity?
+
+    @Parameter(title: "Span")
+    var span: EventSpan?
+
+    @MainActor
+    func perform() async throws -> IntentResult {
+        guard let event = event else { return .result() }
+
+        if let span = span {
+            switch span {
+            case .thisEvent:
+                try calendarManager.deleteEvent(event.id)
+            case .futureEvents:
+                try calendarManager.deleteRecurringEvent(from: event.id, future: true)
+            }
+        }
+
+        return .result()
+    }
+}
+```
+
+Key points:
+- Siri automatically shows a confirmation dialog
+- Recurring events support deleting only this occurrence or all future occurrences
+- When multiple items match, Siri automatically disambiguates
+
+### Custom result views ([21:21](https://developer.apple.com/videos/play/wwdc2026/344/?time=1281))
+
+The default result card comes from `DisplayRepresentation`. You can customize it:
+
+```swift
+struct EventSnippetView: SnippetView {
+    var event: EventEntity
+
+    var body: some Snippet {
+        Snippet(
+            image: event.icon,
+            title: event.title,
+            subtitle: formattedDateRange(event.startDate, event.endDate)
+        ) {
+            // Custom layout
+        }
+    }
+}
+```
+
+Return it from the intent:
+
+```swift
+func perform() async throws -> some IntentResult & ReturnsValue<EventEntity> & ShowsSnippetView {
+    // ... Perform logic
+    return .result(with: updated.entity, snippet: EventSnippetView(event: updated.entity))
+}
+```
+
+Key points:
+- Keep SwiftUI views simple and lightweight
+- Reflect the app's personality through gradients, icons, and colors
+- This works for any intent that returns a result
+
+## Key Takeaways
+
+1. **Intelligent calendar assistant**: With semantic indexing based on `EventEntity`, users can ask "What customer-related meetings do I have next week?" or "How many team meetings do I have this quarter?" and Siri can search answers directly from event titles and notes.
+
+2. **Fast voice creation**: The create intent lets users quickly say "Create a coffee meeting with Alex tomorrow at 3 PM" without opening the app and filling out a form. Combined with location resolution, it can automatically choose a nearby coffee shop.
+
+3. **Batch update assistant**: The update intent supports natural language batch changes such as "Move all Tuesday biweekly meetings this month to Wednesday" or "Change all online meetings this week to in-person." Use recurrence rules and parameter state handling.
+
+4. **Smart reminder integration**: Alarm Union Values can integrate with system reminders. When the user says "Remind me 30 minutes early to prepare meeting materials," an alarm can be added to the event automatically.
+
+5. **Screen-context actions**: While viewing an event detail, users can say "Message the attendees to confirm attendance" or "Share the location with someone." Screen awareness makes these operations feel natural.
+
+## Related Sessions
+
+- [104 - Get to know App Intents](/articles/wwdc2026-104) - An introduction to App Intents core concepts, including intents, entities, queries, and their connection to Siri and Shortcuts
+- [343 - App Intents: Advanced topics and best practices](/articles/wwdc2026-343) - Advanced App Intents features and best practices for optimizing how your app works with Siri
+- [242 - Agentic apps: Powered by Apple Intelligence](/articles/wwdc2026-242) - Agentic app architecture and how apps can proactively collaborate with users
+- [246 - Core Spotlight: LLM-powered search in your app](/articles/wwdc2026-246) - Core Spotlight integration with LLMs to strengthen semantic search
+- [295 - Testing your App Intents at scale](/articles/wwdc2026-295) - The AppIntentsTesting framework for automated App Intents testing

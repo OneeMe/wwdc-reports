@@ -1,0 +1,350 @@
+---
+title: "Code-along: SwiftData で永続化を追加する"
+description: "表現力の高い宣言的 API を使ってアプリの状態を管理するための基礎スキルを学びます。"
+date: "2026-06-10"
+tags: ["SwiftData", "SwiftUI", "データ永続化", "Observation"]
+thumbnail: "/images/sessions/2026/275.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/275/"
+sessionId: "wwdc2026-275"
+year: "2026"
+relatedSessions:
+  - title: "SwiftData"
+    code: "274"
+    description: "SwiftData フレームワークの全体像。手を動かす前に全体アーキテクチャを理解するのに適しています"
+  - title: "SwiftUI"
+    code: "269"
+    description: "`@Query` や `.modelContainer` のさらに多くの使い方を含む、SwiftUI と SwiftData の統合詳細"
+  - title: "Swift"
+    code: "262"
+    description: "マクロシステムと Observation フレームワークの内部機構を含む Swift 言語の新機能"
+  - title: "SwiftData: Dive into inheritance and schema migration"
+    code: "275"
+    description: "モデル継承と Schema マイグレーションを深く解説。Goal の継承設計はこの方法を参考にしています"
+---
+
+## ハイライト
+
+> この Code-along は、純粋にメモリ上で動く SwiftUI の旅行ウィッシュリストアプリを SwiftData に移行する手順を示します。`@Model` マクロ、`@Query` の述語クエリ、モデル継承を使うことで、30 分足らずで数百行の手動状態管理コードを置き換え、同時にクロスプラットフォームの永続ストレージを得られます。
+
+## 主要内容
+
+### メモリから永続化へ: 現実的な痛点
+
+Wishlist は旅行計画アプリです。ユーザーは旅行先を追加し、やることを記録し、季節ごとに一覧できます。改造前は、すべてのデータが `DataSource` クラスにあり、グローバル変数と辞書で管理されていました。フィルタ、並べ替え、検索はすべてメモリ内で行われていました。
+
+デモプロジェクトとしてはそれで十分です。しかしアプリを閉じて再度開くと、さっき追加した "Northern Lights" の旅行は消えてしまいます。すべての変更は初期データへ戻ります。データ量が増えると、メモリ使用量も増え続けます。
+
+SwiftData が解決したいのは、まさにこの種の問題です。動的な状態を永続ストレージ層へつなぎ、データをアプリのライフサイクルの外でも生き残らせます。
+
+### 改造経路: モデル定義からビューのクエリへ
+
+改造は 3 ステップです。
+
+第一に、データ構造を SwiftData モデルとしてマークします。`Activity`、`Trip` などの型に `@Model` マクロを付け、これまでの `@Observable` を置き換えます。SwiftData はこれらの型に対する Observable プロトコル実装を自動生成します ([03:39](https://developer.apple.com/videos/play/wwdc2026/275/?time=219))。
+
+第二に、モデル間の関係を定義します。`@Relationship` マクロで `Trip` と `Activity` の一対多関係を宣言し、カスケード削除ルールを設定します。`Trip` を削除すると、その下のすべての `Activity` が自動的に片付けられます ([10:32](https://developer.apple.com/videos/play/wwdc2026/275/?time=632))。
+
+第三に、SwiftUI ビューで手動データ取得を `@Query` に置き換えます。各子ビューは必要なデータだけを取得し、すべてをメモリに読み込んでから絞り込むのではなく、データベース層で述語によるフィルタを行います ([16:27](https://developer.apple.com/videos/play/wwdc2026/275/?time=987))。
+
+### 予想外の収穫: 数百行のコードを削除できた
+
+改造後、`DataSource` クラスや `TripEditModel` などの補助型は不要になります。SwiftData の `ModelContext` が状態管理、保存ロジック、フィルタ、並べ替え、関係の走査を自動的に引き受けます。以前は手で書く必要があったコードが、フレームワークの組み込み機能に置き換わります。
+
+## 詳細
+
+### `@Model` で永続モデルをマークする
+
+改造は `Activity` 型から始まります。元のコードは `@Observable` マクロを使い、SwiftUI ビューはプロパティバインディングで変更を観測していました。
+
+```swift
+import Foundation
+import SwiftData
+
+@Model
+class Activity {
+    var name: String
+    var isComplete: Bool = false
+    var dateCreated = Date.now
+    var dateEdited = Date.now
+}
+```
+
+ポイント:
+- `@Model` マクロは Observable プロトコル実装も生成するため、ビューはこれらのプロパティへ引き続きバインドできる
+- `ObservableObject` や `@Published` を手動で書く必要はない
+- すべての stored property はデフォルトでデータベースに永続化される
+
+元のコードでは、`name` と `isComplete` に `didSet` observer があり、プロパティ変更時に `dateEdited` を更新していました。`@Model` マクロは `didSet` をサポートしないため、まずこれらの observer を削除し、後で Observation フレームワークの新機能で置き換えます ([03:39](https://developer.apple.com/videos/play/wwdc2026/275/?time=219))。
+
+### enum から class へ: `Goal` のモデル化
+
+元のコードで `Goal` は enum で、18 個の固定された達成目標を定義していました。enum は値型であり、SwiftData の永続モデルにはできません。
+
+改造方針は、`Goal` を class に変え、`name`、`kind`、`target` の 3 つのプロパティを残し、進捗状態を保存するために `completedCount` と `isComplete` を追加することです。そのうえで SwiftData のモデル継承を使い、異なる種類の Goal をサブクラスに分けます。
+
+```swift
+// Goal を基底クラスにする。
+class Goal {
+    var name: String
+    var target: Int
+    var completedCount: Int = 0
+    var isComplete: Bool = false
+    var dateAchieved: Date?
+    var sortOrder: Int = 0
+}
+
+// TripGoal と ActivityGoal は Goal を継承する。
+class TripGoal: Goal { }
+class ActivityGoal: Goal { }
+```
+
+ポイント:
+- enum の閉じた集合という性質は、ユーザー進捗が動的データである永続化場面には合わない
+- モデル継承は明確な階層関係を持つ型に適しており、サブクラスは同じ概念のより具体的な形を表す
+- サブクラスは親クラスのすべての永続化プロパティを自動的に継承する
+
+### モデル関係を定義する
+
+Wishlist では、各 `Trip` が複数の `Activity` を含みます。元のコードは辞書でこの対応関係を手動管理していました。SwiftData では、配列と `@Relationship` マクロで宣言します。
+
+```swift
+import Foundation
+import SwiftData
+
+@Model
+class Trip {
+    var name: String
+    var collection: TripCollection
+
+    var photo: TripImage
+    var thumbnailData: Data?
+
+    @Relationship(deleteRule: .cascade, inverse: \Activity.trip)
+    var activities: [Activity] = []
+
+    private(set) var creationDate = Date.now
+    var subtitle: String?
+    var isComplete: Bool = false
+}
+```
+
+ポイント:
+- `inverse: \Activity.trip` は双方向関係を作り、`Activity` は `activity.trip` で所属する `Trip` を逆参照できる
+- `deleteRule: .cascade` は、`Trip` を削除すると `activities` 配列内のすべての `Activity` も削除されることを意味する
+- `thumbnailData` は `Data?` 型でサムネイルの生バイト列を直接データベースに保存し、フル解像度画像は `TripImage` モデルを通じて外部ファイル参照として保存する
+
+### `ModelContainer` を構成する
+
+アプリ入口で `ModelContainer` を設定すると、SwiftUI が自動的にビュー環境へ注入します。
+
+```swift
+import SwiftUI
+import SwiftData
+
+@main
+struct WishlistApp: App {
+    let container: ModelContainer = {
+        do {
+            let modelContainer = try ModelContainer(
+                for: Trip.self, Activity.self, TripImage.self,
+                Goal.self, TripGoal.self, ActivityGoal.self
+            )
+            try SampleData.seedIfNeeded(in: modelContainer.mainContext)
+            return modelContainer
+        } catch {
+            fatalError("モデルコンテナを作成できませんでした: \(error)")
+        }
+    }()
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .preferredColorScheme(.dark)
+        }
+        .modelContainer(container)
+    }
+}
+```
+
+ポイント:
+- `ModelContainer(for:)` は永続化が必要なすべてのモデル型を受け取り、データベース Schema を構築する
+- `SampleData.seedIfNeeded` は初回起動時に初期データを挿入する
+- `.modelContainer(container)` 修飾子は SwiftUI 環境にこのコンテナを保持させ、`@Query` と `ModelContext` がそこから自動的に取得できるようにする
+
+### `@Query` で対象を絞ったクエリを行う
+
+改造前、ビューは `DataSource` から全データを取得し、自分でフィルタしていました。改造後は、各ビューが必要なデータの部分集合を `@Query` で宣言します。
+
+達成済み目標と未達成目標を分けてクエリします ([16:27](https://developer.apple.com/videos/play/wwdc2026/275/?time=987))。
+
+```swift
+@Query(
+    filter: #Predicate<Goal> { $0.isAchieved },
+    sort: \Goal.dateAchieved,
+    order: .reverse
+)
+private var achievedGoals: [Goal]
+
+@Query(
+    filter: #Predicate<Goal> { !$0.isAchieved },
+    sort: \Goal.sortOrder
+)
+private var upcomingGoals: [Goal]
+```
+
+最近追加された旅行は 5 件に制限します ([16:49](https://developer.apple.com/videos/play/wwdc2026/275/?time=1009))。
+
+```swift
+@Query(FetchDescriptor<Trip>(
+    sortBy: [SortDescriptor(\Trip.creationDate, order: .reverse)],
+    fetchLimit: 5
+))
+private var trips: [Trip]
+```
+
+ポイント:
+- `FetchDescriptor` は並べ替え、返す件数などのクエリ引数を制御する
+- `fetchLimit: 5` は最近の 5 件だけを読み込み、過剰なデータをメモリへ載せることを避ける
+- 述語はデータベース層で実行されるため、全件読み込み後にメモリでフィルタするより効率的
+
+### 動的にクエリを構築する: 季節でグループ化する
+
+`TripCollectionView` は初期化時になって初めて表示する季節が決まるため、`init` 内で `@Query` を動的に構築する必要があります。
+
+```swift
+init(tripCollection: TripCollection, cardSize: TripCard.Size, namespace: Namespace.ID) {
+    _trips = Query(
+        filter: #Predicate<Trip> { $0.collection == tripCollection },
+        sort: \Trip.name
+    )
+    self.tripCollection = tripCollection
+    self.cardSize = cardSize
+    self.namespace = namespace
+}
+```
+
+ポイント:
+- `_trips` はプロパティラッパーの下層ストレージで、`init` 内で直接代入すると動的引数を渡せる
+- `tripCollection` は初期化引数から捕捉され、述語に埋め込まれる
+- クエリ結果は自動的にビュー更新を駆動する
+
+### 検索機能のクエリ実装
+
+検索ビューは入力テキストに応じてクエリ戦略を動的に切り替えます ([18:13](https://developer.apple.com/videos/play/wwdc2026/275/?time=1093))。
+
+```swift
+init(searchText: String, namespace: Namespace.ID) {
+    self.searchText = searchText
+    self.namespace = namespace
+
+    if searchText.isEmpty {
+        // 空検索時は最近の旅行を 3 件表示する。
+        _trips = Query(FetchDescriptor(
+            sortBy: [SortDescriptor(\Trip.creationDate, order: .reverse)],
+            fetchLimit: 3
+        ))
+        _activities = Query(filter: #Predicate<Activity> { _ in false })
+    } else {
+        // 名前で旅行を検索する。
+        let tripSearchPredicate = #Predicate<Trip> {
+            $0.name.localizedStandardContains(searchText)
+        }
+        _trips = Query(filter: tripSearchPredicate, sort: \Trip.name)
+
+        // 名前で活動を検索し、かつ何らかの旅行に属している必要がある。
+        let activitySearchPredicate = #Predicate<Activity> {
+            $0.trip != nil && $0.name.localizedStandardContains(searchText)
+        }
+        _activities = Query(filter: activitySearchPredicate, sort: \Activity.name)
+    }
+}
+```
+
+ポイント:
+- `localizedStandardContains` はローカライズされた大文字小文字非区別の文字列マッチを行う
+- 空検索時はデフォルト内容として最近の旅行 3 件を返す
+- 結果が空の場合、`ContentUnavailableView` が親切な空状態を表示する
+
+### エラー処理
+
+SwiftData 操作はディスク容量不足などの理由で失敗することがあります。ビュー内で捕捉し、エラーを表示します ([19:42](https://developer.apple.com/videos/play/wwdc2026/275/?time=1182))。
+
+```swift
+.onDisappear {
+    do {
+        try updateGoalAchievements()
+    } catch {
+        updateError = error
+        reportError(error)
+    }
+}
+.alert(error: $updateError) {
+    // カスタムエラー表示。
+}
+```
+
+ポイント:
+- `.alert(error:)` は SwiftUI 組み込みのエラー提示修飾子
+- 本番環境では、調査できるようにテレメトリシステムにも報告することが推奨される
+
+### `didSet` を Continuous Observation に置き換える
+
+改造後は、`dateEdited` の自動更新挙動を復元する必要があります。Observation フレームワークは 2027 年版で `withContinuousObservation` を追加します。
+
+```swift
+init(activity: Activity, isLast: Bool, isEditing: Bool) {
+    activity.token = withContinuousObservation(options: .didSet) { event in
+        _ = activity.name
+        _ = activity.isComplete
+
+        if event.matches(\Activity.name) {
+            activity.dateEdited = .now
+        }
+
+        if event.matches(\Activity.isComplete) {
+            activity.dateEdited = .now
+            activity.trip?.isComplete =
+                activity.trip?.activities.isEmpty == false
+                && activity.trip?.activities.allSatisfy { $0.isComplete } == true
+        }
+    }
+    self.activity = activity
+    self.isLast = isLast
+    self.isEditing = isEditing
+}
+```
+
+ポイント:
+- `withContinuousObservation(options: .didSet)` はプロパティ代入後にコールバックを発火する
+- `_ = activity.name` はそのプロパティを観測したいという関心を宣言する
+- `event.matches(\Activity.name)` はどのプロパティが変化したかを正確に判定する
+- `Activity` の完了状態が変わったとき、所属する `Trip` の `isComplete` 状態も連動して更新する
+
+## 重要な示唆
+
+**1. 任意のリスト系アプリを永続化版に変える**
+
+Todo、家計簿、読書リストのようなアプリのデータ構造は SwiftData と自然に相性がよいです。モデルに `@Model`、ビューに `@Query` を追加すれば、午後ひとつで移行できます。入口 API: `@Model` + `ModelContainer`。
+
+**2. 述語クエリで全件読み込みを置き換える**
+
+多くのアプリは起動時に全データをメモリへ読み込みます。`FetchDescriptor` と `fetchLimit`、述語を組み合わせ、現在画面に必要なデータだけを読み込みましょう。リストスクロール性能は明確に改善します。入口 API: `FetchDescriptor(sortBy:fetchLimit:)` + `#Predicate`。
+
+**3. モデル継承で異種データを扱う**
+
+アプリ内に似ているが少し違う複数のエンティティがある場合、たとえば異なる種類のタスクや会員レベルなどでは、enum や protocol ではなくモデル継承を使えます。各サブクラスは自分の永続化テーブルを持ちつつ、親クラスの属性を共有します。入口 API: `class SubModel: ParentModel`。
+
+**4. Continuous Observation でプロパティ単位の副作用を扱う**
+
+プロパティ変化時に連鎖更新が必要な場合、たとえば注文項目を変更した後に注文合計を再計算するような場面では、`withContinuousObservation` は `didSet` より柔軟です。型をまたいだ観測に対応し、SwiftData の永続化ライフサイクルとも両立するからです。入口 API: `withContinuousObservation(options: .didSet)`。
+
+**5. 検索機能をデータベース化する**
+
+メモリ上のフィルタロジックをデータベース述語へ移します。`localizedStandardContains` はローカライズ検索をサポートし、空検索時は最近のデータにフォールバックできます。`ContentUnavailableView` と組み合わせると空状態も扱えます。入口 API: `#Predicate { $0.name.localizedStandardContains(text) }`。
+
+## 関連 Session
+
+- [SwiftData](/articles/wwdc2026-274) — SwiftData フレームワークの全体像。手を動かす前に全体アーキテクチャを理解するのに適しています
+- [SwiftUI](/articles/wwdc2026-269) — `@Query` や `.modelContainer` のさらに多くの使い方を含む、SwiftUI と SwiftData の統合詳細
+- [Swift](/articles/wwdc2026-262) — マクロシステムと Observation フレームワークの内部機構を含む Swift 言語の新機能
+- [SwiftData: Dive into inheritance and schema migration](/articles/wwdc2026-275) — モデル継承と Schema マイグレーションを深く解説。Goal の継承設計はこの方法を参考にしています

@@ -1,0 +1,197 @@
+---
+title: "Build real-time neural rendering pipelines with Metal"
+description: "Learning, Graphics & Games"
+date: "2026-06-10"
+tags: ["Metal", "Machine Learning", "Neural Rendering", "MetalFX", "TensorOps"]
+thumbnail: "/images/sessions/2026/359.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/359/"
+sessionId: "wwdc2026-359"
+year: "2026"
+relatedSessions:
+  - title: "What's new in Metal"
+    code: "101"
+    description: "Overview of the core new features in Metal 4"
+  - title: "Go further with Metal 4 games"
+    code: "388"
+    description: "Detailed practice with MetalFX denoising"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "324"
+    description: "A deep dive into ML Command Encoder and TensorOps"
+  - title: "Metal tensors"
+    code: "330"
+    description: "Tensor API performance optimization"
+---
+
+## Highlight
+
+> Metal 4 provides three layers of machine learning capability: MetalFX offers ready-to-use neural denoising and upscaling, ML Command Encoder runs pretrained models directly inside rendering pipelines, and the TensorOps API lets shaders run small neural networks inline, fully using the neural accelerators in M5 and A19 Pro GPUs.
+
+## Core Content
+
+### The machine-language dilemma of real-time rendering
+
+Real-time rendering developers face a constant tradeoff: better quality requires more samples, but more samples can destroy frame rate.
+
+Take a path tracer as an example. To produce a noise-free image, it needs hundreds of samples per pixel. But a real-time viewport can usually afford only one sample per pixel, which leaves the whole screen full of noise.
+
+Traditional solutions use denoising algorithms, but they either have limited quality or cost too much compute.
+
+### Apple's three-layer solution
+
+Metal 4 provides three progressive layers of machine learning capability:
+
+**Layer 1: MetalFX** — a black-box solution that can be called directly.
+
+**Layer 2: ML Command Encoder** — run trained models inside the rendering pipeline.
+
+**Layer 3: TensorOps API** — hand-write small neural networks directly in shaders.
+
+### MetalFX: immediately usable neural denoising
+
+MetalFX Denoising combines a neural upscaler and denoiser, optimized specifically for Apple silicon.
+
+Maxon's Redshift Live, the real-time path-traced viewport in Cinema 4D, uses this approach. When enabled, a noisy single-sample image becomes clean instantly while preserving a real-time frame rate.
+
+There are three key practices for the best results:
+
+1. **Keep inputs clean** — Auxiliary inputs such as diffuse albedo should be noise-free, because they are the denoiser's strongest signal.
+
+2. **Store what the viewer sees** — Specular reflections should store properties of the reflected geometry, while glass should blend reflection and refraction through the Fresnel term.
+
+3. **Use correct motion vectors** — MetalFX expects dejittered motion vectors without subpixel offsets.
+
+### ML Command Encoder: replacing post-processing pipelines
+
+Denoising is only the starting point. Post-processing pipelines, including tone mapping, color grading, and film simulation, can also use machine learning.
+
+A traditional pipeline chains multiple stages together. Each stage has its own parameters, and the whole system can become very complex. The neural-network approach is to learn the entire color transform.
+
+HDRNet is one example. It uses a downsampled image for global and local analysis, generates local transforms for 16-by-16 tiles, and then applies them to the full image with edge-aware techniques.
+
+The workflow is to train the network in PyTorch, export it as an `MTLPackage`, then load and execute it in Metal 4.
+
+### TensorOps: inline micro-networks in shaders
+
+The most aggressive approach is to run a small neural network directly in a shader.
+
+These networks have only a few thousand parameters, are trained for specific tasks, and can even be trained online every frame.
+
+For example, image-based lighting traditionally requires precomputing an irradiance map. But when the scene is dynamic, such as a day-night cycle, the precomputed result may become stale.
+
+The solution is to let a small MLP learn this signal online. Run several training iterations every frame, and the model can adapt to the new world state in real time.
+
+## Details
+
+### MetalFX denoising integration
+
+([02:16](https://developer.apple.com/videos/play/wwdc2026/359/?time=136))
+
+Integrating MetalFX Denoising is straightforward: the path tracer generates color plus auxiliary inputs, MetalFX outputs a denoised image, and your post-processing flow continues afterward.
+
+The required auxiliary inputs include diffuse albedo and depth. If your renderer already produces them, you can use them directly.
+
+### Dejittered motion vector calculation
+
+([08:46](https://developer.apple.com/videos/play/wwdc2026/359/?time=526))
+
+Correct motion vector calculation is critical for temporal stability. The following code calculates camera-only motion vectors for static objects:
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+// Calculate camera-only motion vectors
+float4 clipCurrent = viewProjCurrent * float4(worldPos, 1.0);
+float2 ndcCurrent = clipCurrent.xy / clipCurrent.w;
+
+float4 clipPrevious = viewProjPrevious * float4(worldPos, 1.0);
+float2 ndcPrevious = clipPrevious.xy / clipPrevious.w;
+
+float2 motion = ndcPrevious - ndcCurrent;
+
+// Get the subpixel offsets for the current and previous frames
+float2 jitterCurrent = getJitter(frameIndex);
+float2 jitterPrevious = getJitter(frameIndexPrevious);
+motion -= jitterPrevious - jitterCurrent;
+```
+
+**Key points:**
+- Transform the world position with the current and previous view-projection matrices.
+- Compute the difference between the two NDC coordinates to obtain the motion vector.
+- Subtract the jitter offset to get a clean dejittered motion vector.
+
+For moving or deforming objects, store the previous frame's world position for each vertex, or skin the mesh twice, then calculate the real motion vector.
+
+### ML Command Encoder deployment flow
+
+([12:03](https://developer.apple.com/videos/play/wwdc2026/359/?time=723))
+
+Deploying a neural network has two steps:
+
+**Setup phase:**
+1. Load the `MTLPackage`.
+2. Specify the network function with a function descriptor.
+3. Create the machine learning pipeline descriptor.
+
+**Execution phase:**
+1. Create the encoder.
+2. Create an argument table and bind inputs and outputs.
+3. Dispatch the command buffer.
+
+The updated rendering pipeline becomes: path tracing to MetalFX denoising to neural tone mapping. Everything is encoded in the same command buffer and executed within the same frame.
+
+### Building inline networks with TensorOps
+
+([17:56](https://developer.apple.com/videos/play/wwdc2026/359/?time=1076))
+
+A neural network consists of three parts: an input layer, hidden layers, and an output layer.
+
+Using a sky probe as an example, this is a 3-4-4-3 MLP, or multilayer perceptron: three floating-point inputs encode direction, and three floating-point outputs represent the average lighting color from that direction.
+
+The flow for evaluating the network in a shader:
+1. Prepare the input tensor, preferably as a 2D matrix for batch processing.
+2. Use the `matmul` 2D tensor operation for matrix multiplication.
+3. Apply the activation function.
+4. Repeat until the output layer.
+
+**SIMD group execution mode:**
+
+([19:29](https://developer.apple.com/videos/play/wwdc2026/359/?time=1169))
+
+When using the `SIMD-group` execution scope, all participating threads work together on the same matrix multiplication and can access cooperative tensors.
+
+The storage of a cooperative tensor is distributed across multiple threads in the threadgroup, avoiding expensive round trips to main memory. Use a cooperative tensor as the output of the first multiplication, and the result stays in fast thread storage memory so the activation function can be applied in place.
+
+### Online training loop
+
+([16:06](https://developer.apple.com/videos/play/wwdc2026/359/?time=966))
+
+Online training changes the traditional rendering loop:
+
+1. Generate a direction you want to sample.
+2. Run inference on the model to obtain a result.
+3. Calculate the analytic solution for the sky lighting problem.
+4. Use the analytic solution to calculate the error.
+5. Run backpropagation to improve the model step by step.
+
+This process can repeat several times per frame, allowing the model to adapt to new world conditions in real time and use that information immediately for shading.
+
+## Key Takeaways
+
+1. **Dynamic irradiance probe** — Build an online-learning irradiance network for your real-time renderer. When scene lighting changes, such as lights turning on and off or a day-night cycle, the network adapts automatically without recomputing a precomputed result. Entry point: TensorOps API plus a custom training loop.
+
+2. **Neural material approximation** — Train a small MLP to learn the response of complex materials. Expensive calculations such as multilayer coatings or subsurface scattering can be approximated by a tiny network running inline in a shader. Entry point: ML Command Encoder for deploying custom networks.
+
+3. **Adaptive post-processing** — Collect image pairs from your project where artists manually grade the image, such as HDR originals plus final graded results, then train a neural tone mapper. After deployment, the renderer can output HDR directly and the network handles stylized post-processing automatically. Entry point: PyTorch training plus `MTLPackage` export.
+
+4. **Real-time AI-assisted lighting** — Use a small network to learn lighting preferences for a specific scene. After an artist adjusts a few lights, the network learns that style and can quickly apply it to other scenes or generate similar lighting setups automatically. Entry point: TensorOps online learning.
+
+5. **Adaptive denoising strength** — Adjust MetalFX denoising strength automatically based on scene content. For example, use a small network to analyze the image and generate an optimal denoiser strength mask for different regions. Entry point: TensorOps plus MetalFX strength masks.
+
+## Related Sessions
+
+- [What's new in Metal](/articles/wwdc2026-101) — Overview of the core new features in Metal 4
+- [Go further with Metal 4 games](/articles/wwdc2026-388) — Detailed practice with MetalFX denoising
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2026-324) — A deep dive into ML Command Encoder and TensorOps
+- [Metal tensors](/articles/wwdc2026-330) — Tensor API performance optimization
+- [Metal Performance Primitives (MPP) Programming Guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf) — Complete code examples and API reference

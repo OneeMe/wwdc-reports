@@ -1,0 +1,298 @@
+---
+title: "LLM プロバイダを Foundation Models フレームワークに持ち込む"
+description: "任意の LLM プロバイダが LanguageModel プロトコルに準拠した Swift パッケージを提供し、Foundation Models フレームワークへ統合する方法を学びます。"
+date: "2026-06-10"
+tags: ["AI", "LLM", "Foundation Models", "Swift", "Machine Learning"]
+thumbnail: "/images/sessions/2026/339.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/339/"
+sessionId: "wwdc2026-339"
+year: "2026"
+relatedSessions:
+  - title: "241 - Foundation Models"
+    code: "241"
+    description: "Foundation Models フレームワークの概要"
+  - title: "242 - エージェント型アプリ"
+    code: "242"
+    description: "複数ステップでツールを使うワークフローを構築する"
+  - title: "324 - Core AI"
+    code: "324"
+    description: "ローカル AI モデルをアプリに統合する"
+  - title: "325 - Core AI の最適化"
+    code: "325"
+    description: "ローカル AI モデルのパフォーマンスを最適化する"
+  - title: "347 - agentic アプリのセキュリティ"
+    code: "347"
+    description: "agentic アプリの安全性を守る"
+---
+
+## ハイライト
+
+> Foundation Models フレームワークは、任意の LLM プロバイダが `LanguageModel` プロトコルに準拠した Swift パッケージを作成できるようになりました。開発者は統一 API でローカルモデルやクラウドモデルを呼び出せます。
+
+## 主要内容
+
+以前、Swift で複数の大規模言語モデルを統合するのは面倒でした。
+
+モデルごとに API 設計、認証方式、データ形式が異なります。別のモデルへ切り替えようとすると、多くのコードを書き直す必要がありました。ローカルモデルとクラウドモデルでは呼び出し方も完全に異なり、保守コストが高くなります。
+
+Apple は Foundation Models フレームワークを開き、任意の LLM プロバイダが `LanguageModel` プロトコルに準拠した Swift パッケージを作れるようにしました。Anthropic の Claude、Google の Gemini、Apple 自身のシステムモデル、Core AI のローカルモデル、MLX コミュニティモデルを、すべて同じ API で呼び出せます。
+
+開発者は別の `LanguageModel` を初期化し、`LanguageModelSession` に渡して `respond` を呼ぶだけです。モデルの切り替えは、1 行のコードを差し替えるくらい簡単になります。
+
+## 詳細
+
+### モデルプロトコルの設計（[04:56](https://developer.apple.com/videos/play/wwdc2026/339/?time=296)）
+
+Foundation Models フレームワークの中核は、`LanguageModel` と `LanguageModelExecutor` という 2 つのプロトコルです。
+
+`LanguageModel` はモデルの能力を表し、`LanguageModelExecutor` は推論の実行を担当します。
+
+```swift
+// LanguageModel プロトコル
+public protocol LanguageModel: Sendable {
+    var capabilities: LanguageModelCapabilities { get }
+    var executorConfiguration: Executor.Configuration { get }
+}
+
+// LanguageModelExecutor プロトコル
+public protocol LanguageModelExecutor: Sendable {
+    init(configuration: Configuration) throws
+    func prewarm(model: Model, transcript: Transcript)
+    func respond(
+        to request: LanguageModelExecutorGenerationRequest,
+        model: Model,
+        streamingInto channel: LanguageModelExecutorGenerationChannel
+    ) async throws
+}
+```
+
+**ポイント:**
+- `capabilities` は、ツール呼び出し、guided generation、推論など、モデルがサポートする能力を宣言します
+- `executorConfiguration` は、フレームワークが Executor を検索して作成するための設定キーで、ハッシュ可能である必要があります
+- `prewarm` は、最初のリクエスト前にモデルリソースを事前ロードするために使います
+- `respond` は中核となる生成メソッドで、ストリーミング出力に対応します
+
+### リソース管理とプリウォーム（[07:28](https://developer.apple.com/videos/play/wwdc2026/339/?time=448)）
+
+モデル重みの読み込みは高コストな処理です。フレームワークは事前準備のために `prewarm` という仕組みを提供します。
+
+```swift
+struct MyLanguageModelExecutor: LanguageModelExecutor {
+
+    private mutating func loadModelIfNeeded() throws -> LoadedWeights {
+        let weights = try loadedModel ?? loadWeights()
+        loadedModel = weights
+        return weights
+    }
+
+    func prewarm(transcript: Transcript) {
+        loadedModel = try? loadModelIfNeeded()
+    }
+
+    func respond(...) async throws {
+        let weights = try loadModelIfNeeded()
+        // ...weights を使って生成する...
+    }
+}
+```
+
+**ポイント:**
+- `prewarm` は最初のリクエスト前に呼ばれ、重みを事前ロードする最適なタイミングです
+- `prewarm` が呼ばれなくても、`loadModelIfNeeded` により読み込みは 1 回だけになります
+- 純粋なクラウドモデルなどのステートレスサービスでは、`prewarm` を何もしない実装にできます
+- Session が破棄されると、キャッシュされた Executor はすべて自動的に解放されます
+
+### セッション状態と KV キャッシュ（[12:22](https://developer.apple.com/videos/play/wwdc2026/339/?time=742)）
+
+フレームワークは設定ごとに Executor をキャッシュし、ステートフルな統合でネットワーク負荷を減らせるようにします。
+
+```swift
+// Executor は各呼び出しで完全な transcript を受け取る
+func respond(to request: ...) async throws {
+    let newTranscript = request.transcript
+
+    // 前回保存した transcript と比較する
+    if newTranscript.hasSamePrefix(as: previousTranscript) {
+        // 新しく追加された entries だけを処理する
+        await processOnlyNewEntries(newTranscript.suffix)
+    } else {
+        // transcript が変更または削除されたため、キャッシュを無効化する
+        invalidateKVCache()
+        await processFullTranscript(newTranscript)
+    }
+
+    previousTranscript = newTranscript
+}
+```
+
+**ポイント:**
+- 同じ設定の Model は、同じ Executor インスタンスを共有します
+- Executor は複数回の呼び出しの間で KV キャッシュを保持でき、重複計算を避けられます
+- 新旧の transcript の差分を比較し、新しく追加された内容だけを処理します
+- entries が削除または変更された場合、関連するキャッシュを無効化する必要があります
+
+### ストリーミング応答の出力（[11:47](https://developer.apple.com/videos/play/wwdc2026/339/?time=707)）
+
+フレームワークは特定の出力順序を求めます。これにより、開発者は重要な情報をすぐに受け取れます。
+
+```swift
+func respond(...) async throws {
+    // 1. 最初にメタデータを送信する
+    await channel.send(.response(action: .updateMetadata([
+        "modelID": "my-model-2026-06-08",
+        "requestID": request.id.uuidString
+    ])))
+
+    // 2. token 使用量を送信する
+    await channel.send(.response(action: .updateUsage(
+        input: .init(totalTokenCount: promptTokens, cachedTokenCount: cachedTokens),
+        output: .init(totalTokenCount: 0, reasoningTokenCount: 0)
+    )))
+
+    // 3. 生成された token をストリーミング送信する
+    for try await token in tokens {
+        await channel.send(.response(action: .appendText(token)))
+    }
+}
+```
+
+**ポイント:**
+- 先にメタデータを送信すると、開発者がログ記録やデバッグをしやすくなります
+- prompt token の課金情報を、ストリーム終了を待たずにすぐ送信します
+- text delta を 1 つずつ送信し、タイプライターのような表示を実現します
+- フレームワーク内部ではストリーミングイベントを集約し、単発呼び出し API としても提供します
+
+### エラー処理（[13:33](https://developer.apple.com/videos/play/wwdc2026/339/?time=813)）
+
+モデルが開発者のリクエストを満たせない場合、Executor は可能な限り近似するか、明確なエラーを投げるべきです。
+
+```swift
+// 開発者は greedy sampling を指定したが、サービスは temperature だけをサポートしている
+if request.generationOptions.sampling?.kind == .greedy {
+    serviceRequest.temperature = 0
+}
+
+// token 予算が小さすぎて schema を満たせない
+if let schema = request.schema,
+   let budget = request.generationOptions.maximumResponseTokens,
+   budget < minimumTokens(for: schema) {
+    throw LanguageModelError.unsupportedCapability(
+        .init(
+            capability: .guidedGeneration,
+            debugDescription: "Token budget too small to satisfy this schema."
+        )
+    )
+}
+```
+
+**ポイント:**
+- 開発者の意図を保つため、まずは近似処理を優先します
+- 近似できない場合は、組み込みの `LanguageModelError` 型を使います
+- 組み込みエラーには、コンテキスト超過、レート制限、拒否、ガードレール違反、未サポート能力などがあります
+- サービス固有のエラーはカスタム型にできますが、できるだけ組み込み型を再利用します
+
+### カスタム Segment（[17:05](https://developer.apple.com/videos/play/wwdc2026/339/?time=1025)）
+
+カスタム Segment により、音声やビデオなど、新しい入出力モダリティをモデルでサポートできます。
+
+```swift
+// カスタム segment を定義する
+public struct AudioSegment: Transcript.CustomSegment {
+    public var id: String
+    public var content: URL
+}
+
+// 開発者は prompt 内で直接使える
+let recording = AudioSegment(id: UUID().uuidString, content: URL(filePath: "/path/to/recording.m4a"))
+let response = try await session.respond {
+    "フランク・ロイド・ライトの最初の建築学校はどこにありましたか？"
+    recording
+}
+
+// Executor はカスタム segment を受け取り、返す
+for try await event in stream {
+    switch event {
+    case .audioFileGenerated(let file):
+        await channel.send(.response(action: .updateCustomSegment(
+            AudioSegment(id: file.id, content: file.url)
+        )))
+    }
+}
+```
+
+**ポイント:**
+- `CustomSegment` は `PromptRepresentable` である必要があり、prompt 内で直接使えます
+- Executor は transcript を通じてカスタム segment を受け取ります
+- 同じ channel を使って、カスタム segment をストリーミングで返します
+- segment ID は、新規追加なのか既存 segment の更新なのかを制御します
+
+### サーバーサイドツール（[18:09](https://developer.apple.com/videos/play/wwdc2026/339/?time=1089)）
+
+サーバーサイドツールは、Web 検索やコード実行など、モデルがサーバー上で自律的に実行する能力です。
+
+```swift
+// モデル上でサーバーサイドツールを宣言する
+public struct MyLanguageModel: LanguageModel {
+    public struct ServerTool: Sendable {
+        public static let webSearch: ServerTool = ...
+    }
+    public init(serverTools: [ServerTool] = []) { }
+}
+
+// Executor はツール結果を受け取り、転送する
+let client = MyServerClient(serverTools: model.serverTools)
+let response = try await client.send(prompt: .init(request))
+for try await chunk in response {
+    switch chunk {
+    case .webSearch(let webSearch):
+        await channel.send(.response(action: .updateCustomSegment(
+            WebSearchSegment(url: webSearch.url, content: webSearch.html)
+        )))
+    case .textDelta(let textDelta):
+        await channel.send(.response(action: .appendText(
+            textDelta.text, tokenCount: textDelta.tokenCount
+        )))
+    }
+}
+```
+
+**ポイント:**
+- サーバーサイドツールは、モデル上の名前付き型として宣言します
+- 表示レベルは 3 種類あります。回答のみ、メタデータ付き回答、完全な出力です
+- カスタム segment を使って、ツールの構造化出力を渡します
+- メタデータは text segment に付加されるため、引用元を扱いやすくなります
+
+## 重要な着想
+
+1. **複数モデル A/B テストツール**
+   - 統一された `LanguageModel` API を基盤に、モデル切り替えと比較テストの UI を実装する
+   - `updateMetadata` からモデル識別子とパフォーマンス指標を取り出す
+   - 入口: `LanguageModelSession` の `respond` メソッド
+
+2. **ローカル優先のハイブリッド推論エンジン**
+   - 簡単なタスクはローカルモデルで処理し、複雑なタスクはクラウドモデルで処理する
+   - `transcript` の長さと `contextOptions` に基づいて動的にルーティングする
+   - `prewarm` で 2 つのモデルを事前ロードし、シームレスな切り替えを実現する
+
+3. **音声対話アプリ**
+   - `CustomSegment` を使って音声の入力と出力をサポートする
+   - `AudioInputSegment` と `AudioOutputSegment` を定義する
+   - モデルがテキストを生成した後、TTS を並行して呼び出し、音声 segment を返す
+
+4. **引用付き検索拡張生成**
+   - サーバーサイド Web 検索ツールを実装する
+   - 検索結果と引用リンクをカスタム segment として返す
+   - UI 内で引用元をハイライト表示する
+
+5. **推論コスト監視ダッシュボード**
+   - `updateUsage` イベントから token 使用量データを収集する
+   - セッションとモデル種別ごとに統計をグループ化する
+   - カスタム metadata で各リクエストの遅延とスループットを追跡する
+
+## 関連 Session
+
+- [241 - Foundation Models](/articles/wwdc2026-241) - Foundation Models フレームワークの概要
+- [242 - エージェント型アプリ](/articles/wwdc2026-242) - 複数ステップでツールを使うワークフローを構築する
+- [324 - Core AI](/articles/wwdc2026-324) - ローカル AI モデルをアプリに統合する
+- [325 - Core AI の最適化](/articles/wwdc2026-325) - ローカル AI モデルのパフォーマンスを最適化する
+- [347 - agentic アプリのセキュリティ](/articles/wwdc2026-347) - agentic アプリの安全性を守る

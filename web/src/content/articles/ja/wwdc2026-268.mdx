@@ -1,0 +1,386 @@
+---
+title: "Profile、修正、検証：Instruments でアプリの応答性を改善する"
+description: "Swift Concurrency instrument、Time Profiler、System Trace を使ってボトルネックを特定する方法を紹介します。Top Functions と Run Comparison で改善を測定し、修正が効いたことを確認する方法も学べます。"
+date: "2026-06-10"
+tags: ["Instruments", "Swift Concurrency", "Time Profiler", "パフォーマンス", "OSSignpost"]
+thumbnail: "/images/sessions/2026/268.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/268/"
+sessionId: "wwdc2026-268"
+year: "2026"
+relatedSessions:
+  - title: "243 - Instruments の新機能"
+    code: "243"
+    description: "Instruments 27 の新機能全体の概要"
+  - title: "267 - Swift Testing の新機能"
+    code: "267"
+    description: "Swift Testing とパフォーマンステストの組み合わせ"
+  - title: "262 - Swift の新機能"
+    code: "262"
+    description: "generics と existential の進化を含む Swift 言語の新機能"
+  - title: "258 - Xcode 27 の新機能"
+    code: "258"
+    description: "Xcode 27 の Coding Assistant とパフォーマンス分析ワークフロー"
+  - title: "259 - Xcode 27 の agents で開発を加速する"
+    code: "259"
+    description: "この session で触れられている Coding Assistant は、existential を多用したコードを自動でリファクタリングできる"
+---
+
+## ハイライト
+
+> Instruments 27 は Top Functions ビュー、Run Comparison、Swift Executors instrument を導入します。OSSignpost でビジネス区間をマーキングすることで、CPU 飽和、executor の取り合い、システムブロックという三種類のカクつきを、手順に沿って診断できます。
+
+## 主要内容
+
+### あるノート App の三つのカクつき
+
+発表者は実際のノート App を例にしました。この App は手書き、画像の挿入、投げ縄ツールでの移動をサポートしています。テスト中に三つの問題が見つかりました。ノート保存後に Apple Pencil の応答が遅れる、ノート一覧のスクロールでフレーム落ちする、投げ縄ツールが固まって動かない、というものです。
+
+この三つの問題は、それぞれ異なる性能上の根本原因に対応しており、必要な診断の考え方も異なります。
+
+### 診断のメンタルモデル
+
+([01:46](https://developer.apple.com/videos/play/wwdc2026/268/?time=106))
+
+Instruments 27 は、四つのステップからなる診断フローを示します。
+
+1. **CPU 飽和** — メインスレッドの CPU が 100% まで上がっている場合、コード自体の実行が遅すぎます
+2. **サンプリングデータの可視化** — Call Tree、Flame Graph、Top Functions で時間のかかる関数を見つけます
+3. **executor の取り合い** — 複数のタスクが Main Actor のリソースを奪い合っています
+4. **システムブロック** — CPU は空いているのに App が停止し、メインスレッドがファイル I/O、同期 lock、IPC を待っています
+
+最初の一歩は必ず Time Profiler です。カクつきの間、メインスレッドの CPU 使用率を見ます。高ければアルゴリズムの問題、低ければブロックの問題です。この判断が、次に使うべきツールを直接決めます。
+
+### 問題1：投げ縄ツールのカクつき — Existential のランタイムコスト
+
+([05:37](https://developer.apple.com/videos/play/wwdc2026/268/?time=337))
+
+発表者はまず、投げ縄選択のロジック全体を OSSignpost の時間区間で囲みました。
+
+```swift
+import os.signpost
+
+let signposter = OSSignposter(subsystem: "デモ App", category: .pointsOfInterest)
+var lassoIntervalState: OSSignpostIntervalState? = nil
+
+func lassoSelectionUpdated() {
+    lassoIntervalState = signposter.beginInterval("投げ縄選択")
+    // キャンバス内の選択を更新する...
+}
+
+func lassoSelectionEnded() {
+    // 投げ縄選択を確定する...
+    signposter.endInterval("投げ縄選択", lassoIntervalState!)
+}
+```
+
+重要な点：
+
+- `OSSignposter` の `subsystem` を App 名に、`category` を `.pointsOfInterest` に設定すると、Instruments は Points of Interest track に自動表示します
+- `beginInterval` と `endInterval` は必ず対で呼び出します。対になっていない場合、区間は trace の終端まで伸びます
+- context menu から、その区間に対応する時間範囲へ直接フィルタできます
+
+フィルタ後、メインスレッド CPU はほぼ 100% でした。つまりコードの実行が遅すぎる問題です。Time Profiler の Top Functions ビューに切り替えると、最も時間を使っていた関数は `swift_project_boxed_opaque_existential` でした。
+
+この runtime 関数は、existential、つまり `any Foo` 型の値を展開します。existential の具体型はコンパイル時に不明なため、実行時に追加のメモリレイアウト処理と動的ディスパッチが必要になります。
+
+([12:11](https://developer.apple.com/videos/play/wwdc2026/268/?time=731))
+
+発表者は三つの代替案を示しました。
+
+```swift
+// 案1：Concrete types。直接 overload する
+func bar(_ a: TypeA) { }
+func bar(_ b: TypeB) { }
+
+// 案2：Generics。コンパイル時に型を確定する
+func bar<T: Foo>(_ generic: T) { }
+
+// 案3：Enum。プロトコルを associated value で置き換える
+enum Foo {
+    case a(TypeA)
+    case b(TypeB)
+}
+func bar(_ enum: Foo) { }
+```
+
+重要な点：
+
+- `any Foo`（existential）は実行時に動的な展開が必要で、`swift_project_boxed_opaque_existential` の呼び出しコストを生みます
+- concrete types と generics は、コンパイラがコンパイル時に型を確定できるため、動的ディスパッチを消せます
+- enum の associated value パターンは、型の集合が固定され、列挙できる場面に向いています
+
+### Run Comparison：修正効果を検証する
+
+([13:30](https://developer.apple.com/videos/play/wwdc2026/268/?time=810))
+
+Instruments 27 は Run Comparison 機能を追加しました。最適化前後の二つの trace を同じドキュメントに入れて比較できます。緑は性能改善、赤は回帰を示します。
+
+比較結果では、`swift_project_boxed_opaque_existential` の呼び出しが完全に消え、全体の実行時間も短くなっていました。新しく導入した generic 関数は回帰として表示されましたが、全体の利得は新しいコストを上回りました。
+
+### 問題2：スクロールのフレーム落ち — thumbnail 描画が Main Actor を占有する
+
+([16:32](https://developer.apple.com/videos/play/wwdc2026/268/?time=992))
+
+Swift Executors instrument は Instruments 27 の新しいツールで、Main Actor、global concurrent executor、custom executor 上で実行されるタスクを可視化します。
+
+Main Actor track には、複数の `renderThumbnail` タスクが見つかりました。それぞれ数百ミリ秒かかっています。これらのタスクは SwiftUI から呼ばれ、暗黙に Main Actor コンテキストを継承していたため、UI 更新をブロックしていました。
+
+([18:29](https://developer.apple.com/videos/play/wwdc2026/268/?time=1109))
+
+修正方法は、`Task` クロージャに `@concurrent` を付けることです。
+
+```swift
+let drawingData = note.drawingData
+let canvasImages = note.decodeCanvas()
+
+thumbnail = await Task(name: "サムネイルをレンダリング") { @concurrent in
+    await renderThumbnail(
+        drawingData: drawingData,
+        canvasImages: canvasImages,
+        size: CGSize(width: 300, height: 240)
+    )
+}.value
+```
+
+重要な点：
+
+- `Task { }` はデフォルトで呼び出し元の Actor コンテキストを継承するため、SwiftUI から呼ぶと Main Actor に残ります
+- `@concurrent` はタスクを global concurrent executor へ明示的にルーティングし、Main Actor を解放します
+- Swift コンパイラは `@concurrent` クロージャ内のデータ競合をチェックします
+- Main Actor から外すと、複数の thumbnail 描画を並列実行できます
+
+### 問題3：保存時のカクつき — 同期ファイル I/O がメインスレッドをブロックする
+
+([19:25](https://developer.apple.com/videos/play/wwdc2026/268/?time=1165))
+
+ノート保存時に UI が短時間停止しました。Time Profiler ではメインスレッド CPU が約 20% しかありませんでした。これは典型的なシステムブロックです。
+
+System Trace に切り替えると、Inspector パネルはメインスレッドが `write` システムコールを実行し、1.7 GB のデータを書き込もうとしていることを示しました。この操作には 500 ミリ秒以上かかり、そのうち約 300 ミリ秒はディスク応答待ちでした。
+
+([24:25](https://developer.apple.com/videos/play/wwdc2026/268/?time=1465))
+
+修正方法は、ファイル書き込みをバックグラウンド Task へ移すことです。
+
+```swift
+Task { @concurrent in
+    let encoder = PropertyListEncoder()
+    encoder.outputFormat = .binary
+    guard let data = try? encoder.encode(snapshots) else { return }
+    let id = signposter.beginInterval("ファイルへ書き込み")
+    try? data.write(to: fileURL, options: .atomic)
+    signposter.endInterval("ファイルへ書き込み", id)
+}
+```
+
+重要な点：
+
+- `Data.write(to:options: .atomic)` は同期呼び出しで、ディスク操作が終わるまで現在のスレッドをブロックします
+- `.atomic` オプションは一度一時ファイルを書いてから rename するため、I/O コストが増えます
+- エンコードと書き込みの両方を `@concurrent` Task で包むと、メインスレッドはすぐ戻り、UI の応答性が保たれます
+- 検証時には System Trace で、`write` syscall がメインスレッドからバックグラウンドスレッドへ移ったことを確認できます
+
+## 詳細
+
+### OSSignpost でビジネス区間をマーキングする
+
+([04:50](https://developer.apple.com/videos/play/wwdc2026/268/?time=290))
+
+Instruments でカクつきを見つける最初の一歩は、重要なビジネス経路に時間マーカーを付けることです。OSSignposter は Points of Interest track にカスタム区間を表示し、後続のフィルタリングと比較を簡単にします。
+
+```swift
+import os.signpost
+
+let signposter = OSSignposter(
+    subsystem: "com.example.NotebookApp",
+    category: .pointsOfInterest
+)
+
+class CanvasViewController {
+    var lassoIntervalState: OSSignpostIntervalState?
+
+    func lassoSelectionUpdated() {
+        lassoIntervalState = signposter.beginInterval("投げ縄選択")
+        // すべての筆画を走査し、投げ縄パスと交差するかを判定する
+        for stroke in allStrokes {
+            if lassoPath.intersects(stroke.boundingRect) {
+                selectedStrokes.insert(stroke)
+            }
+        }
+    }
+
+    func lassoSelectionEnded() {
+        // 投げ縄選択を完了し、選択された筆画をハイライトする
+        highlightSelectedStrokes()
+        signposter.endInterval("投げ縄選択", lassoIntervalState!)
+    }
+}
+```
+
+重要な点：
+
+- `OSSignposter` の `subsystem` には `com.example.NotebookApp` のような reverse-DNS 形式を使い、`category` を `.pointsOfInterest` に設定すると、Instruments が Points of Interest track に色付きの区間バーを自動描画します
+- `beginInterval` が返す `OSSignpostIntervalState` はインスタンス変数に保存し、`endInterval` が正しい区間を閉じられるようにします。対で呼ばない場合、区間は trace の終端まで伸びます
+- Instruments で Points of Interest track の区間を右クリックし、"Set Inspection Range" を選ぶと、その時間帯のサンプリングデータだけを分析でき、無関係なノイズを除外できます
+
+### `@concurrent` で thumbnail 描画を Main Actor から追い出す
+
+([18:29](https://developer.apple.com/videos/play/wwdc2026/268/?time=1109))
+
+SwiftUI ビューから起動した `Task { }` は、デフォルトで呼び出し元の Actor コンテキストを継承します。呼び出し元が `@MainActor` の ViewModel や View body のように Main Actor 上にある場合、Task も Main Actor 上で実行され、UI 更新をブロックします。
+
+```swift
+// 問題のあるコード：Task が暗黙に Main Actor を継承し、スクロールのフレーム落ちを起こす
+func updateThumbnail() async {
+    let drawingData = note.drawingData
+    let canvasImages = note.decodeCanvas()
+
+    // 誤り：@concurrent がないため、タスクは Main Actor に残る
+    thumbnail = await Task(name: "サムネイルをレンダリング") {
+        await renderThumbnail(
+            drawingData: drawingData,
+            canvasImages: canvasImages,
+            size: CGSize(width: 300, height: 240)
+        )
+    }.value
+}
+
+// 修正後のコード：@concurrent がタスクを global concurrent executor へルーティングする
+func updateThumbnailFixed() async {
+    let drawingData = note.drawingData
+    let canvasImages = note.decodeCanvas()
+
+    thumbnail = await Task(name: "サムネイルをレンダリング") { @concurrent in
+        await renderThumbnail(
+            drawingData: drawingData,
+            canvasImages: canvasImages,
+            size: CGSize(width: 300, height: 240)
+        )
+    }.value
+}
+```
+
+重要な点：
+
+- `Task { }` はデフォルトで呼び出し元の Actor コンテキストを継承するため、SwiftUI から呼ぶと Main Actor に残ります。Swift Executors instrument の Main Actor track には、直列実行される複数の `renderThumbnail` タスクが表示されます
+- `@concurrent` はタスクを global concurrent executor へ明示的にルーティングし、Main Actor を解放します。複数の thumbnail 描画を並列実行でき、UI 更新はブロックされなくなります
+- クロージャ前の `drawingData` と `canvasImages` は値型（`Data` と `[UIImage]`）で、値として capture してもデータ競合は起きません。Swift コンパイラは `@concurrent` クロージャ内の Actor をまたぐデータ競合をチェックします
+- 検証方法：Swift Executors instrument で Main Actor track から `renderThumbnail` タスクが消え、Global Concurrent Executor track に対応タスクが現れるかを確認します
+
+### 同期ファイル I/O をバックグラウンドスレッドへ移す
+
+([24:25](https://developer.apple.com/videos/play/wwdc2026/268/?time=1465))
+
+ノート保存時に `Data.write(to:options:)` を直接呼ぶと、ディスク操作が完了するまで現在のスレッドがブロックされます。本例の 1.7 GB のノートデータのような大きなファイルでは、メインスレッドが数百ミリ秒停止します。
+
+```swift
+// 問題のあるコード：同期書き込みがメインスレッドをブロックする
+func saveNote() {
+    let encoder = PropertyListEncoder()
+    encoder.outputFormat = .binary
+    guard let data = try? encoder.encode(snapshots) else { return }
+    // ブロックする！メインスレッドが write syscall の戻りを待つ
+    try? data.write(to: fileURL, options: .atomic)
+}
+
+// 修正後のコード：エンコードと書き込みの両方を @concurrent Task へ移す
+func saveNoteFixed() {
+    Task { @concurrent in
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        guard let data = try? encoder.encode(snapshots) else { return }
+
+        let id = signposter.beginInterval("ファイルへ書き込み")
+        try? data.write(to: fileURL, options: .atomic)
+        signposter.endInterval("ファイルへ書き込み", id)
+    }
+}
+```
+
+重要な点：
+
+- `Data.write(to:options: .atomic)` は同期呼び出しで、`.atomic` オプションは一度一時ファイルを書き込み、その後 `rename` システムコールを実行するため、追加の I/O コストが発生します
+- エンコードと書き込みを `@concurrent` Task で包むと、メインスレッドは `Task { }` 作成後すぐ戻り、UI の応答性が保たれます。実際の I/O 操作はバックグラウンドスレッドで実行されます
+- System Trace で検証します。メインスレッドの Blocked 区間を選択したとき、Inspector パネルに `write` syscall が表示されないはずです。バックグラウンドスレッドの Running 区間には `write` 呼び出しが現れ、引数として書き込み先のファイルパスとデータサイズが表示されます
+- 保存操作の成功/失敗を UI へ返す必要がある場合は、`Task { @concurrent in ... }` と `await` を組み合わせるか、`Task.detached` と callback を使います。ただし `@concurrent` クロージャ内で `@MainActor` 隔離状態を直接変更しないでください
+
+### Time Profiler の三つのビュー
+
+([07:23](https://developer.apple.com/videos/play/wwdc2026/268/?time=443))
+
+Time Profiler はハードウェアタイマーを使い、1ミリ秒間隔で各 CPU core の call stack をサンプリングします。同じ関数が異なる呼び出し経路に現れる場合、Call Tree では分散して表示されます。
+
+Flame Graph は呼び出しツリーを空間的なブロックへ写像します。垂直軸は call stack の深さ、水平軸は総 CPU 時間です。幅の広いバーは高頻度で現れる関数を表し、ホットなコードパスをひと目で見つけられます。
+
+ただし Flame Graph は、`swift_retain` のような Swift runtime 関数には向いていません。これらの関数は大量の呼び出し点に小さく分散し、全体コストを判断しにくくなります。
+
+Top Functions モードはこの問題を解決します。呼び出し階層を捨て、self weight、つまり関数自身の命令実行にかかった時間で、分散したノードを結合します。左側には並べ替えられた関数一覧があり、右側には選択した関数のすべての呼び出し経路の Flame Graph が表示されます。
+
+### System Trace とスレッド状態
+
+([20:37](https://developer.apple.com/videos/play/wwdc2026/268/?time=1237))
+
+System Trace は、OS がいつ、なぜ App を一時停止させたかを可視化します。スレッドには三つの状態があります。
+
+- **Running**：CPU core 上で actively に実行中
+- **Blocked**：リソース待ちで、kernel によって CPU から外されている
+- **Runnable**：リソースは準備済みで、OS scheduler が CPU core を割り当てるのを待っている
+
+Inspector パネルには、システムコールの引数、つまりファイルディスクリプタ、メモリアドレス、データサイズが表示されます。syscall 区間を選択すると、実線部分は on-core 実行時間、半透明部分は off-core のブロック時間を表します。
+
+### 重要な設定の注意点
+
+([03:24](https://developer.apple.com/videos/play/wwdc2026/268/?time=204))
+
+- Profiling は必ず Release ビルドで行います。Debug ビルドはコンパイラ最適化を無効化し、大量の runtime check を挿入するため、測定データが判断を誤らせます
+- Swift Concurrency template には Time Profiler が含まれており、並行タスクと CPU サンプリングを同時に観察できます
+- OSSignpost の区間マーカーは Run Comparison の比較をより正確にし、ノイズの影響を避けます
+
+## 重要な示唆
+
+**1. 重要なビジネス経路に OSSignpost 区間を追加する**
+
+何をするか：App のネットワークリクエスト、データベースクエリ、複雑な描画、ファイル読み書きなどの重要な経路を `beginInterval`/`endInterval` で囲みます。
+
+なぜ価値があるか：マーカーのない trace は混沌として読みにくいですが、マーカーがあればビジネス区間へ直接フィルタでき、Run Comparison と組み合わせて各最適化の効果を正確に測れます。
+
+どう始めるか：App 起動時に `OSSignposter` を初期化し、重要な関数の入口で `beginInterval`、出口で `endInterval` を呼びます。
+
+**2. コード内の `any` プロトコル型を監査する**
+
+何をするか：高頻度で呼ばれる関数をスキャンし、`any SomeProtocol` パラメータがないか確認します。描画、アニメーション、ジェスチャ処理のような性能に敏感な経路では、concrete types、generics、enum associated value に置き換えます。
+
+なぜ価値があるか：`swift_project_boxed_opaque_existential` のような runtime コストは一回の呼び出しでは目立ちませんが、高頻度ループでは蓄積して明らかなカクつきになります。
+
+どう始めるか：Instruments の Top Functions ビューで App の中核インタラクション経路を一度実行し、Swift runtime 関数が上位に出ていないか確認します。
+
+**3. `@concurrent` で計算タスクを Main Actor から外す**
+
+何をするか：SwiftUI から起動されるすべての `Task { }` クロージャを確認します。中に画像デコード、データシリアライズ、複雑なレイアウト計算など重い処理がある場合、`@concurrent` を追加します。
+
+なぜ価値があるか：Swift Concurrency の暗黙の Actor 継承により、Main Actor のブロックは見落としやすくなっています。Swift Executors instrument はこの問題を可視化し、`@concurrent` は標準的な修正方法です。
+
+どう始めるか：Xcode で `Task {` を検索し、`@concurrent` がないものを中心に、クロージャの内容を一つずつ確認します。
+
+**4. システムブロックのチェックリストを作る**
+
+何をするか：App がカクつくのに Time Profiler で CPU が低い場合、System Trace に切り替え、次の順で確認します。ファイル I/O（`write`/`read` syscall）、同期 lock（`pthread_mutex_lock`）、IPC（XPC / `mach_msg`）。
+
+なぜ価値があるか：この種の問題は Time Profiler では見えませんが、System Trace と Inspector パネルなら具体的な syscall と引数まで直接特定できます。
+
+どう始めるか：Instruments で System Trace template を選択し、カクつきの場面を再現し、Inspector で Blocked 区間の syscall 詳細を確認します。
+
+**5. Run Comparison をコードレビューの流れに入れる**
+
+何をするか：性能最適化 PR には毎回、最適化前後の Instruments Run Comparison スクリーンショットを添付します。
+
+なぜ価値があるか：性能最適化は回帰を起こしやすい作業です。Run Comparison の緑/赤の可視化により、最適化効果がひと目で分かり、チームメンバーも変更の影響を理解しやすくなります。
+
+どう始めるか：Instruments で二つの trace を開き、compare ボタンをクリックして baseline run を選び、flame graph スクリーンショットを書き出します。
+
+## 関連セッション
+
+- [243 - Instruments の新機能](/articles/wwdc2026-243) — Instruments 27 の新機能全体の概要
+- [267 - Swift Testing の新機能](/articles/wwdc2026-267) — Swift Testing とパフォーマンステストの組み合わせ
+- [262 - Swift の新機能](/articles/wwdc2026-262) — generics と existential の進化を含む Swift 言語の新機能
+- [258 - Xcode 27 の新機能](/articles/wwdc2026-258) — Xcode 27 の Coding Assistant とパフォーマンス分析ワークフロー
+- [259 - Xcode 27 の agents で開発を加速する](/articles/wwdc2026-259) — この session で触れられている Coding Assistant は、existential を多用したコードを自動でリファクタリングできる

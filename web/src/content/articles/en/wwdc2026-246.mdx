@@ -1,0 +1,377 @@
+---
+title: "LLM search using Core Spotlight"
+description: "Learning"
+date: "2026-06-10"
+tags: ["Core Spotlight", "Foundation Models", "RAG", "Tool Calling", "Apple Intelligence"]
+thumbnail: "/images/sessions/2026/246.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/246/"
+sessionId: "wwdc2026-246"
+year: "2026"
+relatedSessions:
+  - title: "Deep dive into the Foundation Models framework"
+    code: "241"
+    description: "A detailed look at tool calling, Guided Generation, and Generable types"
+  - title: "Build agentic apps with Foundation Models"
+    code: "242"
+    description: "Complete practices for building agentic apps, including more complex tool orchestration"
+  - title: "Create robust evaluations for an agentic app"
+    code: "299"
+    description: "Deep usage of the Evaluations framework, including large-scale dataset generation and custom metrics"
+  - title: "Swift Testing"
+    code: "267"
+    description: "The basics of writing and running automated tests"
+---
+
+## Highlight
+
+> Apple connects Core Spotlight indexes directly to Foundation Models tool calling. Developers only need to donate `CSSearchableItem` values and attach `SpotlightSearchTool`; the large language model can then retrieve local data and generate answers automatically, without a custom vector database or handwritten RAG pipeline.
+
+## Core Content
+
+### From Handwritten Search Queries to Letting the Model Find Answers
+
+Previously, if you wanted AI Q&A over local app data, you had to build a vector database, generate embeddings, assemble prompts, and stuff retrieved results into the model context. That workflow involved a lot of engineering, and it was especially hard to run efficiently on device.
+
+Apple now provides a shorter path. `SpotlightSearchTool` conforms to the Foundation Models Tool protocol, letting the model search your app's Core Spotlight index directly. The model decides when to search and what to search for, then uses the returned results as context to generate an answer.
+
+([00:07](https://developer.apple.com/videos/play/wwdc2026/246/?time=7)) The session uses a hiking app as the example. The user has completed several hikes and written notes in the app after each one. When the user asks, "Which hikes have I gone on?", the model needs to search properties such as completion date and location to compose an answer.
+
+([00:54](https://developer.apple.com/videos/play/wwdc2026/246/?time=54)) Without `SpotlightSearchTool`, developers can only ask the model to guess from world knowledge. With it, the model calls the tool to generate a search query, Spotlight executes the query and returns result descriptions, and the model generates its answer from real data.
+
+### Handling Token Limits on On-Device Models
+
+On-device models have much smaller context windows than cloud models. If you feed the model every piece of metadata in the Spotlight index, the context may be truncated, and inference speed may drop sharply.
+
+Apple's answer is `GuidanceProfile`. It lets developers precisely control which search capabilities are exposed to the model and which attributes can participate in reasoning.
+
+([08:42](https://developer.apple.com/videos/play/wwdc2026/246/?time=522)) For example, if a hiking app does not donate people relationships, you can disable `people` search and keep only core attributes such as `title`, `altitude`, and `completionDate`. For on-device models with tighter context limits, you can use the `.focused(.items)` level directly, returning only the most compact data.
+
+This is an explicit tradeoff: you give up the model's "global view" in exchange for usable on-device inference. It also means the metadata you donate to Spotlight needs to be clean and structured from the beginning.
+
+### The Index Stores Summaries, but the Model Needs Complete Data
+
+To save space, Spotlight stores text content and HTML in compact formats. They are searchable, but not directly readable. After the model finds an item ID through the tool, developers need to provide the full data.
+
+([06:24](https://developer.apple.com/videos/play/wwdc2026/246/?time=384)) `CSSearchableIndexDelegate` adds a `searchableItems(forIdentifiers:)` method. After the model finds an ID, it calls this method. The developer fetches the complete entity from their own database, such as SwiftData or Core Data, builds a `CSSearchableItem`, and returns it. This lets the model efficiently manage result sets with millions of items while still seeing full metadata when needed.
+
+### Break Complex Queries into Pipelines
+
+Some questions cannot be answered with a single search. For example, "How many miles did I hike on average each month this year?" requires the model to search completed hikes, group them by month, and calculate an average.
+
+([09:46](https://developer.apple.com/videos/play/wwdc2026/246/?time=586)) `SpotlightSearchTool` supports pipeline search. The model breaks a complex query into stages: search first, then count and build a table, then calculate the average. Each stage runs inside Spotlight, avoiding the need to pull large amounts of data back into the model context.
+
+([11:34](https://developer.apple.com/videos/play/wwdc2026/246/?time=694)) Developers can also register custom pipeline stages. For example, a hiking app could score notes by "happiness." The model calls that stage inside the pipeline and generates an answer only from high-scoring results. Custom stages use `@Generable`, allowing the model to generate call parameters dynamically from the user's prompt.
+
+### Use the Evaluations Framework to Verify Answer Quality
+
+AI answer quality cannot be checked manually one example at a time. Apple provides the Evaluations framework so developers can automate tests for tool-calling trajectories and result coverage.
+
+([13:47](https://developer.apple.com/videos/play/wwdc2026/246/?time=827)) Developers define a test dataset containing user questions, expected search result IDs, and expected tool-call trajectories. During the test run, the data is first donated to Spotlight, then the model answers the question, and finally the test checks whether the returned results cover the expected items.
+
+## Details
+
+### Basic Integration: One Line Lets an LLM Search Your App Data
+
+([04:20](https://developer.apple.com/videos/play/wwdc2026/246/?time=260)) The default configuration of `SpotlightSearchTool` searches the app's Core Spotlight index:
+
+```swift
+import CoreSpotlight
+import FoundationModels
+
+// Default configuration: searches the app's Core Spotlight index
+let tool = SpotlightSearchTool()
+
+// Or search only file paths in the app sandbox
+let fileTool = SpotlightSearchTool(
+    configuration: .init(
+        sources: [.files]
+    )
+)
+```
+
+**Key points:**
+- `SpotlightSearchTool()` works without parameters, as long as the app has already donated `CSSearchableItem` values
+- `sources: [.files]` limits the search scope to file paths, which is suitable for document-style apps
+
+([04:50](https://developer.apple.com/videos/play/wwdc2026/246/?time=290)) Add the tool to a `LanguageModelSession`:
+
+```swift
+let tool = SpotlightSearchTool()
+
+let session = LanguageModelSession(
+    model: model,
+    tools: [tool],
+    instructions: instructions
+)
+
+let response = try await session.respond(to: "What hikes have I gone on?")
+```
+
+**Key points:**
+- The `tools` array can contain multiple tools; the model decides which one to call
+- The model may call `SpotlightSearchTool` multiple times in a single response, using `queryToken` to distinguish calls
+
+### Load Complete Data on Demand: Implement an Index Delegate
+
+([06:24](https://developer.apple.com/videos/play/wwdc2026/246/?time=384)) When the model needs complete metadata, it asks the app through the delegate:
+
+```swift
+import CoreSpotlight
+
+class IndexDelegate: NSObject, CSSearchableIndexDelegate {
+
+    // After the model finds an ID, this method is called to fetch the complete CSSearchableItem
+    func searchableItems(forIdentifiers identifiers: [String]) async -> [CSSearchableItem] {
+        let entries = await mystore.fetchEntries(ids: identifiers)
+        return entries.map { makeSearchableItem(from: $0) }
+    }
+}
+```
+
+**Key points:**
+- This method is called on a background thread; if the database query takes too long, model inference can time out
+- The returned `CSSearchableItem` can include extra attributes that are not in the index and are provided specifically for model reasoning
+- This is a good place to put metadata that is not suitable for search but is useful for model understanding, such as long-form notes
+
+### Use queryToken to Manage Search Result Streams
+
+([07:37](https://developer.apple.com/videos/play/wwdc2026/246/?time=457)) The model may call the tool multiple times, producing a batch of results each time. Use `queryToken` to distinguish them:
+
+```swift
+let tool = SpotlightSearchTool()
+
+for await reply in tool.searchResults {
+
+    if reply.queryToken != currentToken {
+        // New search call; reset the UI list
+        currentToken = reply.queryToken
+    }
+
+    switch reply.content {
+    case .items(let searchItems):
+        // Append to the current list
+        displayItems.append(contentsOf: searchItems)
+    }
+}
+```
+
+**Key points:**
+- `searchResults` is an `AsyncSequence`, and results arrive in batches
+- Each new tool call from the model changes `queryToken`, so the UI needs to decide whether to append or reset based on it
+- Ignoring `queryToken` can mix data from different search batches
+
+### Precisely Control Search Capabilities Visible to the Model
+
+([08:42](https://developer.apple.com/videos/play/wwdc2026/246/?time=522)) `GuidanceProfile` decides which search functions the model can use:
+
+```swift
+let profile = SpotlightSearchTool.GuidanceProfile(
+    textMatch: true,
+    dates: true,
+    people: false,
+    attributes: [.title, .altitude, .completionDate]
+)
+
+let tool = SpotlightSearchTool(
+    configuration: .init(
+        guide: .init(level: .dynamic(profile))
+    )
+)
+
+// On-device models have smaller contexts; use the focused level
+let focusedTool = SpotlightSearchTool(
+    configuration: .init(
+        guide: .init(level: .focused(.items))
+    )
+)
+```
+
+**Key points:**
+- `textMatch` controls whether text-match search is allowed
+- `dates` and `people` control whether filtering by date or person is allowed
+- `attributes` lists exactly which metadata attributes the model can see; omitted attributes do not enter the model context
+- `.focused(.items)` is the most compact mode, returning only the items themselves without extra metadata
+
+### Custom Pipeline Stages: Let Spotlight Do App-Specific Computation
+
+([11:34](https://developer.apple.com/videos/play/wwdc2026/246/?time=694)) Register a custom stage so Spotlight can run app-specific computation inside the search pipeline:
+
+```swift
+import CoreSpotlight
+import FoundationModels
+
+@Generable
+struct HappinessStage: CustomStage {
+    static var name = "happiness"
+    static var description = "Scores hike by how happy the author was"
+    static var inputTypes: [SearchPipelineDataType] = [.items]
+    static var outputTypes: [SearchPipelineDataType] = [.scoredItems]
+
+    @Guide(description: "Minimum happiness score (0.0-1.0) to include in results")
+    var threshold: Double?
+
+    func execute(on input: SearchPipelineData) async throws -> SearchPipelineData {
+        // Extract notes from items and run sentiment analysis
+        let scored = input.items.map { item in
+            let score = sentimentScore(for: item.attributeSet.contentDescription)
+            return ScoredItem(item: item, score: score)
+        }.sorted { $0.score > $1.score }
+
+        return SearchPipelineData(payload: .scoredItems(scored))
+    }
+}
+
+// Register it in the tool configuration
+let tool = SpotlightSearchTool(configuration: .init(
+    customStages: [.happinessBoost(threshold: 0.5)]
+))
+```
+
+**Key points:**
+- `@Generable` lets the model dynamically generate stage parameters from the user's prompt
+- `@Guide` adds descriptions to properties and helps the model understand when to use the stage
+- `inputTypes` and `outputTypes` declare the stage's data-flow types so the model can arrange the pipeline
+- Computation runs in Spotlight and does not consume model context space
+
+### Data Types Returned by Pipelines
+
+([12:10](https://developer.apple.com/videos/play/wwdc2026/246/?time=730)) After a pipeline runs, results can be returned in several data types:
+
+```swift
+for await reply in tool.searchResults {
+
+    let label = reply.label  // LLM-generated content description label
+
+    switch reply.content {
+    case .items(let searchItems):
+        // Regular search results
+    case .scoredItems(let scored):
+        // Scored and sorted results
+    case .groupedItems(let groups):
+        // Grouped results
+    case .count(let count):
+        // Count result
+    case .table(let table):
+        // Tabular data
+    case .statistic(let statistic):
+        // Statistic value
+    case .text(let text):
+        // Free-form text
+        continue
+    }
+}
+```
+
+**Key points:**
+- `reply.label` is a model-generated content description and can be used directly as a UI title
+- `.table` and `.statistic` are useful for answering statistical questions, such as "How many miles on average each month?"
+- Choose different UI renderers based on the returned data type
+
+### Use the Evaluations Framework for Automated Tests
+
+([13:47](https://developer.apple.com/videos/play/wwdc2026/246/?time=827)) Define the test dataset:
+
+```swift
+import Evaluations
+
+struct TrailRequest: ModelSampleProtocol {
+
+    typealias ExpectedValue = String
+    typealias Expectation = TrajectoryExpectation
+
+    var input: ModelSampleInput
+    var output: ModelSampleOutput<String, TrajectoryExpectation>
+
+    var expectedIdentifiers: [String]  // Item IDs expected to be returned by search
+}
+```
+
+**Key points:**
+- `ModelSampleProtocol` defines the test sample input, expected output, and evaluation metrics
+- `expectedIdentifiers` verifies whether the model found the correct data items
+
+([15:06](https://developer.apple.com/videos/play/wwdc2026/246/?time=906)) Define the expected tool-call trajectory:
+
+```swift
+TrajectoryExpectation(
+    unordered: [
+        ToolExpectation("searchSpotlight", arguments: [.keyOnly(argumentName: "query")])
+    ]
+)
+```
+
+**Key points:**
+- `TrajectoryExpectation` verifies that the model called the expected tool
+- `unordered` means the exact call order is not required
+- `arguments: [.keyOnly(argumentName: "query")]` verifies that the `query` parameter was passed in the call
+
+([15:17](https://developer.apple.com/videos/play/wwdc2026/246/?time=917)) Run the test and check result coverage:
+
+```swift
+@Test("Trail search evaluation meets quality thresholds")
+func trailSearchEval() async throws {
+
+    let items = try Self.loadItems()
+    let samples = try Self.loadSamples()
+
+    // Donate test data to Spotlight
+    try await Self.indexDelegate.indexSearchableItems(items)
+    let tool = Self.makeSearchTool()
+
+    let evaluation = TrailSearchEvaluation(
+        tool: tool,
+        dataset: ArrayLoader(samples: samples)
+    )
+
+    let result = try await evaluation.run()
+
+    // Check that result coverage reaches 50%
+    let coverageMean = result.aggregateValue(.mean(of: Metric("ResultCoverage")))
+    #expect(coverageMean >= 0.5, "Result coverage should be at least 50% across queries")
+}
+```
+
+**Key points:**
+- Donate the data to Spotlight before testing so the search environment is clean
+- `ArrayLoader` loads the test sample set
+- `Metric("ResultCoverage")` calculates the coverage ratio of expected items in the returned results
+- Use `#expect` to assert the coverage threshold
+
+## Key Takeaways
+
+**1. Add a Conversational Search Assistant to an Existing App**
+
+If your app already donates `CSSearchableItem` values, you only need to import the `FoundationModels` framework and attach `SpotlightSearchTool` with a few lines of code to let the model retrieve local data. Users can ask in natural language, and the model will choose the search strategy automatically.
+
+Implementation idea: create a `LanguageModelSession`, add `SpotlightSearchTool` to the `tools` array, and listen to the `searchResults` stream to update the UI.
+
+**2. Use Custom Pipeline Stages for App-Specific Reasoning**
+
+Do not make the main LLM do everything. For example, a notes app can register a `SentimentStage` that scores notes inside Spotlight. When the user asks, "Which of my recent notes have a good mood?", the pipeline filters high-scoring notes first, then passes them to the model for the final answer.
+
+Implementation idea: implement the `CustomStage` protocol, annotate it with `@Generable` and `@Guide`, and register it in the `customStages` configuration of `SpotlightSearchTool`.
+
+**3. Adapt GuidanceProfile for On-Device Models**
+
+On-device model context is limited, and the default configuration may request too much data. Trim `GuidanceProfile` based on your data, disable unnecessary search capabilities, and explicitly list the attributes the model can see. Metadata quality directly determines the ceiling of AI answer quality.
+
+Implementation idea: analyze which attributes in your `CSSearchableItemAttributeSet` are useful for answers, declare them explicitly in `GuidanceProfile`, and keep undeclared attributes out of the model context.
+
+**4. Build Regression Tests with the Evaluations Framework**
+
+AI answer quality can fluctuate as models and data change. Use `ModelSampleProtocol` to define a test set covering common user questions, then automatically verify tool-calling trajectories and result coverage.
+
+Implementation idea: prepare test questions and expected answers, use `TrajectoryExpectation` to verify whether the model called `SpotlightSearchTool`, and use the `ResultCoverage` metric to verify whether the returned items are complete.
+
+**5. Use ContactResolver to Clarify Who "I" Means**
+
+When the user asks, "Who did I go with?", the model needs to know who "I" refers to. Implement `ContactResolver` to return the current user's identity information and help Spotlight filter the correct results.
+
+Implementation idea: implement the `ContactResolver` protocol, fetch user information from the app's account system or the Contacts framework, and assign it to `tool.contactResolver`.
+
+## Related Sessions
+
+- [Deep dive into the Foundation Models framework](/articles/wwdc2026-241) — A detailed look at tool calling, Guided Generation, and Generable types
+- [Build agentic apps with Foundation Models](/articles/wwdc2026-242) — Complete practices for building agentic apps, including more complex tool orchestration
+- [Create robust evaluations for an agentic app](/articles/wwdc2026-299) — Deep usage of the Evaluations framework, including large-scale dataset generation and custom metrics
+- [Swift Testing](/articles/wwdc2026-267) — The basics of writing and running automated tests

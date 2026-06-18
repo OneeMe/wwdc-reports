@@ -1,0 +1,295 @@
+---
+title: "Meet the new MetricKit"
+description: "Explore the new Swift-first MetricKit APIs, StateReporting, diagnostic reports, memory exception diagnostics, and Metal frame-rate metrics in iOS 27."
+date: "2026-06-10"
+tags: ["MetricKit", "StateReporting", "Performance", "Diagnostics", "Swift"]
+thumbnail: "/images/sessions/2026/222.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/222/"
+sessionId: "wwdc2026-222"
+year: "2026"
+relatedSessions:
+  - title: "Find and fix performance issues in your Metal game"
+    code: "388"
+    description: "Concrete use cases and optimization techniques for Metal frame-rate metrics"
+  - title: "What's new in Swift"
+    code: "262"
+    description: "The new MetricKit APIs make extensive use of Swift's AsyncSequence and macro systems"
+  - title: "What's new in SwiftUI"
+    code: "269"
+    description: "SwiftUI app screens are a natural fit for StateReporting-based performance breakdowns"
+  - title: "What's new in Instruments"
+    code: "243"
+    description: "Use the Points of Interest Instrument to verify whether StateReporting states are being reported as expected"
+  - title: "Analyze app performance with MetricKit"
+    code: "268"
+    description: "A deeper look at performance analysis techniques and metric interpretation"
+---
+
+## Highlight
+
+> iOS 27 rewrites MetricKit in Swift and introduces the new `MetricManager` and `StateReporting` frameworks. Developers can cross-analyze performance metrics by app state, such as the current tab or user flow, while also gaining new memory exception diagnostics and Metal frame-rate metrics.
+
+## Key Takeaways
+
+You ship an app, and users say it "feels a bit slow." You open Xcode Instruments and everything looks normal. Where is the problem? Performance on real devices is very different from performance in the simulator. Users may be on older hardware, on low battery, or on a poor network. What you need is real-world data.
+
+That is what MetricKit does. Every day, it packages performance data from your app on real devices into reports and delivers them back to your app. You can upload those reports to your own server, aggregate them, and find the problems.
+
+The old MetricKit had one major limitation: every metric was a global average. Your app has three tabs, and MetricKit tells you "the average scroll hitch rate for the day is 15 ms/s." The number itself may be valid, but you do not know which tab caused it. The Spending tab might be perfectly smooth while the Reports tab is unusable. A global average hides the issue.
+
+iOS 27 solves this with two new pieces: a brand-new Swift-first API and a framework called StateReporting.
+
+The new API drops the old delegate callbacks and uses `async for` loops instead. `MetricManager` provides two AsyncSequences, `metricReports` and `diagnosticReports`, which makes the code much cleaner. Reports are also `Codable`, so you can send them to your server with `JSONEncoder` instead of writing custom parsing logic.
+
+StateReporting solves the question of "which dimensions should metrics be split by." You define your app's important states, such as the current tab or user flow, and MetricKit aggregates metrics by those states. In the earlier example, after adding StateReporting, you might discover that the Spending tab has a hitch rate of only 1 ms/s while the Reports tab reaches 71 ms/s. The optimization target becomes obvious.
+
+## Details
+
+### The New MetricManager API
+
+([00:04:58](https://developer.apple.com/videos/play/wwdc2026/222/?time=298))
+
+iOS 27 rewrites MetricKit in pure Swift. The entry point changes from `MXMetricManager` to `MetricManager`.
+
+```swift
+import MetricKit
+
+let manager = MetricManager()
+
+for await report in manager.metricReports {
+    processReport(report)
+}
+```
+
+Key points:
+- `MetricManager()` is the new entry class, replacing the older `MXMetricManager`
+- `metricReports` is an `AsyncSequence`, received with `for await`
+- This code should run as early as possible during app launch, because late subscription can miss data for the day
+- `MetricManager` must stay alive so the stream can continue receiving later reports
+
+([00:05:25](https://developer.apple.com/videos/play/wwdc2026/222/?time=325))
+
+Reports are `Codable`, so sending them to a server only takes a few lines:
+
+```swift
+import MetricKit
+
+for await report in manager.metricReports {
+    let jsonData = try JSONEncoder().encode(report)
+    sendToServer(jsonData)
+}
+```
+
+Key points:
+- `MetricReport` conforms to `Codable`
+- You can encode the whole report directly with `JSONEncoder`, with no hand-written parsing model
+- `sendToServer` is your own networking-layer method
+
+([00:05:44](https://developer.apple.com/videos/play/wwdc2026/222/?time=344))
+
+If you want to analyze specific metrics locally, iterate over the report's interval entries:
+
+```swift
+import MetricKit
+
+for await report in manager.metricReports {
+    let intervalEntries = report.intervalEntries
+    let fullDayEntry = intervalEntries.fullDayEntry
+
+    for entry in intervalEntries {
+        let memoryMetrics = entry.values.filter { $0.metricGroup == .memory }
+
+        for metric in memoryMetrics {
+            switch metric {
+            case .peakMemory(let peak):
+                processPeakMemory(peak)
+            default: break
+            }
+        }
+    }
+}
+```
+
+Key points:
+- `intervalEntries` contains the full-day summary entry plus several hour-level entries
+- `fullDayEntry` is the aggregate for the full day
+- The `values` in each entry are grouped by `metricGroup`, such as `.memory`, `.cpu`, `.display`, and `.gpu`
+- Use `switch` to match concrete metric types, such as `.peakMemory`
+- This work should run in a detached Task or a dedicated service class
+
+### Diagnostic Reports: From Metrics to Root Cause
+
+([00:08:59](https://developer.apple.com/videos/play/wwdc2026/222/?time=539))
+
+Metrics tell you "something is wrong." Diagnostics tell you "where it went wrong."
+
+```swift
+import MetricKit
+
+let manager = MetricManager()
+
+for await report in manager.diagnosticReports {
+    processReport(report)
+}
+```
+
+Key points:
+- `diagnosticReports` is also an `AsyncSequence`
+- Diagnostic reports are delivered immediately when an event happens, rather than waiting for the daily summary
+- You also need to start listening as early as possible during app launch
+
+([00:09:14](https://developer.apple.com/videos/play/wwdc2026/222/?time=554))
+
+Diagnostic reports also support `Codable`:
+
+```swift
+import MetricKit
+
+for await report in manager.diagnosticReports {
+    let jsonData = try JSONEncoder().encode(report)
+    sendToServer(jsonData)
+}
+```
+
+([00:09:39](https://developer.apple.com/videos/play/wwdc2026/222/?time=579))
+
+Structured access to diagnostics:
+
+```swift
+import MetricKit
+
+for await report in manager.diagnosticReports {
+    switch report.result {
+    case .crash(let crash):
+        let backtrace = crash.callStackTree
+        let reason = crash.terminationReason
+        let category = crash.terminationCategory
+        processCrash(backtrace: backtrace, reason: reason, category: category)
+    case .hang(let hang):
+        processHangDiagnostic(hang)
+    default: break
+    }
+}
+```
+
+Key points:
+- `report.result` uses an enum to distinguish diagnostic types such as `.crash`, `.hang`, and `.memoryException`
+- `crash.callStackTree` is a symbolicated stack that points directly at problem code
+- `terminationReason` explains why the crash occurred
+- `terminationCategory` is new in iOS 27 and explains how the crash is categorized in metrics, making it easier to correlate diagnostics and metrics
+
+### StateReporting: Split Metrics by App State
+
+([00:13:57](https://developer.apple.com/videos/play/wwdc2026/222/?time=837))
+
+This is the most important new MetricKit capability in iOS 27. You define states, and MetricKit aggregates metrics by those states.
+
+```swift
+import MetricKit
+import StateReporting
+
+let domain = StateReportingDomain("com.metrickitsample.tabs")
+let manager = MetricManager(enabledStateReportingDomains: [domain])
+
+let reporter = StateReporter.reporter(for: domain.rawValue)
+reporter.reportTransition(to: "Reports")
+```
+
+Key points:
+- `StateReportingDomain` defines a state domain, usually with a reverse-DNS string
+- Pass the domain into `MetricManager` when creating it through `enabledStateReportingDomains`
+- `StateReporter.reporter(for:)` gets the reporter for that domain
+- `reportTransition(to:)` reports that the app has entered the current state. There is no "end" concept, only "transition to"
+
+([00:14:21](https://developer.apple.com/videos/play/wwdc2026/222/?time=861))
+
+Attach structured metadata with the `@ReportableMetadata` macro:
+
+```swift
+import StateReporting
+
+@ReportableMetadata
+struct ViewConfiguration {
+    let listSize: String
+    let isSorted: Bool
+}
+
+let reporter = StateReporter.reporter(
+    for: domain.rawValue,
+    stableMetadata: ViewConfiguration.self
+)
+
+reporter.reportTransition(
+    to: "Reports",
+    stableMetadata: ViewConfiguration(listSize: "large", isSorted: false)
+)
+```
+
+Key points:
+- The `@ReportableMetadata` macro marks a custom struct, and the compiler generates serialization code
+- The `stableMetadata` parameter specifies the metadata type
+- When reporting a state, you pass a concrete metadata instance
+- This lets MetricKit distinguish performance differences such as "large unsorted list in the Reports tab" versus "small sorted list in the Reports tab"
+
+([00:15:29](https://developer.apple.com/videos/play/wwdc2026/222/?time=929))
+
+Encode reports grouped by state:
+
+```swift
+import MetricKit
+
+for await report in manager.metricReports {
+    let encoder = JSONEncoder()
+
+    let formatKey = MetricReport.encodingFormatKey
+    encoder.userInfo[formatKey] = MetricReport.EncodingFormat.byStateReportingDomain
+
+    let jsonData = try encoder.encode(report)
+    sendToServer(jsonData)
+}
+```
+
+Key points:
+- `MetricReport.encodingFormatKey` is the configuration key for the encoding format
+- `MetricReport.EncodingFormat.byStateReportingDomain` outputs JSON grouped by state domain and state
+- The server can aggregate and analyze data directly by the state dimension
+
+### New Metrics and Diagnostics in iOS 27
+
+([00:03:23](https://developer.apple.com/videos/play/wwdc2026/222/?time=203))
+
+Metal frame-rate metrics. Game developers can get render frame-rate distribution data directly from MetricKit instead of writing their own statistics logic.
+
+([00:03:55](https://developer.apple.com/videos/play/wwdc2026/222/?time=235))
+
+Memory exception diagnostics. When an app or extension is terminated by the system for exceeding its memory limit, MetricKit delivers a diagnostic report containing the stack and termination reason. This did not exist before.
+
+## Ideas to Build
+
+**1. Build a performance profile for every core user flow**
+
+Use StateReporting to define key app flows, such as home loading, product detail, payment confirmation, and video playback, as separate states. After one week in production, you can see exactly which flow has an abnormal hang rate or memory peak. Start with `StateReportingDomain` and `StateReporter.reportTransition(to:)`.
+
+**2. Automatically collect performance data in A/B experiments**
+
+Use the experiment group as another StateReporting domain. Performance metrics for the treatment and control groups are separated automatically, without adding custom performance instrumentation to the experiment code. Evaluate experiments on business metrics and performance metrics together.
+
+**3. Build real-time diagnostic alerts**
+
+Diagnostic reports are delivered immediately, not as part of the daily summary. When the server receives a Crash or Memory Exception diagnostic, trigger an alert right away. With `terminationCategory`, you can distinguish "crashes that need urgent fixes" from "known system-level terminations."
+
+**4. Monitor complex list screens by configuration**
+
+Use `@ReportableMetadata` to report list-screen configuration, such as data size, sort state, and whether image lazy loading is enabled. If the "large list plus unsorted" combination causes scroll hitching to spike, the optimization direction is immediately clear.
+
+**5. Migrate from the old MXMetricManager**
+
+If you already use `MXMetricManager`, the migration path is direct: replace delegate callbacks with `for await` loops, and replace hand-written JSON parsing with `JSONEncoder().encode(report)`. The new API is the future of the framework, and all new features are available only on the new API.
+
+## Related Sessions
+
+- [Find and fix performance issues in your Metal game](/articles/wwdc2026-388) - Concrete use cases and optimization techniques for Metal frame-rate metrics
+- [What's new in Swift](/articles/wwdc2026-262) - The new MetricKit APIs make extensive use of Swift's AsyncSequence and macro systems
+- [What's new in SwiftUI](/articles/wwdc2026-269) - SwiftUI app screens are a natural fit for StateReporting-based performance breakdowns
+- [What's new in Instruments](/articles/wwdc2026-243) - Use the Points of Interest Instrument to verify whether StateReporting states are being reported as expected
+- [Analyze app performance with MetricKit](/articles/wwdc2026-268) - A deeper look at performance analysis techniques and metric interpretation

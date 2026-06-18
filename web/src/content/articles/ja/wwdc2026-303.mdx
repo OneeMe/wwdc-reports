@@ -1,0 +1,293 @@
+---
+title: "すばやく起動するレスポンシブなカメラ App を作る"
+description: "App の起動から最初のプレビューフレームまで、完璧な瞬間を逃さないカメラ App をすばやく起動させる方法を学びます。"
+date: "2026-06-10"
+tags: ["AVFoundation", "AVCaptureSession", "カメラ", "パフォーマンス"]
+thumbnail: "/images/sessions/2026/303.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/303/"
+sessionId: "wwdc2026-303"
+year: "2026"
+relatedSessions:
+  - title: "高解像度写真キャプチャを実装する"
+    code: "304"
+    description: "Responsive Capture と高品質な写真撮影を組み合わせる方法を深掘りする"
+  - title: "よりレスポンシブなカメラ体験を作る"
+    code: "341"
+    description: "Center Stage とカメラ応答性の最適化"
+  - title: "Metal パフォーマンス最適化"
+    code: "388"
+    description: "カスタムプレビューをレンダリングするときの GPU パフォーマンス調整"
+  - title: "Xcode 27"
+    code: "258"
+    description: "Instruments を使ってカメラ起動性能を測定する"
+  - title: "Instruments"
+    code: "243"
+    description: "カメラ App のパフォーマンスボトルネックを特定する"
+---
+
+## ハイライト
+
+> iOS 26 は Deferred Start API を導入し、カメラ App が写真出力や動画出力などプレビュー以外の出力初期化を、最初のプレビューフレーム描画後まで遅らせられるようにしました。Responsive Capture と組み合わせることで、起動時間を半分にしつつ、ユーザーがシャッターを押す瞬間を逃さずに済みます。
+
+## 主要内容
+
+### カメラの起動が遅いと、ユーザーは何を感じるのか
+
+カメラ App を開いたのに、画面は黒いまま。数秒待ってようやくプレビューが出ても、撮りたかった瞬間はもう過ぎています。登壇者はドミノの例でこの問題を説明しました。赤いドミノが倒れようとしている瞬間にカメラを開く。起動が遅いと、プレビューが出た時にはドミノはもう倒れています。
+
+この痛みの裏には 4 つの段階があります。App の起動読み込み、Session の設定と起動、出力オブジェクトの初期化、プレビューフレームの流れ始めです。このうち最も時間がかかるのが 3 つ目、`AVCaptureOutput` の初期化です。
+
+### Deferred Start: 重い処理をプレビュー後に回す
+
+これまでは、すべての出力が `startRunning()` のタイミングでまとめて初期化されていました。`AVCapturePhotoOutput` や `AVCaptureMovieFileOutput` のような重いオブジェクトは起動全体を遅くしますが、プレビューそのものには寄与しません。
+
+Deferred Start の考え方は単純です。まずプレビュー出力だけを初期化し、他の出力は後回しにします。各 `AVCaptureOutput` と `AVCaptureVideoPreviewLayer` に新しい `isDeferredStartEnabled` プロパティが追加され、`true` にするとその出力の初期化を遅延できます。
+
+([02:05](https://developer.apple.com/videos/play/wwdc2026/303/?time=125)) で登壇者は実験室での比較を示しています。Deferred Start を有効にしない場合の起動時間は約 1 秒、有効にすると約 0.5 秒まで短縮され、起動速度はほぼ 2 倍になります。Session の構成が複雑なほど効果は大きくなります。
+
+### プレビューは出たが、シャッターが反応しない場合
+
+Deferred Start には副作用があります。プレビューは速く表示されても、写真出力の初期化がまだ終わっていないため、ユーザーがシャッターを押しても反応しないことがあります。これはスナップ撮影では致命的です。
+
+Apple の解決策が Responsive Capture です。有効にすると、`AVCapturePhotoOutput` が内部にバッファを追加し、出力が完全に初期化される前からキャプチャを開始できるようになります。登壇者は再びドミノで説明しました。Responsive Capture を有効にした緑の iPhone は赤いドミノが倒れる瞬間を撮影でき、無効な紫の iPhone は逃しました。
+
+([14:07](https://developer.apple.com/videos/play/wwdc2026/303/?time=847))
+
+### 継続性能: カメラを「固まった」と感じさせない
+
+プレビューが流れ始めた後も、安定したフレームレートは同じくらい重要です。デバイスが熱くなると、システムはクロックを下げます。App がそれに適応しなければ、プレビューはフレーム落ちします。
+
+`AVCaptureSession` には `hardwareCost` プロパティが追加されました。値は 0 から 1 で、現在の構成がどれくらいハードウェアリソースを使うかを表します。1 を超える場合、その構成はデバイス能力を超えているため、起動前に下位構成へ落とす必要があります。`AVCaptureDevice` の `systemPressureState` は、実行中にシステム圧力を監視するために使えます。圧力が上がったら、フレームレートを下げたり GPU/ANE の使用量を減らしたりします。
+
+([20:16](https://developer.apple.com/videos/play/wwdc2026/303/?time=1216))
+
+### ProRes 録画の I/O 問題
+
+ProRes のような高ビットレート動画の録画には、非常に高いディスク書き込み速度が必要です。従来のファイルシステム I/O は決定的ではありません。バックグラウンドのインデックス作成、メモリ断片化、ストレージの摩耗が書き込み速度に影響し、フレーム落ちにつながります。
+
+iOS 27 は `AVProVideoStorage` を導入し、事前割り当てされたストレージ領域によって決定的な書き込み性能を提供します。これはシステムレベルの singleton で、すべての App が共有します。録画前に `remainingCapacity` と `isBusy` を確認し、`usesProVideoStorage = true` を設定します。
+
+([22:17](https://developer.apple.com/videos/play/wwdc2026/303/?time=1337))
+
+## 詳細
+
+### 自動 Deferred Start
+
+`AVCaptureVideoPreviewLayer` でプレビューをレンダリングする App は、iOS 26 SDK で再コンパイルすると自動モードがデフォルトで有効になります。システムはプレビュー表示後すぐに残りの出力を自動初期化します。
+
+```swift
+import AVFoundation
+
+class DeferredStartDelegate: NSObject, AVCaptureSessionDeferredStartDelegate {
+    func sessionWillRunDeferredStart(_ session: AVCaptureSession) {
+        // 遅延初期化が始まる前に呼ばれる。ここでバックグラウンドリソースを作成できる
+    }
+
+    func sessionDidRunDeferredStart(_ session: AVCaptureSession) {
+        // 遅延初期化が完了した後に呼ばれる。すべての出力が利用可能になる
+    }
+}
+
+let captureSession = AVCaptureSession()
+captureSession.beginConfiguration()
+captureSession.automaticallyRunsDeferredStart = true
+
+let videoPreviewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+videoPreviewLayer.isDeferredStartEnabled = false
+
+let photoOutput = AVCapturePhotoOutput()
+photoOutput.isDeferredStartEnabled = true
+captureSession.addOutput(photoOutput)
+
+captureSession.setDeferredStartDelegate(
+    deferredStartDelegate,
+    deferredStartDelegateCallbackQueue: sessionQueue
+)
+
+captureSession.commitConfiguration()
+captureSession.startRunning()
+```
+
+重要ポイント:
+
+- `automaticallyRunsDeferredStart` は iOS 26 SDK ではデフォルトで `true` です。
+- `videoPreviewLayer.isDeferredStartEnabled = false` により、プレビューを優先的に初期化します。
+- `photoOutput.isDeferredStartEnabled = true` で写真出力を遅延させます。
+- `setDeferredStartDelegate` で callback を登録し、遅延起動の進行状況を把握します。
+- `sessionQueue` には専用の serial queue を使い、メインスレッドをブロックしないようにします。
+
+([09:14](https://developer.apple.com/videos/play/wwdc2026/303/?time=554))
+
+### 手動 Deferred Start
+
+`AVCaptureVideoDataOutput` でカスタムプレビューをレンダリングする App は、手動モードを使う必要があります。`CAMetalLayer` の `addPresentedHandler` で最初のフレームが画面に出た瞬間を捉え、その後に遅延初期化を開始します。
+
+```swift
+import AVFoundation
+import QuartzCore
+
+let captureSession = AVCaptureSession()
+captureSession.beginConfiguration()
+captureSession.automaticallyRunsDeferredStart = false
+
+let videoOutput = AVCaptureVideoDataOutput()
+captureSession.addOutput(videoOutput)
+videoOutput.isDeferredStartEnabled = false
+
+let photoOutput = AVCapturePhotoOutput()
+photoOutput.isDeferredStartEnabled = true
+captureSession.addOutput(photoOutput)
+
+captureSession.setDeferredStartDelegate(
+    deferredStartDelegate,
+    deferredStartDelegateCallbackQueue: sessionQueue
+)
+
+captureSession.commitConfiguration()
+captureSession.startRunning()
+
+// Metal レンダリングループ内
+private var firstFramePresented = false
+
+guard let drawable = layer.nextDrawable() else { return }
+if !firstFramePresented {
+    drawable.addPresentedHandler { _ in
+        captureSession.runDeferredStartWhenNeeded()
+    }
+    firstFramePresented = true
+}
+```
+
+重要ポイント:
+
+- `automaticallyRunsDeferredStart = false` で自動モードを無効にします。
+- `videoOutput.isDeferredStartEnabled = false` により、カスタムプレビューを先に利用可能にします。
+- `addPresentedHandler` は最初のフレームが提示された後に callback されます。
+- `runDeferredStartWhenNeeded()` は、遅延初期化を開始してよいことをシステムに伝えます。
+- 手動モードは、起動フローを精密に制御したい App に向いています。
+
+([11:30](https://developer.apple.com/videos/play/wwdc2026/303/?time=690))
+
+### Responsive Capture を有効にする
+
+Responsive Capture は `AVCapturePhotoOutput` にバッファ層を追加し、出力が完全に初期化される前からキャプチャ処理を開始できるようにします。
+
+```swift
+import AVFoundation
+
+func configurePhotoOutput(for session: AVCaptureSession, device: AVCaptureDevice) {
+    let photoOutput = AVCapturePhotoOutput()
+
+    guard session.canAddOutput(photoOutput) else { return }
+    session.addOutput(photoOutput)
+
+    photoOutput.maxPhotoQualityPrioritization = .quality
+    photoOutput.isResponsiveCaptureEnabled = photoOutput.isResponsiveCaptureSupported
+}
+```
+
+重要ポイント:
+
+- まず `isResponsiveCaptureSupported` でデバイスが対応しているかを確認します。
+- `isResponsiveCaptureEnabled = true` でレスポンシブキャプチャを有効にします。
+- Deferred Start と組み合わせると最も効果的です。
+- わずかな処理遅延と引き換えに、シャッター応答速度を得ます。
+
+([14:07](https://developer.apple.com/videos/play/wwdc2026/303/?time=847))
+
+### システム圧力を監視する
+
+```swift
+import AVFoundation
+
+let captureSession = AVCaptureSession()
+let device = activeVideoInput?.device
+captureSession.beginConfiguration()
+// ... session を設定する ...
+captureSession.commitConfiguration()
+
+guard captureSession.hardwareCost <= 1.0 else {
+    print("hardwareCost \(captureSession.hardwareCost) - session を開始できません。再設定します。")
+    setupLowCostConfiguration()
+}
+
+captureSession.startRunning()
+
+let systemPressureObserver = device?.observe(
+    \.systemPressureState,
+    options: [.initial, .new],
+    changeHandler: { device, change in
+        // 圧力状態に応じてフレームレートを調整するか、GPU/ANE 使用量を減らす
+    }
+)
+```
+
+重要ポイント:
+
+- `hardwareCost` は `commitConfiguration()` の後に確認します。1.0 を超える場合は構成を下げます。
+- `systemPressureState` は KVO で監視し、システム圧力の変化にリアルタイムで対応します。
+- 圧力が上がったら、フレームレートを下げる、binned format を使う、UI の仕事量を減らすといった対応ができます。
+
+([20:16](https://developer.apple.com/videos/play/wwdc2026/303/?time=1216))
+
+### AVProVideoStorage を使う
+
+```swift
+import AVFoundation
+
+func configureProVideoStorage() {
+    guard AVProVideoStorage.isSupported else { return }
+    let storage = AVProVideoStorage.shared
+    guard storage.remainingCapacity != 0 else {
+        storage.openSettings()
+        return
+    }
+}
+
+// 録画設定
+guard AVProVideoStorage.isSupported else { return }
+guard let pvs = AVProVideoStorage.shared else { return }
+
+let movieOutput = AVCaptureMovieFileOutput()
+
+guard movieOutput.isProVideoStorageSupported else { return }
+guard !pvs.isBusy else { return }
+
+let movieFileURL = FileManager.default.temporaryDirectory
+    .appendingPathComponent(UUID().uuidString)
+    .appendingPathExtension("mov")
+
+movieOutput.usesProVideoStorage = true
+movieOutput.startRecording(to: movieFileURL, recordingDelegate: delegate)
+```
+
+重要ポイント:
+
+- `AVProVideoStorage.isSupported` でデバイスが対応しているか確認します。
+- `remainingCapacity` で事前割り当て領域の残量を確認します。0 の場合はユーザーを設定へ案内します。
+- `isBusy` でストレージが他のタスクに使われていないか確認します。
+- `isProVideoStorageSupported` で出力がこの機能に対応しているか確認します。
+- `usesProVideoStorage = true` を有効にすると、録画ファイルはいったん事前割り当て領域に書き込まれ、終了後に目的の場所へ移動されます。
+- `AVAssetWriter` も `usesProVideoStorage` プロパティをサポートします。
+
+([22:17](https://developer.apple.com/videos/play/wwdc2026/303/?time=1337))
+
+## 重要な示唆
+
+- **「即起動」するソーシャルカメラ App を作る**: Deferred Start で 0.5 秒以内にプレビューを表示し、Responsive Capture と組み合わせて、ユーザーが App を開いた瞬間から撮影できるようにします。実装の考え方: 自動モードではプレビュー層だけを先に残し、写真出力を遅延初期化します。`sessionDidRunDeferredStart` callback 後にシャッターボタンを完全に利用可能にします。
+
+- **ライブ配信 App に熱による降格保護を追加する**: `systemPressureState` を監視し、デバイスが過熱したら採集解像度やフレームレートを自動で下げます。これにより配信映像のカクつきや、App がシステムに強制終了される状況を避けられます。実装の考え方: `changeHandler` 内で圧力レベルに応じて `activeFormat` を切り替え、`frameRateOverride` でフレームレートを精密に制御します。
+
+- **iPhone で ProRes のプロ向け録画を実装する**: `AVProVideoStorage` を使って高ビットレート録画の I/O ジッターをなくし、動画クリエイターに安定したプロ録画体験を提供します。実装の考え方: 録画前に `remainingCapacity` と `isBusy` を確認し、`usesProVideoStorage = true` を設定し、録画終了後に一時ディレクトリからファイルを取り出します。
+
+- **VideoDataOutput でリアルタイムフィルタープレビューを作る**: カスタム Metal レンダリングパイプラインを使い、`AVCaptureVideoDataOutput` の `captureOutput(_:didOutput:from:)` で各フレームにフィルターを適用してから提示します。実装の考え方: 手動 Deferred Start を採用し、最初のフレームが表示された後に `runDeferredStartWhenNeeded()` を呼び、同時に写真出力を遅延初期化します。
+
+- **カメラ起動時に UI を段階的に読み込む**: 第 1 段階ではプレビューとシャッターボタンだけを表示し、第 2 段階で `sessionDidRunDeferredStart` 後にアルバムサムネイルやモード選択など非重要 UI をフェードインします。実装の考え方: UI 作成ロジックを 2 つのメソッドに分け、Deferred Start の delegate callback で第 2 段階を起動します。
+
+## 関連セッション
+
+- [高解像度写真キャプチャを実装する](/articles/wwdc2026-304) - Responsive Capture と高品質な写真撮影を組み合わせる方法を深掘りする
+- [よりレスポンシブなカメラ体験を作る](/articles/wwdc2026-341) - Center Stage とカメラ応答性の最適化
+- [Metal パフォーマンス最適化](/articles/wwdc2026-388) - カスタムプレビューをレンダリングするときの GPU パフォーマンス調整
+- [Xcode 27](/articles/wwdc2026-258) - Instruments を使ってカメラ起動性能を測定する
+- [Instruments](/articles/wwdc2026-243) - カメラ App のパフォーマンスボトルネックを特定する

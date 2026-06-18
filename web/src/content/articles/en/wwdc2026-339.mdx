@@ -1,0 +1,298 @@
+---
+title: "Bring an LLM provider to the Foundation Models framework"
+description: "Learn how any LLM provider can integrate with the Foundation Models framework by shipping a Swift package that conforms to the LanguageModel protocol."
+date: "2026-06-10"
+tags: ["AI", "LLM", "Foundation Models", "Swift", "Machine Learning"]
+thumbnail: "/images/sessions/2026/339.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/339/"
+sessionId: "wwdc2026-339"
+year: "2026"
+relatedSessions:
+  - title: "241 - Foundation Models"
+    code: "241"
+    description: "Overview of the Foundation Models framework"
+  - title: "242 - Agentic apps"
+    code: "242"
+    description: "Build workflows that use tools across multiple steps"
+  - title: "324 - Core AI"
+    code: "324"
+    description: "Integrate local AI models into your app"
+  - title: "325 - Core AI optimization"
+    code: "325"
+    description: "Optimize local AI model performance"
+  - title: "347 - Security agentic"
+    code: "347"
+    description: "Protect the security of agentic apps"
+---
+
+## Highlight
+
+> The Foundation Models framework now lets any LLM provider create a Swift package that conforms to the `LanguageModel` protocol, so developers can call local or cloud models through one unified API.
+
+## Core Content
+
+Integrating different large language models in Swift used to be tedious.
+
+Every model had its own API design, authentication method, and data format. Switching to a different model often meant rewriting a lot of code. Local models and cloud models were called in completely different ways, which made maintenance expensive.
+
+Apple has opened the Foundation Models framework so any LLM provider can create a Swift package that conforms to the `LanguageModel` protocol. Anthropic's Claude, Google's Gemini, Apple's own system model, Core AI local models, and community MLX models can all be called through the same API.
+
+Developers only need to initialize a different `LanguageModel`, pass it into `LanguageModelSession`, and call `respond`. Switching models becomes as simple as replacing one line of code.
+
+## Details
+
+### Model Protocol Design ([04:56](https://developer.apple.com/videos/play/wwdc2026/339/?time=296))
+
+The core of the Foundation Models framework is two protocols: `LanguageModel` and `LanguageModelExecutor`.
+
+`LanguageModel` describes model capabilities, while `LanguageModelExecutor` performs inference.
+
+```swift
+// LanguageModel protocol
+public protocol LanguageModel: Sendable {
+    var capabilities: LanguageModelCapabilities { get }
+    var executorConfiguration: Executor.Configuration { get }
+}
+
+// LanguageModelExecutor protocol
+public protocol LanguageModelExecutor: Sendable {
+    init(configuration: Configuration) throws
+    func prewarm(model: Model, transcript: Transcript)
+    func respond(
+        to request: LanguageModelExecutorGenerationRequest,
+        model: Model,
+        streamingInto channel: LanguageModelExecutorGenerationChannel
+    ) async throws
+}
+```
+
+**Key points:**
+- `capabilities` declares the capabilities supported by the model, such as tool calling, guided generation, and reasoning
+- `executorConfiguration` is the configuration key the framework uses to find and create an Executor, and it must be hashable
+- `prewarm` is used to preload model resources before the first request
+- `respond` is the core generation method and supports streaming output
+
+### Resource Management and Prewarming ([07:28](https://developer.apple.com/videos/play/wwdc2026/339/?time=448))
+
+Loading model weights is expensive, so the framework provides a `prewarm` mechanism to prepare ahead of time.
+
+```swift
+struct MyLanguageModelExecutor: LanguageModelExecutor {
+
+    private mutating func loadModelIfNeeded() throws -> LoadedWeights {
+        let weights = try loadedModel ?? loadWeights()
+        loadedModel = weights
+        return weights
+    }
+
+    func prewarm(transcript: Transcript) {
+        loadedModel = try? loadModelIfNeeded()
+    }
+
+    func respond(...) async throws {
+        let weights = try loadModelIfNeeded()
+        // ...generate with weights...
+    }
+}
+```
+
+**Key points:**
+- `prewarm` is called before the first request and is the best time to preload weights
+- Even if `prewarm` is not called, `loadModelIfNeeded` guarantees the weights are loaded only once
+- Stateless services, such as purely cloud-based models, can implement `prewarm` as a no-op
+- When the Session is destroyed, all cached Executors are automatically released
+
+### Session State and KV Cache ([12:22](https://developer.apple.com/videos/play/wwdc2026/339/?time=742))
+
+The framework caches Executors by configuration, letting stateful integrations reduce network overhead.
+
+```swift
+// The Executor receives the full transcript on every call
+func respond(to request: ...) async throws {
+    let newTranscript = request.transcript
+
+    // Compare it with the previously saved transcript
+    if newTranscript.hasSamePrefix(as: previousTranscript) {
+        // Process only the newly added entries
+        await processOnlyNewEntries(newTranscript.suffix)
+    } else {
+        // The transcript was modified or deleted, so invalidate the cache
+        invalidateKVCache()
+        await processFullTranscript(newTranscript)
+    }
+
+    previousTranscript = newTranscript
+}
+```
+
+**Key points:**
+- Models with the same configuration share one Executor instance
+- An Executor can preserve a KV cache across calls to avoid repeated computation
+- Compare old and new transcripts, then process only the newly added content
+- If entries were deleted or modified, the related cache must be invalidated
+
+### Streaming Response Output ([11:47](https://developer.apple.com/videos/play/wwdc2026/339/?time=707))
+
+The framework requires a specific output order so developers can receive critical information promptly.
+
+```swift
+func respond(...) async throws {
+    // 1. Send metadata first
+    await channel.send(.response(action: .updateMetadata([
+        "modelID": "my-model-2026-06-08",
+        "requestID": request.id.uuidString
+    ])))
+
+    // 2. Send token usage
+    await channel.send(.response(action: .updateUsage(
+        input: .init(totalTokenCount: promptTokens, cachedTokenCount: cachedTokens),
+        output: .init(totalTokenCount: 0, reasoningTokenCount: 0)
+    )))
+
+    // 3. Stream generated tokens
+    for try await token in tokens {
+        await channel.send(.response(action: .appendText(token)))
+    }
+}
+```
+
+**Key points:**
+- Send metadata first so developers can log and debug easily
+- Send prompt token billing information immediately, without waiting for the stream to finish
+- Send text deltas one by one to create a typewriter effect
+- The framework internally collects streaming events to provide a one-shot API
+
+### Error Handling ([13:33](https://developer.apple.com/videos/play/wwdc2026/339/?time=813))
+
+When a model cannot satisfy a developer request, the Executor should approximate the behavior where possible or throw a clear error.
+
+```swift
+// The developer requested greedy sampling, but the service only supports temperature
+if request.generationOptions.sampling?.kind == .greedy {
+    serviceRequest.temperature = 0
+}
+
+// The token budget is too small to satisfy the schema
+if let schema = request.schema,
+   let budget = request.generationOptions.maximumResponseTokens,
+   budget < minimumTokens(for: schema) {
+    throw LanguageModelError.unsupportedCapability(
+        .init(
+            capability: .guidedGeneration,
+            debugDescription: "Token budget too small to satisfy this schema."
+        )
+    )
+}
+```
+
+**Key points:**
+- Prefer approximate handling to preserve the developer's intent
+- When approximation is not possible, use the built-in `LanguageModelError` type
+- Built-in errors include context limit exceeded, rate limiting, refusal, guardrail violation, unsupported capability, and more
+- Service-specific errors can use custom types, but reuse built-in types whenever possible
+
+### Custom Segment ([17:05](https://developer.apple.com/videos/play/wwdc2026/339/?time=1025))
+
+Custom Segment lets a model support new input and output modalities, such as audio or video.
+
+```swift
+// Define a custom segment
+public struct AudioSegment: Transcript.CustomSegment {
+    public var id: String
+    public var content: URL
+}
+
+// Developers can use it directly in a prompt
+let recording = AudioSegment(id: UUID().uuidString, content: URL(filePath: "/path/to/recording.m4a"))
+let response = try await session.respond {
+    "Where was Frank Lloyd Wright's original architecture school located?"
+    recording
+}
+
+// The Executor receives and returns custom segments
+for try await event in stream {
+    switch event {
+    case .audioFileGenerated(let file):
+        await channel.send(.response(action: .updateCustomSegment(
+            AudioSegment(id: file.id, content: file.url)
+        )))
+    }
+}
+```
+
+**Key points:**
+- `CustomSegment` must be `PromptRepresentable` so it can be used directly in a prompt
+- The Executor receives custom segments through the transcript
+- Custom segments are streamed back through the same channel
+- The segment ID controls whether a segment is newly added or updates an existing segment
+
+### Server-Side Tools ([18:09](https://developer.apple.com/videos/play/wwdc2026/339/?time=1089))
+
+Server-side tools are capabilities the model runs autonomously on the server, such as web search or code execution.
+
+```swift
+// Declare server-side tools on the model
+public struct MyLanguageModel: LanguageModel {
+    public struct ServerTool: Sendable {
+        public static let webSearch: ServerTool = ...
+    }
+    public init(serverTools: [ServerTool] = []) { }
+}
+
+// The Executor receives tool results and forwards them
+let client = MyServerClient(serverTools: model.serverTools)
+let response = try await client.send(prompt: .init(request))
+for try await chunk in response {
+    switch chunk {
+    case .webSearch(let webSearch):
+        await channel.send(.response(action: .updateCustomSegment(
+            WebSearchSegment(url: webSearch.url, content: webSearch.html)
+        )))
+    case .textDelta(let textDelta):
+        await channel.send(.response(action: .appendText(
+            textDelta.text, tokenCount: textDelta.tokenCount
+        )))
+    }
+}
+```
+
+**Key points:**
+- Server-side tools are declared on the model as named types
+- There are three display levels: answer only, answer with metadata, and full output
+- Use custom segments to pass structured tool output
+- Metadata is attached to the text segment, making sources easier to cite
+
+## Core Ideas
+
+1. **Multi-Model A/B Testing Tool**
+   - Build a model switching and comparison interface on top of the unified `LanguageModel` API
+   - Extract model identifiers and performance metrics from `updateMetadata`
+   - Entry point: the `respond` method on `LanguageModelSession`
+
+2. **Local-First Hybrid Inference Engine**
+   - Use local models for simple tasks and cloud models for complex tasks
+   - Route dynamically based on `transcript` length and `contextOptions`
+   - Use `prewarm` to preload both models and enable seamless switching
+
+3. **Audio Conversation App**
+   - Use `CustomSegment` to support voice input and output
+   - Define `AudioInputSegment` and `AudioOutputSegment`
+   - After the model generates text, call TTS in parallel and return an audio segment
+
+4. **Search-Augmented Generation with Citations**
+   - Implement a server-side web search tool
+   - Return search results and citation links through custom segments
+   - Highlight cited sources in the UI
+
+5. **Inference Cost Monitoring Dashboard**
+   - Collect token usage data from `updateUsage` events
+   - Group statistics by session and model type
+   - Track latency and throughput for each request with custom metadata
+
+## Related Sessions
+
+- [241 - Foundation Models](/articles/wwdc2026-241) - Overview of the Foundation Models framework
+- [242 - Agentic apps](/articles/wwdc2026-242) - Build workflows that use tools across multiple steps
+- [324 - Core AI](/articles/wwdc2026-324) - Integrate local AI models into your app
+- [325 - Core AI optimization](/articles/wwdc2026-325) - Optimize local AI model performance
+- [347 - Security agentic](/articles/wwdc2026-347) - Protect the security of agentic apps
