@@ -463,7 +463,6 @@ const sessions = DATA.s.map(s => ({
   year: s[0], contentId: s[1], title: s[2], description: s[3],
   primaryTopic: s[4], permalink: s[5], resources: s[6], codeSnippets: s[7],
 }));
-const thumbnailUuids = DATA.u;
 
 const topicColorMap = {};
 topics.forEach(t => { topicColorMap[t.id] = t.color; });
@@ -483,9 +482,7 @@ function getGradient(topicId) {
 }
 
 function getThumbnailUrl(session) {
-  const uuid = thumbnailUuids[session.year];
-  if (!uuid) return null;
-  return \`https://devimages-cdn.apple.com/wwdc-services/images/\${uuid}/\${session.contentId}/\${session.contentId}_wide_900x506_2x.jpg\`;
+  return \`/images/sessions/\${session.year}/\${session.contentId}.jpg\`;
 }
 
 function esc(str) {

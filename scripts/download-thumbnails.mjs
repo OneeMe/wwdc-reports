@@ -2,9 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import https from 'https';
 import http from 'http';
+import { fileURLToPath } from 'url';
 
 const REF_REPO = '/Users/onee/Code/onee-workspace/projects/learning/wwdc';
-const OUTPUT_BASE = process.env.WWDC_THUMBNAIL_OUTPUT_DIR || '.cache/session-thumbnails';
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const OUTPUT_BASE = process.env.WWDC_THUMBNAIL_OUTPUT_DIR || path.join(REPO_ROOT, 'web/public/images/sessions');
 
 // Parse frontmatter from markdown
 function parseFrontmatter(content) {
