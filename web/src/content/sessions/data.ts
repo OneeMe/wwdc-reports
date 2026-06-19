@@ -1,4 +1,5 @@
 import sessionsJson from "./sessions.json";
+import { getAppleSessionThumbnailUrl } from "./thumbnails";
 
 export interface Session {
   year: string;
@@ -71,7 +72,5 @@ export function getGradient(topicId: string): string {
 }
 
 export function getThumbnailUrl(session: Session): string | null {
-  const uuid = thumbnailUuids[session.year];
-  if (!uuid) return null;
-  return `https://devimages-cdn.apple.com/wwdc-services/images/${uuid}/${session.contentId}/${session.contentId}_wide_900x506_2x.jpg`;
+  return getAppleSessionThumbnailUrl(session.year, session.contentId, thumbnailUuids);
 }

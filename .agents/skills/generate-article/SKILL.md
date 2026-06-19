@@ -4,6 +4,8 @@ description: |
   批量生成 WWDC session 中文技术文章。当用户说"生成文章""写 WWDC 文章"
   "生成 {year} 年文章""生成 wwdc{year}""批量生成 session""开始生成"
   "继续生成"时触发。按模板产出 `.mdx` 文件到 web/src/content/articles/。
+metadata:
+  internal: true
 ---
 
 # WWDC 文章生成器

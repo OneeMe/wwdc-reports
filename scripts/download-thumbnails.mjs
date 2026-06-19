@@ -4,7 +4,7 @@ import https from 'https';
 import http from 'http';
 
 const REF_REPO = '/Users/onee/Code/onee-workspace/projects/learning/wwdc';
-const OUTPUT_BASE = '/Users/onee/Code/onee-workspace/projects/personal/wwdc-quick-look/web/public/images/sessions';
+const OUTPUT_BASE = process.env.WWDC_THUMBNAIL_OUTPUT_DIR || '.cache/session-thumbnails';
 
 // Parse frontmatter from markdown
 function parseFrontmatter(content) {
