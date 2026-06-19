@@ -113,6 +113,10 @@ node scripts/build-index.mjs
 
 组合爬取流程会读取公开 Apple Developer collection cards，进入每个 session 详情页补充 Resources 和 Code tab 代码片段，并写入 transcript 文本和 manifest。
 
+数据刷新改为纯手动维护。需要更新哪一年，就在本地运行爬取命令，重建 `data/index.json`，检查 diff 后再提交对应数据文件。
+
+仓库发布数据只提交稳定 latest：每年的 `raw_data.json`、transcript 文件、transcript manifest，以及 `data/index.json`。时间戳形式的 `raw_data_*.json` 是本地爬取快照，已被 Git 忽略。
+
 ## 发布地址
 
 ```text

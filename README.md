@@ -113,6 +113,10 @@ node scripts/build-index.mjs
 
 The combined crawl fetches public Apple Developer collection cards, enriches each session from its detail page, extracts Resources and Code tab snippets, and writes transcript text files plus a manifest.
 
+Data refreshes are intentionally manual. Run the crawler locally for the year you want to update, rebuild `data/index.json`, review the diff, and commit the changed data files.
+
+Only stable latest data is committed under `data/`: per-year `raw_data.json`, transcript files, transcript manifests, and `data/index.json`. Timestamped `raw_data_*.json` snapshots are local crawl artifacts and are ignored by Git.
+
 ## Published URLs
 
 ```text

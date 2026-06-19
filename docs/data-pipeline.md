@@ -1,6 +1,6 @@
 # Raw Archive Workflow
 
-The Node.js rewrite treats existing Python scripts as legacy references and defines a new no-key raw archive workflow. The primary command is `crawl`, which fetches public WWDC metadata, enriches each session with public resources/code snippets, and then crawls per-session transcript text in one local run. `archive` and `transcripts` remain manual sub-steps. Everything else is a local helper for inspecting or materializing already archived data.
+The Node.js rewrite treats existing Python scripts as legacy references and defines a no-key raw archive workflow. Data refreshes are manual: run the local CLI for the specific WWDC year, inspect the resulting diff, then commit the stable data files. The primary command is `crawl`, which fetches public WWDC metadata, enriches each session with public resources/code snippets, and then crawls per-session transcript text in one local run. `archive` and `transcripts` remain manual sub-steps. Everything else is a local helper for inspecting or materializing already archived data.
 
 ## Primary workflow
 
@@ -16,9 +16,9 @@ This command:
 2. Fetches each public Apple Developer video page and enriches the matching `videos` entry with:
    - `resources` from the page's top-level Resources list, excluding HD/SD video downloads.
    - `codeSnippets` from the page's Code tab, including time, URL, title, and code text.
-3. Writes both:
+3. Writes both locally:
    - `./raw_data.json` as the stable latest archive.
-   - `./raw_data_<eventShort>_<locale>_<timestamp>.json` as an immutable snapshot.
+   - `./raw_data_<eventShort>_<locale>_<timestamp>.json` as an ignored local snapshot.
 4. Fetches each public Apple Developer video page, preferring the metadata `webPermalink` when available.
 5. Extracts `<section id="transcript-content">` from static HTML.
 6. Writes one raw transcript text file per session under `./transcripts-<locale>/` by default.
@@ -38,9 +38,11 @@ The older Apple JSON service URL can still be used with `--source json`, but it 
 
 1. Run `archive` from the directory where you want the raw metadata stored.
 2. The CLI fetches public Apple Developer metadata from the public video collection page, then enriches each session from its Apple Developer video page.
-3. The CLI writes both:
+3. The CLI writes both locally:
    - `./raw_data.json` as the stable latest archive.
-   - `./raw_data_<eventShort>_<locale>_<timestamp>.json` as an immutable snapshot.
+   - `./raw_data_<eventShort>_<locale>_<timestamp>.json` as an ignored local snapshot.
+
+Published repository data keeps only the stable latest archive (`raw_data.json`), transcript files, transcript manifests, and `data/index.json`. Timestamped `raw_data_*.json` snapshots are useful for local audit/debugging but are not committed.
 
 No `.env` file, API key, or LLM provider is involved.
 
@@ -71,7 +73,7 @@ Existing non-empty transcript files are skipped unless `--force` is passed. Sess
 
 2. `ingest`
    - Alias for `archive` kept as a secondary command name.
-   - Writes enriched `raw_data.json` and a timestamped snapshot to `--out-dir` or the current directory.
+   - Writes enriched `raw_data.json` and an ignored timestamped snapshot to `--out-dir` or the current directory.
 
 3. `transcripts`
    - Reads `raw_data.json`.
