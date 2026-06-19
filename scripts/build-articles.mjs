@@ -407,7 +407,7 @@ body {
     <div style="display:flex;align-items:center;gap:12px;">
       <nav class="nav-links">
         <a href="articles.html" class="active" data-i18n="navArticles">Articles</a>
-        <a href="https://www.skills.sh/swiftggteam/wwdc-quick-look" target="_blank" rel="noopener noreferrer" data-i18n="navSkill">Skill</a>
+        <a href="https://www.skills.sh/swiftggteam/wwdc-quick-look-skill" target="_blank" rel="noopener noreferrer" data-i18n="navSkill">Skill</a>
       </nav>
       <div class="lang-switcher" aria-label="Language">
         <button class="lang-btn active" data-lang="zh" type="button">中文</button>

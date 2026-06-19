@@ -3,20 +3,20 @@
 # WWDC Quick Look Skill
 
 [中文说明](README-CN.md)
-[![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look)](https://www.skills.sh/swiftggteam/wwdc-quick-look)
+[![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look-skill)](https://www.skills.sh/swiftggteam/wwdc-quick-look-skill)
 [Landing Page](https://wwdc-quick-look.swiftgg.team)
 
 WWDC Quick Look is a local agent skill for fast access to Apple WWDC session metadata, transcripts, Code tab snippets, and Resources links.
 
-Install it through skills.sh with one command, then let your agent use `wwdc-quick-look` whenever a WWDC question needs concrete session evidence. The repository also contains the crawler and published dataset that power the skill. The default path is local-first and no-key: it reads public Apple Developer pages, writes structured JSON and transcript text, and serves the latest archive from jsDelivr.
+Install it through skills.sh with one command, then let your agent use `wwdc-quick-look` whenever a WWDC question needs concrete session evidence. The installable skill lives in the lightweight `SwiftGGTeam/wwdc-quick-look-skill` repository. This repository contains the crawler, website, and published dataset that power the skill. The default path is local-first and no-key: it reads public Apple Developer pages, writes structured JSON and transcript text, and serves the latest archive from jsDelivr.
 
 ## Install With skills.sh
 
 ```sh
-npx skills add SwiftGGTeam/wwdc-quick-look
+npx skills add SwiftGGTeam/wwdc-quick-look-skill
 ```
 
-The skills CLI discovers `skills/wwdc-quick-look/SKILL.md` in this repository and installs it into your local agent skill directory. This is the recommended distribution path for Codex, Claude Code, Cursor, and other agent runtimes supported by skills.sh.
+The skills CLI installs from the standalone `SwiftGGTeam/wwdc-quick-look-skill` repository, so users do not need to clone this larger data and website repository. This repository tracks the same skill as a Git submodule at `skills/wwdc-quick-look` for local development.
 
 ## What This Skill Does
 
@@ -35,7 +35,7 @@ The skill can:
 
 ```text
 skills/
-└── wwdc-quick-look/          # Canonical skill source
+└── wwdc-quick-look/          # Submodule: SwiftGGTeam/wwdc-quick-look-skill
     ├── SKILL.md
     ├── scripts/query.mjs
     └── references/data-schema.md
@@ -55,7 +55,7 @@ data/
 └── wwdc26/
 ```
 
-`skills/` is the single source of truth. The playground links expose the same skill to agent runtimes that expect either `.agents/skills` or `.claude/skills`. The repository root intentionally does not keep a `.agents/skills` copy.
+`skills/wwdc-quick-look` is a submodule that points to the standalone skill repository. The playground links expose the same skill to agent runtimes that expect either `.agents/skills` or `.claude/skills`. The repository root intentionally does not keep a `.agents/skills` copy.
 
 ## Use The Query Script Directly
 
@@ -142,6 +142,8 @@ npm test
 npm run check
 node ./bin/wwdc-quick-look.js help
 ```
+
+After cloning this repository for development, initialize the skill submodule with `git submodule update --init --recursive`.
 
 The package has no runtime npm dependencies and requires Node.js 20 or newer.
 

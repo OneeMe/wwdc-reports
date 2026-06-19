@@ -3,20 +3,20 @@
 # WWDC Quick Look Skill
 
 [English README](README.md)
-[![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look)](https://www.skills.sh/swiftggteam/wwdc-quick-look)
+[![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look-skill)](https://www.skills.sh/swiftggteam/wwdc-quick-look-skill)
 [落地页](https://wwdc-quick-look.swiftgg.team)
 
 WWDC Quick Look 是一个面向 Agent 的本地 skill，用来快速查询 Apple WWDC session 的元数据、视频逐字稿、Code tab 代码片段和 Resources 链接。
 
-推荐通过 skills.sh 一条命令分发和安装，然后让 Agent 在遇到 WWDC 问题时直接调用 `wwdc-quick-look`。这个仓库也包含支撑该 skill 的爬取脚本和发布数据。默认工作流是 local-first、no-key：从公开 Apple Developer 页面读取内容，写成结构化 JSON 和 transcript 文本，并通过 jsDelivr 提供最新归档。
+推荐通过 skills.sh 一条命令分发和安装，然后让 Agent 在遇到 WWDC 问题时直接调用 `wwdc-quick-look`。可安装的 skill 已拆到轻量仓库 `SwiftGGTeam/wwdc-quick-look-skill`。当前仓库保留支撑该 skill 的爬取脚本、网站和发布数据。默认工作流是 local-first、no-key：从公开 Apple Developer 页面读取内容，写成结构化 JSON 和 transcript 文本，并通过 jsDelivr 提供最新归档。
 
 ## 通过 skills.sh 安装
 
 ```sh
-npx skills add SwiftGGTeam/wwdc-quick-look
+npx skills add SwiftGGTeam/wwdc-quick-look-skill
 ```
 
-skills CLI 会自动发现本仓库中的 `skills/wwdc-quick-look/SKILL.md`，并把它安装到本机 Agent 的 skill 目录中。这是推荐的分发方式，适用于 skills.sh 支持的 Codex、Claude Code、Cursor 等 Agent 运行时。
+skills CLI 会从独立的 `SwiftGGTeam/wwdc-quick-look-skill` 仓库安装，因此用户不需要 clone 当前这个更大的数据和网站仓库。当前仓库通过 Git submodule 在 `skills/wwdc-quick-look` 引用同一份 skill，方便本地开发同步。
 
 ## 这个 Skill 能做什么
 
@@ -35,7 +35,7 @@ skills CLI 会自动发现本仓库中的 `skills/wwdc-quick-look/SKILL.md`，�
 
 ```text
 skills/
-└── wwdc-quick-look/          # skill 真源
+└── wwdc-quick-look/          # Submodule: SwiftGGTeam/wwdc-quick-look-skill
     ├── SKILL.md
     ├── scripts/query.mjs
     └── references/data-schema.md
@@ -55,7 +55,7 @@ data/
 └── wwdc26/
 ```
 
-`skills/` 是唯一真源。`playground` 下的两个软链接让需要 `.agents/skills` 或 `.claude/skills` 的 Agent 运行时都能加载同一份 skill。仓库根目录不再保留 `.agents/skills` 副本。
+`skills/wwdc-quick-look` 是指向独立 skill 仓库的 submodule。`playground` 下的两个软链接让需要 `.agents/skills` 或 `.claude/skills` 的 Agent 运行时都能加载同一份 skill。仓库根目录不再保留 `.agents/skills` 副本。
 
 ## 直接运行查询脚本
 
@@ -142,6 +142,8 @@ npm test
 npm run check
 node ./bin/wwdc-quick-look.js help
 ```
+
+开发者 clone 当前仓库后，需要运行 `git submodule update --init --recursive` 初始化 skill submodule。
 
 项目没有运行时 npm 依赖，需要 Node.js 20 或更高版本。
 
