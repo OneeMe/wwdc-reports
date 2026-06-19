@@ -1,5 +1,4 @@
 import sessionsJson from "./sessions.json";
-import { getAppleSessionThumbnailUrl } from "./thumbnails";
 
 export interface Session {
   year: string;
@@ -32,7 +31,6 @@ export interface SessionData {
     number, // resources
     number  // codeSnippets
   ]>;
-  u: Record<string, string>;
 }
 
 const DATA = sessionsJson as unknown as SessionData;
@@ -59,8 +57,6 @@ export const sessions: Session[] = DATA.s
 export const yearCounts: Record<string, number> = Object.fromEntries(
   years.map((year) => [year, sessions.filter((s) => s.year === year).length]),
 );
-export const thumbnailUuids = DATA.u;
-
 const topicColorMap: Record<string, [string, string]> = {};
 topics.forEach((t) => {
   topicColorMap[t.id] = t.color;
@@ -71,6 +67,6 @@ export function getGradient(topicId: string): string {
   return `linear-gradient(135deg, ${c[0]} 0%, ${c[1]} 100%)`;
 }
 
-export function getThumbnailUrl(session: Session): string | null {
-  return getAppleSessionThumbnailUrl(session.year, session.contentId, thumbnailUuids);
+export function getThumbnailUrl(session: Session): string {
+  return `/images/sessions/${session.year}/${session.contentId}.jpg`;
 }

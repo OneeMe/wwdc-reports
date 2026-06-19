@@ -636,7 +636,6 @@ const html = `<!DOCTYPE html>
       resources: s[6],
       codeSnippets: s[7],
     }));
-    const thumbnailUuids = DATA.u;
 
     // Topic color map
     const topicColorMap = {};
@@ -654,9 +653,7 @@ const html = `<!DOCTYPE html>
     }
 
     function getThumbnailUrl(session) {
-      const uuid = thumbnailUuids[session.year];
-      if (!uuid) return null;
-      return \`https://devimages-cdn.apple.com/wwdc-services/images/\${uuid}/\${session.contentId}/\${session.contentId}_wide_900x506_2x.jpg\`;
+      return \`/images/sessions/\${session.year}/\${session.contentId}.jpg\`;
     }
 
     function escapeHtml(str) {
