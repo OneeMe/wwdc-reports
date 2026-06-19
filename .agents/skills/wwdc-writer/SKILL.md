@@ -4,6 +4,8 @@ description: |
   生成 WWDC session 深度分析文章。当用户说"写一篇文章""生成 WWDC 文章""写一篇 session 分析"
   "写 wwdc2026-xxx""写 {code}""写 {year} {code}""写 {session} 的解读""写一篇关于 {session} 的文章"
   时触发。用阮一峰风格（简洁、代码驱动、事实优先）产出可直接发布的 `.mdx` 文件。
+metadata:
+  internal: true
 ---
 
 # WWDC Writer
