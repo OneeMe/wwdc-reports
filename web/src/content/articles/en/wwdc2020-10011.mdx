@@ -1,0 +1,220 @@
+---
+title: "Author fragmented MPEG-4 content with AVAssetWriter"
+description: "transform your audio and video content into fragmented mpeg-4 files for a faster and smoother hls streaming experience. learn how to work with the fragmented mpeg-4 format, generate fragmented content from a movie, and set up avassetwriter to create fragments for hls output."
+date: 2020-06-10
+tags: ["WWDC 2020", "AVFoundation", "HLS"]
+thumbnail: "/images/sessions/2020/10011.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10011/"
+sessionId: "wwdc2020-10011"
+year: "2020"
+relatedSessions:
+  - title: "Improve stream authoring with HLS Tools"
+    code: "10225"
+    description: "HLS authoring tools for live and on-demand streams, low-latency delivery, audio codecs, and master playlists."
+  - title: "What's new in Low-Latency HLS"
+    code: "10228"
+    description: "Low-Latency HLS extensions for stream delay of two seconds or less."
+  - title: "Deliver a better HLS audio experience"
+    code: "10158"
+    description: "HLS audio codec support and authoring practices for bandwidth-limited networks."
+  - title: "Export HDR media in your app with AVFoundation"
+    code: "10010"
+    description: "AVFoundation export paths for authoring HDR media with AVAssetExportSession and AVAssetWriter."
+  - title: "Discover how to download and play HLS offline"
+    code: "10655"
+    description: "AVFoundation APIs for downloading and playing HLS content without a network connection."
+---
+
+## Highlight
+
+> AVAssetWriter 在 WWDC20 获得了直接输出 HLS 分段 MPEG-4 数据的能力，应用可以通过 delegate 接收初始化片段和可分离媒体片段，再自行写入 segment 文件与 playlist。
+
+## 核心内容
+
+HLS 制作链路里，编码只是第一步。视频样本可以来自点播文件，也可以来自摄像头直播；样本编码成 HEVC、AAC 这类格式后，还要被切成客户端能逐段请求的媒体片段，并配套生成 playlist。
+
+过去这部分通常由单独的 segmenter 完成。AVAssetWriter 原本擅长把媒体样本写成指定容器的文件，WWDC20 这场 session 把它推进到 HLS 的 segmenter 环节：写入对象不再绑定一个输出 URL，而是在写入过程中把分段 MPEG-4 数据交回给应用。
+
+这个能力的边界也很清楚。AVAssetWriter 负责输出符合 HLS 或 CMAF 约束的 fragmented MP4 数据；应用负责把收到的数据组织成初始化 segment、媒体 segment、单文件或多文件形态，并用 AVAssetSegmentReport 里的信息创建媒体 playlist 和 I-frame playlist。
+
+最后一段重点是切分质量。passthrough、编码模式、自定义切分、音频 sample dependency 和 AAC priming 都会影响 segment 的边界和时间戳。写出文件只是开始，最终还要按 HLS 的要求验证 segment 文件和 playlist。
+
+## 详细内容
+
+### 1. 创建不绑定输出 URL 的 AVAssetWriter
+
+（[05:36](https://developer.apple.com/videos/play/wwdc2020/10011/?time=336)）这场 session 的第一个变化，是用 content type 初始化 AVAssetWriter。讲者明确说明这里不提供 output URL，因为 writer 不直接写一个文件，而是输出数据。
+
+```swift
+// Instantiate asset writer
+let assetWriter = AVAssetWriter(contentType: UTType(AVFileType.mp4.rawValue)!)
+
+// Add inputs
+let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: compressionSettings)
+
+assetWriter.add(videoInput)
+```
+
+关键点：
+
+- `contentType` 使用 MP4 家族的类型，因为 fragmented MP4 仍然符合 MP4 family。
+- `AVAssetWriterInput` 接收媒体样本，`compressionSettings` 表示 writer 会在写入时编码样本。
+- 如果 `outputSettings` 传入 `nil`，writer 进入 passthrough mode，只按收到的样本写出数据。
+- `assetWriter.add(videoInput)` 之后，后续仍然走 AVAssetWriter 常见的 start writing 与 append sample 流程。
+
+### 2. 用 HLS profile 和分段间隔打开 fMP4 输出
+
+（[06:28](https://developer.apple.com/videos/play/wwdc2020/10011/?time=388)）配置阶段需要指定 output file type profile、目标 segment 间隔、初始 segment 起点和 delegate。讲者补充说，HLS 的 target segment duration 需要整数秒，因此示例里使用 6 秒。
+
+```swift
+assetWriter.outputFileTypeProfile = .mpeg4AppleHLS
+
+assetWriter.preferredOutputSegmentInterval = CMTime(seconds: 6.0, preferredTimescale: 1)
+
+assetWriter.initialSegmentStartTime = myInitialSegmentStartTime
+
+assetWriter.delegate = myDelegateObject
+```
+
+关键点：
+
+- `.mpeg4AppleHLS` 让 writer 输出 Apple HLS profile 的 fragmented MP4 数据。
+- `preferredOutputSegmentInterval` 是目标输出间隔；实际边界还会受 sync sample 约束影响。
+- `initialSegmentStartTime` 是 interval 的起点，后面的 audio priming 处理也会要求它跟着时间偏移移动。
+- `delegate` 是应用拿到 segment data 的入口，后面写文件和写 playlist 都依赖它。
+
+### 3. delegate 回调区分初始化片段和媒体片段
+
+（[08:00](https://developer.apple.com/videos/play/wwdc2020/10011/?time=480)、[08:37](https://developer.apple.com/videos/play/wwdc2020/10011/?time=517)）AVAssetWriter 通过 delegate 返回 `Data`，并用 `AVAssetSegmentType` 标记这段数据的类型。第二个 delegate 方法额外返回 `AVAssetSegmentReport`，用于生成 playlist 和 I-frame playlist。
+
+```swift
+optional func assetWriter(_ writer: AVAssetWriter, didOutputSegmentData segmentData: Data, segmentType: AVAssetSegmentType)
+
+
+optional func assetWriter(_ writer: AVAssetWriter, didOutputSegmentData segmentData: Data, segmentType: AVAssetSegmentType, segmentReport: AVAssetSegmentReport?)
+```
+
+```swift
+public enum AVAssetSegmentType : Int {
+    case initialization = 1
+    case separable = 2
+}
+```
+
+关键点：
+
+- `segmentData` 是 writer 输出的 fragmented media data。
+- `initialization` 类型包含 file type box 和 movie box，可作为 HLS 的 initialization segment。
+- `separable` 类型包含一组 movie fragment box 和 media data box，可写成媒体 segment。
+- AVAssetWriter 不写 playlist；应用需要基于收到的 segment 和 `AVAssetSegmentReport` 自己创建 playlist。
+
+### 4. passthrough 与编码模式的边界不同
+
+（[10:53](https://developer.apple.com/videos/play/wwdc2020/10011/?time=653)）passthrough mode 不编码样本。讲者说，writer 会在达到或超过目标间隔后，等到下一个 sync sample 之前输出媒体数据，因为 CMAF 要求每个 segment 从 sync sample 开始，Apple HLS 也偏好这种结构。
+
+```swift
+let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
+```
+
+关键点：
+
+- `outputSettings: nil` 表示 passthrough，writer 按收到的样本写出。
+- passthrough 模式下只能添加一个 `AVAssetWriterInput`。
+- 如果 sync sample 离目标间隔太远，实际输出的 segment duration 会明显长于设定值，可能不适合 HLS。
+- 编码模式可以在视频样本达到目标间隔时强制生成 sync sample，让输出更接近设定间隔。
+- 需要多码率、多语言或音视频分离时，应使用多个 AVAssetWriter 实例并通过 master playlist 组织。
+
+### 5. 自定义切分只适用于 passthrough
+
+（[13:45](https://developer.apple.com/videos/play/wwdc2020/10011/?time=825)）如果应用需要在到达目标间隔之前切出 segment，可以把 `preferredOutputSegmentInterval` 设成 `.indefinite`，然后自己调用 `flushSegment`。讲者强调这只适用于 passthrough，不能和编码模式一起使用。
+
+```swift
+// Set properties
+assetWriter.outputFileTypeProfile = .mpeg4AppleHLS
+
+assetWriter.preferredOutputSegmentInterval = .indefinite
+
+assetWriter.delegate = myDelegateObject
+
+// Passthrough
+let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
+```
+
+关键点：
+
+- `.indefinite` 表示 writer 不按固定 interval 自动切分。
+- 自定义切分时不需要设置 `initialSegmentStartTime`，因为没有固定 interval。
+- `flushSegment` 会输出上一次调用之后追加的所有样本。
+- `flushSegment` 必须在 sync sample 之前调用，保证下一个 fragmented media data 能从 sync sample 开始。
+- 如果音频和视频都有 sample dependencies，均匀对齐会变难；这种场景应考虑把音频和视频做成 separate streams。
+
+### 6. 先检查音频依赖，再处理 priming 时间偏移
+
+（[15:17](https://developer.apple.com/videos/play/wwdc2020/10011/?time=917)）AVAssetTrack 新增属性用于检查音频 track 是否有 sample dependencies，例如 USAC audio。这个判断会影响 passthrough、自定义切分和音视频是否适合复用在同一条流里。
+
+```swift
+extension AVAssetTrack {
+       /* indicates whether this audio track has dependencies (e.g. kAudioFormatMPEGD_USAC) */
+    open var hasAudioSampleDependencies: Bool { get }
+}
+```
+
+关键点：
+
+- `hasAudioSampleDependencies` 让应用在打包前知道音频样本是否依赖前后样本。
+- 有依赖的音频也需要遵守从 sync sample 开始的 segment 规则。
+- 当音频和视频都存在依赖，单一 muxed stream 的切点更难稳定，separate streams 更容易控制。
+
+（[16:16](https://developer.apple.com/videos/play/wwdc2020/10011/?time=976)）AAC 编码会在第一段真实音频样本前加入 priming。常见 AAC priming 是 2,112 个 audio samples，在 44,100Hz 下约 48ms。CMAF 使用 edit list box 补偿；Apple HLS profile 为了兼容旧播放器不使用 edit list，而是把 audio media 的 `baseMediaDecodeTime` 向前移动 priming 的长度。
+
+这会遇到一个限制：`baseMediaDecodeTime` 是无符号整数，不能早于 0。session 给出的做法是把音频和视频样本一起向后平移同样的 offset，再把 audio 的 decode time 向前补偿 priming。`initialSegmentStartTime` 也要使用相同 offset。讲者提到几秒通常够用，Apple 的 Media File Segmenter 使用 10 秒 offset。
+
+## 核心启发
+
+### 1. VOD 到 fMP4 HLS 转码器
+
+**做什么**：把本地电影文件转成 fMP4 segment 文件和 HLS playlist。
+
+**为什么值得做**：session 的点播流程就是用 AVAssetReader 从源 movie 读样本，再推给 AVAssetWriter 输出 fragmented MP4 segment data。
+
+**怎么开始**：用 `AVAssetWriter(contentType:)` 创建 writer，设置 `.mpeg4AppleHLS` 和 6 秒 `preferredOutputSegmentInterval`，在 delegate 里把 `initialization` 与 `separable` 数据写成文件，再根据 `AVAssetSegmentReport` 写 playlist。
+
+### 2. 直播采集到 HLS 分发
+
+**做什么**：把摄像头和麦克风采集到的样本实时打包成 HLS segment。
+
+**为什么值得做**：transcript 明确列出 `AVCaptureVideoDataOutput` 和 `AVCaptureAudioDataOutput` 作为 live material 的输入来源，AVAssetWriter 可以接住这些 sample data。
+
+**怎么开始**：从 capture output 收到样本后 append 到 writer input；视频使用编码模式，让 writer 在接近目标间隔的位置生成 sync sample；delegate 收到 segment 后立刻写文件或上传到服务器。
+
+### 3. 按业务标记自定义切片
+
+**做什么**：在课程章节、赛事回合或广告边界前主动切出 segment。
+
+**为什么值得做**：session 提供了 `.indefinite` 加 `flushSegment` 的自定义切分路径，适合固定时间间隔不够准确的场景。
+
+**怎么开始**：只在 passthrough 模式使用这条路径，把 `preferredOutputSegmentInterval` 设成 `.indefinite`；在目标 sync sample 前调用 `flushSegment`；如果音频和视频依赖关系复杂，改用 separate streams。
+
+### 4. 多码率和多语言 HLS 输出器
+
+**做什么**：为同一个内容生成不同码率、不同语言或音视频分离的 HLS variants。
+
+**为什么值得做**：session 说明可以通过 master playlist 交付多个 video/audio streams，创建多个 AVAssetWriter 实例来生成这些 streams。
+
+**怎么开始**：为每条 variant 建一个 writer，分别设置 HLS profile、segment interval 和 delegate；playlist 层把 variant stream 和 audio rendition 组合起来；如果使用 Apple HLS profile，给样本和 `initialSegmentStartTime` 应用相同的 priming offset。
+
+### 5. HLS 打包质量检查工具
+
+**做什么**：把每次生成的 segment 文件和 playlist 自动送进验证步骤。
+
+**为什么值得做**：session 结尾强调 HLS 有要求和推荐项，Apple 建议验证用 AVAssetWriter 写出的 segment files 和 playlist。
+
+**怎么开始**：在 delegate 写完一批 segment 后保留生成目录，运行 HLS 验证工具检查 playlist、duration、segment boundary 和兼容性，把失败报告返回到打包配置里修正。
+
+## 关联 Session
+
+- [Improve stream authoring with HLS Tools](/articles/wwdc2020-10225) - 了解 HLS authoring 工具、低延迟测试流、音频 codec 和 master playlist 的制作流程。
+- [What's new in Low-Latency HLS](/articles/wwdc2020-10228) - 继续看低延迟 HLS 协议扩展，以及如何把 HLS 延迟压到两秒以内。
+- [Deliver a better HLS audio experience](/articles/wwdc2020-10158) - 补齐 HLS 音频 codec、带宽受限网络和 authoring specification 的上下文。
+- [Export HDR media in your app with AVFoundation](/articles/wwdc2020-10010) - 对照 AVFoundation 中 AVAssetExportSession 与 AVAssetWriter 的媒体导出路径。
+- [Discover how to download and play HLS offline](/articles/wwdc2020-10655) - 从播放端理解 AVFoundation 如何下载、持久化和离线播放 HLS 内容。

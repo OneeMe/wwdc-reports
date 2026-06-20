@@ -1,0 +1,195 @@
+---
+title: "Improve Core ML integration with async prediction"
+description: "Learn how to speed up machine learning features in your app with the latest Core ML execution engine improvements and find out how aggressive asset caching can help with inference and faster model loads."
+date: "2023-06-10"
+tags: ["Core ML", "Machine Learning", "Swift Concurrency", "Performance"]
+thumbnail: "/images/sessions/2023/10049.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10049/"
+sessionId: "wwdc2023-10049"
+year: "2023"
+relatedSessions:
+  - title: "Optimize machine learning for Metal apps"
+    code: "10050"
+    description: "PyTorch、TensorFlow 和 JAX 在 Metal 上的加速"
+  - title: "Deploy machine learning models with Core ML Tools"
+    code: "10049"
+    description: "模型转换与压缩"
+  - title: "Explore machine learning in Create ML"
+    code: "10049"
+    description: "Create ML 模型开发工作流"
+---
+
+## Highlight
+
+> iOS 17 的 Core ML 推理引擎对多数模型自动提速，无需重新编译模型或修改代码；新增的异步预测 API（async prediction）让开发者可以用 Swift Concurrency 并发执行模型推理，吞吐量提升可达 2 倍。
+
+## 核心内容
+
+### 自动提速：升级系统即可获益
+
+以前，想要提升模型推理速度，开发者需要手动调整模型精度、重新训练或更换架构。iOS 17 的 Core ML 推理引擎在底层做了优化，很多模型在升级后预测时间直接缩短。这个提速随系统更新而来，不需要重新编译 .mlmodel 文件，也不需要改一行代码。
+
+### 模型加载的生命周期与缓存
+
+Core ML 加载模型时，会先检查缓存。如果该配置和设备组合已经有缓存，直接走 cached load；如果没有，则触发一次 device-specialized compilation，把结果写入缓存。这个 uncached load 可能很慢，但后续加载会快很多。
+
+缓存文件存在磁盘上，关联模型路径和配置，跨应用启动和设备重启都有效。只有在磁盘空间不足、系统更新、或编译模型被删除/修改时，缓存才会被清理。
+
+用 Core ML Instrument 可以观察加载事件：标有 "prepare and cache" 的是 uncached load，标 "cached" 的是缓存命中。性能报告现在也支持显示 uncached load 时间。
+
+### 异步预测 API 解决并发瓶颈
+
+以前用同步预测 API，模型不是线程安全的，必须用 actor 串行执行。这导致输入准备和模型推理都被串在一个队列里，GPU 利用率低，UI 也卡顿。
+
+iOS 17 引入了 `prediction()` 的 async 版本。它线程安全，支持 Swift Concurrency。把 ColorizingService 从 actor 改成普通 class 后，多个预测可以并发执行。配合 `Task.cancel()`，用户快速滚动时未完成的预测会被取消。
+
+Demo 里用 LazyVGrid 展示图片，切换 async API 后，初始视图着色时间从 2 秒降到 1 秒，吞吐量提升约 2 倍。
+
+### 内存控制：别无限并发
+
+并发预测会同时加载多组输入输出，内存峰值可能飙升。建议加流量控制，比如限制最多 2 个 in-flight predictions。对于摄像头流数据，可以直接丢弃过期的帧，避免积压。
+
+## 详细内容
+
+### 检查设备算力可用性
+
+（[08:29](https://developer.apple.com/videos/play/wwdc2023/10049/?time=509)）
+
+有些体验要求 Neural Engine 才能满足性能或功耗需求。iOS 17 新增了 `MLComputeDevice` 和 `availableComputeDevices` API，可以在运行时检查设备支持哪些算力单元。
+
+```swift
+import CoreML
+
+let model = try await MLModel.load(contentsOf: modelURL)
+
+// 检查是否有 Neural Engine
+let hasNeuralEngine = model.availableComputeDevices.contains {
+    if case .neuralEngine = $0 { return true }
+    return false
+}
+
+if hasNeuralEngine {
+    // 使用需要 Neural Engine 的模型
+}
+```
+
+**关键点：**
+- `MLModel.load(contentsOf:)` 异步加载模型
+- `availableComputeDevices` 返回当前设备支持的算力单元列表
+- `MLComputeDevice` 是枚举，包含 `.cpu`、`.gpu`、`.neuralEngine` 等 case
+
+### 异步预测 API 的使用
+
+（[17:33](https://developer.apple.com/videos/play/wwdc2023/10049/?time=1053)）
+
+```swift
+import CoreML
+
+class ColorizingService {
+    private let colorizerModel: Colorizer
+    
+    init() throws {
+        let config = MLModelConfiguration()
+        colorizerModel = try Colorizer(configuration: config)
+    }
+    
+    func colorize(image: UIImage) async throws -> UIImage? {
+        // 检查任务是否已被取消
+        guard !Task.isCancelled else { return nil }
+        
+        // 准备输入（缩放到模型要求的尺寸）
+        let resizedImage = image.resized(to: CGSize(width: 256, height: 256))
+        guard let pixelBuffer = resizedImage.pixelBuffer else { return nil }
+        
+        // 异步预测
+        let input = ColorizerInput(image: pixelBuffer)
+        let output = try await colorizerModel.prediction(input: input)
+        
+        return UIImage(pixelBuffer: output.colorizedImage)
+    }
+}
+```
+
+**关键点：**
+- `try await colorizerModel.prediction(input:)` 是新的异步 API
+- 在方法开头检查 `Task.isCancelled`，避免为已取消的任务准备输入
+- 不再需要 actor 隔离，多个预测可以并发执行
+- 配合 SwiftUI 的 `.task` modifier，视图消失时自动取消
+
+### 流量控制限制并发数
+
+（[21:17](https://developer.apple.com/videos/play/wwdc2023/10049/?time=1277)）
+
+```swift
+actor ColorizingService {
+    private let colorizerModel: Colorizer
+    private var inFlightCount = 0
+    private let maxInFlight = 2
+    
+    func colorize(image: UIImage) async throws -> UIImage? {
+        // 等待直到有可用槽位
+        while inFlightCount >= maxInFlight {
+            try await Task.sleep(nanoseconds: 10_000_000) // 10ms
+        }
+        
+        inFlightCount += 1
+        defer { inFlightCount -= 1 }
+        
+        guard !Task.isCancelled else { return nil }
+        
+        let resizedImage = image.resized(to: CGSize(width: 256, height: 256))
+        guard let pixelBuffer = resizedImage.pixelBuffer else { return nil }
+        
+        let input = ColorizerInput(image: pixelBuffer)
+        let output = try await colorizerModel.prediction(input: input)
+        
+        return UIImage(pixelBuffer: output.colorizedImage)
+    }
+}
+```
+
+**关键点：**
+- 用 actor 控制 `inFlightCount`，保证线程安全
+- `maxInFlight = 2` 限制同时进行的预测数量
+- `defer` 确保计数器在方法结束时正确递减
+- 对于摄像头流，可以直接 `return nil` 而不是等待，丢弃过期帧
+
+### 三种预测 API 的选择
+
+（[22:04](https://developer.apple.com/videos/play/wwdc2023/10049/?time=1324)）
+
+| 场景 | 推荐 API |
+|------|---------|
+| 同步上下文，输入间隔远大于模型延迟 | 同步 `prediction(input:)` |
+| 输入成批到达 | `predictions(from:)` 批处理 API |
+| 异步上下文，大量输入随时间单独到达 | 异步 `prediction(input:)` |
+
+ML Program 和 Pipeline 模型类型从并发预测中获益最大。添加并发前，务必用 Instruments 的 Core ML + Allocations 模板分析，确认确实对用例有帮助。
+
+## 核心启发
+
+**1. 实时滤镜相机**
+- **做什么**：用 Core ML 模型给摄像头画面加实时风格迁移或人像分割滤镜
+- **为什么值得做**：异步预测 API 让每帧处理不阻塞主线程，流量控制防止内存爆炸
+- **怎么开始**：用 `AVCaptureVideoDataOutput` 获取帧，在 `.task` 中调用异步 `prediction()`，设置 `maxInFlight = 1` 保证只处理最新帧
+
+**2. 批量图片智能分类**
+- **做什么**：相册里选 100 张照片，用 Core ML 模型自动分类（风景/人像/美食）
+- **为什么值得做**：并发预测把总时间从串行的几十秒降到几秒，用户不用等待
+- **怎么开始**：用 `PhotosPicker` 选图，在 `TaskGroup` 中并发调用预测，限制并发数为 3-5
+
+**3. 离线语音识别助手**
+- **做什么**：完全离线的语音转文字 + 意图识别，不依赖网络
+- **为什么值得做**：iOS 17 推理引擎提速 + 异步 API，让端侧语音模型响应更快
+- **怎么开始**：用 `SFSpeechRecognizer` 获取音频流，分片送入 Core ML 声学模型，用 async sequence 处理结果
+
+**4. 智能相册去重**
+- **做什么**：扫描本地相册，用图像嵌入模型找出相似照片
+- **为什么值得做**：批量并发提取特征向量，大幅缩短扫描时间
+- **怎么开始**：用 `PHAsset` 遍历照片，用 Vision 框架提取特征，Core ML 模型计算相似度矩阵
+
+## 关联 Session
+
+- [Optimize machine learning for Metal apps](/articles/wwdc2023-10050) — PyTorch 2.0、TensorFlow 和 JAX 在 Metal 上的加速
+- [Deploy machine learning models with Core ML Tools](/articles/wwdc2023-10049) — 模型转换、量化和压缩
+- [Explore machine learning in Create ML](/articles/wwdc2023-10049) — 用 Create ML 交互式开发和评估模型

@@ -1,0 +1,272 @@
+---
+title: "Accelerate machine learning with Metal"
+description: "learn how to accelerate your machine learning transformer models with new features in metal performance shaders graph. we"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10218.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10218/"
+sessionId: "wwdc2024-10218"
+year: "2024"
+relatedSessions:
+  - title: "Bring your machine learning and AI models to Apple silicon"
+    code: "10159"
+    description: "learn how to optimize your machine learning and ai models to leverage the power of apple silicon"
+  - title: "Train your machine learning and AI models on Apple GPUs"
+    code: "10160"
+    description: "learn how to train your models on apple silicon with metal for pytorch, jax and tensorflow"
+  - title: "Deploy machine learning and AI models on-device with Core ML"
+    code: "10161"
+    description: "learn new ways to optimize speed and memory performance when you convert and run machine learning and ai models"
+  - title: "Support real-time ML inference on the CPU"
+    code: "10211"
+    description: "discover how you can use bnnsgraph to accelerate the execution of your machine learning model on the cpu"
+  - title: "Explore machine learning on Apple platforms"
+    code: "10223"
+    description: "get started with an overview of machine learning frameworks on apple platforms"
+---
+
+## Highlight
+
+> 在 Apple 平台上部署机器学习模型有三个阶段：训练、部署准备、应用集成。这场 Session 聚焦在推理性能优化环节。
+
+---
+
+## 核心内容
+
+在 Apple 平台上部署机器学习模型有三个阶段：训练、部署准备、应用集成。这场 Session 聚焦在推理性能优化环节。
+
+如果你的应用使用 Core ML 部署模型，MPSGraph 已经在底层提供 GPU 加速。你也可以用 PyTorch、TensorFlow、JAX 等框架训练模型，它们都构建在 Metal Performance Shaders Graph（MPSGraph）之上。在某些场景下你可能需要直接使用 MPSGraph：当你的应用本身就用 Metal，需要将 ML 任务与其他 GPU 工作排在一起；或者你需要共享底层 Metal 资源如 Buffer。
+
+今年的更新分三个方向。针对 Transformer 模型的计算性能优化，包括融合 Scaled Dot-Product Attention（SDPA）算子和 KV Cache 原地更新。内存带宽优化，新增 4-bit 整数量化支持。质量改进，包括分块量化和 Adapters 机制。此外还有 FFT 加速和 MPSGraph Viewer 可视化工具。
+
+---
+
+## 详细内容
+
+### 融合 Scaled Dot-Product Attention（SDPA）
+
+Transformer 模型的核心是 Multi-Head Attention 块，其中 Scaled Dot-Product Attention 由一系列操作组成。MPSGraph 今年新增了融合算子，把这些操作合并为一个 kernel 执行（[03:56](https://developer.apple.com/videos/play/wwdc2024/10218/?time=236)）。
+
+调用方式：
+
+```swift
+let sdpaResult = graph.scaledDotProductAttention(
+    query: queryTensor,
+    key: keyTensor,
+    value: valueTensor
+)
+```
+
+关键点：
+- `scaledDotProductAttention` 接受 Q、K、V 三个张量作为参数
+- 将多个操作融合为单个 kernel，减少中间结果的读写开销
+- 替换手动实现的 SDPA 即可获得性能提升，代码改动量极小
+
+### KV Cache 原地更新
+
+自回归生成时，每生成一个新 token 都要把之前所有 token 重新送入矩阵乘法，导致 K、V 投影被反复计算。KV Cache 把已计算的 K、V 值存下来复用，把矩阵-矩阵乘法简化为矩阵-向量乘法（[05:00](https://developer.apple.com/videos/play/wwdc2024/10218/?time=300)）。
+
+用 Variable + sliceUpdate 实现原地更新：
+
+```swift
+// 创建占位符表示 cache，维度取决于模型
+let keyCachePlaceholder = MPSGraphTensor(
+    shape: [batch, heads, maxLength, headDim],
+    dataType: .float32
+)
+
+// 创建 Variable，代表 cache 的当前状态
+let keyCacheVariable = graph.makeVariable(
+    name: "keyCache",
+    shape: [batch, heads, maxLength, headDim],
+    dataType: .float32
+)
+
+// 用 sliceUpdateDataTensor 将新 key 投影插入 cache
+let updatedCache = graph.sliceUpdateDataTensor(
+    newKeyProjection,
+    updateTensor: keyCacheVariable,
+    startIndex: [0, 0, currentPosition, 0],
+    endIndex: [batch, heads, currentPosition + 1, headDim],
+    stride: [1, 1, 1, 1],
+    name: "updateKeyCache"
+)
+
+// 将更新后的 cache 赋回 Variable，MPSGraph 会优化为原地更新
+keyCacheVariable.assign(updatedCache)
+
+// 用 slice 操作提取已计算的部分
+let validCache = graph.slice(
+    tensor: keyCacheVariable,
+    startIndex: [0, 0, 0, 0],
+    endIndex: [batch, heads, currentPosition + 1, headDim],
+    stride: [1, 1, 1, 1],
+    name: "extractValidCache"
+)
+```
+
+关键点：
+- `makeVariable` 创建可变张量，与普通图操作结果不同，可以被重新赋值
+- `sliceUpdateDataTensor` 指定 start/end 数组决定新值插入位置
+- 将 `updatedCache` 赋回 `keyCacheVariable`，MPSGraph 自动优化为原地更新，避免每轮迭代分配新内存
+- `slice` 提取 cache 中已计算的有效部分，再传给 SDPA
+
+### 4-bit 整数量化
+
+大语言模型的权重可达数十 GB，通常用 16-bit 浮点表示。MPS 之前已支持 8-bit 整数量化（内存减半），今年新增 4-bit 格式（内存再减半）（[07:46](https://developer.apple.com/videos/play/wwdc2024/10218/?time=466)）。
+
+MPS 提供两种量化方案。线性量化（affine quantization）适合权重均匀分布的情况，8-bit 有 256 个量化点，4-bit 有 16 个，量化时将值映射到最近的量化点。LUT 量化适合权重集中在不同区域的情况，你根据数据分布自选量化点存入查找表，每个权重只需 4 或 8 bit 的索引。
+
+```swift
+// 线性量化：反量化回浮点
+let dequantized = graph.dequantize(
+    quantizedTensor: quantizedWeights,
+    scale: scaleValue,
+    zeroPoint: zeroPointValue,
+    dataType: .float32,
+    name: "dequantize"
+)
+
+// LUT 量化：传入查找表
+let dequantizedLUT = graph.dequantize(
+    quantizedTensor: quantizedWeights,
+    lut: lookupTable,  // 32-bit 浮点查找表
+    dataType: .float32,
+    name: "dequantizeLUT"
+)
+```
+
+关键点：
+- `dequantize` 方法将量化值转回 32-bit 浮点
+- 线性量化传 `scale` 和 `zeroPoint`；LUT 量化传 `lut` 查找表
+- 当反量化操作后面紧接矩阵乘法，MPSGraph 自动将两者融合为量化矩阵乘法，逐元素反量化而不是先存一个完整的反量化副本
+
+### 分块量化
+
+对全部权重使用单一的 scale 和 zeroPoint 会限制精度。分块量化将权重分成小块，每块各自拥有 scale 和 zeroPoint，精度更高（[10:45](https://developer.apple.com/videos/play/wwdc2024/10218/?time=645)）。
+
+```swift
+// 分块量化：传入 tensor 形式的 scale 和 zeroPoint，每个 block 一组
+let dequantizedBlocked = graph.dequantize(
+    quantizedTensor: quantizedWeights,
+    scale: scalePerBlock,        // tensor, 每个 block 一个值
+    zeroPoint: zeroPointPerBlock, // tensor, 每个 block 一个值
+    dataType: .float32,
+    name: "dequantizeBlocked"
+)
+```
+
+关键点：
+- 与全局量化代码结构相同，区别是 `scale` 和 `zeroPoint` 从标量变为张量
+- 每个 block 有独立的 scale/zeroPoint，更精确地匹配局部权重分布
+
+### Adapters（Callables）
+
+Adapters 是插入模型的小层，只更新 adapter 内参数。可以用于适配新任务，也可以补偿量化引入的误差。MPSGraph 通过 callables 机制实现（[11:48](https://developer.apple.com/videos/play/wwdc2024/10218/?time=708)）。
+
+```swift
+// 1. 在主图中调用 adapter
+let adapterOutput = graph.call(
+    "myAdapter",
+    inputs: [inputTensor],
+    outputTypes: [MPSGraphTensorDataType.float32]
+)
+
+// 2. 创建 adapter 的子图
+let adapterGraph = MPSGraph()
+let adapterInput = adapterGraph.placeholder(
+    shape: nil,  // unranked
+    dataType: .float32,
+    name: "input"
+)
+let adapterOutputTensor = adapterGraph.multiplication(
+    adapterInput,
+    adapterGraph.constant(2.0, dataType: .float32),
+    name: "output"
+)
+
+// 3. 编译 adapter 为 GraphExecutable
+let adapterExecutable = adapterGraph.compile(
+    device: metalDevice,
+    inputs: [MPSGraphInput(shape: [batch, dim], dataType: .float32)],
+    outputTensor: adapterOutputTensor
+)
+
+// 4. 主图编译时通过 descriptor 映射 adapter 名到 executable
+let descriptor = MPSGraphCompilationDescriptor()
+descriptor.callables = ["myAdapter": adapterExecutable]
+let mainExecutable = mainGraph.compile(
+    device: metalDevice,
+    inputs: mainInputs,
+    outputTensors: mainOutputs,
+    descriptor: descriptor
+)
+```
+
+关键点：
+- `graph.call` 在主图中声明对 adapter 的调用，提供名称、输入和输出类型
+- adapter 本身是一个独立的 MPSGraph，编译为 `GraphExecutable`
+- 主图编译时用 `MPSGraphCompilationDescriptor` 的 `callables` 字典将名称映射到实际的 executable
+- 可用于补偿量化误差，只需微调 adapter 参数
+
+### FFT 加速
+
+MPSGraph 今年新增 FFT 支持，适合音频预处理等场景（[13:49](https://developer.apple.com/videos/play/wwdc2024/10218/?time=829)）。通过 strided NDArray API 实现滑动窗口视图，无需内存拷贝：
+
+```swift
+// 创建滑动窗口视图
+let windowedView = inputTensor.arrayView(
+    shape: [1, numWindows, windowSize],
+    strides: [1, hopSize, 1],
+    name: "stftView"
+)
+
+// 加窗 + FFT
+let windowed = graph.multiplication(windowedData, hannWindow, name: "applyWindow")
+let fftResult = graph.fft(
+    tensor: windowed,
+    axes: [2],
+    name: "computeFFT"
+)
+```
+
+关键点：
+- `arrayView` 通过内存别名创建视图，零拷贝
+- strides 参数控制窗口步长，如 256 元素跳步实现 50% 重叠
+- 先乘窗函数（Hann/Gaussian），再调用 `fft` 计算各窗口的频谱
+
+### MPSGraph Viewer
+
+Xcode 16 新增 MPSGraph Viewer，可直接打开 MPSGraph 包文件，可视化计算图的连接关系（[17:25](https://developer.apple.com/videos/play/wwdc2024/10218/?time=1045)）。支持：按设备查看优化后的 Stitched Shader 区域；Operations Navigator 列出所有算子；Constants Navigator 按大小排列常量并预览权重；Inspector 查看变量的创建和使用位置。
+
+可通过 `MPSGraphExecutable` 的 `serialize` API 创建包文件，也可用 `mpsgraphtool convert` 从 CoreML 或 ONNX 模型转换。
+
+---
+
+## 核心启发
+
+- **做什么**：将手动实现的 SDPA 替换为 MPSGraph 的融合算子
+  为什么值得做：改动最小，收益最大——多个操作融合为一个 kernel，减少中间结果读写
+  怎么开始：找到代码中手写 attention 的位置，替换为 `graph.scaledDotProductAttention(query:key:value:)`，验证输出一致即可
+
+- **做什么**：为自回归推理实现 KV Cache + Variable 原地更新
+  为什么值得做：避免每轮迭代重算全部 K/V 投影，序列越长加速越明显；原地更新避免反复分配内存
+  怎么开始：用 `makeVariable` 创建 cache，`sliceUpdateDataTensor` 插入新值，`assign` 赋回变量，`slice` 提取有效部分
+
+- **做什么**：评估 4-bit 量化对模型精度的影响，选择合适的量化方案
+  为什么值得做：从 8-bit 降到 4-bit 内存带宽再减半，但需要验证输出质量是否可接受
+  怎么开始：权重均匀分布用线性量化，集中分布用 LUT 量化；先跑基准测试再对比量化后精度；用 MPSGraph Viewer 在量化前后对比计算图
+
+- **做什么**：用 Adapters（Callables）补偿量化误差
+  为什么值得做：量化节省了带宽但引入精度损失，adapter 只需少量参数即可微调输出质量
+  怎么开始：在主图中用 `graph.call` 插入 adapter 调用，编译时通过 `CompilationDescriptor.callables` 映射名称到 executable
+
+---
+
+## 关联 Session
+
+- [Bring your machine learning and AI models to Apple silicon](/articles/wwdc2024-10159) — 模型转换与 Apple Silicon 优化的完整流程
+- [Train your machine learning and AI models on Apple GPUs](/articles/wwdc2024-10160) — 用 Metal 为 PyTorch、JAX、TensorFlow 训练模型
+- [Deploy machine learning and AI models on-device with Core ML](/articles/wwdc2024-10161) — Core ML 转换与部署的性能优化
+- [Support real-time ML inference on the CPU](/articles/wwdc2024-10211) — BNNSGraph 在 CPU 上加速 ML 推理
+- [Explore machine learning on Apple platforms](/articles/wwdc2024-10223) — Apple 平台 ML 框架全览

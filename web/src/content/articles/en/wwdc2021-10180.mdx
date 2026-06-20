@@ -1,0 +1,284 @@
+---
+title: "Detect and diagnose memory issues"
+description: "discover how you can understand and diagnose memory performance problems with xcode. we'll take you through the latest updates to xcode's tools, explore metrics, check out the memgraph collection feature in xctest, and learn how to catch regressions using a performance xctest."
+date: "2021-06-06"
+tags: ["Developer Tools", "Performance", "Memory"]
+thumbnail: "/images/sessions/2021/10180.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10180/"
+sessionId: "wwdc2021-10180"
+year: "2021"
+relatedSessions:
+  - title: "Ultimate application performance survival guide"
+    code: "10181"
+    description: "用系统指标和工具建立应用性能诊断流程"
+  - title: "ARC in Swift: Basics and beyond"
+    code: "10216"
+    description: "解释 Swift 自动引用计数和循环引用问题"
+  - title: "Symbolication: Beyond the basics"
+    code: "10211"
+    description: "说明调试符号如何帮助定位性能和崩溃问题"
+  - title: "Getting started with Instruments"
+    code: "411"
+    description: "学习使用 Instruments 分析应用运行时行为"
+---
+
+## Highlight
+
+> Xcode 13 为性能 XCTest 增加 ktrace 和 memgraph 诊断收集，开发者可以在内存回归发生时拿到测试前后的内存快照，并用 leaks、vmmap、heap、malloc_history 定位泄漏、堆增长和碎片。
+
+## 核心内容
+
+用户点了“保存菜谱”，App 下载数据，界面显示“Saved”。功能看起来完成了。
+
+几周后，老设备用户开始反馈：App 从后台回来经常重新启动。原因可能是内存压力。iOS 内存有限，系统会终止后台 App 来回收内存。App 的内存 footprint 越大，留在内存里的机会越小。
+
+开发者过去常见的做法是问题出现后再手动抓内存图。这个流程太晚。等到用户遇到问题，开发者很难复现同一条操作路径，也很难知道是哪一次提交引入了增长。
+
+Apple 在这场 session 给出的方案是把内存监控放进 XCTest。每次新功能合入前，用性能测试记录内存指标，设置 baseline。后续运行的平均值超过 baseline，测试直接失败。
+
+Xcode 13 的变化在诊断阶段。性能测试失败后，`xcodebuild` 可以收集诊断文件。非内存指标收集 ktrace，内存指标收集 memgraph。memgraph 记录进程地址空间、虚拟内存区域、malloc 块和它们之间的指针关系。开发者拿到失败测试的 pre/post 两个快照，就能继续分析增长来自哪里。
+
+### 从“是否回归”到“为什么回归”
+
+性能 XCTest 先回答第一个问题：这次运行是否比 baseline 更差。
+
+memgraph 继续回答第二个问题：内存为什么变多。演讲把常见问题分成三类：泄漏（leaks）、堆分配回归（heap allocation regressions）、碎片（fragmentation）。对应工具分别是 `leaks`、`vmmap`、`heap`、`malloc_history`。
+
+### 内存 footprint 看 dirty 和 compressed
+
+App 的内存 profile 可以分成 dirty、compressed、clean 三类。Dirty memory 是 App 写过的内存，包括 heap allocations、解码后的图片缓冲区和 frameworks。Compressed memory 是最近没有访问的 dirty pages，被内存压缩器压缩。Clean memory 是没有写过、可以 page out 的数据，比如磁盘上的 memory mapped files。
+
+这场 session 讨论的 footprint 指 dirty memory 加 compressed memory。Clean memory 不算入这里的 footprint。
+
+## 详细内容
+
+### 1. 用性能 XCTest 测量内存（[04:52](https://developer.apple.com/videos/play/wwdc2021/10180/?time=292)）
+
+Apple 使用 `measure(metrics:options:block:)` API，把“保存菜谱”这条 UI 路径放进性能测试。测试目标是 `XCUIApplication` 的内存占用。
+
+```swift
+// Monitor memory performance with XCTests
+
+func testSaveMeal() {
+    let app = XCUIApplication()
+
+    let options = XCTMeasureOptions()
+    options.invocationOptions = [.manuallyStart]
+
+    measure(metrics: [XCTMemoryMetric(application: app)],
+            options: options) {
+
+        app.launch()
+
+        startMeasuring()
+
+        app.cells.firstMatch.buttons["Save meal"].firstMatch.tap()
+
+             let savedButton = app.cells.firstMatch.buttons["Saved"].firstMatch
+        XCTAssertTrue(savedButton.waitForExistence(timeout: 30))
+    }
+}
+```
+
+关键点：
+- `let app = XCUIApplication()` 创建 UI 测试中的目标应用对象。
+- `let options = XCTMeasureOptions()` 创建性能测量配置。
+- `options.invocationOptions = [.manuallyStart]` 让测试手动控制测量起点。
+- `measure(metrics: [XCTMemoryMetric(application: app)], options: options)` 指定测量目标应用的内存指标。
+- `app.launch()` 启动应用，但此时还没有开始计入测量。
+- `startMeasuring()` 开始记录内存指标，避免启动阶段干扰保存操作的结果。
+- `app.cells.firstMatch.buttons["Save meal"].firstMatch.tap()` 执行用户动作：点击保存按钮。
+- `let savedButton = app.cells.firstMatch.buttons["Saved"].firstMatch` 找到保存完成后的 UI 状态。
+- `XCTAssertTrue(savedButton.waitForExistence(timeout: 30))` 等待下载和保存完成，最多 30 秒。
+
+Xcode 会展示每次 iteration 的测量值，并计算平均值。开发者可以把某次平均值设为 baseline。后续平均值超过 baseline，测试以 regression 失败。
+
+### 2. 收集 ktrace 和 memgraph（[07:49](https://developer.apple.com/videos/play/wwdc2021/10180/?time=469)）
+
+Xcode 13 增加了性能测试诊断收集。命令行入口是 `xcodebuild` 的 `enablePerformanceTestsDiagnostics` flag。
+
+```bash
+xcodebuild test -enablePerformanceTestsDiagnostics YES
+```
+
+关键点：
+- `xcodebuild test` 从命令行运行测试，适合放进 CI。
+- `-enablePerformanceTestsDiagnostics YES` 启用性能测试诊断收集。
+- 非内存指标会收集 ktrace 文件，可用 Instruments 打开分析。
+- 内存指标会收集 memgraph 文件，可用 Xcode visual debugger 和命令行工具分析。
+
+测试完成后，控制台输出会指出测试是否失败、是否因为 regression 失败、当前平均值比 baseline 差多少，以及 `xcresult` bundle 的路径。打开 `xcresult` 后，可以在测试日志底部找到附加的 memgraph。
+
+XCTest 会额外追加一次 iteration 来启用 malloc stack logging。内存测试会得到两个 memgraph：`pre` 是测量开始时的快照，`post` 是测量结束时的快照。它们用于分析一次 iteration 内的内存增长。
+
+### 3. 先检查泄漏（[12:17](https://developer.apple.com/videos/play/wwdc2021/10180/?time=737)）
+
+Stefan 建议拿到失败测试的 memgraph 后，先查泄漏。泄漏指进程分配了对象，随后丢失所有引用，内存没有释放。Swift 中常见原因是 retain cycle（循环强引用）。
+
+```bash
+leaks post.memgraph
+```
+
+关键点：
+- `leaks` 是检查泄漏的命令行工具。
+- `post.memgraph` 是测量结束时的内存快照。
+- 输出会显示泄漏数量和泄漏字节数。
+- 输出中的对象图可以提示泄漏对象之间的引用关系。
+- 出现 `ROOT CYCLE` 时，问题是 retain cycle。
+- 因为 XCTest 自动启用 malloc stack logging，输出还会包含泄漏对象的 allocation call stack。
+
+演讲中的 Meal Planner 示例里，`leaks` 显示 4 个泄漏，共 240 bytes。对象图里有 `ROOT CYCLE`，符号显示它和 meal plan、menu item 对象有关。调用栈继续把分配位置指向 `populateMealData`。
+
+修复思路来自 Swift ARC（Automatic Reference Counting，自动引用计数）：避免两个对象互相持有强引用。若业务必须保留反向关系，把其中一个引用改成 weak reference（弱引用）。
+
+```swift
+weak var mealPlan: MealPlan?
+```
+
+关键点：
+- `weak` 表示这个属性不增加被引用对象的引用计数。
+- `MealPlan?` 需要是可选类型，因为弱引用对象释放后会自动变成 `nil`。
+- 把反向引用改成弱引用后，两个对象不再通过强引用形成 retain cycle。
+- ARC 可以在外部引用消失后释放对象。
+
+### 4. 用 vmmap 和 heap 找堆增长（[15:27](https://developer.apple.com/videos/play/wwdc2021/10180/?time=927)）
+
+如果没有泄漏，下一步看 heap。堆分配回归指进程在堆上分配了比以前更多的对象，导致 footprint 增长。
+
+```bash
+vmmap -summary pre.memgraph
+vmmap -summary post.memgraph
+```
+
+关键点：
+- `vmmap -summary` 给出进程内存使用概览。
+- 分别查看 pre 和 post，可以看到一次测量前后的 footprint 差值。
+- 关注以 `MALLOC_` 开头的区域，因为这些区域包含 heap objects。
+- 在 `vmmap` 输出中，`swapped` 对应 iOS 上的 compressed memory。
+- 分析 footprint 时看 `dirty size` 和 `swapped size`。
+
+演讲中的示例里，pre footprint 约 112 MB，post footprint 约 125 MB，增长约 13 MB。`MALLOC_LARGE` 区域持有约 13 MB dirty memory，和回归大小匹配。
+
+接着用 `heap -diffFrom` 看 post 中新增了哪些堆对象。
+
+```bash
+heap post.memgraph -diffFrom pre.memgraph
+```
+
+关键点：
+- `heap` 用于检查 memgraph 中的堆对象。
+- `post.memgraph` 是要分析的目标快照。
+- `-diffFrom pre.memgraph` 只显示 post 中存在、pre 中不存在的对象。
+- 输出会按 object class 展示对象数量和总字节数。
+- 大量 `non-object` 在 Swift 中通常表示 raw malloced bytes。
+
+演讲示例中，`heap -diffFrom` 显示约 13 MB 新对象，其中主要类型是 `non-object`。这说明要继续查 raw malloced bytes。
+
+### 5. 从地址追到分配调用栈（[17:23](https://developer.apple.com/videos/play/wwdc2021/10180/?time=1043)）
+
+确认增长来自 `non-object` 后，先拿到具体地址。
+
+```bash
+heap post.memgraph -addresses non-object -minSize 500000
+```
+
+关键点：
+- `-addresses` 输出匹配对象的地址。
+- `non-object` 只筛选 raw malloced bytes。
+- `-minSize 500000` 只看至少 500 KB 的对象，减少噪音。
+- 找到约 13 MB 的对象后，可以把它作为主要嫌疑对象。
+
+有了地址，可以查看谁引用它，也可以查看它在哪里分配。
+
+```bash
+leaks --traceTree 0xADDRESS post.memgraph
+leaks --referenceTree --groupByType post.memgraph
+malloc_history post.memgraph -fullStacks 0xADDRESS
+```
+
+关键点：
+- `leaks --traceTree 0xADDRESS post.memgraph` 显示引用这个地址的对象树。
+- `leaks --referenceTree --groupByType post.memgraph` 从根对象向下聚合引用树，并按类型分组。
+- `malloc_history post.memgraph -fullStacks 0xADDRESS` 显示该地址对象的完整分配调用栈。
+- `malloc_history` 依赖 malloc stack logging；XCTest 收集的 memgraph 已经自动启用。
+
+演讲中，`leaks --traceTree` 和 `leaks --referenceTree` 都指向 `meal data` 对象。`malloc_history -fullStacks` 把分配位置指向 `saveMeal` 函数。问题是 cell 保存一个大 buffer，写入磁盘后仍由类成员持有。修复方式是在写入完成后把引用清掉。
+
+```swift
+mealData = nil
+```
+
+关键点：
+- `mealData` 是类成员，只要 cell 实例存在，引用就会继续存在。
+- 写入磁盘后继续持有大 buffer，会让每个保存过的 cell 都保留内存。
+- `mealData = nil` 删除最后一个引用后，Swift 的 `Data` 会释放底层 buffer。
+- 这个修复缩短了大对象的生命周期，降低峰值 footprint。
+
+### 6. 检查碎片（[24:51](https://developer.apple.com/videos/play/wwdc2021/10180/?time=1491)）
+
+Fragmentation（碎片）指 dirty pages 没有被充分使用。iOS 的 page 是固定大小、不可拆分的块。进程写入 page 的一部分后，整个 page 都算 dirty。对象释放后留下的空洞如果无法容纳后续分配，就会变成浪费。
+
+```bash
+vmmap -summary post.memgraph
+```
+
+关键点：
+- 同一个 `vmmap -summary` 可以查看碎片。
+- 滚到输出底部的 malloc zones 区域。
+- 看 `% FRAG` 列，它表示每个 malloc zone 中因碎片浪费的比例。
+- 普通情况下关注 `DefaultMallocZone`。
+- memgraph 启用 malloc stack logging 时，堆分配进入 `MallocStackLoggingLiteZone`。
+- Apple 给出的经验目标是碎片率约 25% 或更低。
+
+减少碎片的原则是让生命周期相近的对象在内存中靠近分配。这样释放时能形成更大的连续空闲区域。演讲还提到 autorelease pool：pool 出作用域后，会释放其中创建的对象，使这些临时对象拥有相近生命周期。
+
+```swift
+autoreleasepool {
+    // Allocate temporary objects that should be released together.
+}
+```
+
+关键点：
+- `autoreleasepool` 创建一个局部释放范围。
+- 作用域中的临时对象会在 pool 结束时释放。
+- 适合把一批生命周期相近的临时对象放在一起。
+- 对长时间运行的进程或 extension，碎片更需要定期检查。
+
+## 核心启发
+
+### 1. 给高风险 UI 流程加内存回归测试
+
+- **做什么**：为“保存”“导入”“导出”“下载离线包”这类流程写 UI performance test。
+- **为什么值得做**：这些流程容易创建大对象。`XCTMemoryMetric` 可以在回归进入主分支前失败。
+- **怎么开始**：用 `XCUIApplication` 打开目标页面，用 `XCTMeasureOptions` 设置 `.manuallyStart`，在关键点击前调用 `startMeasuring()`。
+
+### 2. 把 memgraph 收集接入 CI
+
+- **做什么**：CI 运行性能测试时启用 `-enablePerformanceTestsDiagnostics YES`，把失败测试的 `xcresult` 保存成构建产物。
+- **为什么值得做**：回归发生时，开发者可以直接下载 pre/post memgraph，不必重新复现。
+- **怎么开始**：在现有 `xcodebuild test` 命令后加入 flag，并在 CI 中归档 `xcresult` 路径。
+
+### 3. 为大对象建立释放检查清单
+
+- **做什么**：检查图片解码 buffer、下载数据、导入文件、临时 `Data` 是否在使用后释放。
+- **为什么值得做**：演讲中的 13 MB 回归来自写盘后仍被类成员持有的 buffer。
+- **怎么开始**：用 `heap -diffFrom` 找增长类型，用 `malloc_history -fullStacks` 找分配函数，在操作结束处清掉最后引用。
+
+### 4. 给 retain cycle 建立固定排查路径
+
+- **做什么**：把 `leaks post.memgraph` 作为内存回归的第一步检查。
+- **为什么值得做**：`ROOT CYCLE` 能直接指出循环引用，malloc stack logging 能把对象分配位置带出来。
+- **怎么开始**：拿到 post memgraph 后先跑 `leaks`，从输出里的 app 符号进入 Xcode，检查双向引用，把反向关系改成 `weak`。
+
+### 5. 为长运行 extension 检查碎片率
+
+- **做什么**：定期用 `vmmap -summary` 查看 extension 的 malloc zone 碎片率。
+- **为什么值得做**：长运行进程经历大量分配和释放，更容易让 address space 被碎片化。
+- **怎么开始**：抓取 memgraph 后查看 `% FRAG`，重点看 `DefaultMallocZone` 或启用 MSL 时的 `MallocStackLoggingLiteZone`，目标控制在约 25% 或更低。
+
+## 关联 Session
+
+- [Ultimate application performance survival guide](/articles/wwdc2021-10181) — 建立从指标到工具的应用性能诊断流程。
+- [ARC in Swift: Basics and beyond](/articles/wwdc2021-10216) — 理解 Swift ARC、强引用、弱引用和循环引用。
+- [Symbolication: Beyond the basics](/articles/wwdc2021-10211) — 学习把地址映射回函数名和源码位置，辅助分析调用栈。
+- [Getting started with Instruments](/articles/wwdc19-411) — 使用 Instruments 的 Allocations 等工具观察对象生命周期。

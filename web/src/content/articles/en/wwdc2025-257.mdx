@@ -1,0 +1,260 @@
+---
+title: "Optimize home electricity usage with EnergyKit"
+description: "learn how to support energykit in your app so people can optimize electricity usage at home. this can help people run appliances or charge evs during times when electricity is cleaner and cheaper. get"
+date: 2026-06-10
+tags: ["EnergyKit", "HomeKit", "EV", "可再生能源", "Swift Concurrency"]
+thumbnail: "/images/sessions/2025/257.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/257/"
+sessionId: "wwdc2025-257"
+year: "2025"
+relatedSessions:
+  - title: "Finish tasks in the background"
+    code: "227"
+    description: "在后台任务里持续刷新 ElectricityGuidance"
+  - title: "Demystify concurrency in SwiftUI"
+    code: "266"
+    description: "理解 EnergyKit AsyncSequence 在 SwiftUI 中的消费方式"
+  - title: "Meet the Smart Home"
+    code: "242"
+    description: "Home app 与 HomeKit Home 的整体能力背景"
+  - title: "Build a UIKit document-based app"
+    code: "260"
+    description: "同期 system services 框架的另一种系统集成范式"
+---
+
+## Highlight
+
+> EnergyKit 把电网清洁度与电价的实时预测以 AsyncSequence 形式开放给 App，让电动车和智能恒温器可以把负载挪到电更干净、更便宜的时段。
+
+---
+
+## 核心内容
+
+晚上 6:30 把电动车插上电，车自动开始充电——这是大多数 App 的默认行为。问题在于，6:30 到 9:00 是美国大多数时区的用电高峰，电价最贵，电网里燃煤和天然气机组贡献最多。等到凌晨风电上线、负荷下来，车其实早就充满了。用户既花了更多钱，又用了更脏的电。Grid Forecast 这个 Home App 的功能去年就给用户看到了这个问题，但第三方 App 没法把这种"什么时候电更干净"的信号接进自己的充电调度逻辑。
+
+WWDC25 的 EnergyKit 把驱动 Grid Forecast 的那套数据直接暴露成框架。核心抽象是 `EnergyVenue`（一个物理充电地点，绑定到 HomeKit Home）和 `ElectricityGuidance`（0 到 1 的预测值，越低表示越干净/便宜）。EV 厂商和恒温器厂商现在可以拉到 24 小时窗口的引导值，把"立刻开始充电"换成"在引导值最低的几个小时里充电"。配套的 `LoadEvent` 反馈通道把实际充电行为回写给 EnergyKit，最终生成"本次充电期间多少电来自清洁时段"的洞察，回到用户面前。整套数据存在 Core Data 本地，端到端加密同步到 CloudKit，跟 HomeKit Home 的成员共享。
+
+---
+
+## 详细内容
+
+EnergyKit 的接入分四步：选定 venue、订阅 guidance、回报 LoadEvents、查询 insights。
+
+第一步是 onboarding（[03:13](https://developer.apple.com/videos/play/wwdc2025/257/?time=193)）。用户在 App 里给某个充电地点开启 Clean Energy Charging，App 拿到该地点附近的 `EnergyVenue` 列表让用户选择，然后把 venue 的 UUID 持久化到本地。每次启动重新校验 venue 是否仍然存在：
+
+```swift
+// Retrieve an EnergyVenue
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+
+    let venue: EnergyVenue
+
+    init?(venueID: UUID) async {
+        guard let energyVenue = await EnergyVenue.venue(for: venueID) else {
+            return nil
+        }
+        venue = energyVenue
+    }
+}
+```
+
+关键点：
+
+- `EnergyVenue.venue(for:)` 是 async 调用，因为 venue 元数据可能需要从系统服务读取。
+- 返回 optional——venue 可能因为用户在 Home App 删除而失效，所以构造器是 failable。
+- 持久化的应该是 `UUID`，不是整个 venue 对象；venue 本身每次启动重新解析。
+
+第二步是订阅 guidance（[06:03](https://developer.apple.com/videos/play/wwdc2025/257/?time=363)）。`ElectricityGuidance.Query` 选择 action 类型——EV 用 `.shift`（同样的电量挪到更好的时段），恒温器用 `.reduce`（直接少用）。`sharedService.guidance(...)` 返回 AsyncSequence，每次电网预测刷新都会推一个新值过来：
+
+```swift
+// Fetch ElectricityGuidance
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+    // The current active guidance.
+    var guidance: ElectricityGuidance?
+
+    fileprivate func streamGuidance(
+        venueID: UUID,
+        update: (_ guidance: ElectricityGuidance) -> Void
+    ) async throws {
+        let query = ElectricityGuidance.Query(suggestedAction: .shift)
+        for try await currentGuidance in ElectricityGuidance.sharedService.guidance(
+            using: query,
+            at: venueID
+        ) {
+            update(currentGuidance)
+          	break
+        }
+    }
+}
+```
+
+关键点：
+
+- `Query(suggestedAction: .shift)` 明确告诉系统你是位移型负载（EV），系统会按这个语义优化预测。
+- `for try await` 是 AsyncSequence 的标准消费方式，配合 throws 处理网络/权限失败。
+- `break` 体现一次性消费——只取最新的一份 guidance 用来生成调度，不持续监听。
+- `update` 用回调而不是直接写属性，方便调用方在 actor 边界外更新观察对象。
+
+如果需要长期跟踪（比如充电过程中遇到电网突变要重新调度），把 break 去掉就好。后台刷新场景必须包到 BackgroundTask 里（[07:00](https://developer.apple.com/videos/play/wwdc2025/257/?time=420)）：
+
+```swift
+// Fetch ElectricityGuidance
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+    // The task used to stream guidance.
+    private var streamGuidanceTask: Task<(), Error>?
+
+    ///Start streaming guidance and store the value in the observed property 'guidance'.
+    func startGuidanceMonitoring() {
+       streamGuidanceTask?.cancel()
+        streamGuidanceTask = Task.detached { [weak self] in
+            if let venueID = self?.venue.id {
+                try? await self?.streamGuidance(venueID: venueID) { guidance in
+                    self?.guidance = guidance
+                    if Task.isCancelled {
+                        return
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+关键点：
+
+- `streamGuidanceTask?.cancel()` 在启动新流之前先取消旧的，避免泄漏并发任务。
+- `Task.detached` 与 `[weak self]` 保证 manager 释放时任务不阻止其析构。
+- `Task.isCancelled` 检查放在 update 闭包里，确保取消信号能及时退出回调链。
+
+第三步是 LoadEvents 反馈（[11:30](https://developer.apple.com/videos/play/wwdc2025/257/?time=690) 起）。一次充电会话由 `begin / active / end` 三种 state 组成，Apple 推荐稳态下每 15 分钟生成一个 active 事件，遇到暂停、调度变更、功率突变时也要生事件：
+
+```swift
+// Start a session
+
+import EnergyKit
+
+// A controller that handles an electric vehicle
+@Observable class ElectricVehicleController {
+    // The session
+    var session: ElectricVehicleLoadEvent.Session?
+
+    // The current guidance stored at the EV
+    var currentGuidance: ElectricityGuidance
+
+    // Whether the EV is following guidance
+    var isFollowingGuidance: Bool = true
+
+    fileprivate func beginSession() {
+        session = ElectricVehicleLoadEvent.Session(
+            id: UUID(),
+            state: .begin,
+            guidanceState: .init(
+                wasFollowingGuidance: isFollowingGuidance,
+                guidanceToken: currentGuidance.guidanceToken
+            )
+        )
+    }
+}
+```
+
+关键点：
+
+- 一次会话用一个 `UUID` 贯穿 begin/active/end，三个事件共享同一个 id。
+- `guidanceToken` 来自当时拉到的那份 guidance，且只对获取它的那台手机有效。
+- `wasFollowingGuidance` 让 EnergyKit 区分"用户主动覆盖"和"按引导执行"两种调度行为。
+
+测量数据用 Foundation 的 `Measurement<UnitPower>` 和 `Measurement<UnitEnergy>`，单位是毫瓦和毫瓦时（[11:30](https://developer.apple.com/videos/play/wwdc2025/257/?time=690)）。事件创建后批量提交：
+
+```swift
+// Submit events
+
+import EnergyKit
+
+// A controller that handles an electric vehicle
+@Observable class ElectricVehicleController {
+    // EnergyVenue
+    // The venue at which the EV uses energy
+    var currentVenue: EnergyVenue
+
+    // Electric EV Events
+    // The list of generated EV load events
+    var events = [ElectricVehicleLoadEvent]()
+    
+    func submitEvents() async throws {
+        try await currentVenue.submitEvents(events)
+    }
+}
+```
+
+关键点：
+
+- `submitEvents` 直接挂在 venue 上——事件归属哪个充电地点是固定的，不需要再传。
+- 官方明确推荐批量提交以减少 IPC 开销，且**禁止**在两次充电之间提交事件。
+- 提交的数据走 CloudKit 端到端加密，跟 HomeKit Home 的家庭成员共享。
+
+第四步是查询 insights（[13:25](https://developer.apple.com/videos/play/wwdc2025/257/?time=805)）。`ElectricityInsightQuery` 用 `.cleanliness` 和 `.tariff` 的 OptionSet 决定要哪些维度，granularity 选 `.daily` 时返回每日聚合：
+
+```swift
+// Create an insight query
+
+import EnergyKit
+
+@Observable final class EnergyVenueManager  {
+    func createInsightsQuery(on date: Date) -> ElectricityInsightQuery {
+        return ElectricityInsightQuery(
+            options: .cleanliness.union(.tariff),
+            range: self.dayInterval(date: date),
+            granularity: .daily,
+            flowDirection: .imported
+        )
+    }
+}
+```
+
+关键点：
+
+- `flowDirection: .imported` 表示从电网"取电"（充电），如果做 V2G 反向放电要换成 exported。
+- `.cleanliness` 把电量分桶到 clean/reduce/avoid 三档；`.tariff` 分到 super off peak 到 critical peak 五档。
+- tariff 维度只在用户在 Home App 绑定了电力账户、且套餐是 time-of-use 时才有数据。
+
+整体流程下来，App 从"有没有电"变成"电从哪来、几点用最划算、用户实际用得怎么样"。
+
+---
+
+## 核心启发
+
+- **做什么**：在你的 EV 或储能 App 里加一个 Clean Energy Charging 开关
+  - 为什么值得做：默认即时充电会让用户在峰段用最贵最脏的电，开启 EnergyKit 后系统替你算好窗口，App 只需要在更优时段触发充电；这是用户能感知的差异化卖点。
+  - 怎么开始：先做 onboarding 流程，让用户给每个充电地点选 `EnergyVenue` 并存 UUID；再在原有充电触发逻辑里插入一个 `streamGuidance` 调用，按返回值决定是否立刻启动。
+
+- **做什么**：把 LoadEvents 当作产品分析数据回灌
+  - 为什么值得做：LoadEvents 不只是给 EnergyKit 算 insights 的，它本身就是一份带功率/电量/时间戳的细粒度充电日志，回到 App 里可以做"本周清洁充电占比"卡片、年度回顾、社区排行等内容。
+  - 怎么开始：在充电控制器里加一层 event cache，按 15 分钟窗口或功率变化触发 append；会话结束统一 `submitEvents`，同时把这份缓存复制一份留作本地分析。
+
+- **做什么**：智能恒温器/热水器接 `.reduce` 引导
+  - 为什么值得做：EV 是 shift（挪时段），但恒温器是 reduce（直接少用），EnergyKit 同一个框架两种语义都覆盖；对配电紧张地区的用户来说，关键时段降一两度是真金白银。
+  - 怎么开始：把 query 的 suggestedAction 换成 `.reduce`，引导值高时把目标温度调宽 1–2°C 并通知用户原因；配合 critical peak 标签做更激进的策略。
+
+- **做什么**：用 BackgroundTask 维持长充电的 guidance 实时性
+  - 为什么值得做：一次 Level 2 充电可能 6–8 小时，App 不可能一直前台运行；guidance 在中途刷新时要能让车跟上。
+  - 怎么开始：把 `streamGuidanceTask` 包到 `BGAppRefreshTask` 或 widget 的更新回调里，guidance 变化超过阈值就重排 charging schedule，并写一个新的 `guidanceToken` 进下一批 LoadEvent。
+
+---
+
+## 关联 Session
+
+- [Finish tasks in the background](/articles/wwdc2025-227) — 在后台任务里持续刷新 ElectricityGuidance 的官方推荐做法
+- [Demystify concurrency in SwiftUI](/articles/wwdc2025-266) — 理解 EnergyKit AsyncSequence 在 SwiftUI 中的消费方式
+- [Meet the Smart Home](/articles/wwdc2025-242) — Home app 与 HomeKit Home 的整体能力背景
+- [Build a UIKit document-based app](/articles/wwdc2025-260) — 同期 system services 框架的另一种系统集成范式

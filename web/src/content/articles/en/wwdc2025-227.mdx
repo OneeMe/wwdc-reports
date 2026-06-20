@@ -1,0 +1,206 @@
+---
+title: "Finish tasks in the background"
+description: "discover background execution advancements and understand how the system schedules runtime. we"
+date: 2026-06-10
+tags: ["系统服务"]
+thumbnail: "/images/sessions/2025/227.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/227/"
+sessionId: "wwdc2025-227"
+year: "2025"
+relatedSessions:
+  - title: "Deliver age-appropriate experiences in your app"
+    code: "299"
+    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
+  - title: "Filter and tunnel network traffic with NetworkExtension"
+    code: "234"
+    description: "learn about the apis in the networkextension framework that give your app the po"
+  - title: "Get ahead with quantum-secure cryptography"
+    code: "314"
+    description: "learn how to protect your app"
+  - title: "Optimize home electricity usage with EnergyKit"
+    code: "257"
+    description: "learn how to support energykit in your app so people can optimize electricity us"
+---
+
+## Highlight
+
+> iOS 26 引入 `BGContinuedProcessingTask`，让用户主动发起的长任务（视频导出、社交媒体发布、配件升级）能够在 app 进入后台后继续执行，并由系统提供进度 UI 与取消入口。
+
+## 核心内容
+
+用户在 app 里点了"导出 4K 视频"，按 home 键回主屏。过去这种场景里，开发者通常用 `beginBackgroundTask` 抢一段宽限时间，几十秒就被系统挂起，导出失败。要么就只能拉回前台，强迫用户盯着进度条等待。两条路都谈不上体验。
+
+iOS 26 给出了第三条路。Apple 工程师 Ryan 在 session 中说明：app 进入后台后默认被 suspend，不分配 CPU 时间，目的是保护电池、维持前台流畅。后台运行不是权利，是系统按"高效、最小、可恢复、礼貌、自适应"五条原则分发的有限资源（[01:02](https://developer.apple.com/videos/play/wwdc2025/227/?time=62)）。在这个前提下，新增的 `BGContinuedProcessingTask` 专门覆盖一类场景：用户显式触发、有明确终点、进度可量化的长任务。系统会在后台拉起一块 UI，展示标题、副标题和进度条，用户随时可以取消。Journal app 的导出功能就是用这个 API 驱动的（[11:40](https://developer.apple.com/videos/play/wwdc2025/227/?time=700)）。
+
+新 API 不取代旧 API，而是补齐了 iOS 后台运行工具箱的最后一块。预取内容用 `BGAppRefreshTask`，服务端推送更新用 Background Push，离线 ML 推理或数据库维护用 `BGProcessingTask`，文件句柄收尾用 `beginBackgroundTask`，用户发起的长任务用 `BGContinuedProcessingTask`。每个 API 对应一种工作画像，系统据此安排资源。
+
+## 详细内容
+
+**注册一个 app refresh 任务**（[08:27](https://developer.apple.com/videos/play/wwdc2025/227/?time=507)）：SwiftUI 应用通过 scene modifier 声明，系统按使用频率调度，常用 app 命中率更高。
+
+```swift
+import BackgroundTasks
+import SwiftUI
+
+@main
+struct ColorFeed: App {
+    var body: some Scene {
+        WindowGroup {
+            // ...
+        }
+        .backgroundTask(.appRefresh("com.colorfeed.wwdc25.appRefresh")) {
+            await self.handleAppRefreshTask()
+        }
+    }
+}
+```
+
+关键点：
+- `.backgroundTask(.appRefresh(...))` 是 SwiftUI 提供的 scene modifier，绑定到一个反向域名风格的标识符上。
+- 闭包是 `async` 的，系统在后台唤醒 app 时调用它，闭包返回后 app 重新被 suspend。
+- 这条路径不需要在 `AppDelegate` 里 `register`，SwiftUI 帮你做了。
+
+**注册并提交 processing 任务**（[09:45](https://developer.apple.com/videos/play/wwdc2025/227/?time=585)）：用于 ML 推理、数据库整理这类对延迟不敏感的批处理。可以要求"必须充电 + 必须有网"才执行，把电池影响压到最低。
+
+```swift
+import BackgroundTasks
+import UIKit
+
+class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) -> Bool {
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: "com.example.apple-samplecode.ColorFeed.db_cleaning",
+            using: nil
+        ) { task in
+            self.handleAppRefresh(task: task as! BGProcessingTask)
+        }
+    }
+
+    func submitProcessingTaskRequest() {
+        let request = BGProcessingTaskRequest(
+            identifier: "com.example.apple-samplecode.ColorFeed.db_cleaning"
+        )
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = true
+
+        BGTaskScheduler.shared.submit(request)! 
+    }
+}
+```
+
+关键点：
+- `register` 必须在 app 启动早期完成，否则后台被唤醒时系统找不到 handler，任务直接失败（[09:56](https://developer.apple.com/videos/play/wwdc2025/227/?time=596)）。
+- `using: nil` 让系统选择回调队列。
+- `requiresExternalPower = true` 声明只在充电时跑，对电池友好。
+- `requiresNetworkConnectivity = true` 声明需要联网，没网时系统会推迟。
+- `submit` 后由系统决定何时执行，不是立即跑。
+
+**短时收尾用 begin/end background task**（[10:51](https://developer.apple.com/videos/play/wwdc2025/227/?time=651)）：app 即将进入后台时，给一段额外运行时间做状态保存、文件句柄关闭。
+
+```swift
+import UIKit
+
+@main
+class AppDelegate: UIResponder, UIApplicationDelegate {
+    var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+   
+    func saveState() { /*  ... */ }
+
+    func handlePersistence() {
+        let app = UIApplication.shared
+        guard backgroundTaskID != .invalid else { return }
+        backgroundTaskID = app.beginBackgroundTask(withName: "Finish Export") {
+            app.endBackgroundTask(self.backgroundTaskID)
+            self.backgroundTaskID = .invalid
+        }
+
+        self.saveState()
+
+        app.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+}
+```
+
+关键点：
+- `beginBackgroundTask(withName:)` 返回一个 token，必须保存。
+- 闭包是 expiration handler，系统判断超时会调用它，里面只该做一件事：endBackgroundTask 然后退出。
+- 工作做完后必须显式 `endBackgroundTask`，否则系统会强杀 app。
+- 适合"几秒钟收尾"，不适合长任务。
+
+**注册 continued processing 任务**（[14:00](https://developer.apple.com/videos/play/wwdc2025/227/?time=840)）：和 `BGProcessingTask` 不同，这里的 register 是动态的，在用户表达意图后才调用。
+
+```swift
+import BackgroundTasks
+
+func handleDialogConfirmation() {
+    BGTaskScheduler.shared.register("com.colorfeed.wwdc25.userTask") { task in
+        let task = task as! BGContinuedProcessingTask
+                                                                      
+        var shouldContinue = true
+        task.expirationHandler = {
+            shouldContinue = false
+        }
+
+        task.progress.totalUnitCount = 100
+        task.progress.completedUnitCount = 0
+
+        while shouldContinue {
+            // Do some work
+            task.progress.completedUnitCount += 1
+        }
+
+        task.setTaskCompleted(success: true)
+    }
+}
+```
+
+关键点：
+- 标识符必须先在 Info.plist 的 `BGTaskSchedulerPermittedIdentifiers` 中声明，且以 bundle ID 开头。
+- `expirationHandler` 只翻一个 flag，循环里检查 flag 优雅退出，不要在 handler 里做重活。
+- `task.progress` 用的是 Foundation 的 `Progress` Reporting Protocol，系统订阅它来驱动 UI。完全不更新进度的任务会被判定为卡死并 expire（[14:44](https://developer.apple.com/videos/play/wwdc2025/227/?time=884)）。
+- 完成后必须调用 `setTaskCompleted(success:)`，系统据此回收资源、关闭进度 UI。
+
+**提交 continued processing 请求**（[15:47](https://developer.apple.com/videos/play/wwdc2025/227/?time=947)）：
+
+```swift
+import BackgroundTasks
+
+func submitContinuedProcessingTaskRequest() {
+    let request = BGContinuedProcessingTaskRequest(
+        identifier: "com.colorfeed.wwdc25.userTask",
+        title: "A succinct title",
+        subtitle: "A useful and informative subtitle"
+    )
+
+    request.strategy = .fail
+
+    BGTaskScheduler.shared.submit(request)!
+}
+```
+
+关键点：
+- `title` 和 `subtitle` 都要本地化，会直接显示在系统 UI 里给用户看。
+- `strategy = .fail` 表示"如果不能立即开始就直接失败"，适合"现在不跑就没意义"的任务。默认行为是排队等待。
+- 通配符标识符（`bundleID.context.*`）支持在注册和提交时拼接动态后缀（[13:37](https://developer.apple.com/videos/play/wwdc2025/227/?time=817)）。
+- 后台 GPU 访问需要在 Xcode 添加 capability，运行时通过 `scheduler.supportedResources` 查询设备是否支持（[17:11](https://developer.apple.com/videos/play/wwdc2025/227/?time=1031)）。
+
+## 核心启发
+
+- **给"导出/上传/发布"加上后台续跑能力**：为什么值得做：用户最常吐槽的就是"按返回就中断"，付费心智强的功能（视频导出、批量上传、配件固件升级）一旦被打断就要重来。怎么开始：在按钮 handler 里 `register` 一个 `BGContinuedProcessingTask`，用 `Progress` 驱动现有进度逻辑，把 `setTaskCompleted` 接到原来的完成回调上。
+
+- **用 `BGProcessingTask` 把"夜里跑"的活拉到充电时段**：为什么值得做：embedding 重建、本地索引、缓存清理、ML 模型预热这些活在前台跑就是浪费用户电池，挪到充电时段还能借助系统调度的成本均摊。怎么开始：在 `AppDelegate` 启动时 `register` 一个 identifier，提交请求时设 `requiresExternalPower = true` 和 `requiresNetworkConnectivity = true`，剩下的交给系统排队。
+
+- **把"打开 app 看到旧内容"改成"打开就有新内容"**：为什么值得做：Feed 类、阅读类、邮件类 app 的体感差异往往来自冷启动那一秒。怎么开始：用 SwiftUI 的 `.backgroundTask(.appRefresh(...))` modifier 注册一个轻量预取闭包，结合服务端 Background Push 做兜底——前者按使用频率调度，后者按事件触发，两条腿走路。
+
+- **任务始终带进度，不带就被杀**：为什么值得做：`BGContinuedProcessingTask` 把"系统觉得你卡死"和"系统觉得你在干活"区分开了，不更新 `Progress` 就会被 expire。怎么开始：把现有的进度回调接到 `task.progress.completedUnitCount`，哪怕是估算值也比不报好；同时为 `expirationHandler` 准备一个能立刻退出的检查点。
+
+## 关联 Session
+
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — Declared Age Range API 让 app 根据年龄段提供合适内容。
+- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — NetworkExtension 框架的过滤与隧道能力，覆盖系统级网络拦截场景。
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — 在 CryptoKit 中接入抗量子算法，保护未来十年的数据。
+- [Optimize home electricity usage with EnergyKit](/articles/wwdc2025-257) — EnergyKit 让 app 配合家庭电网情况调度耗能任务。

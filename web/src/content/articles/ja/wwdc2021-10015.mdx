@@ -1,0 +1,351 @@
+---
+title: "Build apps that share data through CloudKit and Core Data"
+description: "Learn how to easily build apps that share data between multiple iCloud users with NSPersistentCloudKitContainer. Discover how to create informative experiences around shared data and learn about the CloudKit technologies that support these features in Core Data."
+date: "2021-06-07"
+tags: ["Core Data", "CloudKit", "Data Sharing"]
+thumbnail: "/images/sessions/2021/10015.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10015/"
+sessionId: "wwdc2021-10015"
+year: "2021"
+relatedSessions:
+  - title: "What's new in CloudKit"
+    code: "10093"
+    description: "了解 CloudKit 的新功能，包括 Record Zone Sharing"
+  - title: "Bring Core Data concurrency to Swift and SwiftUI"
+    code: "10017"
+    description: "Core Data 的 Swift Concurrency 支持"
+  - title: "Synchronizing a local store to the cloud"
+    code: "101"
+    description: "Core Data 与 CloudKit 同步的基础"
+---
+
+## Highlight
+
+> iOS 15 中 `NSPersistentCloudKitContainer` 新增了对 CloudKit Record Zone Sharing 的完整支持，开发者只需添加一个 shared store description、调用 `share(_:to:completion:)` 方法、以及处理 `UICloudSharingController` 的回调，就能让 Core Data 中的对象在多个 iCloud 用户之间实时同步，且每个参与者都能获得适合自己权限的 UI 展示。
+
+## 核心内容
+
+### 从 Photos 的共享相册说起
+
+想象你要在 App 里实现类似 Photos 共享相册的功能。用户创建一个内容集合，邀请几个朋友加入，大家都能查看，部分人还能编辑。
+
+以前实现这个功能需要大量自定义代码：搭建后端、处理实时同步、管理权限、解决冲突。CloudKit 虽然提供了基础设施，但要把这些能力整合到 Core Data 中，工作量依然很大。
+
+iOS 15 的 `NSPersistentCloudKitContainer` 把这一切封装好了。
+
+### 两个数据库，一个上下文
+
+共享功能的核心架构变化是：App 现在同时连接两个 CloudKit 数据库：
+
+- **Private Database**：用户自己拥有的数据
+- **Shared Database**：其他用户共享给你的数据
+
+这两个数据库各自镜像到一个本地 persistent store。关键点是：使用同一个 `NSManagedObjectContext` 就能访问两个 store 中的数据。对开发者来说，查询共享数据和查询私有数据的代码完全一样。
+
+### 启用共享存储
+
+第一步是在 Core Data Stack 中添加 shared store description。
+
+```swift
+// [5:20](https://developer.apple.com/videos/play/wwdc2021/10015/?time=320)
+let privateStoreDescription = container.persistentStoreDescriptions.first!
+let storesURL = privateStoreDescription.url!.deletingLastPathComponent()
+privateStoreDescription.url = storesURL.appendingPathComponent("private.sqlite")
+privateStoreDescription.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
+privateStoreDescription.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+
+let sharedStoreURL = storesURL.appendingPathComponent("shared.sqlite")
+let sharedStoreDescription = privateStoreDescription.copy()
+sharedStoreDescription.url = sharedStoreURL
+
+let containerIdentifier = privateStoreDescription.cloudKitContainerOptions!.containerIdentifier
+let sharedStoreOptions = NSPersistentCloudKitContainerOptions(containerIdentifier: containerIdentifier)
+sharedStoreOptions.databaseScope = .shared
+sharedStoreDescription.cloudKitContainerOptions = sharedStoreOptions
+container.persistentStoreDescriptions.append(sharedStoreDescription)
+```
+
+关键点：
+- 复制 private store description，修改 URL 为 shared.sqlite
+- 创建 `NSPersistentCloudKitContainerOptions`，设置 `databaseScope = .shared`
+- 两个 store 共用同一个 CloudKit container identifier
+- 需要启用 persistent history tracking 和 remote change notification
+
+### 发起共享
+
+共享一个对象只需要几行代码。`share(_:to:completion:)` 方法专门设计为与 `UICloudSharingController` 配合使用。
+
+```swift
+// [6:00](https://developer.apple.com/videos/play/wwdc2021/10015/?time=360)
+@IBAction func shareNoteAction(_ sender: Any) {
+  guard let barButtonItem = sender as? UIBarButtonItem else {
+    fatalError("Not a UI Bar Button item??")
+  }
+
+  guard let post = self.post else {
+    fatalError("Can't share without a post")
+  }
+
+  let container = AppDelegate.sharedAppDelegate.coreDataStack.persistentContainer
+  let cloudSharingController = UICloudSharingController {
+    (controller, completion: @escaping (CKShare?, CKContainer?, Error?) -> Void) in
+    container.share([post], to: nil) { objectIDs, share, container, error in
+      if let actualShare = share {
+        post.managedObjectContext?.performAndWait {
+          actualShare[CKShare.SystemFieldKey.title] = post.title
+        }
+      }
+      completion(share, container, error)
+    }
+  }
+  cloudSharingController.delegate = self
+
+  if let popover = cloudSharingController.popoverPresentationController {
+    popover.barButtonItem = barButtonItem
+  }
+  present(cloudSharingController, animated: true) {}
+}
+```
+
+关键点：
+- `container.share([post], to: nil)` 创建一个新的 share，包含 post 对象
+- `to: nil` 表示创建新 share；传入已有 share 则把对象添加到该 share
+- 可以在 completion 中设置 share 的元数据，如标题
+- `UICloudSharingController` 处理后续的邀请流程
+
+### 接受共享邀请
+
+当用户点击邮件中的共享链接时，App 需要接受这个邀请。
+
+```swift
+// 在 AppDelegate 中处理
+func application(_ application: UIApplication, userDidAcceptCloudKitShareWith cloudKitShareMetadata: CKShare.Metadata) {
+  let container = coreDataStack.persistentContainer
+  container.acceptShareInvitations(from: [cloudKitShareMetadata], into: sharedPersistentStore) { shares, error in
+    // NSPersistentCloudKitContainer 会自动同步共享对象到本地 store
+  }
+}
+```
+
+关键点：
+- `acceptShareInvitations(from:into:completion:)` 接受邀请
+- 传入 shared store，容器会自动将共享对象同步到本地
+- 同步完成后，App 的 UI 会自动反映新数据
+
+### Record Zone Sharing 的工作原理
+
+NSPersistentCloudKitContainer 使用 CloudKit 的 Record Zone Sharing，而非传统的 hierarchical sharing。
+
+在传统 hierarchical sharing 中，记录关联到一个 root record（share）。而 Record Zone Sharing 中：
+
+- 共享的 `CKRecord` 存放在一个 shared `CKRecordZone` 中
+- 每个 shared zone 由一个 `CKShare` 记录标识
+- `CKShare` 包含所有者、参与者、权限等信息
+- NSPersistentCloudKitContainer 自动管理 zone 和记录的分配
+
+每个参与者在两个数据库中都有数据：
+- **Private Database**：包含自己拥有的 zone（无论是否共享）
+- **Shared Database**：包含别人共享给自己的 zone
+
+### 构建共享感知 UI
+
+共享功能不仅是数据同步，还需要在 UI 中传达共享状态。演讲者展示了几个关键场景：
+
+**标记共享对象**
+
+```swift
+// [17:58](https://developer.apple.com/videos/play/wwdc2021/10015/?time=1078)
+override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+  // ... dequeue cell ...
+  let post = dataProvider.fetchedResultsController.object(at: indexPath)
+  cell.title.text = post.title
+
+  if sharingProvider.isShared(object: post) {
+    let attachment = NSTextAttachment(image: UIImage(systemName: "person.circle")!)
+    let attributedString = NSMutableAttributedString(attachment: attachment)
+    attributedString.append(NSAttributedString(string: " " + (post.title ?? "")))
+    cell.title.text = nil
+    cell.title.attributedText = attributedString
+  }
+  return cell
+}
+```
+
+关键点：
+- 使用 `person.circle` SF Symbol 标记共享内容
+- `sharingProvider.isShared(object:)` 判断对象是否在共享中
+
+**SharingProvider 协议**
+
+为了测试和模块化，演讲者设计了一个 `SharingProvider` 协议：
+
+```swift
+// [17:06](https://developer.apple.com/videos/play/wwdc2021/10015/?time=1026)
+protocol SharingProvider {
+  func isShared(object: NSManagedObject) -> Bool
+  func isShared(objectID: NSManagedObjectID) -> Bool
+  func participants(for object: NSManagedObject) -> [RenderableShareParticipant]
+  func shares(matching objectIDs: [NSManagedObjectID]) throws -> [NSManagedObjectID: RenderableShare]
+  func canEdit(object: NSManagedObject) -> Bool
+  func canDelete(object: NSManagedObject) -> Bool
+}
+```
+
+这个协议的好处：
+- 每个方法对应一个具体的 UI 决策点
+- 便于注入 mock 实现进行单元测试
+- 将 CloudKit 细节与 UI 代码解耦
+
+**实现 SharingProvider**
+
+```swift
+// [20:01](https://developer.apple.com/videos/play/wwdc2021/10015/?time=1201)
+extension CoreDataStack: SharingProvider {
+  func isShared(object: NSManagedObject) -> Bool {
+    return isShared(objectID: object.objectID)
+  }
+
+  func isShared(objectID: NSManagedObjectID) -> Bool {
+    var isShared = false
+    if let persistentStore = objectID.persistentStore {
+      if persistentStore == sharedPersistentStore {
+        isShared = true
+      } else {
+        let container = persistentContainer
+        do {
+          let shares = try container.fetchShares(matching: [objectID])
+          if nil != shares.first {
+            isShared = true
+          }
+        } catch let error {
+          print("Failed to fetch share for \(objectID): \(error)")
+        }
+      }
+    }
+    return isShared
+  }
+
+  func canEdit(object: NSManagedObject) -> Bool {
+    return persistentContainer.canUpdateRecord(forManagedObjectWith: object.objectID)
+  }
+
+  func canDelete(object: NSManagedObject) -> Bool {
+    return persistentContainer.canDeleteRecord(forManagedObjectWith: object.objectID)
+  }
+}
+```
+
+关键点：
+- 检查对象的 persistent store 是否为 shared store
+- 使用 `fetchShares(matching:)` 获取对象的 share 信息
+- `canUpdateRecord(forManagedObjectWith:)` 检查当前用户是否有编辑权限
+- `canDeleteRecord(forManagedObjectWith:)` 检查删除权限
+
+### 权限控制
+
+共享创建者可以设置参与者的权限：
+
+- **Read-Only**：只能查看，不能编辑或删除
+- **Read-Write**：可以查看、编辑、添加内容
+
+UI 需要根据当前用户的权限动态调整：
+- 只读参与者看不到 Edit 按钮
+- 不能滑动删除只读共享的内容
+- 编辑模式下也不能删除只读内容
+
+## 详细内容
+
+### 测试共享 UI
+
+演讲者强调了测试共享相关 UI 的重要性。`SharingProvider` 协议让注入 mock 变得容易：
+
+```swift
+// [18:44](https://developer.apple.com/videos/play/wwdc2021/10015/?time=1124)
+func testSharedPostsGetDisclosure() {
+  var sharedObjectIDs: Set<NSManagedObjectID> = Set()
+  let context = coreDataStack.persistentContainer.viewContext
+  self.generatePosts(in: context, postSaveBlock: { posts in
+    for (index, post) in posts.enumerated where (index % 4) == 0 {
+      sharedObjectIDs.insert(post.objectID)
+    }
+  })
+
+  let provider = BlockBasedShareProvider(stack: coreDataStack)
+  provider.isSharedBlock = sharedObjectIDs.contains
+  mainViewController.sharingProvider = provider
+
+  // ... perform fetch and verify cells ...
+  for index in 0..<rowCount {
+    let indexPath = IndexPath(row: index, section: 0)
+    let post = mainViewController.dataProvider.fetchedResultsController.object(at: indexPath)
+    guard let cell = mainViewController.tableView(
+      mainViewController.tableView,
+      cellForRowAt: indexPath
+    ) as? PostCell else {
+      XCTFail("Encountered an unexpected cell type")
+      return
+    }
+
+    if sharedObjectIDs.contains(post.objectID) {
+      guard let attachment = cell.title.attributedText?
+        .attributes(at: 0, effectiveRange: nil)[.attachment] as? NSTextAttachment else {
+        XCTFail("Expected an image attachment at the first character")
+        return
+      }
+      XCTAssertEqual(expectedSharedImage, attachment.image)
+    } else {
+      XCTAssertEqual(cell.title.text, title)
+    }
+  }
+}
+```
+
+关键点：
+- 创建 `BlockBasedShareProvider` 注入自定义行为
+- `isSharedBlock` 控制哪些对象被视为共享
+- 验证共享对象的 cell 显示 person.circle 图标
+- 验证非共享对象正常显示文本标题
+
+### 共享边界
+
+NSPersistentCloudKitContainer 能根据对象之间的关系推断哪些记录需要共享。如果对象 A 关联到对象 B，共享 A 时 B 也会被包含。
+
+也可以通过显式传入 `CKShare` 参数，控制对象分配到哪个共享 zone。
+
+## 核心启发
+
+**1. 构建家庭共享型待办 App**
+
+- **做什么**：创建一个家庭共享的购物清单或任务管理 App，家庭成员可以实时协作
+- **为什么值得做**：`NSPersistentCloudKitContainer` 处理了所有同步、冲突解决、权限管理的复杂性，开发者只需关注 UI
+- **怎么开始**：在 Core Data Stack 中添加 shared store description，用 `UICloudSharingController` 发起共享
+
+**2. 为笔记 App 添加协作功能**
+
+- **做什么**：在现有笔记 App 中，让用户把特定笔记共享给同事或朋友共同编辑
+- **为什么值得做**：共享粒度精确到单个 `NSManagedObject`，不会暴露用户的其他私有笔记
+- **怎么开始**：为笔记对象添加 share 按钮，调用 `container.share([note], to: nil)`
+
+**3. 实现权限感知的 UI**
+
+- **做什么**：根据当前用户在共享中的角色（所有者/只读/读写）动态调整界面
+- **为什么值得做**：`canEdit` 和 `canDelete` API 让权限检查变得简单，避免用户尝试无权限操作
+- **怎么开始**：实现 `SharingProvider` 协议，在 `cellForRowAt` 和编辑按钮逻辑中调用
+
+**4. 设计可测试的共享模块**
+
+- **做什么**：用 `SharingProvider` 协议模式将共享逻辑与 UI 解耦
+- **为什么值得做**：便于单元测试各种共享场景（共享/非共享、只读/读写），无需连接真实 CloudKit
+- **怎么开始**：定义 `SharingProvider` 协议，创建 `BlockBasedShareProvider` mock 实现
+
+**5. 构建跨设备共享体验**
+
+- **做什么**：利用 NSPersistentCloudKitContainer 的自动同步，让共享内容在所有设备上实时可用
+- **为什么值得做**：用户在一台设备上接受共享邀请后，其他登录同一 Apple ID 的设备自动获得访问权限
+- **怎么开始**：确保 App 正确处理 `acceptShareInvitations`，并在所有设备上使用相同的 Core Data Stack 配置
+
+## 关联 Session
+
+- [What's new in CloudKit](/articles/wwdc2021-10093) — 深入讲解 CloudKit Record Zone Sharing 的底层机制
+- [Bring Core Data concurrency to Swift and SwiftUI](/articles/wwdc2021-10017) — Core Data 的 Swift Concurrency 支持，与共享数据结合使用
+- [Synchronizing a local store to the cloud](/articles/wwdc2021-101) — Core Data 与 CloudKit 同步的基础知识

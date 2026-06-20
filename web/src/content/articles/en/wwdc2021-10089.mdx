@@ -1,0 +1,304 @@
+---
+title: "Explore Verifiable Health Records"
+description: "find out how you can securely request access to someone's verifiable health records and incorporate that data safely into your app. the health app helps people download, view, and share their health records, including their covid-19 immunization and test results — and ios 15 brings support for the smart health card, a verifiable health record that incorporates the fhir health data standard. we'll show you how your app can go about requesting access to this record and how you can verify the signature of the file using cryptokit and the issuer's public key."
+date: "2021-06-08"
+tags: ["Health & Fitness", "Privacy & Security"]
+thumbnail: "/images/sessions/2021/10089.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10089/"
+sessionId: "wwdc2021-10089"
+year: "2021"
+relatedSessions:
+  - title: "What's new in HealthKit"
+    code: "10001"
+    description: "discover the latest updates to healthkit, including new data types and features for ios 15."
+  - title: "Build a research and care app, part 1"
+    code: "10068"
+    description: "learn how researchkit and carekit can work together to build clinical research apps."
+  - title: "Handling FHIR without getting burned"
+    code: "10060"
+    description: "learn how to handle FHIR data in your app without running into common pitfalls."
+  - title: "Apple's privacy pillars in focus"
+    code: "10085"
+    description: "understand apple's approach to privacy and how to build privacy into your app."
+---
+
+## Highlight
+
+> iOS 15 让 Health App 可以存储和分享可验证健康记录（Verifiable Health Records），基于 SMART Health Cards 规范。用户通过扫描 QR Code 或下载文件导入疫苗接种记录、检测结果等凭证，这些记录经过加密签名，任何第三方都可以用 CryptoKit 验证其真实性。开发者可以用 `HKVerifiableClinicalRecordQuery` 请求用户分享这些记录。
+
+## 核心内容
+
+### 什么是可验证健康记录
+
+（[00:23](https://developer.apple.com/videos/play/wwdc2021/10089/?time=23)）
+
+可验证健康记录是医疗发行方（如医院、实验室）签发的数字凭证，包含：
+- 多个 FHIR 资源（Patient 资源 + 临床资源）
+- SMART Health Card 格式打包
+- JSON Web Signature（JWS）加密签名
+
+与普通 Health Records 的区别：
+- 由发行方签名，任何人可验证真实性
+- 只包含必要信息，数据最小化
+- 可离线验证，不需要查询发行方服务器
+
+### 导入方式
+
+（[03:55](https://developer.apple.com/videos/play/wwdc2021/10089/?time=235)）
+
+用户可以通过三种方式导入：
+
+1. **Health Records 连接**（仅限美国、英国、加拿大）
+   - 在 Health App 中连接支持 Health Records 的医疗机构
+   - 自动下载可验证记录
+
+2. **下载文件**
+   - 打开 `.smart-health-cards` 扩展名的文件
+   - Health App 自动识别并导入
+
+3. **扫描 QR Code**
+   - 用相机扫描 SMART Health Card QR Code
+   - 直接跳转到 Health App 导入界面
+
+### HealthKit 访问权限
+
+（[04:42](https://developer.apple.com/videos/play/wwdc2021/10089/?time=282)）
+
+访问可验证健康记录需要：
+1. `com.apple.developer.healthkit` entitlement
+2. **Verifiable Health Records** 特殊 entitlement
+3. 每次查询都需要用户显式授权
+
+授权模式与传统 Health Records 不同：
+- 不需要预先申请类型权限
+- 每次执行查询时弹出授权 sheet
+- 用户选择具体分享哪些记录
+- 授权是一次性的，不建立长期访问
+
+## 详细内容
+
+### HKVerifiableClinicalRecordQuery
+
+（[04:47](https://developer.apple.com/videos/play/wwdc2021/10089/?time=287)）
+
+```swift
+import HealthKit
+
+// 创建查询
+let recordTypes = ["https://smarthealth.cards#health-card",
+                   "https://smarthealth.cards#immunization"]
+let predicate = HKQuery.predicateForClinicalRecords(
+    with RelevantDateWithin: DateInterval(start: Date().addingTimeInterval(-7*86400),
+                                          end: Date())
+)
+
+let query = HKVerifiableClinicalRecordQuery(
+    recordTypes: recordTypes,
+    predicate: predicate
+) { query, records, error in
+
+    guard let records = records, !records.isEmpty else {
+        print("No records shared or error: \(error?.localizedDescription ?? "")")
+        return
+    }
+
+    // 处理用户分享的记录
+    for record in records {
+        print("Issuer: \(record.issuer)")
+        print("JWS: \(record.jws)")
+    }
+}
+
+// 执行查询（会弹出授权 sheet）
+healthStore.execute(query)
+```
+
+关键点：
+- `recordTypes` 是字符串数组，指定要查询的记录类型
+- 只有包含所有指定类型的记录才会显示在授权 sheet 中
+- `predicate` 可以进一步筛选时间范围
+- 每次执行都会弹出授权 sheet
+
+### 解析和验证 JWS
+
+（[10:54](https://developer.apple.com/videos/play/wwdc2021/10089/?time=654)）
+
+```swift
+import CryptoKit
+import Combine
+
+// 定义 JWS 数据结构
+struct SmartHealthCardJWS: Codable {
+    let header: JWSHeader
+    let payload: JWSPayload
+    let signature: Data
+
+    struct JWSHeader: Codable {
+        let alg: String       // 签名算法
+        let kid: String       // 公钥 ID
+        let zip: String?      // 压缩算法
+    }
+
+    struct JWSPayload: Codable {
+        let iss: String       // 发行方 URL
+        let nbf: Date         // 生效时间
+        let exp: Date?        // 过期时间
+        let vc: VerifiableCredential
+
+        struct VerifiableCredential: Codable {
+            let type: [String]
+            let credentialSubject: CredentialSubject
+
+            struct CredentialSubject: Codable {
+                let fhirVersion: String
+                let fhirBundle: FHIRBundle
+            }
+        }
+
+        struct FHIRBundle: Codable {
+            let resourceType: String
+            let entry: [Entry]
+
+            struct Entry: Codable {
+                let resource: FHIRResource
+            }
+        }
+    }
+
+    // 从紧凑序列化格式解析
+    init(fromCompactSerialization string: String) throws {
+        let parts = string.split(separator: ".").map(String.init)
+        guard parts.count == 3 else {
+            throw NSError(domain: "JWSParsing", code: -1, userInfo: nil)
+        }
+
+        // 解码 Header
+        let headerData = Data(base64URLEncoded: parts[0]) ?? Data()
+        let headerDecoder = JSONDecoder()
+        header = try headerDecoder.decode(JWSHeader.self, from: headerData)
+
+        // 解码 Payload（可能压缩）
+        let payloadData = Data(base64URLEncoded: parts[1]) ?? Data()
+        let decoderPayload: Data
+        if header.zip == "DEF" {
+            decoderPayload = try payloadData.decompressed(using: .deflate)
+        } else {
+            decoderPayload = payloadData
+        }
+
+        let payloadDecoder = JSONDecoder()
+        payload = try payloadDecoder.decode(JWSPayload.self, from: decoderPayload)
+
+        // 保存签名
+        signature = Data(base64URLEncoded: parts[2]) ?? Data()
+    }
+}
+
+// 验证签名
+extension SmartHealthCardJWS {
+    func verifySignature() -> AnyPublisher<Bool, Error> {
+        // 获取发行方公钥
+        let issuerURL = URL(string: payload.iss)!
+        let jwksURL = issuerURL.appendingPathComponent(".well-known/jwks.json")
+
+        return URLSession.shared.dataTaskPublisher(for: jwksURL)
+            .map(\.data)
+            .decode(type: JWKSResponse.self, decoder: JSONDecoder())
+            .map { jwks in
+                // 根据 kid 找到对应的公钥
+                guard let jwk = jwks.keys.first(where: { $0.kid == self.header.kid }) else {
+                    throw NSError(domain: "JWSVerification", code: -2, userInfo: nil)
+                }
+
+                // 转换为 CryptoKit 公钥
+                let publicKey = try P256.Signing.PublicKey(x963Representation: jwk.toX963())
+
+                // 验证签名
+                let signedData = (parts[0] + "." + parts[1]).data(using: .utf8)!
+                return publicKey.isValidSignature(self.signature, for: signedData)
+            }
+            .eraseToAnyPublisher()
+    }
+}
+
+// 使用示例
+let jwsString = "..." // 从 HKVerifiableClinicalRecord.jws 获取
+let jws = try SmartHealthCardJWS(fromCompactSerialization: jwsString)
+
+jws.verifySignature()
+    .sink { isValid in
+        print("Signature is valid: \(isValid)")
+    }
+    .store(in: &cancellables)
+```
+
+关键点：
+- JWS 采用紧凑序列化格式：header.payload.signature
+- Header 指定算法（ES256）和公钥 ID
+- Payload 用 DEFLATE 压缩，需要先解压
+- 公钥从发行方的 `.well-known/jwks.json` 获取
+- 用 CryptoKit 的 `P256.Signing.PublicKey` 验证签名
+
+### 数据提取
+
+（[13:36](https://developer.apple.com/videos/play/wwdc2021/10089/?time=816)）
+
+```swift
+// 提取疫苗接种信息
+func extractImmunizations(from record: HKVerifiableClinicalRecord) -> [Immunization] {
+    guard let jwsData = record.jws.data(using: .utf8),
+          let jws = try? SmartHealthCardJWS(fromCompactSerialization: jwsData) else {
+        return []
+    }
+
+    var immunizations: [Immunization] = []
+
+    for entry in jws.payload.vc.fhirBundle.entry {
+        if let resource = entry.resource as? ImmunizationResource {
+            immunizations.append(Immunization(
+                vaccine: resource.vaccineCode,
+                date: resource.occurrenceDateTime,
+                manufacturer: resource.manufacturer
+            ))
+        }
+    }
+
+    return immunizations
+}
+```
+
+关键点：
+- FHIR Bundle 包含多个资源
+- 每个资源有对应的 resourceType 字段
+- 参考 Handling FHIR without getting burned session 了解更多
+
+## 核心启发
+
+### 1. 在医疗健康 App 中集成健康凭证验证
+
+如果你的 App 涉及疫苗接种、检测结果验证，可以用可验证健康记录替代纸质证明或简单的照片上传。用户直接从 Health App 分享已验证的凭证，不需要额外拍照。
+
+开始方式：集成 `HKVerifiableClinicalRecordQuery`，在需要验证健康凭证的页面触发查询。用户授权后，提取你需要的特定信息（如疫苗类型、接种日期）。
+
+### 2. 构建健康凭证的发行系统
+
+如果你的机构是医疗机构，可以成为 SMART Health Cards 的发行方。签发流程包括：
+1. 构建 FHIR 资源
+2. 打包成 SMART Health Card
+3. 用机构私钥签名
+4. 生成 QR Code 或文件供用户下载
+
+开始方式：参考 SMART Health Cards 规范，用 CryptoKit 实现签名逻辑。确保私钥安全存储在 HSM 中，公钥发布到 `.well-known/jwks.json`。
+
+### 3. 在非医疗 App 中保护用户隐私
+
+即使你的 App 不是医疗类，也可能接触到用户的健康信息。使用可验证健康记录的方式比直接收集敏感数据更隐私友好——用户控制分享哪些信息，每次分享都是一次性的。
+
+开始方式：如果 App 涉及健康相关的场景（如健身房、保险），不要直接收集用户的医疗记录。引导用户从 Health App 分享可验证记录，App 只读取必要的字段。
+
+## 关联 Session
+
+- [What's new in HealthKit](/articles/wwdc2021-10001) — HealthKit 在 iOS 15 中的所有更新
+- [Build a research and care app, part 1](/articles/wwdc2021-10068) — 使用 ResearchKit 和 CareKit 构建临床研究 App
+- [Handling FHIR without getting burned](/articles/wwdc2021-10060) — 正确处理 FHIR 数据的最佳实践
+- [Apple's privacy pillars in focus](/articles/wwdc2021-10085) — Apple 四项隐私支柱的技术实现

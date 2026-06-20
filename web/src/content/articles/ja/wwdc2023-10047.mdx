@@ -1,0 +1,286 @@
+---
+title: "Use Core ML Tools for machine learning model compression"
+description: "discover how to reduce the footprint of machine learning models in your app with core ml tools. learn how to use techniques like palettization, pruning, and quantization to dramatically reduce model size while still achieving great accuracy. explore comparisons between compression during the training stages and on fully trained models, and learn how compressed models can run even faster when your app takes full advantage of the apple neural engine."
+date: "2023-06-10"
+tags: ["WWDC 2023", "Machine Learning", "Core ML"]
+thumbnail: "/images/sessions/2023/10047.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10047/"
+sessionId: "wwdc2023-10047"
+year: "2023"
+relatedSessions:
+  - title: "Discover machine learning enhancements in Create ML"
+    code: "10044"
+    description: "find out how create ml can help you do even more with machine learning models. learn about the latest updates to image understanding and text-based tasks with multilingual bert embeddings."
+  - title: "Improve Core ML integration with async prediction"
+    code: "10050"
+    description: "discover how to use the new async prediction api in core ml to improve the responsiveness of your app."
+  - title: "Explore Natural Language multilingual models"
+    code: "10042"
+    description: "learn how to create custom natural language models for text classification and word tagging using multilingual, transformer-based embeddings."
+---
+
+## Highlight
+
+> Core ML Tools 7 引入了三种模型压缩技术（剪枝、量化、调色板量化）和两种工作流（训练后压缩、训练时压缩），配合 iOS 17 和 macOS Sonoma 的运行时优化，让开发者将模型体积减小到原来的 1/8 甚至更小，同时在 Apple Neural Engine 上获得最高 75% 的推理加速。
+
+---
+
+## 核心内容
+
+### 问题：模型越来越大，App 体积压力剧增
+
+ResNet50 有 2500 万参数，Float16 精度下占 50MB。Stable Diffusion 这样的新模型更大。App 中部署的模型数量也在增加，体积压力持续上升。
+
+压缩模型有三个直接好处：
+
+1. 同样的内存预算可以部署更多模型
+2. 可以部署更大、能力更强的模型
+3. 更小的模型意味着更少的数据搬运，推理速度可能更快
+
+### Apple 的方案：三种压缩技术 + 两种工作流
+
+Core ML Tools 7 将压缩 API 统一整合到 `coremltools.optimize` 模块下：
+
+- `coremltools.optimize.coreml`：训练后压缩，直接操作已转换的 Core ML 模型
+- `coremltools.optimize.torch`：训练时压缩，在 PyTorch 训练流程中引入压缩
+
+---
+
+## 详细内容
+
+### 三种压缩技术原理（[02:35](https://developer.apple.com/videos/play/wwdc2023/10047/?time=155)）
+
+**剪枝（Pruning）**：将最小的权重设为 0，用稀疏矩阵存储。
+
+```
+原始权重矩阵：    剪枝后（50% 稀疏）：
+[0.1, 0.9, 0.3]   [0,   0.9, 0.3]
+[0.8, 0.2, 0.5]   [0.8, 0,   0.5]
+[0.4, 0.7, 0.1]   [0.4, 0.7, 0  ]
+```
+
+关键点：
+
+- 只存储非零值和零的位置
+- 模型大小与稀疏度线性相关：50% 稀疏 ≈ 50% 大小
+- ResNet50 在 50% 稀疏下从 50MB 降到约 28MB
+
+**量化（Quantization）**：将 Float16 权重映射到 INT8 范围。
+
+```
+scale = 2.35, bias = 0
+原始值 → 缩放/偏移/取整 → INT8
+最小值 → -127
+最大值 → 127
+```
+
+关键点：
+
+- 每个权重从 2 字节降到 1 字节，压缩比 2 倍
+- `scale` 和 `bias` 用于反量化回原始范围
+- 非零 bias 有时能减少量化误差
+
+**调色板量化（Palettization）**：将相似权重聚类，用聚类中心值表示。
+
+```
+原始权重：[0.12, 0.11, 0.89, 0.91, 0.13, 0.88]
+聚类中心：{0: 0.12, 1: 0.89}
+索引表： [0, 0, 1, 1, 0, 1]
+```
+
+关键点：
+
+- 4 个聚类 = 2 bit/权重，压缩比 8 倍
+- 16 个聚类 = 4 bit/权重，压缩比 4 倍
+- 聚类中心存储在查找表中，原始矩阵变为索引表
+
+### 训练后压缩（Post-Training Compression）（[06:02](https://developer.apple.com/videos/play/wwdc2023/10047/?time=362)）
+
+对已训练好的 Core ML 模型直接压缩，简单快速：
+
+```python
+import coremltools as ct
+from coremltools.optimize.coreml import (
+    OpMagnitudePrunerConfig,
+    OpPalettizerConfig,
+    OpLinearQuantizerConfig,
+    OptimizationConfig,
+    prune_weights,
+    palettize_weights,
+    quantize_weights
+)
+
+# 加载已转换的 Core ML 模型
+model = ct.models.MLModel("my_model.mlpackage")
+
+# --- 剪枝：目标 75% 稀疏 ---
+pruner_config = OpMagnitudePrunerConfig(
+    target_sparsity=0.75
+)
+pruner_global_config = OptimizationConfig(
+    global_config=pruner_config
+)
+pruned_model = prune_weights(model, pruner_global_config)
+
+# --- 调色板量化：6 bit ---
+palettizer_config = OpPalettizerConfig(
+    mode="kmeans",
+    nbits=6
+)
+palettizer_global_config = OptimizationConfig(
+    global_config=palettizer_config
+)
+palettized_model = palettize_weights(model, palettizer_global_config)
+
+# --- 线性量化：8 bit ---
+quantizer_config = OpLinearQuantizerConfig(
+    mode="linear_symmetric"
+)
+quantizer_global_config = OptimizationConfig(
+    global_config=quantizer_config
+)
+quantized_model = quantize_weights(model, quantizer_global_config)
+
+# 保存压缩后的模型
+pruned_model.save("my_model_pruned.mlpackage")
+```
+
+关键点：
+
+- `OptimizationConfig` 描述压缩方式，`global_config` 应用到所有层
+- 也可以为不同层设置不同的 `op_config`
+- 训练后压缩是一步完成的，不需要训练数据
+- 压缩比越高，精度损失越大，需要在实际数据上验证
+
+### 训练时压缩（Training-Time Compression）（[08:08](https://developer.apple.com/videos/play/wwdc2023/10047/?time=488)）
+
+在 PyTorch 训练过程中引入压缩，让权重适应压缩约束：
+
+```python
+import torch
+import coremltools as ct
+from coremltools.optimize.torch import (
+    MagnitudePrunerConfig,
+    MagnitudePruner,
+    DKMPalettizerConfig,
+    DKMPalettizer
+)
+
+# --- 训练时剪枝 ---
+# 1. 定义配置
+pruner_config = MagnitudePrunerConfig(
+    target_sparsity=0.75
+)
+
+# 2. 创建 pruner
+pruner = MagnitudePruner(model, pruner_config)
+
+# 3. 插入剪枝层
+pruner.prepare()
+
+# 4. 微调训练
+for epoch in range(num_epochs):
+    for batch in dataloader:
+        optimizer.zero_grad()
+        output = model(batch.input)
+        loss = criterion(output, batch.target)
+        loss.backward()
+        optimizer.step()
+    # 更新 pruner 内部状态
+    pruner.step()
+
+# 5. 将剪枝掩码折叠到权重中
+pruner.finalize()
+
+# 6. 转换为 Core ML
+compressed_model = ct.convert(model, inputs=[ct.ImageType(name="input", shape=(1, 3, 224, 224))])
+compressed_model.save("pruned_model.mlpackage")
+
+# --- 训练时调色板量化（DKM 算法） ---
+palettizer_config = DKMPalettizerConfig(
+    global_config={"n_bits": 2}
+)
+palettizer = DKMPalettizer(model, palettizer_config)
+palettizer.prepare()
+
+# 微调训练...
+for epoch in range(num_epochs):
+    for batch in dataloader:
+        # 训练循环
+        ...
+    palettizer.step()
+
+palettizer.finalize()
+
+# 转换时使用 palettization 管道
+compressed_model = ct.convert(
+    model,
+    inputs=[ct.ImageType(name="input", shape=(1, 3, 224, 224))],
+    pass_pipeline=ct.PassPipeline.DEFAULT_PALETTIZATION
+)
+```
+
+关键点：
+
+- `prepare()` 在模型中插入压缩友好的层
+- `step()` 在训练过程中更新压缩状态
+- `finalize()` 将压缩后的权重恢复为模型权重
+- DKM（Differentiable K-Means）是一种基于注意力机制的可微分 k-means 算法
+- 转换时设置 `pass_pipeline=DEFAULT_PALETTIZATION` 告诉转换器使用调色板表示
+
+### 运行时性能优化（[20:44](https://developer.apple.com/videos/play/wwdc2023/10047/?time=1244)）
+
+iOS 16 和 iOS 17 的运行时行为有重要差异：
+
+| 特性 | iOS 16 | iOS 17 |
+|------|--------|--------|
+| 支持的压缩类型 | 仅权重压缩 | 权重压缩 + 8-bit 激活量化 |
+| 推理速度 | 与 Float16 相同 | 特定场景下更快 |
+
+iOS 17 的改进在于：权重在运算前才解压，而不是提前全部解压到内存中。对于内存受限的模型（如 Neural Engine 上的大模型），这可以减少内存带宽压力，从而加速推理。
+
+实测加速数据（iPhone 14 Pro Max）：
+
+- 4-bit 调色板模型：5% ~ 30% 加速
+- 稀疏模型：最高 75% 加速
+
+### 性能优化策略（[23:39](https://developer.apple.com/videos/play/wwdc2023/10047/?time=1419)）
+
+```
+步骤 1：用 optimize.coreml API 快速探索各种压缩配置
+        ↓
+步骤 2：在目标设备上 profile，用 Xcode 的 Core ML Performance Report
+        ↓
+步骤 3：筛选出速度提升最大的配置
+        ↓
+步骤 4：在这些配置上评估精度，必要时用 optimize.torch 训练时压缩
+        ↓
+步骤 5：确定最终模型
+```
+
+关键点：
+
+- 先用训练后压缩快速验证，不需要训练数据
+- 用 Xcode 的 Core ML Performance Report 查看每层运算在哪里执行（CPU/GPU/Neural Engine）
+- 精度不够时再用训练时压缩，代价是更长的训练时间
+- 最终选择是压缩比、精度和速度三者之间的权衡
+
+---
+
+## 核心启发
+
+1. **将 Stable Diffusion 模型压缩到移动端可用**：用 4-bit 调色板量化将 Stable Diffusion 从数百 MB 压缩到几十 MB。为什么值得做：Stable Diffusion 的图像生成能力极强，但原始模型太大无法在 iPhone 上运行。压缩后可以在设备端实现文生图。怎么开始：用 `coremltools.optimize.coreml` 的 `palettize_weights` 尝试 4-bit 和 6-bit 配置，在验证集上评估生成质量，选择最佳平衡点。
+
+2. **为实时相机滤镜压缩图像分割模型**：用训练时剪枝将人像分割模型压缩 50%，同时保持边缘精度。为什么值得做：实时相机应用需要 30fps 以上的推理速度，模型越小，Neural Engine 的吞吐量越高。怎么开始：在 PyTorch 中加载预训练的分割模型，用 `MagnitudePruner` 设置 50% 目标稀疏度，微调 5-10 个 epoch，转换为 Core ML 后在真机上测试帧率。
+
+3. **用 8-bit 量化部署多语言 BERT 模型**：将 BERT 文本分类模型从 Float16 量化到 INT8，体积减半。为什么值得做：BERT 模型虽然准确率高，但嵌入层参数量大。量化后可以在内存受限的设备（如 Apple Watch）上运行。怎么开始：用 `quantize_weights` 应用 8-bit 线性对称量化，在测试集上验证分类准确率是否可接受。
+
+4. **构建模型压缩自动化流水线**：在 CI/CD 中集成 Core ML Tools 压缩步骤，每次模型更新后自动尝试多种压缩配置。为什么值得做：手动尝试压缩配置耗时且容易遗漏最优解。自动化可以在每次模型迭代时快速找到最佳压缩比。怎么开始：写一个 Python 脚本，遍历不同的 `nbits`（调色板）和 `target_sparsity`（剪枝）组合，在每个配置上评估模型大小和验证集精度，输出帕累托前沿。
+
+---
+
+## 关联 Session
+
+- [Discover machine learning enhancements in Create ML](/articles/wwdc2023-10044) — Create ML 训练模型后，用 Core ML Tools 压缩以减小体积
+- [Improve Core ML integration with async prediction](/articles/wwdc2023-10050) — Core ML 的异步预测 API，配合压缩模型实现更流畅的用户体验
+- [Explore Natural Language multilingual models](/articles/wwdc2023-10042) — BERT 多语言模型的训练，压缩后更适合端侧部署

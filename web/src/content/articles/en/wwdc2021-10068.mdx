@@ -1,0 +1,440 @@
+---
+title: "Build a research and care app, part 1: Setup onboarding"
+description: "Learn how ResearchKit and CareKit can work together to take the tedium out of paper surveys. Code along with us and build a working care pilot app. Explore best practices for onboarding and consent with ResearchKit, and find out how your app can require participants to sign consent documents by leveraging CareKit's store and UI components."
+date: "2021-06-08"
+tags: ["ResearchKit", "CareKit", "Health", "Onboarding"]
+thumbnail: "/images/sessions/2021/10068.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10068/"
+sessionId: "wwdc2021-10068"
+year: "2021"
+relatedSessions:
+  - title: "Build a research and care app, part 2: Schedule tasks"
+    code: "10069"
+    description: "ResearchKit 和 CareKit 结合的第二部分，讲解任务调度"
+  - title: "Build a research and care app, part 3: Visualize progress"
+    code: "10282"
+    description: "第三部分，讲解数据可视化和进度追踪"
+  - title: "What's new in ResearchKit and CareKit"
+    code: "10148"
+    description: "ResearchKit 和 CareKit 的年度更新总览"
+  - title: "Create charts and insights with CareKit"
+    code: "10283"
+    description: "CareKit 图表功能详解"
+---
+
+## Highlight
+
+> ResearchKit 和 CareKit 联合使用，在 CareKit 任务卡片中嵌入 ResearchKit 调查流程，实现「必须完成知情同意才能访问 Care 计划」的 gated onboarding，同时支持 HealthKit、通知和设备运动权限的统一请求。
+
+## 核心内容
+
+医疗研究应用的两个核心需求：收集参与者数据（ResearchKit）和持续管理护理计划（CareKit）。过去这两个框架通常是分开使用的，iOS 15 开始展示如何把它们结合起来。
+
+具体场景是这样的：一个物理治疗研究 App（叫 Recover），帮助膝部手术后的参与者做康复训练。新用户进来必须先完成知情同意，才能看到具体的康复任务。这个流程用 ResearchKit 实现，但嵌入在 CareKit 的界面中。
+
+关键设计点：
+- Onboarding 任务每天重复显示，直到完成
+- 完成后其他任务才会出现在 Care Feed 中
+- 签名、权限请求都集成在一个流程里
+
+### 在 CareKit Store 中持久化 Onboarding 任务
+
+（[05:39](https://developer.apple.com/videos/play/wwdc2021/10068/?time=339)）
+
+首先在 AppDelegate 中创建一个 CareKit 任务并持久化到 Store：
+
+```swift
+// 创建每日重复的日程
+let dailySchedule = OCKSchedule.dailyAtTime(
+    hour: 8, minutes: 0,
+    start: Date(), end: nil,
+    text: "请在每天上午 8 点前完成"
+)
+
+// 创建任务
+let onboardingTask = OCKTask(
+    id: TaskID.onboarding,
+    title: "参与同意与引导",
+    carePlanUUID: UUID(),
+    schedule: dailySchedule
+)
+onboardingTask.instructions = "请阅读并同意研究条款"
+onboardingTask.impactsAdherence = false  // 不影响完成度环
+
+// 持久化到 Store
+store.addTaskAndWait(onboardingTask) { result in
+    switch result {
+    case .success:
+        print("Onboarding task added successfully")
+    case .failure(let error):
+        print("Failed to add onboarding task: \(error)")
+    }
+}
+```
+
+关键点：
+- `OCKSchedule.dailyAtTime` 创建每日重复日程
+- `impactsAdherence = false` 让这个任务不计入完成度
+- 任务 ID 必须唯一，用于后续查询
+
+### 检查 Onboarding 完成状态
+
+（[07:20](https://developer.apple.com/videos/play/wwdc2021/10068/?time=440)）
+
+在 CareFeedViewController 中，根据 onboarding 是否完成决定显示哪些任务：
+
+```swift
+func checkIfOnboardingIsComplete(completion: @escaping (Bool) -> Void) {
+    let query = OCKOutcomeQuery()
+    query.taskIDs = [TaskID.onboarding]
+
+    store.fetchOutcomes(query: query) { outcomes, error in
+        guard error == nil else {
+            completion(false)
+            return
+        }
+
+        // 如果找到 outcome，说明已完成
+        completion(!(outcomes?.isEmpty ?? true))
+    }
+}
+
+// 在 prepare 方法中使用
+override func prepareListViewController(
+    _ listViewController: OCKListViewController,
+    for date: Date
+) {
+    checkIfOnboardingIsComplete { [weak self] isComplete in
+        guard let self = self else { return }
+
+        if isComplete {
+            // 显示所有任务
+            self.appendAllTasks(to: listViewController, for: date)
+        } else {
+            // 只显示 onboarding 任务
+            self.appendOnboardingTask(to: listViewController)
+        }
+    }
+}
+```
+
+关键点：
+- `OCKOutcomeQuery` 查询任务的完成记录
+- 没有 outcome 意味着用户还没完成
+- 查询是异步的，需要在 completion handler 中处理
+
+### 创建 ResearchKit Onboarding 调查
+
+（[09:31](https://developer.apple.com/videos/play/wwdc2021/10068/?time=571)）
+
+在 Surveys.swift 中创建一个包含五个步骤的 onboarding 流程：
+
+```swift
+func createOnboardingSurvey() -> ORKTask {
+    // 步骤 1：欢迎页
+    let welcomeStep = ORKInstructionStep(
+        identifier: "onboarding.welcome"
+    )
+    welcomeStep.title = "欢迎参与 Recover 研究"
+    welcomeStep.detailText = "本研究的目的是帮助术后康复"
+    welcomeStep.image = UIImage(named: "welcome_header")
+
+    // 步骤 2：知情说明（带图标的要点列表）
+    let consentStep = ORKInstructionStep(
+        identifier: "onboarding.consent"
+    )
+    consentStep.title = "知情同意"
+    consentStep.detailText = "参与本研究需要您了解以下信息"
+
+    // 使用 SF Symbol 作为项目符号
+    let healthDataItem = ORKBodyItem(
+        text: "您将被要求分享健康数据",
+        detailText: nil,
+        image: UIImage(systemName: "heart.fill"),
+        learnMoreItem: nil,
+        bulletPoint: true
+    )
+
+    let tasksItem = ORKBodyItem(
+        text: "您需要完成指定的康复任务",
+        detailText: nil,
+        image: UIImage(systemName: "checkmark.circle.fill"),
+        learnMoreItem: nil,
+        bulletPoint: true
+    )
+
+    let signatureItem = ORKBodyItem(
+        text: "您需要提供签名以表示同意",
+        detailText: nil,
+        image: UIImage(systemName: "signature"),
+        learnMoreItem: nil,
+        bulletPoint: true
+    )
+
+    let privacyItem = ORKBodyItem(
+        text: "您的数据将被安全保存",
+        detailText: "所有数据均经过加密处理",
+        image: UIImage(systemName: "lock.fill"),
+        learnMoreItem: nil,
+        bulletPoint: true
+    )
+
+    consentStep.bodyItems = [
+        healthDataItem,
+        tasksItem,
+        signatureItem,
+        privacyItem
+    ]
+
+    // 步骤 3：签名（HTML 知情同意书）
+    let signatureStep = ORKWebViewStep(
+        identifier: "onboarding.signature",
+        html: getConsentDocumentHTML()
+    )
+    signatureStep.showSignatureAfterContent = true
+
+    // 步骤 4：权限请求
+    let healthTypesToWrite: Set<HKSampleType> = [
+        HKObjectType.quantityType(forIdentifier: .stepCount)!
+    ]
+    let healthTypesToRead: Set<HKSampleType> = [
+        HKObjectType.quantityType(forIdentifier: .activeEnergyBurned)!
+    ]
+
+    let healthPermission = ORKHealthKitPermissionType(
+        typesToWrite: healthTypesToWrite,
+        typesToRead: healthTypesToRead
+    )
+
+    let notificationPermission = ORKNotificationPermissionType()
+    let motionPermission = ORKMotionActivityPermissionType()
+
+    let permissionsStep = ORKRequestPermissionsStep(
+        identifier: "onboarding.permissions"
+    )
+    permissionsStep.permissionTypes = [
+        healthPermission,
+        notificationPermission,
+        motionPermission
+    ]
+
+    // 步骤 5：完成页
+    let completionStep = ORKCompletionStep(
+        identifier: "onboarding.completion"
+    )
+    completionStep.title = "感谢您的参与"
+    completionStep.detailText = "您现在可以开始使用 Recover App"
+
+    // 组装成有序任务
+    return ORKOrderedTask(
+        identifier: "onboarding",
+        steps: [
+            welcomeStep,
+            consentStep,
+            signatureStep,
+            permissionsStep,
+            completionStep
+        ]
+    )
+}
+```
+
+关键点：
+- `ORKInstructionStep` 用于展示说明文字
+- `ORKBodyItem` 支持 SF Symbol 作为项目符号
+- `ORKWebViewStep` 的 `showSignatureAfterContent = true` 显示签名框
+- iOS 15 新增 `ORKNotificationPermissionType` 和 `ORKMotionActivityPermissionType`
+
+### 在 CareKit 中显示 ResearchKit 调查
+
+（[11:59](https://developer.apple.com/videos/play/wwdc2021/10068/?time=719)）
+
+使用新引入的 `OCKSurveyTaskViewController`：
+
+```swift
+func appendOnboardingTask(
+    to listViewController: OCKListViewController
+) {
+    // 创建 event query
+    let eventQuery = OCKEventQuery(
+        for: Date(),
+        taskIDs: [TaskID.onboarding]
+    )
+
+    // 创建调查任务视图控制器
+    let surveyVC = OCKSurveyTaskViewController(
+        taskID: TaskID.onboarding,
+        eventQuery: eventQuery,
+        storeManager: storeManager,
+        survey: createOnboardingSurvey(),
+        resultHandler: { result in
+            // 将 ResearchKit 结果转换为 CareKit outcome 值
+            let dateAnswer = result.results?.first(where: {
+                $0.identifier == "onboarding.completion"
+            }) as? ORKDateQuestionResult
+
+            let outcomeValue = OCKOutcomeValue(
+                dateAnswer?.dateAnswer ?? Date()
+            )
+
+            return [outcomeValue]
+        }
+    )
+
+    surveyVC.delegate = self
+
+    // 创建任务卡片并添加到列表
+    let card = OCKSimpleTaskView(
+        taskID: TaskID.onboarding,
+        eventQuery: eventQuery,
+        owner: self
+    )
+    card.controller = surveyVC
+
+    listViewController.appendView(card)
+}
+```
+
+关键点：
+- `OCKSurveyTaskViewController` 专门用于在 CareKit 中显示 ResearchKit 调查
+- `resultHandler` 闭包负责把 ResearchKit 结果转换为 CareKit outcome
+- 设置 delegate 以监听完成事件
+
+### 处理 Onboarding 完成并刷新界面
+
+（[12:49](https://developer.apple.com/videos/play/wwdc2021/10068/?time=769)）
+
+实现 delegate 方法，当用户完成 onboarding 时刷新 feed：
+
+```swift
+extension CareFeedViewController: OCKSurveyTaskViewControllerDelegate {
+    func surveyTaskViewController(
+        _ viewController: OCKSurveyTaskViewController,
+        didFinish task: ORKTask,
+        with result: TaskResult
+    ) {
+        // 检查是否成功完成（用户没有取消）
+        guard case .success = result else {
+            return
+        }
+
+        // 重新加载 feed，显示其他任务
+        reload()
+    }
+
+    func surveyTaskViewController(
+        _ viewController: OCKSurveyTaskViewController,
+        didCancel task: ORKTask
+    ) {
+        // 用户取消了，不需要特殊处理
+    }
+}
+```
+
+关键点：
+- `reload()` 刷新整个日历页面
+- 完成后 onboarding 卡片不再显示，其他任务开始出现
+- 用户取消不算完成，下次打开仍会显示 onboarding
+
+## 详细内容
+
+### HTML 知情同意书格式
+
+签名步骤需要的 HTML 文档应该包含完整的法律文本：
+
+```swift
+func getConsentDocumentHTML() -> String {
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: -apple-system; padding: 20px; }
+            h1 { color: #007aff; }
+            .section { margin: 20px 0; }
+        </style>
+    </head>
+    <body>
+        <h1>Recover 研究知情同意书</h1>
+
+        <div class="section">
+            <h2>1. 研究目的</h2>
+            <p>本研究旨在评估物理治疗对膝部手术后康复的效果。</p>
+        </div>
+
+        <div class="section">
+            <h2>2. 数据收集</h2>
+            <p>我们将收集您的健康数据，包括每日步数、运动消耗等。</p>
+        </div>
+
+        <div class="section">
+            <h2>3. 隐私保护</h2>
+            <p>所有数据均经过加密，仅研究团队可访问。</p>
+        </div>
+
+        <div class="section">
+            <h2>4. 自愿参与</h2>
+            <p>您可以随时退出研究，不会影响任何医疗服务。</p>
+        </div>
+    </body>
+    </html>
+    """
+}
+```
+
+关键点：
+- 使用 HTML5 标准格式
+- 可以内联 CSS 样式
+- 签名框会自动出现在内容下方
+
+### HealthKit 权限类型说明
+
+请求 HealthKit 权限时需要明确指定要读写的类型：
+
+| 类别 | 常用类型 | 用途 |
+|------|----------|------|
+| 运动数据 | `stepCount`、`distanceWalkingRunning` | 活动量统计 |
+| 体能指标 | `activeEnergyBurned`、`basalEnergyBurned` | 热量消耗 |
+| 健康指标 | `heartRate`、`bloodPressure` | 生理指标 |
+| 睡眠数据 | `sleepAnalysis` | 睡眠质量 |
+
+关键点：
+- 只请求必需的数据类型
+- 在知情同意书中明确说明每种数据的用途
+- 用户可以随时在设置中撤销权限
+
+## 核心启发
+
+1. **做医疗研究的 gated onboarding**
+   - **做什么**：用户必须完成知情同意才能访问 App 的主要功能
+   - **为什么值得做**：医疗研究必须获得参与者明确同意，否则存在法律风险。Gated onboarding 确保每个用户都看过同意书
+   - **怎么开始**：用 ResearchKit 创建 consent 流程，在 CareKit 中查询 outcome 状态来控制内容显示
+
+2. **用 SF Symbol 优化知情说明的可读性**
+   - **做什么**：在 `ORKInstructionStep` 的 `bodyItems` 中使用 SF Symbol 代替普通项目符号
+   - **为什么值得做**：医疗/法律文本通常晦涩难懂，视觉元素能帮助理解，降低用户放弃率
+   - **怎么开始**：创建 `ORKBodyItem` 时传入 `UIImage(systemName:)`
+
+3. **集成 HealthKit、通知和运动权限请求**
+   - **做什么**：在 onboarding 流程中一次性请求所有必需权限
+   - **为什么值得做**：分散的权限请求会打断用户体验，统一请求在知情同意的上下文中更合理
+   - **怎么开始**：用 `ORKRequestPermissionsStep` 组合 `ORKHealthKitPermissionType`、`ORKNotificationPermissionType`、`ORKMotionActivityPermissionType`
+
+4. **做可验证的电子签名**
+   - **做什么**：用 `ORKWebViewStep` 收集用户签名，保存到 CareKit outcome 中
+   - **为什么值得做**：电子签名有法律效力，比简单的「我同意」按钮更正式
+   - **怎么开始**：`showSignatureAfterContent = true` + HTML 同意文档
+
+5. **做个性化的康复计划引导**
+   - **做什么**：在 onboarding 最后询问用户的康复目标，后续根据目标定制 CareKit 任务
+   - **为什么值得做**：个性化的护理计划能显著提升用户参与度和康复效果
+   - **怎么开始**：在 completion step 前加一个 `ORKFormStep` 收集用户偏好，存入 outcome 后用于任务调度
+
+## 关联 Session
+
+- [Build a research and care app, part 2: Schedule tasks](/articles/wwdc2021-10069) — 第二部分，讲解如何用 CareKit 调度康复任务
+- [Build a research and care app, part 3: Visualize progress](/articles/wwdc2021-10282) — 第三部分，讲解数据可视化和进度追踪
+- [What's new in ResearchKit and CareKit](/articles/wwdc2021-10148) — ResearchKit 和 CareKit 的年度更新总览
+- [Create charts and insights with CareKit](/articles/wwdc2021-10283) — CareKit 图表功能详解

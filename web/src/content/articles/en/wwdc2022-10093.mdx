@@ -1,0 +1,418 @@
+---
+title: "Integrate your custom collaboration app with Messages"
+description: "discover how the sharedwithyou framework can augment your app's collaboration infrastructure. we'll show you how to send secure invitations to collaborative content and synchronize participant changes. we'll also cover displaying content updates within the relevant conversation."
+date: 2026-06-10
+tags: ["WWDC 2022", "Shared with You", "Messages", "Collaboration"]
+thumbnail: "/images/sessions/2022/10093.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10093/"
+sessionId: "wwdc2022-10093"
+year: "2022"
+relatedSessions:
+  - title: "Add Shared with You to your app"
+    code: "10094"
+    description: "Use Shared with You to surface Messages content inside your app with shelves, attribution views, and Universal Links."
+  - title: "Enhance collaboration experiences with Messages"
+    code: "10095"
+    description: "Connect collaborative documents to Messages conversations and FaceTime calls with system UI for collaboration state."
+  - title: "Meet Transferable"
+    code: "10062"
+    description: "Adopt Transferable to support ShareLink, drag and drop, copy and paste, and custom data representations."
+  - title: "What's new in SwiftUI"
+    code: "10052"
+    description: "Explore SwiftUI updates including ShareLink and other APIs used by modern sharing flows."
+---
+
+## Highlight
+
+> Messages 团队的 Devin 和 Lance 详细讲解了 iOS 16 和 macOS Ventura 中新增的自定义协作 API。这套 API 允许第三方协作应用深度集成到信息 App 的对话流程中，用户可以在不离开对话的情况下分享文档、设置权限、即时验证访问。
+
+## 核心内容
+
+很多协作 App 已经有自己的服务器、权限模型和文档链接。问题出在分享那一刻：用户在 App 里复制链接，再到 Messages 里发送；接收方点开链接后，服务端还要确认这个账号是否有权限。群聊成员变化时，文档权限还要手动同步。
+
+iOS 16 和 macOS Ventura 给自定义协作基础设施补上了系统级流程。App 先用 `SWCollaborationMetadata` 描述要分享的内容，把它交给 Share Sheet 或拖放。用户在 Messages 里选收件人和分享选项，发送前系统再回调 App，请它生成 Universal Link 和协作标识符（[01:51](https://developer.apple.com/videos/play/wwdc2022/10093/?time=111)）。
+
+这个延迟生成链接的设计很关键。链接可以根据最终收件人和用户选择的权限生成。发送设备还会给 App 一组收件人的加密身份，App 把这些身份存到服务器。接收方打开 Universal Link 时，系统能生成签名身份证明，服务器验证后直接把文档访问权授予当前账号（[02:50](https://developer.apple.com/videos/play/wwdc2022/10093/?time=170)）。
+
+Session 讲的是一条完整链路：准备协作元数据、启动协作、保存参与者身份、验证访问、处理成员变更、把编辑和提及通知发回 Messages。适合已经有协作后端、并且已经支持 Universal Links 的 App。
+
+## 详细内容
+
+### 1. 用 `SWCollaborationMetadata` 描述协作内容
+
+（[04:21](https://developer.apple.com/videos/play/wwdc2022/10093/?time=261)）系统首先需要知道这次协作分享代表什么内容。`SWCollaborationMetadata` 存放本地标识符、标题、发起人的账号提示，以及用户可配置的分享选项。
+
+```swift
+let localIdentifier = SWLocalCollaborationIdentifier(rawValue: "identifier")
+let metadata = SWCollaborationMetadata(localIdentifier: localIdentifier)
+metadata.title = "Content Title"
+metadata.initiatorHandle = "user@example.com"
+
+let formatter = PersonNameComponentsFormatter()
+if let components = formatter.personNameComponents(from: "Devin") {
+    metadata.initiatorNameComponents = components
+}
+
+metadata.defaultShareOptions = ...
+```
+
+关键点：
+
+- `SWLocalCollaborationIdentifier` 只需要让你的 App 在本地找到这份内容，Session 明确说它不需要跨设备一致。
+- `SWCollaborationMetadata` 是后续 Share Sheet、拖放和发送回调共同使用的核心对象。
+- `metadata.title` 会展示给用户，帮助用户确认正在分享哪份内容。
+- `metadata.initiatorHandle` 和 `initiatorNameComponents` 只用于本地展示，让用户确认当前分享账号。
+- `defaultShareOptions` 放默认权限设置，用户发送前还能在系统 UI 里修改。
+
+分享选项由三层对象组成。`SWCollaborationOption` 表示单个选项；`SWCollaborationOptionsPickerGroup` 表示互斥选项；`SWCollaborationOptionsGroup` 表示多个独立开关；`SWCollaborationShareOptions` 把这些组选项挂到元数据上（[06:34](https://developer.apple.com/videos/play/wwdc2022/10093/?time=394)）。
+
+```swift
+let permission = SWCollaborationOptionsPickerGroup(identifier: UUID().uuidString,
+                                                   options: [
+    SWCollaborationOption(title: "Can make changes", identifier: UUID().uuidString),
+    SWCollaborationOption(title: "Read only", identifier: UUID().uuidString)
+])
+permission.options[0].isSelected = true
+permission.title = "Permission"
+
+let additionalOptions = SWCollaborationOptionsGroup(identifier: UUID().uuidString,
+                                                    options: [
+    SWCollaborationOption(title: "Allow mentions", identifier: UUID().uuidString),
+    SWCollaborationOption(title: "Allow comments", identifier: UUID().uuidString)
+])
+additionalOptions.title = "Additional Settings"
+let optionsGroups = [permission, additionalOptions]
+metadata.defaultShareOptions = SWCollaborationShareOptions(optionsGroups: optionsGroups)
+```
+
+关键点：
+
+- `permission` 使用 `SWCollaborationOptionsPickerGroup`，用户只能在「可编辑」和「只读」之间选一个。
+- `permission.options[0].isSelected = true` 设置默认选择，发送前用户仍可修改。
+- `additionalOptions` 使用 `SWCollaborationOptionsGroup`，提及和评论是两个独立开关。
+- 每个 group 和 option 都有 identifier，发送前 App 会用这些标识符读取用户最终选择。
+- `SWCollaborationShareOptions(optionsGroups:)` 是挂到 `metadata.defaultShareOptions` 的入口。
+
+### 2. 把协作元数据交给分享入口
+
+（[07:58](https://developer.apple.com/videos/play/wwdc2022/10093/?time=478)）SwiftUI 可以通过 `Transferable` 和 `ShareLink` 暴露协作内容。模型对象返回一个 `SWCollaborationMetadata` 的 proxy representation，视图里直接把模型交给 `ShareLink`。
+
+```swift
+struct CustomCollaboration: Transferable {
+    var name: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        ProxyRepresentation { customCollaboration in
+            SWCollaborationMetadata(
+                localIdentifier: .init(rawValue: "com.example.customcollaboration"),
+                title: customCollaboration.name,
+                defaultShareOptions: nil,
+                initiatorHandle: "johnappleseed@apple.com",
+                initiatorNameComponents: nil
+            )
+        }
+    }
+}
+```
+
+```swift
+struct ContentView: View {
+    var body: some View {
+        ShareLink(item: CustomCollaboration(name: "Example"), preview: .init("Example"))
+    }
+}
+```
+
+关键点：
+
+- `CustomCollaboration` 遵守 `Transferable`，让模型对象参与系统分享和拖放流程。
+- `ProxyRepresentation` 返回 `SWCollaborationMetadata`，系统拿到的是协作元数据，而不是普通文件内容。
+- `localIdentifier` 和 `title` 来自当前模型，发送回调时 App 可以回到自己的内容记录。
+- `ShareLink(item:preview:)` 是 SwiftUI 的分享入口，Session 把它和协作元数据串在一起使用。
+
+UIKit、AppKit 和拖放场景使用 `NSItemProvider`。`SWCollaborationMetadata` 遵守 `NSItemProviderReading` 和 `NSItemProviderWriting`，所以可以直接注册到 item provider（[09:08](https://developer.apple.com/videos/play/wwdc2022/10093/?time=548)）。
+
+```swift
+func presentActivityViewController(metadata: SWCollaborationMetadata) {
+    let itemProvider = NSItemProvider()
+    itemProvider.registerObject(metadata, visibility: .all)
+    let activityConfig = UIActivityItemsConfiguration(itemProviders: [itemProvider])
+    let shareSheet = UIActivityViewController(activityItemsConfiguration: activityConfig)
+    present(shareSheet, animated: true)
+}
+```
+
+```swift
+func createDragItem(metadata: SWCollaborationMetadata) -> UIDragItem {
+    let itemProvider = NSItemProvider()
+    itemProvider.registerObject(metadata, visibility: .all)
+    return UIDragItem(itemProvider: itemProvider)
+}
+```
+
+关键点：
+
+- `NSItemProvider()` 是协作元数据进入 UIKit 分享系统的容器。
+- `registerObject(metadata, visibility: .all)` 让系统进程能读取这份元数据。
+- `UIActivityItemsConfiguration` 把 item provider 交给 Share Sheet。
+- `UIDragItem(itemProvider:)` 让同一份元数据支持 iOS 和 iPadOS 拖放。
+- Session 建议注册多种表示形式，例如同时提供文件表示，这样 Messages 可以在需要时提供「发送副本」选项。
+
+### 3. 发送前用 `SWCollaborationCoordinator` 启动协作
+
+（[11:22](https://developer.apple.com/videos/play/wwdc2022/10093/?time=682)）用户点发送后，Messages 会通过 `SWCollaborationCoordinator` 协调 App 完成准备工作。这个 coordinator 是单例，App 应该在启动后尽早设置 action handler，因为系统可能在后台启动 App 来处理协作。
+
+```swift
+private let collaborationCoordinator = SWCollaborationCoordinator.shared
+
+func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]?) -> Bool {
+    // Conform to the SWCollaborationActionHandler protocol
+    collaborationCoordinator.actionHandler = self
+}
+```
+
+关键点：
+
+- `SWCollaborationCoordinator.shared` 是全局协调入口。
+- `didFinishLaunchingWithOptions` 里设置 `actionHandler`，避免后台处理协作时找不到委托。
+- handler 对象需要遵守 `SWCollaborationActionHandler`。
+- Session 提醒要立即处理 action，超时会影响发送流程。
+
+第一个 action 是 `SWStartCollaborationAction`。它带着用户最终选择后的元数据。App 此时向服务端准备协作，拿到 Universal Link 和 device-independent collaboration identifier，然后 fulfill 这个 action（[12:27](https://developer.apple.com/videos/play/wwdc2022/10093/?time=747)）。
+
+```swift
+func collaborationCoordinator(_ coordinator: SWCollaborationCoordinator,
+                              handle action: SWStartCollaborationAction) {
+    let localID = action.collaborationMetadata.localIdentifier.rawValue
+    let selectedOptions = action.collaborationMetadata.userSelectedShareOptions
+    let prepareRequest = APIRequest.PrepareCollaboration(localID: localID, selectedOptions)
+    Task {
+        do {
+            let response = try await apiController.send(request: prepareRequest)
+            let identifier = response.deviceIndependentIdentifier
+            action.fulfill(using: response.url, collaborationIdentifier: identifier)
+        } catch {
+            Log.error("Caught error while preparing the collaboration: \(error)")
+            action.fail() // cancels the message
+        }
+    }
+}
+```
+
+关键点：
+
+- `action.collaborationMetadata.localIdentifier.rawValue` 把发送前的系统回调映射回 App 本地内容。
+- `userSelectedShareOptions` 是用户在系统 UI 中最终选定的权限配置。
+- `APIRequest.PrepareCollaboration` 是示例服务端请求，代表你的后端为这次协作生成链接和标识符。
+- `action.fulfill(using:collaborationIdentifier:)` 同时交出 Universal Link 和设备无关协作标识符。
+- `action.fail()` 会取消消息发送，适合服务端准备失败的情况。
+
+### 4. 保存参与者身份，之后用于即时验证
+
+（[13:40](https://developer.apple.com/videos/play/wwdc2022/10093/?time=820)）启动协作成功后，系统会发送 `SWUpdateCollaborationParticipantsAction`。这个 action 包含参与者的加密身份。App 要把 `addedIdentities` 里的 `rootHash` 存到服务端，并和这份协作内容关联。
+
+```swift
+func collaborationCoordinator(_ coordinator: SWCollaborationCoordinator,
+                              handle action: SWUpdateCollaborationParticipantsAction) {
+    let identifier = action.collaborationMetadata.collaborationIdentifier
+    let participants: [Data] = action.addedIdentities.compactMap { $0.rootHash }
+    let addParticipants = APIRequest.AddParticipants(identifier: identifier, participants)
+    Task {
+        do {
+            try await apiController.send(request: addParticipants)
+            action.fulfill() // sends the URL provided by the start action
+        } catch {
+            Log.error("Caught error while adding participants to collaboration: \(error)")
+            action.fail() // cancels the message
+        }
+    }
+}
+```
+
+关键点：
+
+- `collaborationIdentifier` 来自前一个 start action 的 fulfill 调用。
+- `addedIdentities` 是 Messages 根据收件人和协作标识符生成的身份集合。
+- `rootHash` 是 Session 指定要保存到服务器的数据，后续验证访问时会用它匹配接收方。
+- `action.fulfill()` 不带参数，成功后 Messages 会发送前一步生成的 URL。
+- 失败时调用 `action.fail()`，发送会被取消。
+
+### 5. 接收方打开链接时生成签名身份证明
+
+（[19:12](https://developer.apple.com/videos/play/wwdc2022/10093/?time=1152)）接收方打开 Universal Link 时，App 先通过 `SWHighlightCenter` 找到协作 highlight，再调用 `getSignedIdentityProof`。这个证明包含签名数据，服务器验证签名后再重建 root hash。
+
+```swift
+func application(_ app: UIApplication, open url: URL,
+               options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
+    let highlightCenter: SWHighlightCenter = self.highlightCenter
+    let challengeRequest = APIRequest.GetChallengeData()
+    Task {
+        do {
+            let highlight = try highlightCenter.collaborationHighlight(for: url)
+            let challenge = try await apiController.send(request: challengeRequest)
+            let proof = try await highlightCenter.getSignedIdentityProof(for: highlight,
+                                                                       using: challenge.data)
+    let proofOfInclusionRequest = APIRequest.SubmitProofOfInclusion(for: proof)
+            let result = try await apiController.send(request: proofOfInclusionRequest)
+            documentController.update(currentDocument, with: result)
+        } catch {
+            Log.error("Caught error while generating proof of inclusion: \(error)")
+        }
+    }
+}
+```
+
+关键点：
+
+- `collaborationHighlight(for: url)` 判断当前 Universal Link 是否对应协作内容。
+- `APIRequest.GetChallengeData()` 是示例中的服务端 challenge，用来防止重放请求。
+- `getSignedIdentityProof(for:using:)` 让设备对 challenge 数据签名，并返回 `SWPersonIdentityProof`。
+- `APIRequest.SubmitProofOfInclusion` 代表把证明交给服务器验证。
+- 服务器验证通过后，App 再更新当前文档访问状态。
+
+Session 解释了服务端验证的数学来源。接收方每台设备有加密公钥，系统用这些公钥构造 Merkle tree，root hash 表示某个收件人在这次协作中的身份。服务器验证签名后，用 proof of inclusion 重建 root hash，再和发送时保存的 root hash 列表比较（[20:09](https://developer.apple.com/videos/play/wwdc2022/10093/?time=1209)）。
+
+```swift
+func generateRootHashFromArray(localHash: SHA256Digest, inclusionHashes: [SHA256Digest],
+                       publicKeyIndex: Int) -> SHA256Digest {
+    guard let firstHash = inclusionHashes.first else { return localHash }
+    // Check if the node is the left or the right child
+    let isLeft = publicKeyIndex.isMultiple(of: 2)
+    // Calculate the combined hash
+    var rootHash: SHA256Digest
+    if isLeft {
+        rootHash = hash(concatenate([localHash, firstHash]), using: .sha256)
+    } else {
+        rootHash = hash(concatenate([firstHash, localHash]), using: .sha256)
+    }
+    // Recursively pass in elements and move up the Merkle tree
+    let newInclusionHashes = inclusionHashes.dropFirst()
+    rootHash = generateRootHashFromArray(
+        localHash: rootHash,
+        inclusionHashes: Array(newInclusionHashes),
+        publicKeyIndex: (publicKeyIndex / 2)
+    )
+    return rootHash
+}
+```
+
+关键点：
+
+- `localHash` 是当前设备公钥哈希或上一层计算结果。
+- `inclusionHashes.first` 取出 proof of inclusion 提供的第一个兄弟节点。
+- `publicKeyIndex.isMultiple(of: 2)` 决定当前节点在左侧还是右侧。
+- 拼接顺序必须根据左右位置决定，顺序不同会得到不同 root hash。
+- `dropFirst()` 消耗当前兄弟节点，递归继续向 Merkle tree 根节点移动。
+- 最终返回的 `rootHash` 要和服务端保存的收件人 root hash 比较。
+
+### 6. 群聊成员变化时同步权限
+
+（[24:12](https://developer.apple.com/videos/play/wwdc2022/10093/?time=1452)）协作所在 Messages 群聊成员变化时，用户可以从对话里的横幅把变化同步到 App。App 收到的仍然是 `SWUpdateCollaborationParticipantsAction`，这次要处理 `addedIdentities` 和 `removedIdentities`。
+
+```swift
+func collaborationCoordinator(_ coordinator: SWCollaborationCoordinator,
+                              handle action: SWUpdateCollaborationParticipantsAction) {
+    // Example of removing participants only. Handle the added identities here too.
+    let identifier = action.collaborationMetadata.collaborationIdentifier
+    let removed: [Data] = action.removedIdentities.compactMap { $0.rootHash }
+    let removeParticipants = APIRequest.RemoveParticipants(identifier: identifier, removed)
+    Task {
+        do {
+            try await apiController.send(request: removeParticipants)
+            action.fulfill()
+        } catch {
+            log.error("Caught error while adding participants to collaboration: \(error)")
+            action.fail()
+        }
+    }
+}
+```
+
+关键点：
+
+- `removedIdentities` 里同样读取 `rootHash`，用它定位要撤销访问权的人。
+- 如果已有账号和 removed identity 关联，服务端撤销该账号访问权。
+- 如果还没有账号关联，服务端删除之前保存的 root hash 即可。
+- 代码注释说明示例只展示删除，完整实现还要处理新增身份。
+- `action.fulfill()` 表示 App 已经完成权限同步。
+
+### 7. 把协作动态发回 Messages 对话
+
+（[25:54](https://developer.apple.com/videos/play/wwdc2022/10093/?time=1554)）协作内容发生变化后，App 可以通过 `SWHighlightCenter` 发布 notice。Messages 会在分享该链接的对话中显示横幅，例如内容被编辑、成员加入或退出、某人被提及、内容被移动或重命名。
+
+```swift
+func postContentEditEvent(identifier: SWCollaborationIdentifier) throws {
+    let highlightCenter: SWHighlightCenter = self.highlightCenter
+    let highlight = try highlightCenter.collaborationHighlight(forIdentifier: identifier)
+
+    let editEvent = SWHighlightChangeEvent(highlight: highlight, trigger: .edit)
+
+    highlightCenter.postNotice(for: editEvent)
+}
+```
+
+关键点：
+
+- `collaborationHighlight(forIdentifier:)` 用协作标识符找回系统中的 highlight。
+- `SWHighlightChangeEvent` 表示内容更新或评论这类变化。
+- `trigger: .edit` 指明这次 notice 是编辑事件。
+- `postNotice(for:)` 把事件交给系统，Messages 负责在相关对话里展示。
+
+提及某个协作者时，先用 root hash 创建 `SWPerson.Identity`，再创建 `SWHighlightMentionEvent`。Session 说明这条 notice 只会展示给被提及的用户（[26:50](https://developer.apple.com/videos/play/wwdc2022/10093/?time=1610)）。
+
+```swift
+func postMentionEvent(identifier: SWCollaborationIdentifier, mentionedRootHash: Data) throws {
+    let mentionedIdentity = SWPerson.Identity(rootHash: mentionedRootHash)
+
+    let highlightCenter: SWHighlightCenter = self.highlightCenter
+    let highlight = try highlightCenter.collaborationHighlight(forIdentifier: identifier)
+
+    let mentionEvent = SWHighlightMentionEvent(highlight: highlight,
+                                               mentionedPersonIdentity: mentionedIdentity)
+    highlightCenter.postNotice(for: mentionEvent)
+}
+```
+
+关键点：
+
+- `mentionedRootHash` 来自前面验证访问时已经和用户账号关联的身份数据。
+- `SWPerson.Identity(rootHash:)` 把服务端保存的身份转换成系统可识别的人。
+- `SWHighlightMentionEvent` 绑定协作 highlight 和被提及的身份。
+- `postNotice(for:)` 发布后，Messages 只把提及 notice 展示给对应用户。
+
+内容被移动、重命名或删除时，用 persistence event。下面的代码展示重命名触发器（[27:23](https://developer.apple.com/videos/play/wwdc2022/10093/?time=1643)）。
+
+```swift
+func postContentRenamedEvent(identifier: SWCollaborationIdentifier) throws {
+    let highlightCenter: SWHighlightCenter = self.highlightCenter
+    let highlight = try highlightCenter.collaborationHighlight(forIdentifier: identifier)
+
+    let renamedEvent = SWHighlightPersistenceEvent(highlight: highlight, trigger: .renamed)
+    highlightCenter.postNotice(for: renamedEvent)
+}
+```
+
+关键点：
+
+- `SWHighlightPersistenceEvent` 覆盖内容移动、重命名、删除这类状态变化。
+- `trigger: .renamed` 明确告诉系统这次变化是重命名。
+- App 只需要发布事件，Messages 会把用户带回对应协作内容。
+
+## 核心启发
+
+- **做一个群聊驱动的文档邀请流程**：把文档的分享按钮改成 `SWCollaborationMetadata` + Share Sheet。用户在 Messages 里选人和权限后，服务端再生成链接。这样链接、权限和收件人保持一致。
+
+- **做一个免复制账号的协作加入流程**：接收方打开 Universal Link 后，用 `SWHighlightCenter.getSignedIdentityProof` 取签名证明，服务端重建 root hash 并匹配发送时保存的身份。适合文档、白板、代码审阅这类多人协作产品。
+
+- **做一个群聊成员自动同步权限的后台任务**：在 `SWUpdateCollaborationParticipantsAction` 中同时处理 `addedIdentities` 和 `removedIdentities`。新增成员写入 root hash，移除成员撤销账号访问权或删除未绑定 root hash。
+
+- **做一个协作动态回流 Messages 的通知系统**：编辑、评论、提及、重命名时分别发布 `SWHighlightChangeEvent`、`SWHighlightMentionEvent` 和 `SWHighlightPersistenceEvent`。用户在对话里看到横幅后，可以直接回到对应内容。
+
+- **做一个 SwiftUI 原生分享模型**：让协作文档模型遵守 `Transferable`，在 `ProxyRepresentation` 中返回 `SWCollaborationMetadata`，再用 `ShareLink` 暴露入口。这样同一份模型能服务分享、拖放和系统协作流程。
+
+## 关联 Session
+
+- [Add Shared with You to your app](/articles/wwdc2022-10094) — 这场讲普通 Shared with You 内容如何在 App 内浮现，是理解 `SWHighlightCenter` 和 attribution UI 的基础。
+- [Enhance collaboration experiences with Messages](/articles/wwdc2022-10095) — 这场讲 CloudKit、iCloud Drive 和自定义协作如何接入 Messages 协作 UI，和本 session 的自定义后端流程互补。
+- [Meet Transferable](/articles/wwdc2022-10062) — 本 session 的 SwiftUI 示例依赖 `Transferable` 和 `ProxyRepresentation`，这场会系统解释模型层分享表示。
+- [What's new in SwiftUI](/articles/wwdc2022-10052) — 本 session 使用 `ShareLink` 作为 SwiftUI 分享入口，这场会覆盖 SwiftUI 2022 的相关分享能力。

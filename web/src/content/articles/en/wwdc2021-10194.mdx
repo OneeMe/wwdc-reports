@@ -1,0 +1,537 @@
+---
+title: "Swift concurrency: Update a sample app"
+description: "Discover Swift concurrency in action: follow along as we update an existing sample app. Get real-world experience with async/await, actors, and continuations. We'll also explore techniques for migrating existing code to Swift concurrency over time."
+date: "2021-06-06"
+tags: ["Swift", "Concurrency"]
+thumbnail: "/images/sessions/2021/10194.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10194/"
+sessionId: "wwdc2021-10194"
+year: "2021"
+relatedSessions:
+  - title: "Meet async/await in Swift"
+    code: "10132"
+    description: "介绍 Swift async/await 的基本模型和调用方式。"
+  - title: "Protect mutable state with Swift actors"
+    code: "10133"
+    description: "解释 actor 如何隔离可变状态，避免数据竞争。"
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "讲解任务层级、取消和结构化并发。"
+  - title: "Discover concurrency in SwiftUI"
+    code: "10019"
+    description: "把 Swift 并发用于 SwiftUI 应用的界面更新。"
+  - title: "Swift concurrency: Behind the scenes"
+    code: "10254"
+    description: "解释 Swift 并发运行时的调度和性能设计。"
+---
+
+## Highlight
+
+> Apple 用 Coffee Tracker 示例 App 演示把 completion handler、Dispatch queue 和回调队列逐步迁移到 async/await、actor 与 MainActor，让现有 Swift 项目获得更清晰的异步代码和更安全的状态隔离。
+
+## 核心内容
+
+Coffee Tracker 是一个 watchOS 示例 App。用户记录当天喝过的咖啡，表盘 complication 显示当前咖啡因水平。
+
+这个 App 很小，却有真实项目常见的并发问题。界面和模型在主队列更新。后台 I/O 用一个 dispatch queue。HealthKit 的 completion handler 可能从任意队列返回。代码表面分成 UI、模型、HealthKit 三层，运行时却散落在多个执行队列。
+
+以前维护这种代码，开发者要记住每个回调在哪个队列执行。保存 HealthKit 数据要写 completion handler。读取 HealthKit 查询结果要从回调里继续处理。更新 SwiftUI 模型前，还要手动跳回主线程。
+
+Apple 在 Swift 5.5 引入 async/await（异步等待）、actor（参与者）和 MainActor（主参与者）。这场演讲做的事很具体：不重写整个 App，只沿着 Coffee Tracker 的数据流，一段一段迁移。
+
+第一步是把已有异步 API 换成 `await` 调用。第二步是用 continuation（延续）包装还没有 async 版本的回调 API。第三步是把共享状态放进 actor。最后把 UI 模型标记为 `@MainActor`，让编译器负责主线程隔离。
+
+### 从底层函数开始迁移
+
+保存咖啡因样本是一个很适合开始的点。它靠近 HealthKit，调用链短，改动范围小。
+
+Apple 先把 `store.save` 的 completion handler 版本换成 async 版本。调用者不再传入闭包，直接 `try await` 等待结果。错误处理仍然保留在同一个函数里。
+
+### 旧 API 可以继续存在
+
+项目迁移通常无法一次改完。演讲保留 completion handler 入口，把旧方法标记为 deprecated，再在内部创建 `Task` 调用新的 async 方法。
+
+这样，旧调用方还能工作。新代码可以直接走 async 版本。
+
+### actor 让并发边界变成类型边界
+
+HealthKitController 负责授权、保存和查询 HealthKit。它内部有 `isAuthorized`、`anchor` 等状态。以前这些状态可能被不同队列同时访问。
+
+把 `HealthKitController` 改成 `actor` 后，状态访问由 actor 隔离。外部调用它的方法需要 `await`。并发边界写在类型声明上，调用方能从代码里直接看到。
+
+### UI 模型交给 MainActor
+
+CoffeeData 是 SwiftUI 的 `ObservableObject`，它的 `currentDrinks` 会驱动界面。这个对象应该在主线程更新。
+
+演讲先给 `updateModel(newDrinks:deletedDrinks:)` 标记 `@MainActor`，后来把整个 `CoffeeData` 类型标记为 `@MainActor`。这样，模型更新和 SwiftUI 绑定保持在主执行环境中。
+
+## 详细内容
+
+### 1. 用 async/await 替换 HealthKit 保存回调
+
+（[07:34](https://developer.apple.com/videos/play/wwdc2021/10194/?time=454)）HealthKit 的 `HKHealthStore.save(_:)` 有 async 版本后，保存样本可以写成顺序代码。成功路径和错误路径在同一个 `do/catch` 中处理。
+
+```swift
+do {
+    try await store.save(caffeineSample)
+    self.logger.debug("\(mgCaffeine) mg Drink saved to HealthKit")
+} catch {
+    self.logger.error("Unable to save \(caffeineSample) to the HealthKit store: \(error.localizedDescription)")
+}
+```
+
+关键点：
+- `do` 包住可能抛错的异步调用。
+- `try await store.save(caffeineSample)` 等待 HealthKit 保存样本完成。
+- `self.logger.debug` 只在保存成功后执行。
+- `catch` 捕获保存失败的错误。
+- `error.localizedDescription` 写入日志，方便定位 HealthKit 保存失败原因。
+
+（[09:38](https://developer.apple.com/videos/play/wwdc2021/10194/?time=578)）函数本身也要变成 async。调用方由函数签名知道它会挂起。
+
+```swift
+public func save(drink: Drink) async {
+```
+
+关键点：
+- `public` 保留原来的访问级别。
+- `func save(drink: Drink)` 仍然接收一个 `Drink`。
+- `async` 表示函数内部可以调用 `await`，调用方也要用 `await`。
+
+（[10:15](https://developer.apple.com/videos/play/wwdc2021/10194/?time=615)）同步上下文里不能直接 `await`，需要创建一个任务。
+
+```swift
+Task { await self.healthKitController.save(drink: drink) }
+```
+
+关键点：
+- `Task { ... }` 创建新的异步任务。
+- `await` 等待 actor 或异步函数完成保存。
+- `self.healthKitController.save(drink: drink)` 复用刚迁移后的 async 方法。
+
+### 2. 给旧 completion handler 增加 async 替代入口
+
+（[12:13](https://developer.apple.com/videos/play/wwdc2021/10194/?time=733)）迁移过程中，旧 API 可以保留。Apple 的做法是把旧方法标记为废弃，并在内部调用新 async 方法。
+
+```swift
+@available(*, deprecated, message: "Prefer async alternative instead")
+public func requestAuthorization(completionHandler: @escaping (Bool) -> Void ) {
+    Task {
+        let result = await requestAuthorization()
+        completionHandler(result)
+    }
+}
+```
+
+关键点：
+- `@available(*, deprecated, message: "Prefer async alternative instead")` 提醒调用方改用 async 版本。
+- `completionHandler` 保留旧调用形式。
+- `Task` 让同步方法内部可以调用 async 方法。
+- `let result = await requestAuthorization()` 调用新的授权函数。
+- `completionHandler(result)` 把 async 结果桥接回旧回调。
+
+（[14:55](https://developer.apple.com/videos/play/wwdc2021/10194/?time=895)）新的授权函数直接返回 `Bool`。调用方不用再在闭包里读结果。
+
+```swift
+public func requestAuthorization() async -> Bool {
+    guard isAvailable else { return false }
+
+    do {
+        try await store.requestAuthorization(toShare: types, read: types)
+        self.isAuthorized = true
+        return true
+    } catch let error {
+        self.logger.error("An error occurred while requesting HealthKit Authorization: \(error.localizedDescription)")
+        return false
+    }
+}
+```
+
+关键点：
+- `async -> Bool` 表示函数异步完成，并返回授权是否成功。
+- `guard isAvailable else { return false }` 先处理设备不支持 HealthKit 的情况。
+- `try await store.requestAuthorization(toShare: types, read: types)` 请求 HealthKit 授权。
+- `self.isAuthorized = true` 记录授权成功状态。
+- `catch let error` 捕获授权错误。
+- 失败时记录日志并返回 `false`。
+
+### 3. 用 continuation 包装没有 async 版本的 HealthKit 查询
+
+（[17:43](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1063)）`HKAnchoredObjectQuery` 仍然使用 completion handler。这里用 `withCheckedThrowingContinuation` 把回调结果转成 async 返回值。
+
+```swift
+private func queryHealthKit() async throws -> ([HKSample]?, [HKDeletedObject]?, HKQueryAnchor?) {
+    return try await withCheckedThrowingContinuation { continuation in
+        // Create a predicate that only returns samples created within the last 24 hours.
+        let endDate = Date()
+        let startDate = endDate.addingTimeInterval(-24.0 * 60.0 * 60.0)
+        let datePredicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [.strictStartDate, .strictEndDate])
+
+        // Create the query.
+        let query = HKAnchoredObjectQuery(
+            type: caffeineType,
+            predicate: datePredicate,
+            anchor: anchor,
+            limit: HKObjectQueryNoLimit) { (_, samples, deletedSamples, newAnchor, error) in
+
+            // When the query ends, check for errors.
+            if let error = error {
+                continuation.resume(throwing: error)
+            } else {
+                continuation.resume(returning: (samples, deletedSamples, newAnchor))
+            }
+        }
+        store.execute(query)
+    }
+}
+```
+
+关键点：
+- `async throws` 表示查询会挂起，也可能抛错。
+- `withCheckedThrowingContinuation` 创建一个可抛错的 continuation。
+- `endDate` 和 `startDate` 限定最近 24 小时的样本。
+- `HKQuery.predicateForSamples` 构造 HealthKit 查询条件。
+- `HKAnchoredObjectQuery` 查询新增样本、删除样本和新的 anchor。
+- `if let error = error` 处理查询失败。
+- `continuation.resume(throwing: error)` 把回调错误交给 async 调用方。
+- `continuation.resume(returning: (samples, deletedSamples, newAnchor))` 返回查询结果。
+- `store.execute(query)` 启动 HealthKit 查询。
+
+（[20:17](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1217)）包装完成后，上层加载函数可以按顺序写：查询、更新 anchor、转换数据、更新模型。
+
+```swift
+@discardableResult
+public func loadNewDataFromHealthKit() async -> Bool {
+
+    guard isAvailable else {
+        logger.debug("HealthKit is not available on this device.")
+        return false
+    }
+
+    logger.debug("Loading data from HealthKit")
+
+    do {
+        let (samples, deletedSamples, newAnchor) = try await queryHealthKit()
+
+        // Update the anchor.
+        self.anchor = newAnchor
+
+        // Convert new caffeine samples into Drink instances.
+        let newDrinks: [Drink]
+        if let samples = samples {
+            newDrinks = self.drinksToAdd(from: samples)
+        } else {
+            newDrinks = []
+        }
+
+        // Create a set of UUIDs for any samples deleted from HealthKit.
+        let deletedDrinks = self.drinksToDelete(from: deletedSamples ?? [])
+
+        // Update the data on the main queue.
+        await MainActor.run {
+            // Update the model.
+            self.updateModel(newDrinks: newDrinks, deletedDrinks: deletedDrinks)
+        }
+        return true
+    } catch {
+        self.logger.error("An error occurred while querying for samples: \(error.localizedDescription)")
+        return false
+    }
+}
+```
+
+关键点：
+- `@discardableResult` 允许调用方忽略返回值。
+- `guard isAvailable` 阻止不支持 HealthKit 的设备继续执行。
+- `try await queryHealthKit()` 等待刚包装好的查询函数返回。
+- `self.anchor = newAnchor` 保存下一次增量查询的位置。
+- `drinksToAdd(from:)` 把 HealthKit 样本转成 `Drink`。
+- `drinksToDelete(from:)` 把删除记录转成 UUID 集合。
+- `await MainActor.run` 把模型更新切到主执行环境。
+- `catch` 记录查询失败并返回 `false`。
+
+### 4. 用 @MainActor 固定 UI 模型更新位置
+
+（[25:09](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1509)）`updateModel(newDrinks:deletedDrinks:)` 会修改用于显示的数据。给它标记 `@MainActor` 后，调用方不必手写 `MainActor.run` 包裹整段更新逻辑。
+
+```swift
+@MainActor
+private func updateModel(newDrinks: [Drink], deletedDrinks: Set<UUID>) {
+```
+
+关键点：
+- `@MainActor` 把这个方法隔离到主 actor。
+- `private` 表示方法只在类型内部使用。
+- `newDrinks` 是从 HealthKit 新增样本转换来的饮品列表。
+- `deletedDrinks` 是 HealthKit 已删除样本对应的 UUID 集合。
+
+（[26:43](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1603)）调用处只保留一行 `await`。
+
+```swift
+await self.updateModel(newDrinks: newDrinks, deletedDrinks: deletedDrinks)
+```
+
+关键点：
+- `await` 表示调用可能跨 actor 边界。
+- `self.updateModel` 会在主 actor 上执行。
+- 调用点不再直接管理主队列切换。
+
+（[50:03](https://developer.apple.com/videos/play/wwdc2021/10194/?time=3003)）当整个 UI 模型都应该在主线程使用时，可以标记整个类型。
+
+```swift
+@MainActor
+class CoffeeData: ObservableObject {
+```
+
+关键点：
+- `@MainActor` 作用在整个 `CoffeeData` 类型上。
+- `CoffeeData` 的实例方法和属性访问默认在主 actor 上。
+- `ObservableObject` 与 SwiftUI 绑定，适合放在主 actor。
+
+### 5. 把 HealthKitController 改成 actor
+
+（[29:24](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1764)）`HealthKitController` 管理 HealthKit 相关状态。把类型声明改成 `actor` 后，它内部的可变状态由 actor 串行保护。
+
+```swift
+actor HealthKitController {
+```
+
+关键点：
+- `actor` 定义一个受隔离保护的引用类型。
+- `HealthKitController` 内部状态不能被外部同步随意访问。
+- 外部调用 actor 隔离的方法通常需要 `await`。
+
+（[34:01](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2041)）旧 completion handler 方法不需要访问 actor 隔离状态，可以标记为 `nonisolated`。这样旧入口不要求调用方跨 actor 等待。
+
+```swift
+@available(*, deprecated, message: "Prefer async alternative instead")
+nonisolated public func requestAuthorization(completionHandler: @escaping (Bool) -> Void ) {
+    // ...
+}
+
+@available(*, deprecated, message: "Prefer async alternative instead")
+nonisolated public func loadNewDataFromHealthKit(completionHandler: @escaping (Bool) -> Void = { _ in }) {
+    // ...
+}
+```
+
+关键点：
+- `nonisolated` 表示这个方法不隔离到 actor 实例。
+- 两个旧方法仍然被标记为 deprecated。
+- 方法体内部可以创建 `Task`，再调用 actor 的 async 方法。
+- 这种写法服务于逐步迁移，保留旧调用方。
+
+### 6. 用 CoffeeDataStore actor 隔离磁盘读写状态
+
+（[36:20](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2180)）演讲接着把磁盘读写从 `CoffeeData` 里拆出去，放到私有 actor。
+
+```swift
+private actor CoffeeDataStore {
+
+}
+```
+
+关键点：
+- `private actor` 只在当前文件或作用域内部使用。
+- `CoffeeDataStore` 专门负责加载和保存饮品数据。
+- 磁盘 I/O 相关状态从 UI 模型中分离出来。
+
+（[38:37](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2317)）`savedValue` 移入 actor，用来判断数据是否真的变化。
+
+```swift
+private var savedValue: [Drink] = []
+```
+
+关键点：
+- `private var` 是 actor 内部可变状态。
+- `[Drink]` 保存上一次写入磁盘的饮品列表。
+- 初始值 `[]` 表示还没有保存过任何饮品。
+
+（[39:00](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2340)）文件路径也放进 `CoffeeDataStore`，让存储细节集中在一个类型里。
+
+```swift
+private var dataURL: URL {
+    get throws {
+        try FileManager
+            .default
+            .url(for: .documentDirectory,
+                 in: .userDomainMask,
+                 appropriateFor: nil,
+                 create: false)
+            // Append the file name to the directory.
+            .appendingPathComponent("CoffeeTracker.plist")
+    }
+}
+```
+
+关键点：
+- `private var dataURL: URL` 计算 plist 文件路径。
+- `get throws` 表示获取路径可能抛错。
+- `FileManager.default.url` 查找用户文档目录。
+- `.appendingPathComponent("CoffeeTracker.plist")` 追加应用数据文件名。
+
+（[45:26](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2726)）保存逻辑移入 actor 后，`savedValue` 和文件写入在同一个隔离域内执行。
+
+```swift
+// Begin saving the drink data to disk.
+func save(_ currentDrinks: [Drink]) {
+
+    // Don't save the data if there haven't been any changes.
+    if currentDrinks == savedValue {
+        logger.debug("The drink list hasn't changed. No need to save.")
+        return
+    }
+
+    // Save as a binary plist file.
+    let encoder = PropertyListEncoder()
+    encoder.outputFormat = .binary
+
+    let data: Data
+
+    do {
+        // Encode the currentDrinks array.
+        data = try encoder.encode(currentDrinks)
+    } catch {
+        logger.error("An error occurred while encoding the data: \(error.localizedDescription)")
+        return
+    }
+
+    // Save the data to disk as a binary plist file.
+    do {
+        // Write the data to disk.
+        try data.write(to: self.dataURL, options: [.atomic])
+
+        // Update the saved value.
+        self.savedValue = currentDrinks
+
+        self.logger.debug("Saved!")
+    } catch {
+        self.logger.error("An error occurred while saving the data: \(error.localizedDescription)")
+    }
+}
+```
+
+关键点：
+- `func save(_ currentDrinks: [Drink])` 接收当前 UI 模型中的饮品列表。
+- `if currentDrinks == savedValue` 避免重复写入相同数据。
+- `PropertyListEncoder()` 创建 plist 编码器。
+- `encoder.outputFormat = .binary` 指定二进制 plist。
+- `try encoder.encode(currentDrinks)` 把数组编码为 `Data`。
+- `try data.write(to: self.dataURL, options: [.atomic])` 原子写入文件。
+- `self.savedValue = currentDrinks` 写入成功后更新缓存值。
+- 两个 `catch` 分别处理编码失败和写入失败。
+
+### 7. 用 async 初始化加载数据流
+
+（[48:01](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2881)）`CoffeeData` 的加载流程现在可以串起来：从 actor 读取磁盘数据，清理过期饮品，更新模型，请求 HealthKit 授权，再加载新数据。
+
+```swift
+func load() async {
+    var drinks = await store.load()
+
+    // Drop old drinks
+    drinks.removeOutdatedDrinks()
+
+    // Assign loaded drinks to model
+    currentDrinks = drinks
+
+    // Load new data from HealthKit.
+    let success = await self.healthKitController.requestAuthorization()
+    guard success else {
+        logger.debug("Unable to authorize HealthKit.")
+        return
+    }
+
+    await self.healthKitController.loadNewDataFromHealthKit()
+}
+```
+
+关键点：
+- `func load() async` 表示加载流程会挂起。
+- `await store.load()` 从 `CoffeeDataStore` actor 读取磁盘数据。
+- `drinks.removeOutdatedDrinks()` 删除过期饮品。
+- `currentDrinks = drinks` 更新 SwiftUI 使用的模型数据。
+- `await self.healthKitController.requestAuthorization()` 请求 HealthKit 授权。
+- `guard success else` 在授权失败时提前返回。
+- `await self.healthKitController.loadNewDataFromHealthKit()` 拉取 HealthKit 新数据。
+
+（[49:08](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2948)）初始化器不能直接标记为 async。演讲用 `Task` 启动加载。
+
+```swift
+Task { await load() }
+```
+
+关键点：
+- `Task` 在初始化期间启动异步工作。
+- `await load()` 调用刚才的加载流程。
+- UI 模型创建后，数据加载在任务中继续执行。
+
+### 8. 替换后台刷新里的 completion handler
+
+（[52:18](https://developer.apple.com/videos/play/wwdc2021/10194/?time=3138)）watchOS 后台任务处理函数里也可以创建 `Task`，用 async 方法检查 HealthKit 更新。任务结束后，再调用系统 API 标记后台任务完成。
+
+```swift
+// Check for updates from HealthKit.
+let model = CoffeeData.shared
+
+Task {
+    let success = await model.healthKitController.loadNewDataFromHealthKit()
+
+    if success {
+        // Schedule the next background update.
+        scheduleBackgroundRefreshTasks()
+        self.logger.debug("Background Task Completed Successfully!")
+    }
+
+    // Mark the task as ended, and request an updated snapshot, if necessary.
+    backgroundTask.setTaskCompletedWithSnapshot(success)
+}
+```
+
+关键点：
+- `let model = CoffeeData.shared` 取得共享 UI 模型。
+- `Task` 启动异步后台刷新逻辑。
+- `await model.healthKitController.loadNewDataFromHealthKit()` 从 HealthKit 拉取新数据。
+- `if success` 只在成功时安排下一次后台刷新。
+- `scheduleBackgroundRefreshTasks()` 继续 watchOS 后台刷新节奏。
+- `backgroundTask.setTaskCompletedWithSnapshot(success)` 通知系统任务已结束。
+
+## 核心启发
+
+### 1. 给现有 App 做渐进式 async/await 迁移
+
+- **做什么**：从一个靠近系统框架的底层服务开始，把 completion handler 方法改成 async 方法。
+- **为什么值得做**：演讲展示了旧方法可以保留，新方法在内部逐步替换调用链，不需要一次改完整个项目。
+- **怎么开始**：挑一个 `save`、`load` 或 `requestAuthorization` 这类小函数，新增 `async` 版本；旧 completion handler 方法内部用 `Task` 调用新版本，并加 `@available(*, deprecated, message: "Prefer async alternative instead")`。
+
+### 2. 包装还没有 async 版本的回调 API
+
+- **做什么**：把项目里仍然依赖 completion handler 的系统 API 包装成 async 函数。
+- **为什么值得做**：`HKAnchoredObjectQuery` 的示例说明，continuation 可以把回调结果变成 `try await`，上层业务逻辑会更顺。
+- **怎么开始**：写一个私有 helper，例如 `queryHealthKit() async throws`；在 `withCheckedThrowingContinuation` 中创建原始查询；成功时 `resume(returning:)`，失败时 `resume(throwing:)`。
+
+### 3. 把缓存和文件读写放进 actor
+
+- **做什么**：为本地缓存、plist/JSON 文件读写、最近一次保存值建立一个私有 actor。
+- **为什么值得做**：`CoffeeDataStore` 把 `savedValue` 和 `dataURL` 都收进同一个 actor，减少 UI 模型里的后台状态。
+- **怎么开始**：新建 `private actor DataStore`；把 `savedValue`、文件 URL、`save(_:)`、`load()` 移进去；外部用 `await store.save(value)` 和 `await store.load()` 调用。
+
+### 4. 给 SwiftUI 模型标记 @MainActor
+
+- **做什么**：把驱动界面的 `ObservableObject` 或它的更新方法标记为 `@MainActor`。
+- **为什么值得做**：CoffeeData 的 `currentDrinks` 会触发 SwiftUI 更新，放在 MainActor 后，调用处不再散落 `DispatchQueue.main.async` 或 `MainActor.run`。
+- **怎么开始**：先给会修改 `@Published` 属性的方法加 `@MainActor`；如果整个模型都面向 UI，再把 `@MainActor` 放到类声明上。
+
+### 5. 重写后台任务的异步链路
+
+- **做什么**：把 watchOS 后台刷新、推送处理、定时同步这类入口改成 `Task` + async 服务调用。
+- **为什么值得做**：演讲里的 ExtensionDelegate 保留系统回调入口，在内部用 async 方法加载 HealthKit 数据，最后仍然按系统要求结束后台任务。
+- **怎么开始**：在 delegate 方法中创建 `Task`；任务里 `await` 调用模型或服务；成功后安排下一次任务；结尾调用系统的完成 API。
+
+## 关联 Session
+
+- [Meet async/await in Swift](/articles/wwdc2021-10132) — 从语言层面理解 async 函数、await 调用和错误处理。
+- [Protect mutable state with Swift actors](/articles/wwdc2021-10133) — 解释 actor 隔离如何保护可变状态。
+- [Explore structured concurrency in Swift](/articles/wwdc2021-10134) — 讲解任务结构、取消传播和并发任务组织。
+- [Discover concurrency in SwiftUI](/articles/wwdc2021-10019) — 展示 SwiftUI 应用中使用 Swift 并发更新界面。
+- [Swift concurrency: Behind the scenes](/articles/wwdc2021-10254) — 了解 Swift 并发运行时如何调度任务。

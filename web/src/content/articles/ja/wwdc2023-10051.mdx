@@ -1,0 +1,320 @@
+---
+title: "Create a great ShazamKit experience"
+description: "Discover how your app can offer a great audio matching experience with the latest updates to ShazamKit."
+date: "2023-06-10"
+tags: ["ShazamKit", "Audio", "SwiftUI", "Music"]
+thumbnail: "/images/sessions/2023/10051.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10051/"
+sessionId: "wwdc2023-10051"
+year: "2023"
+relatedSessions:
+  - title: "Create custom catalogs at scale with ShazamKit"
+    code: "10051"
+    description: "大规模自定义音频目录"
+  - title: "Add SharePlay to your app"
+    code: "10239"
+    description: "SharePlay 共享体验"
+  - title: "Discover Continuity Camera for tvOS"
+    code: "10256"
+    description: "tvOS 的 Continuity Camera"
+---
+
+## Highlight
+
+> ShazamKit 新增 `SHManagedSession` 自动处理麦克风录音和音频引擎配置，几行代码即可实现音频识别；`SHLibrary` 重新设计后支持读写删操作且跨设备同步；`SHSession` 扩展了 PCM 格式支持和多匹配返回能力。
+
+## 核心内容
+
+### 以前：手动配置音频引擎才能识别
+
+用 ShazamKit 做音频识别，以前要手动配置 `AVAudioEngine`：安装 tap 接收 PCM buffer、准备音频引擎、请求录音权限、启动录音、把 buffer 传给 `SHSession`。这套流程对不熟悉音频编程的开发者很不友好，代码量大还容易出错。
+
+### 现在：SHManagedSession 几行代码搞定
+
+iOS 17 引入了 `SHManagedSession`，自动处理所有录音相关的工作。你只需创建实例、调用 `result()` 或遍历 `results`、处理返回的 match/noMatch/error。
+
+`SHManagedSession` 支持两种模式：
+- 单次识别：调用 `result()`，返回一个结果
+- 持续识别：遍历 `results` async sequence，适合长时间监听
+
+调用 `cancel()` 停止录音和匹配。`prepare()` 可以提前分配资源和预录制，让后续识别响应更快。
+
+### SHLibrary：读写删一体化
+
+以前的 `SHMediaLibrary` 只能写入匹配结果，而且只能写带有有效 Shazam ID 的条目。新的 `SHLibrary` 支持：
+- `addItems(_:)` 添加媒体项
+- `items` 读取当前应用添加的所有条目
+- `removeItems(_:)` 删除条目
+
+读取和删除只能操作本应用添加的内容，不会暴露用户在其他应用中的 Shazam 记录。`SHLibrary` 符合 `Observable` 协议，SwiftUI 视图会自动刷新。
+
+### 更多格式支持和多匹配
+
+`SHSession` 的 `matchStreamingBuffer` 以前只支持特定采样率的 PCM buffer，现在支持大多数格式设置和更宽的采样率范围，ShazamKit 会自动做格式转换。
+
+自定义目录中，如果多个参考签名相似，ShazamKit 现在会返回所有匹配结果，按匹配质量排序。你可以在 `mediaItems` 中过滤出需要的条目。
+
+## 详细内容
+
+### 单次识别
+
+（[06:46](https://developer.apple.com/videos/play/wwdc2023/10051/?time=406)）
+
+```swift
+import ShazamKit
+
+let managedSession = SHManagedSession()
+
+let result = await managedSession.result()
+
+switch result {
+case .match(let match):
+    print("Match found. MediaItemsCount: \(match.mediaItems.count)")
+case .noMatch(_):
+    print("No match found")
+case .error(_, _):
+    print("An error occurred")
+}
+```
+
+**关键点：**
+- `SHManagedSession()` 自动处理麦克风权限和录音
+- `result()` 是异步方法，返回单个识别结果
+- 结果有三种状态：match、noMatch、error
+- Info.plist 中必须添加 `NSMicrophoneUsageDescription`
+
+### 持续识别
+
+（[07:16](https://developer.apple.com/videos/play/wwdc2023/10051/?time=436)）
+
+```swift
+let managedSession = SHManagedSession()
+
+// 持续监听，返回多个结果
+for await result in managedSession.results {
+    switch result {
+    case .match(let match):
+        print("Match found: \(match.mediaItems.first?.title ?? "")")
+    case .noMatch(_):
+        print("No match found")
+    case .error(let error, _):
+        print("Error: \(error.localizedDescription)")
+    }
+}
+```
+
+**关键点：**
+- `results` 是 async sequence，适合长时间监听场景
+- 调用 `cancel()` 会终止 async sequence
+- 每个匹配结果独立处理，可以持续接收新匹配
+
+### 完整的 Matcher 实现
+
+（[08:02](https://developer.apple.com/videos/play/wwdc2023/10051/?time=482)）
+
+```swift
+import Foundation
+import ShazamKit
+
+struct MatchResult: Identifiable, Equatable {
+    let id = UUID()
+    let match: SHMatch?
+}
+
+@MainActor final class Matcher: ObservableObject {
+    
+    @Published var isMatching = false
+    @Published var currentMatchResult: MatchResult?
+    
+    var currentMediaItem: SHMatchedMediaItem? {
+        currentMatchResult?.match?.mediaItems.first
+    }
+
+    private let session: SHManagedSession
+    
+    init() {
+        if let catalog = try? ResourcesProvider.catalog() {
+            session = SHManagedSession(catalog: catalog)
+        } else {
+            session = SHManagedSession()
+        }
+    }
+    
+    func match() async {
+        isMatching = true
+        
+        for await result in session.results {
+            switch result {
+            case .match(let match):
+                Task { @MainActor in
+                    self.currentMatchResult = MatchResult(match: match)
+                }
+            case .noMatch(_):
+                print("No match")
+                endSession()
+            case .error(let error, _):
+                print("Error \(error.localizedDescription)")
+                endSession()
+            }
+            stopRecording()
+        }
+    }
+    
+    func stopRecording() {
+        session.cancel()
+    }
+    
+    func endSession() {
+        isMatching = false
+        currentMatchResult = MatchResult(match: nil)
+    }
+}
+```
+
+**关键点：**
+- 可以用自定义 catalog 初始化 `SHManagedSession(catalog:)`
+- 无参初始化则使用默认的 Shazam 音乐目录
+- `@MainActor` 和 `@Published` 让 SwiftUI 自动响应状态变化
+- `stopRecording()` 调用 `cancel()` 停止录音
+
+### 预热准备
+
+（[10:07](https://developer.apple.com/videos/play/wwdc2023/10051/?time=607)）
+
+```swift
+let managedSession = SHManagedSession()
+
+// 提前预热，分配资源并开始预录制
+await managedSession.prepare()
+
+// 用户点击识别按钮时，响应更快
+let result = await managedSession.result()
+```
+
+**关键点：**
+- `prepare()` 提前分配匹配所需资源
+- 开始预录制，缩短从请求到结果的时间
+- 调用是可选的，ShazamKit 会在需要时自动调用
+
+### SwiftUI 中响应状态变化
+
+（[11:39](https://developer.apple.com/videos/play/wwdc2023/10051/?time=699)）
+
+```swift
+struct MatchView: View {
+    let session: SHManagedSession
+    
+    var body: some View {
+        VStack {
+            Text(session.state == .idle ? "Hear Music?" : "Matching")
+            if session.state == .matching {
+                ProgressView()
+            } else {
+                Button {
+                    // start match
+                } label: {
+                    Text("Learn the Dance")
+                }
+            }
+        }
+    }
+}
+```
+
+**关键点：**
+- `session.state` 有三种：`.idle`、`.prerecording`、`.matching`
+- `SHManagedSession` 符合 `Observable`，SwiftUI 自动刷新
+- 在 idle 状态显示按钮，在 matching 状态显示进度条
+
+### 读写 Shazam Library
+
+（[15:23](https://developer.apple.com/videos/play/wwdc2023/10051/?time=923)）
+
+```swift
+import ShazamKit
+
+// 添加媒体项到 Shazam Library
+func add(mediaItems: [SHMediaItem]) async throws {
+    try await SHLibrary.default.addItems(mediaItems)
+}
+
+// 在 SwiftUI 中读取
+struct LibraryView: View {
+    var body: some View {
+        List(SHLibrary.default.items) { item in
+            MediaItemView(item: item)
+        }
+    }
+}
+
+// 在非 UI 上下文中读取
+func mostPopularGenre() async -> String? {
+    let currentItems = await SHLibrary.default.items
+    let genres = currentItems.flatMap { $0.genres }
+    return highestOccurringGenre(from: genres)
+}
+
+// 删除媒体项
+func remove(mediaItems: [SHMediaItem]) async throws {
+    try await SHLibrary.default.removeItems(mediaItems)
+}
+```
+
+**关键点：**
+- `SHLibrary.default` 是单例，跨设备同步
+- `addItems` 写入，`items` 读取，`removeItems` 删除
+- 只能操作本应用添加的条目
+- 符合 `Observable`，SwiftUI List 自动刷新
+
+### 过滤多匹配结果
+
+（[20:23](https://developer.apple.com/videos/play/wwdc2023/10051/?time=1223)）
+
+```swift
+func match(from televisionShowCatalog: SHCustomCatalog) async -> [SHMatchedMediaItem] {
+    let managedSession = SHManagedSession(catalog: televisionShowCatalog)
+    let result = await managedSession.result()
+    
+    if case .match(let match) = result {
+        // 过滤特定剧集的媒体项
+        let filteredMediaItems = match.mediaItems.filter { $0.title == "Episode 2" }
+        return filteredMediaItems
+    }
+    
+    return []
+}
+```
+
+**关键点：**
+- 自定义目录中相似音频会返回多个匹配
+- `match.mediaItems` 按匹配质量排序
+- 用 `filter` 根据元数据选择需要的条目
+- 在生成目录时做好元数据标注，方便后续过滤
+
+## 核心启发
+
+**1. 听歌识曲社交 App**
+- **做什么**：朋友聚会时，自动识别播放的歌曲并生成共享播放列表
+- **为什么值得做**：`SHManagedSession` 几行代码实现识别，`SHLibrary` 自动同步到所有设备
+- **怎么开始**：用 `SHManagedSession` 持续识别，匹配成功后用 `SHLibrary.default.addItems` 保存，用 SwiftUI 展示 `SHLibrary.default.items`
+
+**2. 舞蹈/健身跟练 App**
+- **做什么**：识别背景音乐，自动加载对应的舞蹈教学或健身指导视频
+- **为什么值得做**：Demo 中的"学跳舞"场景直接可用，Managed Session 自动处理录音
+- **怎么开始**：用 `SHManagedSession` 识别歌曲，从 `match.mediaItems.first` 获取歌曲信息，根据歌曲 ID 查找对应的视频资源
+
+**3. 电视直播内容识别**
+- **做什么**：识别电视播放的节目，显示实时剧情介绍或演员信息
+- **为什么值得做**：自定义目录支持多匹配返回，同一片头可以区分不同集数
+- **怎么开始**：用 Shazam CLI 生成电视节目目录，为每集标注不同元数据，用 `filter` 选出当前集数
+
+**4. 现场演出曲目单生成器**
+- **做什么**：演唱会或音乐节现场，自动记录演出的每一首歌并生成曲目单
+- **为什么值得做**：`results` async sequence 可以持续监听整场演出，`SHLibrary` 保存记录
+- **怎么开始**：用 `for await result in session.results` 持续识别，去重后生成时间戳曲目单
+
+## 关联 Session
+
+- [Create custom catalogs at scale with ShazamKit](/articles/wwdc2023-10051) — 大规模自定义音频目录
+- [Add SharePlay to your app](/articles/wwdc2023-10239) — SharePlay 共享体验
+- [Discover Continuity Camera for tvOS](/articles/wwdc2023-10256) — tvOS 的 Continuity Camera

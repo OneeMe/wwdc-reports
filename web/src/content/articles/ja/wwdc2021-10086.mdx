@@ -1,0 +1,297 @@
+---
+title: "What's new in CloudKit"
+description: "cloudkit provides a secure, convenient, and reliable cloud database for your apps — and it's only getting better. discover how you can unravel your threads with support for async/await and convenience api additions. we'll also show you how to encourage collaboration between people using your app through sharing entire record zones of data, and explore how to adopt cloudkit features like encrypted values and help protect sensitive data within your app."
+date: "2021-06-08"
+tags: ["System Services", "Privacy & Security"]
+thumbnail: "/images/sessions/2021/10086.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10086/"
+sessionId: "wwdc2021-10086"
+year: "2021"
+relatedSessions:
+  - title: "Apple's privacy pillars in focus"
+    code: "10085"
+    description: "at apple, we believe that privacy is a fundamental human right. learn about our four privacy pillars and the technical approaches that keep your users' data safe."
+  - title: "Meet CloudKit Console"
+    code: "10087"
+    description: "discover the new cloudkit console, a web-based tool for managing your cloudkit containers and databases."
+  - title: "Build dynamic iOS apps with the Create ML framework"
+    code: "10038"
+    description: "discover how you can use the create ml framework to build dynamic iOS apps that leverage on-device machine learning."
+---
+
+## Highlight
+
+> CloudKit 在 iOS 15 中获得了三项核心升级：原生支持 Swift async/await 让异步代码更线性、加密字段（encryptedValues）让敏感数据自动端侧加密、Zone Sharing 让整区数据分享不再需要构建记录层级。这些改进降低了 CloudKit 的使用门槛，同时提升了数据安全性和协作能力。
+
+## 核心内容
+
+### 从回调地狱到 async/await
+
+（[00:38](https://developer.apple.com/videos/play/wwdc2021/10086/?time=38)）
+
+CloudKit 的 API 分为两层：面向新手的 Convenience API（CKContainer 和 CKDatabase 上的函数）和面向生产环境的 Operation API（NSOperation 子类）。Operation API 支持批量操作、分页、变更追踪等高级功能，但代码复杂度也高得多。
+
+iOS 15 为 Convenience API 引入了 async/await 变体。对比同一段删除记录的逻辑：
+
+**旧代码（回调式）：**
+
+```swift
+func deleteLastPerson(completionHandler: ((Result<Void, Error>) -> Void)? = nil) {
+    database.delete(withRecordID: lastPersonRecordId) { recordId, error in
+        if let recordId = recordId {
+            os_log("Record with ID \(recordId.recordName) was deleted.")
+        }
+        if let error = error {
+            self.reportError(error)
+            completionHandler?(.failure(error))
+        } else {
+            completionHandler?(.success(()))
+        }
+    }
+}
+```
+
+**新代码（async/await）：**
+
+```swift
+func deleteLastPerson() async throws {
+    do {
+        let recordId = try await database.deleteRecord(with: lastPersonRecordId)
+        os_log("Record with ID \(recordId.recordName) was deleted.")
+    } catch {
+        self.reportError(error)
+        throw error
+    }
+}
+```
+
+关键点：
+- 新 API 消除了可选值解包和条件分支
+- 控制流变成线性，错误处理用 `try/catch`
+- 每个 Convenience API 函数都有两个版本：带 completionHandler 的和 async 的
+
+### 批量操作也支持 async
+
+（[09:14](https://developer.apple.com/videos/play/wwdc2021/10086/?time=554)）
+
+之前的 Convenience API 只能单条操作。iOS 15 新增了批量修改函数：
+
+```swift
+func deleteLastPeople() async throws {
+    let recordIds = [lastPersonRecordId, penultimatePersonRecordId]
+    let (_, deleteResults) = try await database.modifyRecords(deleting: recordIds)
+
+    for (recordId, deleteResult) in deleteResults {
+        switch deleteResult {
+        case .failure(let error):
+            self.reportError(error, itemId: recordId)
+        case .success:
+            os_log("Record with ID \(recordId.recordName) was deleted.")
+        }
+    }
+}
+```
+
+关键点：
+- `modifyRecords(deleting:)` 返回 `(saveResults, deleteResults)` 两个字典
+- 每个结果用 `Result` 类型包裹，明确区分成功和失败
+- 函数级别的错误只代表操作本身失败（如网络不可用），单条记录的错误在 `deleteResults` 中
+
+### Result 类型澄清回调职责
+
+（[05:39](https://developer.apple.com/videos/play/wwdc2021/10086/?time=339)）
+
+CloudKit Operation API 以前用两套回调报告错误：per-item completion block 和 per-operation completion block。同一个错误可能在两个地方出现，开发者容易混淆。
+
+iOS 15 用 Swift.Result 类型重新设计了回调：
+
+```swift
+// 旧 API：错误参数分散在多个可选参数中
+fetchRecordsOp.perRecordCompletionBlock = { record, recordID, error in
+    // error 可能是 CKError.unknownItem
+}
+fetchRecordsOp.fetchRecordsCompletionBlock = { recordsByRecordID, operationError in
+    // operationError 可能是 CKError.partialFailure
+    // 还要从 partialErrorsByItemID 中解析单条错误
+}
+
+// 新 API：Result 类型明确区分 per-item 和 per-operation
+fetchRecordsOp.perRecordResultBlock = { recordID, result in
+    // result 是 .success(record) 或 .failure(CKError.unknownItem)
+}
+fetchRecordsOp.fetchRecordsResultBlock = { result in
+    // result 是 .success，不再重复报告单条错误
+}
+```
+
+关键点：
+- `perRecordResultBlock` 只报告单条记录的成功或失败
+- `fetchRecordsResultBlock` 只报告操作整体的成功或失败
+- 所有 CKOperation 现在都暴露了 per-item 回调
+
+## 详细内容
+
+### 加密字段：一行代码保护敏感数据
+
+（[13:43](https://developer.apple.com/videos/play/wwdc2021/10086/?time=823)）
+
+CloudKit 之前只对 CKAsset 提供自动加密。iOS 15 扩展了这个能力，字符串、数字、日期、CLLocation 和数组都可以直接加密存储。
+
+```swift
+// 设备 1：设置加密值
+let record = CKRecord(recordType: "MedicalData")
+record.encryptedValues["diagnosis"] = "Hypertension"
+record.encryptedValues["bloodPressure"] = 140.0
+
+let modifyOp = CKModifyRecordsOperation(recordsToSave: [record])
+database.add(modifyOp)
+
+// 设备 2：读取后自动解密
+let fetchOp = CKFetchRecordsOperation(recordIDs: [recordID])
+fetchOp.perRecordResultBlock = { recordID, result in
+    switch result {
+    case .success(let record):
+        let diagnosis = record.encryptedValues["diagnosis"] as? String
+        let bp = record.encryptedValues["bloodPressure"] as? Double
+        print("Diagnosis: \(diagnosis ?? ""), BP: \(bp ?? 0)")
+    case .failure(let error):
+        print("Fetch failed: \(error)")
+    }
+}
+database.add(fetchOp)
+```
+
+关键点：
+- `encryptedValues` 是 CKRecord 的新属性，用法和普通字段一样
+- 加密在设备端完成，密钥材料存储在 iCloud Keychain 中
+- 支持 CloudKit 分享功能，只有 CKShare 的参与者能解密相关字段
+- CKAsset 已经默认加密，不能再次设为 encryptedValue
+- CKReference 不能被加密，因为服务器需要看到引用关系
+
+### 账户状态检查
+
+（[16:35](https://developer.apple.com/videos/play/wwdc2021/10086/?time=995)）
+
+加密操作需要有效的 iCloud 账户。iOS 15 新增了 `temporarilyUnavailable` 状态：
+
+```swift
+let container = CKContainer.default()
+
+// 检查账户状态
+let status = try await container.accountStatus()
+
+switch status {
+case .available:
+    // 可以执行加密操作
+    print("Account is available")
+case .noAccount:
+    // 引导用户登录 iCloud
+    print("No iCloud account")
+case .restricted:
+    // 受家长控制或配置限制
+    print("Account is restricted")
+case .temporarilyUnavailable:
+    // 账户已登录但未就绪，引导用户到设置验证
+    print("Account temporarily unavailable")
+case .couldNotDetermine:
+    // 网络问题或系统错误
+    print("Could not determine account status")
+}
+
+// 监听账户状态变化
+NotificationCenter.default.addObserver(
+    forName: .CKAccountChanged,
+    object: nil,
+    queue: .main
+) { _ in
+    print("iCloud account changed")
+}
+```
+
+关键点：
+- `temporarilyUnavailable` 是 iOS 15 新增状态，表示账户已登录但需要验证
+- 应引导用户到设置 App 完成验证
+- 通过 `CKAccountChanged` 通知监听状态变化
+
+### Zone Sharing：整区分享不再需要层级
+
+（[21:10](https://developer.apple.com/videos/play/wwdc2021/10086/?time=1270)）
+
+CloudKit 分享之前需要构建记录层级（parent references），以根记录创建 CKShare。iOS 15 引入了 Zone Sharing，可以直接分享整个记录区。
+
+**旧方式：记录层级分享**
+
+```swift
+// 创建记录层级
+let zone = CKRecordZone(zoneName: "MyZone")
+let fileRecordA = CKRecord(recordType: "File", recordID: CKRecord.ID(zoneID: zone.zoneID))
+let fileRecordB = CKRecord(recordType: "File", recordID: CKRecord.ID(zoneID: zone.zoneID))
+let folderRecord = CKRecord(recordType: "Folder", recordID: CKRecord.ID(zoneID: zone.zoneID))
+
+fileRecordA.setParent(folderRecord)
+fileRecordB.setParent(folderRecord)
+
+// 以 folder 为根记录创建分享
+let share = CKShare(rootRecord: folderRecord)
+let (saveResults, _) = try await database.modifyRecords(saving: [folderRecord, share])
+```
+
+**新方式：Zone Sharing**
+
+```swift
+// 直接分享整个 Zone
+let zone = CKRecordZone(zoneName: "MyZone")
+let share = CKShare(recordZoneID: zone.zoneID)
+
+let (saveResults, _) = try await database.modifyRecords(saving: [share])
+for (recordID, saveResult) in saveResults {
+    // 处理每条结果
+}
+```
+
+关键点：
+- Zone Sharing 不需要 parent references
+- 每个 Zone 只能有一个 Zone-wide share
+- Zone-wide share 的记录名固定为 `CKRecordNameZoneWideShare`
+- 不能与层级分享共存于同一 Zone
+- 接受 Zone Share 时，`rootRecord` 和 `hierarchicalRootRecordID` 为 nil
+
+### 两种分享方式的选择
+
+（[24:59](https://developer.apple.com/videos/play/wwdc2021/10086/?time=1499)）
+
+| 场景 | 推荐方式 |
+|------|---------|
+| 数据天然形成层级（文件夹-文件） | 层级分享（rootRecord + parent references）|
+| Zone 是平铺的记录集合 | Zone Sharing |
+| 需要同一 Zone 内多个独立分享 | 层级分享 |
+
+Apple 内部的使用案例：
+- 层级分享：Notes、Reminders、iCloud Drive 文件夹
+- Zone Sharing：HomeKit Secure Video、HomePod 多用户
+
+## 核心启发
+
+### 1. 用 async/await 重构 CloudKit 代码
+
+如果你的项目还在用 completion block 调用 CloudKit，迁移到 async/await 能显著降低维护成本。从最简单的单条操作开始，逐步替换批量操作。
+
+开始方式：找出所有 `database.save()`、`database.fetch()` 的回调式调用，替换为 `try await database.saveRecord()` 和 `try await database.record(for:)`。Xcode 的自动补全会提示可用的 async 变体。
+
+### 2. 为敏感数据启用加密字段
+
+任何存储在 CloudKit 中的个人身份信息、医疗记录、财务数据都应该使用 `encryptedValues`。成本几乎为零，但隐私承诺提升一个量级。
+
+开始方式：审计现有 CloudKit 数据模型，识别敏感字段。将 `record["field"]` 替换为 `record.encryptedValues["field"]`。在 CloudKit Console 中确认字段类型显示为 "Encrypted String" 等前缀。
+
+### 3. 用 Zone Sharing 简化协作功能
+
+如果你的 App 有「共享项目/共享工作区」的需求，且数据模型是平铺的（没有明显的父子关系），Zone Sharing 比构建人工层级简单得多。
+
+开始方式：创建一个自定义 Zone，把所有需要共享的记录放入其中。初始化 `CKShare(recordZoneID:)` 并保存。接受分享的一方通过标准的 CloudKit 分享流程加入。
+
+## 关联 Session
+
+- [Apple's privacy pillars in focus](/articles/wwdc2021-10085) — Apple 四项隐私支柱的技术实现细节
+- [Meet CloudKit Console](/articles/wwdc2021-10087) — 全新的 Web 版 CloudKit 管理工具
+- [Build dynamic iOS apps with the Create ML framework](/articles/wwdc2021-10038) — 在设备端训练个性化机器学习模型

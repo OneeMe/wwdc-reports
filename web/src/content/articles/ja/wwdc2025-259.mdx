@@ -1,0 +1,262 @@
+---
+title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+description: "develop generative ai features for your swiftui apps using the foundation models framework. get started by applying the basics of the framework to create an awesome feature. watch step-by-step example"
+date: 2026-06-10
+tags: ["机器学习"]
+thumbnail: "/images/sessions/2025/259.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/259/"
+sessionId: "wwdc2025-259"
+year: "2025"
+relatedSessions:
+  - title: "Meet the Foundation Models framework"
+    code: "286"
+    description: "认识 Foundation Models 框架，了解端侧大语言模型的整体能力。"
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "深入 Guided Generation、tool calling、流式输出的内部机制。"
+  - title: "Explore prompt design & safety for on-device foundation models"
+    code: "248"
+    description: "Prompt 设计与安全实践。"
+  - title: "Get started with MLX for Apple silicon"
+    code: "315"
+    description: "在 Apple 芯片上用 MLX 训练和部署自己的模型。"
+---
+
+## Highlight
+
+> Foundation Models 框架让 Swift 开发者用 `@Generable` 注解直接生成自定义结构体，无需手写 JSON 解析。
+
+---
+
+## 核心内容
+
+旅行规划这件事，最痛苦的是从一张白纸开始：去哪、玩几天、住哪、吃什么。Naomy 在这个 code-along 里要做的就是把这件事丢给端侧大模型——选一个景点（比如 Joshua Tree），点一下 Generate，模型直接吐出一份带每日活动安排的完整行程。整个过程不联网、不上传任何数据，因为模型已经嵌在 macOS、iPadOS、iOS 和 visionOS 的系统里。
+
+但要把模型接进 SwiftUI app，开发者会卡在几个地方：怎么调 prompt 才高效？模型输出是字符串，怎么变成 Swift 结构体？模型要怎么调用 MapKit 这样的外部数据源？输出延迟怎么压下来？设备没开 Apple Intelligence 怎么办？这一节用 30 分钟把这五件事全部演示了一遍：Xcode Playground 实时迭代 prompt（[02:54](https://developer.apple.com/videos/play/wwdc2025/259/?time=174)），`@Generable` + `@Guide` 让模型生成结构化数据（[04:47](https://developer.apple.com/videos/play/wwdc2025/259/?time=287)），实现 `Tool` 协议接 MapKit（[11:43](https://developer.apple.com/videos/play/wwdc2025/259/?time=703)），流式响应配合 `PartiallyGenerated`（[20:15](https://developer.apple.com/videos/play/wwdc2025/259/?time=1215)），用新的 Foundation Models Instrument 找瓶颈，再用 prewarm 和 `includeSchemaInPrompt: false` 把首字延迟压到几乎察觉不到（[24:24](https://developer.apple.com/videos/play/wwdc2025/259/?time=1464)）。
+
+---
+
+## 详细内容
+
+**Xcode Playground 调 prompt（[02:54](https://developer.apple.com/videos/play/wwdc2025/259/?time=174)）**。反复跑 app 改 prompt 一天就过去了。Xcode 更新后的 Playground 给出更快的路径：在任意 Swift 文件里写 `#Playground`，canvas 会像 SwiftUI Preview 一样实时回显结果。改一个字，模型立刻重新跑一遍。
+
+**Guided Generation（[04:47](https://developer.apple.com/videos/play/wwdc2025/259/?time=287)）**。把自定义结构体标成 `@Generable`，模型就能直接产出该类型的实例。`@Guide` 宏可以加描述、限定取值集合、限定数组长度，多个 guide 可以叠加。
+
+```swift
+import FoundationModels
+
+@Generable
+struct Itinerary {
+    @Guide(description: "A catchy title for the trip")
+    var title: String
+
+    var description: String
+
+    var rationale: String
+
+    @Guide(.count(3))
+    var days: [DayPlan]
+}
+
+@Generable
+struct DayPlan {
+    var title: String
+    var activities: [String]
+}
+```
+
+关键点：
+- `@Generable` 注解作用于结构体，要求其所有属性也是 Generable（`String`、`Int` 等基础类型已内置支持）；
+- `@Guide(description:)` 把描述塞进 schema，等同于对该字段额外做一次 prompt；
+- `@Guide(.count(3))` 强制 `days` 数组恰好包含 3 个元素，这种约束在生成阶段直接生效，不必在拿到结果后再校验。
+
+**用 builder API 写 Instructions（[06:50](https://developer.apple.com/videos/play/wwdc2025/259/?time=410)）**。`Instructions` 闭包里既能传字符串，也能传 Generable 实例做 few-shot 示例。Foundation Models 会把 Generable 实例自动转成模型可读的文本。
+
+```swift
+@Observable
+final class ItineraryPlanner {
+    let landmark: Landmark
+    var itinerary: Itinerary?
+
+    private let session: LanguageModelSession
+
+    init(landmark: Landmark) {
+        self.landmark = landmark
+        self.session = LanguageModelSession {
+            "You are a travel planner. Build a 3-day itinerary."
+            "Landmark: \(landmark.name)"
+            "Here is an example itinerary:"
+            Itinerary.exampleJapanTrip
+        }
+    }
+
+    func generate() async throws {
+        let response = try await session.respond(
+            to: "Generate an itinerary for \(landmark.name).",
+            generating: Itinerary.self
+        )
+        itinerary = response.content
+    }
+}
+```
+
+关键点：
+- `LanguageModelSession` 用尾随闭包接收 instructions，内部是 result builder，可混合字符串与 Generable 实例；
+- `respond(to:generating:)` 显式指定输出类型为 `Itinerary.self`，框架自动把 schema 注入 prompt；
+- 把 planner 标成 `@Observable`，UI 才会随 `itinerary` 变化刷新；
+- Naomy 强调（[09:22](https://developer.apple.com/videos/play/wwdc2025/259/?time=562)）planner 应该在 `.task` 里创建，而不是直接作为 `@State` 初始值，否则 SwiftUI 会反复构造它带来无谓开销。
+
+**Tool 协议接外部数据（[11:12](https://developer.apple.com/videos/play/wwdc2025/259/?time=672)）**。模型自己决定何时调工具、调几次。一个 Tool 需要：唯一的 `name`、`description`（告诉模型什么时候该用）、`Arguments` 类型（必须 Generable）、以及 `call` 方法。
+
+```swift
+import FoundationModels
+import MapKit
+
+struct FindPointsOfInterestTool: Tool {
+    let name = "findPointsOfInterest"
+    let description = "Search for points of interest near a landmark, given a category."
+
+    let landmark: Landmark
+
+    @Generable
+    enum Category: String {
+        case restaurant
+        case marina
+        case desertAttraction
+        case hikingTrail
+    }
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Natural language search query, e.g. 'sunset viewpoint'")
+        var query: String
+        var category: Category
+    }
+
+    func call(arguments: Arguments) async throws -> ToolOutput {
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = arguments.query
+        request.region = MKCoordinateRegion(
+            center: landmark.coordinate,
+            latitudinalMeters: 20_000,
+            longitudinalMeters: 20_000
+        )
+        let response = try await MKLocalSearch(request: request).start()
+        let names = response.mapItems.prefix(5).map(\.name).compactMap { $0 }
+        return ToolOutput(names.joined(separator: ", "))
+    }
+}
+```
+
+关键点：
+- `name` 和 `description` 会被框架自动写进 instructions，模型据此判断该不该调用；
+- `Arguments` 必须是 Generable，模型会按 schema 生成 query 和 category——大堡礁配 marina、Joshua Tree 配 desertAttraction 是模型的世界知识在起作用（[13:07](https://developer.apple.com/videos/play/wwdc2025/259/?time=787)）；
+- `call(arguments:)` 是 async 方法，搜索 20km 半径内的兴趣点，返回 `ToolOutput`；
+- 注册工具：在 `LanguageModelSession` 初始化时通过 `tools:` 参数传入实例，可以同时在 prompt 里显式提示"use the tool"以提升调用频率（[15:30](https://developer.apple.com/videos/play/wwdc2025/259/?time=930)）。
+
+**可用性处理（[16:37](https://developer.apple.com/videos/play/wwdc2025/259/?time=997)）**。设备可能不支持 Apple Intelligence、用户可能没开启、模型可能正在下载。三种状态对应三种 UI：
+
+```swift
+struct LandmarkTripView: View {
+    let landmark: Landmark
+    private let model = SystemLanguageModel.default
+
+    var body: some View {
+        switch model.availability {
+        case .available:
+            generateButton
+        case .unavailable(.appleIntelligenceNotEnabled):
+            Text("Enable Apple Intelligence in Settings to plan trips.")
+        case .unavailable(.modelNotReady):
+            Text("Model is still downloading. Please try again later.")
+        case .unavailable:
+            funFactView // 设备根本不支持，藏掉生成按钮
+        }
+    }
+}
+```
+
+关键点：
+- `SystemLanguageModel.default.availability` 返回模型状态枚举，开发者按 case 分别给降级 UI；
+- 测试方法不需要真去关 Apple Intelligence，Xcode scheme 里有 **Foundation Models Availability** override，可以模拟 Device Not Eligible / Apple Intelligence Not Enabled / Model Not Ready 三种状态（[17:27](https://developer.apple.com/videos/play/wwdc2025/259/?time=1047)）。
+
+**流式输出（[20:15](https://developer.apple.com/videos/play/wwdc2025/259/?time=1215)）**。把 `respond` 换成 `streamResponse`，返回的不再是完整 `Itinerary`，而是 `Itinerary.PartiallyGenerated`——所有属性都被自动改成 Optional。
+
+```swift
+func generateStreaming() async throws {
+    let stream = session.streamResponse(
+        to: "Generate an itinerary for \(landmark.name).",
+        generating: Itinerary.self
+    )
+    for try await partial in stream {
+        partialItinerary = partial // 每帧都是更完整的 Itinerary.PartiallyGenerated
+    }
+}
+```
+
+关键点：
+- 返回值是 `AsyncSequence`，每次迭代拿到一个增量更新的版本——第一帧可能只有 title，第二帧多出 description，依此类推；
+- `PartiallyGenerated` 类型自动遵循 `Identifiable`，SwiftUI 的 `ForEach` 直接可用，不必自己管 ID（[22:53](https://developer.apple.com/videos/play/wwdc2025/259/?time=1373)）；
+- 在视图层用 `if let title = partial?.title` 解包，并配合 `.contentTransition(.interpolate)` 加动画，效果就是文字一段段平滑渐入。
+
+**性能优化（[24:24](https://developer.apple.com/videos/play/wwdc2025/259/?time=1464)）**。新的 Foundation Models Instrument 拆出三条轨道：Asset Loading（蓝色，模型加载耗时）、Inference（推理）、Tool Calling（紫色），还显示 input token 数。Naomy 用两招把首字延迟压下来：
+
+```swift
+// 优化 1：用户点开 landmark 详情时就预热
+struct LandmarkDescriptionView: View {
+    let planner: ItineraryPlanner
+
+    var body: some View {
+        descriptionContent
+            .task {
+                planner.session.prewarm()
+            }
+    }
+}
+
+// 优化 2：跳过 schema 注入
+let response = try await session.respond(
+    to: "Generate an itinerary for \(landmark.name).",
+    generating: Itinerary.self,
+    options: GenerationOptions(includeSchemaInPrompt: false)
+)
+```
+
+关键点：
+- `prewarm()` 提前把模型加载进内存，时机选在用户给出明确意图之后（点开 landmark 时），等他读完介绍再点 Generate，模型已经就位（[26:28](https://developer.apple.com/videos/play/wwdc2025/259/?time=1588)）；
+- `includeSchemaInPrompt: false` 省掉 schema token，但要满足两个前置条件之一：同一 session 已经发过同类型请求，或 instructions 里已包含完整示例；
+- 注意：关掉 schema 注入会丢失 `@Guide` 描述，所以示例必须够全——如果有 Optional 属性，示例需要覆盖该属性有值和 nil 两种情况（[28:35](https://developer.apple.com/videos/play/wwdc2025/259/?time=1715)）。
+
+---
+
+## 核心启发
+
+- **做什么：把端侧 LLM 当成业务字段的"自动生成器"，而非聊天框**。
+  为什么值得做：传统做法是模型出 JSON、客户端解析、字段对不齐就崩溃；Guided Generation 把生成约束交给模型 runtime，类型即合约。
+  怎么开始：选一个目前用模板硬凑的功能（推荐文案、菜单分类、行程摘要），把目标结构体加 `@Generable` + `@Guide`，先在 `#Playground` 里跑通再接到 UI。
+
+- **做什么：给关键字段加 `.contentTransition(.interpolate)` + 流式生成**。
+  为什么值得做：流式能把"等 8 秒看一坨结果"变成"1 秒看到第一行、边读边出"，主观延迟下降一个数量级。
+  怎么开始：把 `respond` 换成 `streamResponse`，把视图绑到 `PartiallyGenerated` 类型，逐字段 `if let` 解包，给文本和列表加 transition。
+
+- **做什么：在用户行为节点 prewarm**。
+  为什么值得做：模型可能被系统从内存换出，第一次调用要等加载；prewarm 把这段耗时挪到用户感知不到的地方。
+  怎么开始：找出"用户表达意图"到"用户真正点击生成"之间的等待间隙（点开详情、开始打字、滑动到目标卡片），在 `.task` 或 `onChange` 里调 `session.prewarm()`。
+
+- **做什么：把可用性状态做成一等公民的 UI 分支**。
+  为什么值得做：Apple Intelligence 不是所有设备都有，写"出错了"等于劝退用户；按 unavailable 子状态分别引导，能保住转化率。
+  怎么开始：在主入口 view 顶层 switch `SystemLanguageModel.default.availability`，三种 unavailable 给三种文案，并用 Xcode scheme 的 Foundation Models Availability override 跑通每条分支。
+
+- **做什么：在 prompt 稳定后开 `includeSchemaInPrompt: false`**。
+  为什么值得做：schema token 是隐性成本，多轮对话里反复发同样的 schema 既慢又浪费上下文。
+  怎么开始：先在 instructions 里写一份完整的 Generable 示例（Optional 属性两种情况都覆盖），再在 `GenerationOptions` 里关掉 schema 注入，用 Foundation Models Instrument 对比 input token 数。
+
+---
+
+## 关联 Session
+
+- [Meet the Foundation Models framework](/articles/wwdc2025-286) — 框架入门概览，先看这条再看 code-along。
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — Guided Generation、tool calling、流式输出的内部机制深挖。
+- [Explore prompt design & safety for on-device foundation models](/articles/wwdc2025-248) — Prompt 设计与安全护栏的最佳实践。
+- [Develop for Shortcuts and Spotlight with App Intents](/articles/wwdc2025-260) — 把生成能力包进 App Intents，让 Shortcuts 与 Spotlight 直接调起。
+- [Design interactive snippets](/articles/wwdc2025-281) — 把 AI 生成结果以 snippet 形式呈现在系统入口。

@@ -1,0 +1,345 @@
+---
+title: "What's new in Background Assets"
+description: "Waiting is no fun! Discover how Background Assets can help your app download content before it even launches. We'll show you how to integrate Background Assets into an existing app, explore when to use essential or non-essential assets, and learn how to make debugging your extension a breeze."
+date: "2023-06-06"
+tags: ["App Services", "Graphics & Games", "Background Assets"]
+thumbnail: "/images/sessions/2023/10108.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10108/"
+sessionId: "wwdc2023-10108"
+year: "2023"
+relatedSessions:
+  - title: "Create a more responsive camera experience"
+    code: "10105"
+    description: "iOS 17 相机响应性新 API"
+  - title: "Support external cameras in your iPadOS app"
+    code: "10106"
+    description: "在 iPadOS 应用中使用外部相机"
+  - title: "What's new in the Photos picker"
+    code: "10107"
+    description: "系统照片选择器的新改进"
+---
+
+## Highlight
+
+> Background Assets 在 iOS 17 新增了 Essential Downloads 功能，让应用可以在 App Store 安装期间下载必需资源，用户首次启动时无需等待。同时提供了 `xcrun backgroundassets-debug` 调试工具来模拟扩展的各个入口点。
+
+## 核心内容
+
+用户最不想遇到的事情，就是打开应用后面对一个漫长的下载进度条。游戏关卡、视频课程、杂志内容——这些大体积资源如果等到应用启动后才下载，体验会很差。
+
+（[01:05](https://developer.apple.com/videos/play/wwdc2023/10108/?time=65)）Background Assets 框架（iOS 16.1 引入）通过 App Extension 在应用未运行时下载资源。今年新增 Essential Downloads，让关键资源可以在 App Store 安装期间就完成下载。
+
+### 基础架构
+
+（[01:20](https://developer.apple.com/videos/play/wwdc2023/10108/?time=80)）Background Assets 由两部分组成：
+- **Background Assets 框架**：应用内调度下载
+- **App Extension**：在应用未运行时执行下载逻辑
+
+Extension 在三个时机被唤醒：应用安装时、应用更新时、后台周期性检查。
+
+### Essential Downloads
+
+（[10:35](https://developer.apple.com/videos/play/wwdc2023/10108/?time=635)）Essential Downloads 是今年的核心新功能。标记为 essential 的资源会在应用安装期间下载，与 App Store 下载进度合并显示。下载完成前，用户无法启动应用。
+
+这适合游戏的首个关卡、应用的核心内容等必须在首次启动时就有的资源。
+
+### 运行时限制
+
+（[04:42](https://developer.apple.com/videos/play/wwdc2023/10108/?time=282)）Extension 有严格的资源限制：
+- 内存限制：几 MB，超限会被终止
+- 运行时间：每天默认几分钟，根据应用使用频率动态调整
+- 低电量模式或关闭后台刷新时 Extension 不运行
+
+### 调试工具
+
+（[29:38](https://developer.apple.com/videos/play/wwdc2023/10108/?time=1778)）`xcrun backgroundassets-debug` 工具可以模拟 Extension 的各个入口点，无需等待真实的安装或后台事件。
+
+## 详细内容
+
+### Info.plist 配置
+
+（[16:00](https://developer.apple.com/videos/play/wwdc2023/10108/?time=960)）在应用的 Info.plist 中添加必需键：
+
+```xml
+<key>BAManifestURL</key>
+<string>https://your-cdn.com/manifest.json</string>
+
+<key>BAInitialDownloadRestrictions</key>
+<dict>
+    <key>BADownloadAllowance</key>
+    <integer>104857600</integer>
+    <key>BAEssentialDownloadAllowance</key>
+    <integer>52428800</integer>
+    <key>BADownloadDomainAllowList</key>
+    <array>
+        <string>your-cdn.com</string>
+    </array>
+</dict>
+
+<key>BAMaxInstallSize</key>
+<integer>209715200</integer>
+
+<key>BAEssentialMaxInstallSize</key>
+<integer>104857600</integer>
+```
+
+关键点：
+- `BAManifestURL`：清单文件的 URL
+- `BADownloadAllowance`：非必需资源的总下载大小上限（字节）
+- `BAEssentialDownloadAllowance`：必需资源的总下载大小上限（字节）
+- `BAEssentialMaxInstallSize`：必需资源安装后的磁盘占用上限
+- `BAMaxInstallSize`：非必需资源安装后的磁盘占用上限
+- `BADownloadDomainAllowList`：首次启动前允许下载的域名白名单
+
+### Extension 实现
+
+（[24:46](https://developer.apple.com/videos/play/wwdc2023/10108/?time=1486)）创建 Background Assets Extension：
+
+```swift
+import BackgroundAssets
+
+class DownloadExtension: NSObject, BADownloaderExtension {
+    
+    func downloads(for request: BAContentRequest,
+                   manifestURL: URL,
+                   extensionInfo: BAAppExtensionInfo) -> Set<BADownload> {
+        
+        // 解析清单文件
+        guard let manifestData = try? Data(contentsOf: manifestURL),
+              let manifest = try? JSONDecoder().decode(Manifest.self, from: manifestData) else {
+            return []
+        }
+        
+        // 将清单保存到 App Group
+        saveManifestToAppGroup(manifest)
+        
+        var downloads: Set<BADownload> = []
+        
+        for session in manifest.sessions where !session.isDownloaded {
+            let download = BAURLDownload(
+                identifier: session.id,
+                request: URLRequest(url: session.videoURL),
+                essential: session.isEssential,
+                fileSize: session.fileSize,
+                applicationGroupIdentifier: "group.com.yourapp",
+                priority: .default
+            )
+            downloads.insert(download)
+        }
+        
+        return downloads
+    }
+    
+    func backgroundDownload(_ download: BADownload,
+                           didFinishDownloadingTo fileURL: URL) {
+        // 使用 withExclusiveControl 确保互斥访问
+        BADownloadManager.shared.withExclusiveControl { control in
+            guard let control = control else { return }
+            
+            // 将文件从临时位置移动到最终位置
+            do {
+                let finalURL = self.finalURL(for: download)
+                try FileManager.default.moveItem(at: fileURL, to: finalURL)
+                
+                // 更新本地状态
+                self.markSessionAsDownloaded(download.identifier)
+            } catch {
+                print("Failed to move file: \(error)")
+            }
+        }
+    }
+    
+    func backgroundDownload(_ download: BADownload, failedWithError error: Error) {
+        // 如果是必需下载失败，转为非必需重新排队
+        if let urlDownload = download as? BAURLDownload, urlDownload.isEssential {
+            let nonEssentialDownload = urlDownload.removingEssential()
+            try? BADownloadManager.shared.scheduleDownload(nonEssentialDownload)
+        }
+    }
+}
+```
+
+关键点：
+- `downloads(for:manifestURL:extensionInfo:)` 返回需要下载的资源集合
+- 必需下载只能在安装/更新事件中调度
+- 使用 `withExclusiveControl` 确保应用和扩展不会同时操作文件
+- 下载完成后立即移动到最终位置
+- 必需下载失败时，使用 `removingEssential()` 转为非必需重新排队
+
+### 应用端集成
+
+（[19:31](https://developer.apple.com/videos/play/wwdc2023/10108/?time=1171)）在应用中管理下载：
+
+```swift
+import BackgroundAssets
+
+class SessionManager: NSObject, BADownloadManagerDelegate {
+    let downloadManager = BADownloadManager.shared
+    
+    override init() {
+        super.init()
+        downloadManager.delegate = self
+    }
+    
+    func startDownload(for session: Session) {
+        downloadManager.withExclusiveControl { control in
+            guard let control = control else { return }
+            
+            // 检查是否已在下载队列中
+            if let existingDownload = self.downloadManager.currentDownloads
+                .first(where: { $0.identifier == session.id }) {
+                // 已存在，提升到前台加速下载
+                self.downloadManager.startForegroundDownload(existingDownload)
+            } else {
+                // 创建新下载
+                let download = BAURLDownload(
+                    identifier: session.id,
+                    request: URLRequest(url: session.videoURL),
+                    essential: false,
+                    fileSize: session.fileSize,
+                    applicationGroupIdentifier: "group.com.yourapp",
+                    priority: .default
+                )
+                
+                try? self.downloadManager.scheduleDownload(download)
+                self.downloadManager.startForegroundDownload(download)
+            }
+        }
+    }
+    
+    // MARK: - BADownloadManagerDelegate
+    
+    func downloadManager(_ manager: BADownloadManager,
+                        downloadDidProgress download: BADownload) {
+        updateProgress(for: download.identifier, progress: download.progress)
+    }
+    
+    func downloadManager(_ manager: BADownloadManager,
+                        downloadDidFinish download: BADownload) {
+        // 文件已在 Extension 中移动到最终位置
+        markSessionAsDownloaded(download.identifier)
+    }
+    
+    func downloadManager(_ manager: BADownloadManager,
+                        downloadDidFail download: BADownload,
+                        withError error: Error) {
+        print("Download failed: \(error)")
+    }
+}
+```
+
+关键点：
+- `BADownloadManager` 是单例，直接连接系统调度器
+- `withExclusiveControl` 保证与 Extension 的互斥
+- `startForegroundDownload` 将后台下载提升到前台，加速完成
+- 前台提升不会重启下载，会从断点续传
+- 前台下载遇到网络问题会立即失败（不像后台会重试）
+
+### 调试 Extension
+
+（[29:38](https://developer.apple.com/videos/play/wwdc2023/10108/?time=1778)）使用 `backgroundassets-debug` 工具模拟入口点：
+
+```bash
+# 列出已连接设备
+xcrun backgroundassets-debug list-devices
+
+# 模拟应用安装事件
+xcrun backgroundassets-debug simulate app-install \
+    --device <DEVICE_UUID> \
+    --bundle-id com.yourapp
+
+# 模拟应用更新事件
+xcrun backgroundassets-debug simulate app-update \
+    --device <DEVICE_UUID> \
+    --bundle-id com.yourapp
+
+# 模拟后台周期性检查
+xcrun backgroundassets-debug simulate periodic \
+    --device <DEVICE_UUID> \
+    --bundle-id com.yourapp
+```
+
+关键点：
+- 设备需要开启开发者模式
+- 可以通过蓝牙或 Wi-Fi 发送命令，无需 USB 连接
+- 模拟事件会重置 Extension 的运行时间限制
+- 使用 `man backgroundassets-debug` 查看完整文档
+
+### 文件管理最佳实践
+
+（[09:44](https://developer.apple.com/videos/play/wwdc2023/10108/?time=584)）下载的文件默认标记为可清除（purgeable）：
+
+```swift
+// 将下载的文件放在 Caches 目录
+let cachesURL = FileManager.default.urls(for: .cachesDirectory,
+                                          in: .userDomainMask).first!
+let finalURL = cachesURL.appendingPathComponent("downloads/\(identifier)")
+
+// 使用 move 操作，不要复制
+try FileManager.default.moveItem(at: tempURL, to: finalURL)
+```
+
+关键点：
+- 下载的文件放在 Caches 目录，系统可以在空间不足时清除
+- 使用 `moveItem` 而不是 `copyItem`，保持文件的可清除属性
+- 修改或解压后的文件不再被系统追踪，会占用备份空间
+- 应用启动时检查文件是否存在，不存在则重新下载
+
+### Essential Download 流程
+
+（[11:21](https://developer.apple.com/videos/play/wwdc2023/10108/?time=681)）必需下载的生命周期：
+
+1. 用户从 App Store 请求安装应用
+2. 系统读取 Info.plist 中的 essential 配置
+3. 应用安装完成后，系统唤醒 Extension
+4. Extension 返回必需和非必需下载的混合集合
+5. 必需下载立即开始，与应用安装进度合并显示
+6. 必需下载完成后，应用变为可启动
+7. 非必需下载在后台继续
+
+关键点：
+- 必需下载的文件大小必须准确，否则下载会失败
+- 用户可以在 App Store 设置中禁用应用内内容下载
+- 应用必须处理必需资源未下载完成的情况
+- 服务器需要支持 HTTP Range 请求以支持断点续传
+
+## 核心启发
+
+**1. 为内容型应用实现"即开即用"体验**
+
+做什么：将应用的核心内容（如新闻应用的首页数据、教育应用的第一课、游戏的前几关）标记为 Essential Downloads，确保用户首次打开就能使用。
+
+为什么值得做：用户从 App Store 下载应用后，如果打开还要等待内容下载，流失率会很高。Essential Downloads 让内容随应用一起到达。
+
+怎么开始：在 Info.plist 中配置 `BAEssentialDownloadAllowance` 和 `BAEssentialMaxInstallSize`，在 Extension 的 `downloads(for:)` 中将核心资源的 `essential` 参数设为 `true`。
+
+**2. 构建智能资源预加载系统**
+
+做什么：利用后台周期性检查，在用户不使用应用时预加载新内容。比如播客应用在有 Wi-Fi 时自动下载新剧集。
+
+为什么值得做：Background Assets 会根据用户使用习惯智能调度 Extension 运行。常用应用获得更多运行时间，不常用的被限流。
+
+怎么开始：在 Extension 中解析清单文件，比较服务器上的最新内容和本地已下载的内容，返回需要更新的 `BADownload` 集合。使用 `BADownloadManager` 的 `currentDownloads` 避免重复调度。
+
+**3. 为游戏应用实现关卡流式加载**
+
+做什么：将游戏关卡分为必需（前 3 关）和可选（后续关卡），必需关卡随安装下载，后续关卡在后台预加载。
+
+为什么值得做：游戏包体通常很大，全部打包进 IPA 会超过 App Store 限制。Background Assets 让游戏可以按需下载关卡资源。
+
+怎么开始：设计一个资源清单系统，每个关卡记录文件大小和下载 URL。前几个关卡标记为 essential，其余标记为非必需。在 Extension 中根据用户进度优先下载即将用到的关卡。
+
+**4. 实现离线优先的视频学习应用**
+
+做什么：让用户可以标记想离线观看的视频，应用通过 Background Assets 在后台下载，完成后通知用户。
+
+为什么值得做：用户在 Wi-Fi 环境下标记视频，后台自动下载，等他们上地铁或飞机时内容已经准备好了。
+
+怎么开始：应用内维护一个"待下载"列表，通过 App Group 与 Extension 共享。Extension 在后台运行时读取这个列表并调度下载。应用启动时使用 `withExclusiveControl` 检查下载状态并更新 UI。
+
+## 关联 Session
+
+- [Create a more responsive camera experience](/articles/wwdc2023-10105) — iOS 17 相机响应性新 API：延迟处理、零快门延迟、响应式拍摄
+- [Support external cameras in your iPadOS app](/articles/wwdc2023-10106) — 在 iPadOS 应用中使用 Apple Studio Display 等外部相机
+- [What's new in the Photos picker](/articles/wwdc2023-10107) — 系统照片选择器的新改进，支持嵌入和连续选择
+- [Meet SwiftUI for spatial computing](/articles/wwdc2023-10109) — SwiftUI 在空间计算平台上的全新能力

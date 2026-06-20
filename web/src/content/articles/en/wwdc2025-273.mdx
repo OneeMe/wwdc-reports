@@ -1,0 +1,205 @@
+---
+title: "Meet SwiftUI spatial layout"
+description: "explore new tools for building spatial experiences using swiftui. learn the basics of 3d swiftui views on visionos, customize existing layouts with depth alignments, and use modifiers to rotate and po"
+date: 2026-06-10
+tags: ["Design", "空间计算", "SwiftUI"]
+thumbnail: "/images/sessions/2025/273.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/273/"
+sessionId: "wwdc2025-273"
+year: "2025"
+relatedSessions:
+  - title: "Better together: SwiftUI and RealityKit"
+    code: "274"
+    description: "discover how to seamlessly blend swiftui and realitykit in visionos 26. we"
+  - title: "Build a SwiftUI app with the new design"
+    code: "323"
+    description: "explore the ways liquid glass transforms the look and feel of your app. discover"
+  - title: "Build a UIKit app with the new design"
+    code: "284"
+    description: "update your uikit app to take full advantage of the new design system. we"
+  - title: "Explore prompt design & safety for on-device foundation models"
+    code: "248"
+    description: "design generative ai experiences that leverage the strengths of the foundation m"
+---
+
+## Highlight
+
+> visionOS 26 把 SwiftUI 的布局系统扩展到三维：每个视图除了 width / height / X / Y，还会算出 depth 和 Z position，原有的 VStack、HStack、ZStack、alignment 这些 2D 工具都可以直接复用。
+
+---
+
+## 核心内容
+
+Trevor 在 BOT-anist 这个机器人收藏 app 里遇到了一个具体的麻烦：他想做一个旋转的机器人 carousel，让多个 Model3D 围成一圈水平排列；想给每个机器人加一张说明卡片，结果卡片被模型挡住看不见；想给火箭加一个 45 度旋转，HStack 里的卡片就被旋转后的火箭模型撞到了。RealityKit 当然可以做这些，但它要写场景、写实体、写组件，离 SwiftUI 的声明式写法太远——很多场景里，开发者只是想用熟悉的 VStack / HStack / ZStack 把几个 3D 视图摆好。
+
+visionOS 26 的解法是：把 SwiftUI 现有的 2D 布局系统直接扩展到三维。每个视图多算一个 depth 和 Z 位置，Model3D 像 Image 一样有固定三维尺寸，RealityView 像 Color 一样有弹性深度，ZStack 现在会沿 Z 轴组合子视图的深度。在这个统一模型上，Apple 加了四个新工具：depth alignment（深度对齐）、rotation3DLayout（影响布局的旋转）、SpatialContainer 和 spatialOverlay（同一 3D 空间叠放多视图）。Trevor 用它们一步步把 BOT-anist 的「Automaton Arrangements」搭了出来——从单个机器人 profile，到三人深度领奖台，到水平旋转 carousel，再到带选中光环的交互。整个过程没有一行 RealityKit 代码。
+
+---
+
+## 详细内容
+
+**3D 视图基础**（[03:02](https://developer.apple.com/videos/play/wwdc2025/273/?time=182)）。SwiftUI 在 visionOS 上把 2D 布局规则平移到三维：每个视图都有 depth。Image / Color / Text 这些平面视图深度为 0，行为和 iOS 一致；Model3D 有固定深度，类似 Image；RealityView、GeometryReader3D、resizable 的 Model3D 有弹性深度，类似 Color。
+
+```swift
+// Many views have 0 depth
+HStack {
+  Image("RobotHead")
+    .debugBorder3D(.red)
+  Text("Hello! I'm a piece of text. I have 0 depth.")
+    .debugBorder3D(.red)
+  Color.blue
+    .debugBorder3D(.red)
+    .frame(width: 200, height: 200)
+}
+```
+
+关键点：
+- `Image` / `Text` / `Color` 在 visionOS 上深度为 0，行为和 iOS 一致；
+- `debugBorder3D` 是 Trevor 自己写的工具修饰器，用来可视化 3D frame，session 末尾会展示实现；
+- HStack 在 3D 中会自动按子视图的最大深度组合自己的深度。
+
+Window 的深度提案是固定的，超出会被系统裁剪；Volume 的深度可调整。Volume 与 Window 的选择参考 HIG 的 [Designing for visionOS](https://developer.apple.com/design/human-interface-guidelines/designing-for-visionos)。
+
+**Depth alignment**（[08:11](https://developer.apple.com/videos/play/wwdc2025/273/?time=491)）。Stack 和 Layout 类型的默认 depth alignment 是 `.back`，子视图会按后沿对齐。Trevor 把 ResizableRobotView 和 RobotNameCard 放进 VStack，卡片被机器人挡在后面看不见。把 `VStack` 换成 `VStackLayout` 后，可以加 `.depthAlignment(.front)`：
+
+```swift
+// Customizing depth alignments
+struct RobotProfile: View {
+  let robot: Robot
+
+  var body: some View {
+    VStackLayout().depthAlignment(.front) {
+      ResizableRobotView(asset: robot.model3DAsset)
+      RobotNameCard(robot: robot)
+    }
+    .frame(width: 300)
+  }
+}
+```
+
+关键点：
+- 想用 `.depthAlignment` 修饰器，必须把 `VStack` 写成 `VStackLayout()`，因为这个修饰器作用在 Layout 类型上；
+- `.front` 让子视图的前沿对齐，文字卡片就能浮在模型前面；
+- 可选 `.back`（默认）/ `.center` / `.front` 三种标准对齐。
+
+**自定义 DepthAlignmentID**（[10:27](https://developer.apple.com/videos/play/wwdc2025/273/?time=627)）。三种标准对齐不够时，可以定义自己的对齐规则。Trevor 想做一个「深度领奖台」——第一名最靠前，第二名居中，第三名最后。
+
+```swift
+// Defining a custom depth alignment guide
+struct DepthPodiumAlignment: DepthAlignmentID {
+  static func defaultValue(in context: ViewDimensions3D) -> CGFloat {
+    context[.front]
+  }
+}
+
+extension DepthAlignment {
+  static let depthPodium = DepthAlignment(DepthPodiumAlignment.self)
+}
+```
+
+关键点：
+- 实现 `DepthAlignmentID` 协议只需要一个 `defaultValue` 方法，返回该视图在这个对齐线上的位置；
+- 默认值用 `context[.front]`，即子视图默认按前沿对齐；
+- 在 `DepthAlignment` 上加静态常量后，就可以像 `.front` 一样使用 `.depthPodium`。
+
+之后在 HStack 里用 `.depthAlignment(.depthPodium)`，再对中间和后面的机器人调用 `.alignmentGuide(.depthPodium) { $0[DepthAlignment.center] }` 和 `$0[DepthAlignment.back]`，就得到三人前后错落的领奖台效果。
+
+**rotation3DLayout vs rotation3DEffect**（[12:00](https://developer.apple.com/videos/play/wwdc2025/273/?time=720)）。`rotation3DEffect` 是视觉效果，不影响布局——HStack 不知道火箭被旋转了 90 度，于是会撞到旁边的卡片。`rotation3DLayout` 修改视图在布局系统中的 frame，父布局能感知旋转后的几何，并以轴对齐的 bounding box 紧密包裹。
+
+```swift
+// Rotate using any axis or angle
+HStackLayout().depthAlignment(.front) {
+  RocketDetailsCard()
+  Model3D(named: "ToyRocket")
+    .rotation3DLayout(.degrees(isRotated ? 45 : 0), axis: .z)
+}
+```
+
+关键点：
+- `rotation3DLayout` 接收角度和轴，跟 `rotation3DEffect` 签名相似；
+- 区别在于它会更新布局系统看到的 frame，HStack 因此会让出空间给旋转后的火箭；
+- 对动画状态 `isRotated` 切换时，周围视图的位置会跟着平滑调整。
+
+**carousel 的实现**（[14:42](https://developer.apple.com/videos/play/wwdc2025/273/?time=882)）。Trevor 直接复用了 `MyRadialLayout`（来自老 session《Compose custom layouts with SwiftUI》），原本是为 2D 写的，在 visionOS 上一样工作。要把垂直的环改成水平躺下来的 carousel：
+
+```swift
+struct RobotCarousel: View {
+  let robots: [Robot]
+
+  var body: some View {
+    VStack {
+      Spacer()
+      MyRadialLayout {
+        ForEach(robots) { robot in
+          ResizableRobotView(asset: robot.model3DAsset)
+            .rotation3DLayout(.degrees(-90), axis: .x)
+        }
+      }
+      .rotation3DLayout(.degrees(90), axis: .x)
+    }
+  }
+}
+```
+
+关键点：
+- 外层对 `MyRadialLayout` 旋转 90 度，整圈躺平，原本的高度变成深度；
+- 内层对每个机器人反向旋转 -90 度，让它们继续直立；
+- `VStack { Spacer(); MyRadialLayout { ... } }` 让 carousel 贴在 volume 底部，2D 的 Spacer 技巧在 3D 一样用。
+
+**SpatialContainer 与 spatialOverlay**（[17:00](https://developer.apple.com/videos/play/wwdc2025/273/?time=1020)）。ZStack 沿 Z 轴堆叠子视图，深度会累加；如果想让多个视图占据同一个 3D 空间（像俄罗斯套娃），就用 `SpatialContainer`，并指定 3D 对齐线如 `.topTrailingBack`、`.bottomLeadingFront`。单视图叠加用 `spatialOverlay`，叠上去的视图会自动缩放到目标视图大小。Trevor 给 carousel 加选中态时只用了后者：
+
+```swift
+struct RobotCarouselItem: View {
+  let robot: Robot
+  let isSelected: Bool
+
+  var body: some View {
+    ResizableRobotView(asset: robot.model3DAsset)
+      .spatialOverlay(alignment: .bottom) {
+        if isSelected {
+          ResizableSelectionRingModel()
+        }
+      }
+  }
+}
+```
+
+关键点：
+- 选中光环和机器人共享同一个 3D 空间，光环按 `.bottom` 对齐到机器人脚下；
+- 光环大小自动跟随机器人，不用手动写尺寸；
+- 这种「同一空间叠一个附加视图」的场景，spatialOverlay 比 SpatialContainer 更轻量。
+
+**收尾：debugBorder3D**（[18:32](https://developer.apple.com/videos/play/wwdc2025/273/?time=1112)）。整个 session 用到的 3D 边框工具，本身就是新 API 的组合——一个 `spatialOverlay` 装两层 ZStack，外层画前后两面 2D border，内层画上下两条，再用 `rotation3DLayout(.degrees(90), axis: .y)` 把内层翻到左右两面。六个面拼出一个完整 3D 包围盒。
+
+---
+
+## 核心启发
+
+- **做什么**：把现有 SwiftUI app 的 3D 演示视图升级成布局可感知的版本。
+  - 为什么值得做：之前用 `rotation3DEffect` 的旋转模型经常撞到相邻卡片或溢出 volume，把它替换成 `rotation3DLayout` 后，HStack/VStack 会自动腾出空间，UI 不再"穿模"。
+  - 怎么开始：搜索代码库里的 `rotation3DEffect`，按需求判断是纯视觉动画（保留）还是需要影响布局（替换为 `rotation3DLayout`）。
+
+- **做什么**：给 visionOS 上有说明卡片的 Model3D 加上 `.depthAlignment(.front)`。
+  - 为什么值得做：默认 depth alignment 是 `.back`，文字卡片会被模型挡住，用户读不到；改成 `.front` 后说明浮在模型前方。
+  - 怎么开始：把 `VStack` / `HStack` 改写成 `VStackLayout()` / `HStackLayout()`，链式调用 `.depthAlignment(.front)`。
+
+- **做什么**：在 visionOS 项目里实现并 commit 一个 `debugBorder3D` 修饰器。
+  - 为什么值得做：3D 布局比 2D 难调，肉眼难判断每个视图实际占的体积，3D 边框是最便宜的可视化工具。
+  - 怎么开始：直接抄 session [18:32](https://developer.apple.com/videos/play/wwdc2025/273/?time=1112) 的实现，放到 DEBUG-only 的 View extension 里。
+
+- **做什么**：选中态视觉用 `spatialOverlay` 叠加，而不是 ZStack。
+  - 为什么值得做：ZStack 会沿 Z 轴撑开总深度，导致选中态的容器变厚、影响周围布局；`spatialOverlay` 共享同一 3D 空间，附加视图自动适配宿主尺寸。
+  - 怎么开始：在选中状态切换处用 `.spatialOverlay(alignment: .bottom) { if isSelected { RingView() } }` 替代 ZStack 写法。
+
+- **做什么**：自定义 `DepthAlignmentID` 实现"重要内容更靠前"的展示。
+  - 为什么值得做：标准的 front / center / back 三档不够，电商的「主推商品」、社交的「VIP 头像」、收藏 app 的「Top Pick」都需要更细的层次。
+  - 怎么开始：定义符合 `DepthAlignmentID` 协议的 struct，在 Layout 上调 `.depthAlignment(.yourGuide)`，关键视图再用 `.alignmentGuide` 指定差异化位置。
+
+---
+
+## 关联 Session
+
+- [Better together: SwiftUI and RealityKit](/articles/wwdc2025-274) — SwiftUI 3D 视图怎么和 RealityKit 实体互通，Maks 和 Amanda 用 BOT-anist 演示混用方案。
+- [Build a SwiftUI app with the new design](/articles/wwdc2025-323) — Liquid Glass 在 SwiftUI 中的使用方式，可与空间布局组合出新的视觉层次。
+- [Build a UIKit app with the new design](/articles/wwdc2025-284) — 同一套新设计语言在 UIKit 侧的迁移路径。
+- [Explore prompt design & safety for on-device foundation models](/articles/wwdc2025-248) — 设备端基础模型的提示词设计与安全实践。

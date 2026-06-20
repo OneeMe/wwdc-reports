@@ -1,0 +1,224 @@
+---
+title: "HLS 动态广告插播探索"
+description: "了解如何在 HLS 流中创建广告与正片之间的无缝过渡，使用 HLS 标签和 AVFoundation API 实现插播内容播放。"
+date: "2021-06-08"
+tags: ["Audio & Video"]
+thumbnail: "/images/sessions/2021/10140.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10140/"
+sessionId: "wwdc2021-10140"
+year: "2021"
+relatedSessions:
+  - title: "使用 Group Activities 构建自定义体验"
+    code: "10187"
+    description: "SharePlay 中的媒体共享"
+  - title: "使用 Group Activities 协调媒体体验"
+    code: "10225"
+    description: "多人同步播放"
+  - title: "Safari 中的 Group Activities"
+    code: "10189"
+    description: "Web 端的 SharePlay 支持"
+  - title: "Core Image Kernel 改进"
+    code: "10159"
+    description: "视频处理性能优化"
+---
+
+# HLS 动态广告插播探索
+
+## Highlight
+
+> HLS Interstitials 将广告作为独立资源通过 master playlist 引用，不再用 DISCONTINUITY 拼接。支持在任意时间点插入广告、延迟绑定广告素材、直播场景提前返回，且原生支持 AirPlay 和画中画。
+
+## 核心内容
+
+在 HLS 流中插入广告一直是个麻烦事。服务端拼接需要在 playlist 生成前就把广告段和内容段缝在一起，无法实现动态决策；客户端双播放器方案需要手动协调缓冲和视图层级，AirPlay 和画中画难以支持。
+
+WWDC2021 引入的 HLS Interstitials 彻底改变了这一局面。广告作为独立资源通过 master playlist 引用，播放器自动协调主内容和广告之间的缓冲、切换和导航限制。广告可以在任意时间点插入，支持延迟绑定（late binding）和重新绑定（rebinding），且原生兼容 AirPlay 和画中画。
+
+## 详细内容
+
+### 传统方案的痛点
+
+服务端广告插入使用 DISCONTINUITY 标签（00:41）：
+- 静态方案：广告段在 playlist 生成前就必须拼接好
+- 无法实现延迟绑定：用户接近广告标记时才能决策广告内容
+- 受限于段边界：广告标记落在内容段中间时需要拆分段
+- 编码匹配：广告需要与正片相同的质量层级和编码参数
+- 直播场景：打包器需要为整个广告时段逐段输出
+
+客户端双播放器方案（01:55）：
+- 一个播放器播主内容，另一个播广告
+- 需要手动协调缓冲，广告预取会影响正片的自适应码率性能
+- AirPlay 和画中画难以实现
+
+### HLS Interstitials 的核心设计
+
+HLS Interstitials 将广告视为可独立调度的资源（02:37）：
+- 广告不再用 DISCONTINUITY 拼接，而是通过 master playlist 引用
+- 支持动态延迟绑定和重新绑定
+- 可在节目时间轴的任意位置插入广告，不受段边界限制
+- AVKit 内置支持 tvOS 导航限制
+- 原生支持 AirPlay 和画中画，广告会随 AirPlay 会话一起传输
+- 播放器自动协调主内容和广告之间的缓冲与系统资源
+
+### 播放流程
+
+点播场景（03:36）：主内容播放到广告标记处暂停，广告依次播放，完成后从暂停处恢复。
+
+直播场景（04:21）：广告播放完成后，播放器向前跳跃广告时长重新加入直播边缘，保持与直播同步。
+
+缓冲策略（04:01）：播放器先缓冲主内容到第一个广告起点，然后预缓冲第一个广告，再预缓冲第二个广告，最后恢复缓冲主内容，确保切换无缝。
+
+### 服务端广告插入：DATERANGE 标签
+
+使用 `EXT-X-DATERANGE` 标签定义广告（04:38）：
+
+```
+#EXT-X-DATERANGE:CLASS="com.apple.hls.interstitial",\
+ID="ad-1",\
+START-DATE="2021-06-07T10:00:05Z",\
+DURATION=15,\
+X-ASSET-URI="https://cdn.example.com/ad1/master.m3u8",\
+X-RESUME-OFFSET=0
+```
+
+关键属性：
+
+| 属性 | 作用 |
+|------|------|
+| `CLASS` | 固定值 `com.apple.hls.interstitial` |
+| `ID` | 唯一标识事件 |
+| `START-DATE` | 广告在主时间轴上的开始时间 |
+| `DURATION` | 广告时长 |
+| `X-ASSET-URI` | 广告 master playlist 的 URI |
+| `X-RESUME-OFFSET` | 主内容恢复位置相对于 START-DATE 的偏移 |
+
+`X-RESUME-OFFSET` 的取值策略（05:21）：
+- 设为 0：点播场景，从暂停处恢复
+- 省略：直播场景，按广告时长向前跳跃，重新加入直播边缘
+- 设为广告时长：跳过内嵌广告
+
+背靠背广告通过相同 START-DATE 实现（06:00）：
+
+```
+#EXT-X-DATERANGE:CLASS="com.apple.hls.interstitial",ID="ad-1",START-DATE="...",DURATION=15,X-ASSET-URI="ad1.m3u8"
+#EXT-X-DATERANGE:CLASS="com.apple.hls.interstitial",ID="ad-2",START-DATE="...",DURATION=15,X-ASSET-URI="ad2.m3u8"
+```
+
+### 延迟绑定：X-ASSET-LIST
+
+使用 `X-ASSET-LIST` 替代 `X-ASSET-URI` 实现延迟绑定（06:26）：JSON 对象在缓冲时才获取，允许在最后一刻决策广告内容：
+
+```json
+{
+  "ASSETS": [
+    { "URI": "https://cdn.example.com/ad1/master.m3u8", "DURATION": 15 },
+    { "URI": "https://cdn.example.com/ad2/master.m3u8", "DURATION": 15 }
+  ]
+}
+```
+
+### 直播提前返回
+
+`X-PLAYOUT-LIMIT` 实现直播场景的提前返回（06:55）。例如突发新闻需要中断广告：
+
+```
+#EXT-X-DATERANGE:CLASS="com.apple.hls.interstitial",\
+ID="live-ad",\
+START-DATE="...",\
+DURATION=15,\
+X-ASSET-URI="...",\
+X-PLAYOUT-LIMIT=12
+```
+
+广告最多播放 12 秒就返回直播，即使广告素材本身有 15 秒。
+
+### 导航限制
+
+`X-RESTRICT` 控制用户导航行为（08:13）：
+
+| 值 | 行为 |
+|----|------|
+| `jump` | 阻止用户从广告前 seek 到广告后 |
+| `skip` | 阻止以非标准速率播放广告（防止快进跳过） |
+
+tvOS 上 AVKit 自动强制执行这些限制。其他平台或使用自定义播放器时，应用需要自行实现。
+
+### 客户端 API
+
+**AVPlayerInterstitialEventMonitor**：监听服务端插入的广告事件（08:56）
+
+```swift
+let player = AVPlayer(url: movieURL)  // 包含 EXT-X-DATERANGE 标签
+let observer = AVPlayerInterstitialEventMonitor(primaryPlayer: player)
+
+NotificationCenter.default.addObserver(
+    forName: AVPlayerInterstitialEventMonitor.currentEventDidChangeNotification,
+    object: observer,
+    queue: .main
+) { _ in
+    self.updateUI(observer.currentEvent, observer.interstitialPlayer)
+}
+```
+
+**AVPlayerInterstitialEvent**：描述单个插播事件（09:50）
+
+```swift
+class AVPlayerInterstitialEvent {
+    var primaryItem: AVPlayerItem? { get }      // 主内容
+    var identifier: String { get }               // 事件 ID
+    var time: CMTime { get }                     // 媒体时间起点
+    var date: Date? { get }                      // 日期起点
+    var templateItems: [AVPlayerItem] { get }    // 广告素材模板
+    var restrictions: Restrictions { get }       // 导航限制
+    var resumptionOffset: CMTime { get }         // 恢复偏移
+    var playoutLimit: CMTime { get }             // 播放上限
+    var userDefinedAttributes: [AnyHashable: Any] { get }  // 自定义属性
+}
+```
+
+**AVPlayerInterstitialEventController**：客户端程序化插入广告（11:40）
+
+```swift
+let player = AVPlayer(url: movieURL)  // 无广告的纯内容
+let controller = AVPlayerInterstitialEventController(primaryPlayer: player)
+
+let adPodTemplates = [AVPlayerItem(url: ad1URL), AVPlayerItem(url: ad2URL)]
+let event = AVPlayerInterstitialEvent(
+    primaryItem: player.currentItem,
+    time: CMTime(seconds: 10, preferredTimescale: 1),
+    templateItems: adPodTemplates,
+    restrictions: [],
+    resumptionOffset: .zero,
+    playoutLimit: .invalid
+)
+
+controller.events = [event]
+player.currentItem?.translatesPlayerInterstitialEvents = true
+```
+
+`translatesPlayerInterstitialEvents = true` 让 AVKit 在时间轴上放置导航标记并在 tvOS 上强制执行导航限制。
+
+### tvOS 演示效果
+
+- 无限制广告：时间轴显示广告标记，播放时出现倒计时，用户可选择跳过（13:02）
+- skip 限制：播放时无跳过选项，必须完整看完（13:34）
+- jump 限制：用户尝试 seek 跳过广告时，播放头自动吸附到广告标记，广告播放完成后才继续 seek（13:57）
+
+## 核心启发
+
+1. **用 DATERANGE 替代 DISCONTINUITY**：新方案将广告作为独立资源引用，playlist 更简洁，支持动态决策和重新绑定。
+
+2. **点播设 resume offset 为 0，直播省略该属性**：点播从暂停处恢复，直播自动跳跃到直播边缘保持同步。
+
+3. **用 X-ASSET-LIST 实现延迟绑定**：广告决策服务在缓冲时才被调用，可以根据用户画像实时选择最合适的广告。
+
+4. **X-PLAYOUT-LIMIT 应对直播突发场景**：体育赛事突发精彩瞬间、新闻插播等场景，用 playout limit 提前中断广告返回直播。
+
+5. **自定义属性传递广告元数据**：在 DATERANGE 中定义 beacon URL、广告 ID 等自定义属性，通过 `userDefinedAttributes` 在客户端获取，用于广告效果追踪。
+
+## 关联 Session
+
+- [WWDC2021 10187 - 使用 Group Activities 构建自定义体验](https://developer.apple.com/videos/play/wwdc2021/10187/) — SharePlay 中的媒体共享
+- [WWDC2021 10225 - 使用 Group Activities 协调媒体体验](https://developer.apple.com/videos/play/wwdc2021/10225/) — 多人同步播放
+- [WWDC2021 10189 - Safari 中的 Group Activities](https://developer.apple.com/videos/play/wwdc2021/10189/) — Web 端的 SharePlay 支持
+- [WWDC2021 10159 - Core Image Kernel 改进](https://developer.apple.com/videos/play/wwdc2021/10159/) — 视频处理性能优化

@@ -1,0 +1,257 @@
+---
+title: "Compose advanced models with Create ML Components"
+description: "take your custom machine learning models to the next level with create ml components. we'll show you how to work with temporal data like video or audio and compose models that can count repetitive human actions or provide advanced sound classification. we'll also share best practices on using incremental fitting to speed up model training with new data."
+date: 2026-06-10
+tags: ["WWDC 2022", "Create ML", "Machine Learning"]
+thumbnail: "/images/sessions/2022/10020.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10020/"
+sessionId: "wwdc2022-10020"
+year: "2022"
+relatedSessions:
+  - title: "Get to know Create ML Components"
+    code: "10019"
+    description: "Learn the Transformer and Estimator building blocks behind custom Create ML tasks."
+  - title: "Explore the machine learning development experience"
+    code: "10017"
+    description: "Walk through model discovery, conversion, evaluation, integration, and performance tuning."
+  - title: "Optimize your Core ML usage"
+    code: "10027"
+    description: "Understand Core ML performance on CPU, GPU, and Neural Engine for on-device ML."
+  - title: "Meet AsyncSequence"
+    code: "10058"
+    description: "Use Swift AsyncSequence to iterate over values that arrive over time."
+---
+
+## Highlight
+
+> 这是 Create ML Components 的进阶 Session。基础部分（Transformer、Estimator 的概念）在 "Get to know Create ML Components" 中介绍。本场聚焦两个高级主题：时序数据处理和增量训练。
+
+---
+
+## 核心内容
+
+做动作分类时，模型告诉你一段视频里正在做 jumping jack。真实健身 App 还需要回答另一个问题：做了几次。一次 jumping jack 横跨连续帧，单帧图像没有完整答案。
+
+Create ML Components 在这里引入了 temporal transformer（时序变换器）。它接收 `AsyncSequence`，输出新的 `AsyncSequence`。视频帧、摄像头帧、音频 buffer 都可以按时间流动，再被组合成窗口、下采样或送进模型。
+
+Session 的第一个例子是动作重复计数器。流程从视频或摄像头帧开始，提取人体姿态，选出一个人，把姿态分成窗口，再累计动作次数。计数结果是浮点数，因为模型会把未完成的一部分动作也算进去。
+
+第二个例子是声音分类器训练。传统做法每次重训都会重新提取全部音频特征。Create ML Components 允许先把 feature extractor 和 classifier 拆开，缓存预处理后的特征。新增数据来了，只处理新增部分；调分类器参数时，也不用重复做特征提取。
+
+## 详细内容
+
+### 用 AsyncSequence 表达视频和音频
+
+（[01:55](https://developer.apple.com/videos/play/wwdc2022/10020/?time=115)）演讲者先把问题拆开：视频是一串随时间到达的帧，Swift 的 `AsyncSequence` 正好表达这种输入。逐帧处理可以用 `map`。需要一次处理多帧时，就用 temporal transformer。
+
+概念代码（根据 transcript 提到的组件名整理，省略真实初始化参数）：
+
+```swift
+let frames = videoReader.read(videoURL)
+
+let transformedFrames = frames.map { frame in
+    preprocess(frame)
+}
+
+let windows = SlidingWindowTransformer(
+    length: 90,
+    stride: 90
+).applied(to: transformedFrames)
+```
+
+关键点：
+
+- `videoReader.read(videoURL)` 表示把视频读取成按时间到达的帧序列，transcript 明确说 video reader 会返回 frames 的 async sequence。
+- `map` 用来异步地逐帧变换，适合一次只处理一帧的场景。
+- `SlidingWindowTransformer` 是时序组件，输入是 async sequence，输出是 windowed async sequence。
+- `length: 90` 表示每个窗口包含 90 帧或 90 个姿态。
+- `stride: 90` 表示窗口之间不重叠；后面的实时摄像头例子会把 stride 改小。
+
+### 组合动作重复计数器
+
+（[03:42](https://developer.apple.com/videos/play/wwdc2022/10020/?time=222)）动作计数管线由四段组成：`HumanBodyPoseExtractor`、`PoseSelector`、`SlidingWindowTransformer`、`HumanBodyActionCounter`。
+
+概念代码（组件名来自 transcript，调用形式用于说明组合顺序）：
+
+```swift
+let poseExtractor = HumanBodyPoseExtractor()
+let poseSelector = PoseSelector(strategy: .rightMostJointLocation)
+let slidingWindow = SlidingWindowTransformer(length: 90, stride: 90)
+let actionCounter = HumanBodyActionCounter()
+
+let repetitionCounter = poseExtractor
+    .appending(poseSelector)
+    .appending(slidingWindow)
+    .appending(actionCounter)
+```
+
+关键点：
+
+- `HumanBodyPoseExtractor` 的输入是 image，输出是人体姿态数组；transcript 提到它背后使用 Vision framework。
+- 输出是数组，因为一张图里可能有多人，群体训练场景很常见。
+- `PoseSelector(strategy: .rightMostJointLocation)` 从数组里选一个姿态；演讲者在例子里使用 right-most joint location 策略。
+- `SlidingWindowTransformer(length: 90, stride: 90)` 把连续姿态分成 90 个一组的窗口。
+- `HumanBodyActionCounter` 消费窗口化的姿态序列，输出到目前为止的累计重复次数。
+
+### 把离线视频改成实时摄像头
+
+（[05:38](https://developer.apple.com/videos/play/wwdc2022/10020/?time=338)）离线视频可以 90 帧更新一次计数。实时健身 App 等不了那么久。Session 的改法很小：输入换成 `readCamera`，stride 从 90 调到 15。
+
+概念代码（根据 transcript 中的 `readCamera` 与 stride 参数整理）：
+
+```swift
+let cameraFrames = readCamera(configuration)
+
+let liveWindow = SlidingWindowTransformer(
+    length: 90,
+    stride: 15
+)
+
+let liveCounter = poseExtractor
+    .appending(poseSelector)
+    .appending(liveWindow)
+    .appending(actionCounter)
+```
+
+关键点：
+
+- `readCamera(configuration)` 表示读取摄像头帧，transcript 说它接收 camera configuration 并返回 camera frames 的 async sequence。
+- `length: 90` 继续保留 90 帧窗口，让计数器看到完整动作片段。
+- `stride: 15` 让窗口每 15 帧滑动一次。
+- 如果摄像头是 30fps，15 帧就是半秒，因此计数每半秒更新一次。
+- stride 太大会让反馈慢；stride 变小会增加计算频率，需要按 App 目标取舍。
+
+### 拆开声音分类器的特征提取和训练
+
+（[06:30](https://developer.apple.com/videos/play/wwdc2022/10020/?time=390)）Create ML 的 `MLSoundClassifier` 仍然是训练声音分类器的最简单入口。需要更多控制时，可以把它拆成底层组件：`AudioFeaturePrint` feature extractor 和一个 classifier。
+
+（[08:04](https://developer.apple.com/videos/play/wwdc2022/10020/?time=484)）关键动作是先调用 `preprocess`，把输入数据通过 transformers 处理到 estimator 前面，再用预处理后的 features 训练模型。
+
+概念代码（展示 transcript 提到的 `AudioFeaturePrint`、logistic regression classifier 和 `preprocess`）：
+
+```swift
+let featureExtractor = AudioFeaturePrint()
+let classifier = LogisticRegressionClassifier()
+
+let soundClassifier = featureExtractor.appending(classifier)
+
+let features = try await soundClassifier.preprocess(trainingData)
+let model = try await soundClassifier.fitted(to: features)
+```
+
+关键点：
+
+- `AudioFeaturePrint` 是 temporal transformer，会从 audio buffers 的 async sequence 中提取音频特征。
+- `LogisticRegressionClassifier` 是演讲者在例子里选择的分类器。
+- `featureExtractor.appending(classifier)` 表示把特征提取和分类器组合成声音分类任务。
+- `preprocess(trainingData)` 把训练数据先处理成 features，后续可以复用。
+- `fitted(to: features)` 表示在已经提取好的特征上训练，避免每次重训都重新跑特征提取。
+
+### 新数据和调参都复用旧特征
+
+（[08:38](https://developer.apple.com/videos/play/wwdc2022/10020/?time=518)）当你发现新训练数据，只需要对新增数据做特征提取，再把 supplemental features 追加到旧 features 后面。调 classifier 参数时，也可以继续复用旧 features。
+
+概念代码（强调数据流，非完整 API）：
+
+```swift
+let originalFeatures = try await soundClassifier.preprocess(originalData)
+let supplementalFeatures = try await soundClassifier.preprocess(newData)
+
+let allFeatures = originalFeatures + supplementalFeatures
+
+let tunedClassifier = LogisticRegressionClassifier(l2Penalty: newPenalty)
+let tunedSoundClassifier = featureExtractor.appending(tunedClassifier)
+let tunedModel = try await tunedSoundClassifier.fitted(to: allFeatures)
+```
+
+关键点：
+
+- `originalFeatures` 是旧数据的预处理结果，已经缓存下来。
+- `supplementalFeatures` 只来自新增数据，节省旧数据的重复特征提取时间。
+- `allFeatures` 表示把旧 features 和新增 features 合并后训练。
+- `l2Penalty` 是 transcript 中提到的分类器参数。
+- 调参时不能改变 feature extractor；演讲者明确提醒，改变它会让旧 features 失效。
+
+### 用 batch 增量训练、早停和 checkpoint
+
+（[09:43](https://developer.apple.com/videos/play/wwdc2022/10020/?time=583)）大数据集可能放不进内存。Session 的做法是把 logistic regression classifier 换成 updatable classifier，例如 fully connected neural network classifier，然后按 batch 更新模型。
+
+（[10:53](https://developer.apple.com/videos/play/wwdc2022/10020/?time=653)）演讲者还引入 Swift Algorithms package，用 `chunks` 把 features 分批。
+
+概念代码（展示 transcript 中的 default model、`chunks`、`update`、`mapFeatures`、checkpoint）：
+
+```swift
+var model = classifier.defaultModel()
+let features = try await soundClassifier.preprocess(trainingData)
+
+for iteration in 0..<maxIterations {
+    for batch in features.chunks(ofCount: batchSize) {
+        model = try await classifier.update(model, with: batch)
+    }
+
+    let validationPredictions = try await model.mapFeatures(validationFeatures)
+    let accuracy = Metrics.classificationAccuracy(
+        validationPredictions,
+        validationAnnotations
+    )
+
+    if accuracy >= 0.95 {
+        break
+    }
+
+    if iteration.isMultiple(of: checkpointInterval) {
+        try model.write(to: checkpointURL)
+    }
+}
+
+try model.write(to: finalModelURL)
+```
+
+关键点：
+
+- `defaultModel()` 对应 transcript 中的 default initialized model，它只是训练起点，尚不能用于有效预测。
+- `preprocess(trainingData)` 放在训练循环前，避免每个 iteration 都重新提取特征。
+- `features.chunks(ofCount: batchSize)` 来自 Swift Algorithms 的分组思路，用来控制一次加载到内存的训练数据量。
+- `classifier.update(model, with: batch)` 是增量训练的核心，每个 batch 更新一次模型。
+- `mapFeatures(validationFeatures)` 用验证集生成预测，再和 annotations 配对评估。
+- `accuracy >= 0.95` 来自演讲中的早停例子：准确率达到 95% 后停止训练。
+- `model.write(to: checkpointURL)` 放在循环内，用于保存训练进度；训练很久的模型可以从 checkpoint 恢复。
+
+## 核心启发
+
+### 1. 健身动作计数器
+
+- **做什么**：用摄像头统计 jumping jack、squat 或 lunge 的次数。
+- **为什么值得做**：Session 已经给出姿态提取、姿态选择、滑动窗口、动作计数四段组件，适合做实时反馈。
+- **怎么开始**：用 `readCamera` 获取帧序列，把 stride 设成 15 左右，先在单人画面下验证计数延迟和准确率。
+
+### 2. 训练视频回放分析工具
+
+- **做什么**：导入一段训练视频，自动按窗口统计动作次数，并标出动作变化的时间段。
+- **为什么值得做**：离线视频可以使用 90 帧、90 stride 的非重叠窗口，计算压力比实时场景低。
+- **怎么开始**：用 video reader 读取帧，接上 `HumanBodyPoseExtractor`、`PoseSelector`、`SlidingWindowTransformer` 和 `HumanBodyActionCounter`。
+
+### 3. 可持续更新的声音分类器
+
+- **做什么**：为环境音、设备声音或提醒声训练分类器，并持续加入新录音。
+- **为什么值得做**：`preprocess` 让旧数据的音频特征可复用，新增数据只补充新增 features。
+- **怎么开始**：先用 `AudioFeaturePrint` 提取 features，缓存结果，再用分类器训练；新数据到来时只跑新增样本的特征提取。
+
+### 4. 大数据集低内存训练
+
+- **做什么**：在内存受限的 Mac 或持续集成机器上训练声音分类模型。
+- **为什么值得做**：updatable classifier 支持按 batch 更新模型，不必一次加载全部训练数据。
+- **怎么开始**：把分类器换成 fully connected neural network classifier，用 Swift Algorithms 的 `chunks` 分批，再在循环里调用 `update`。
+
+### 5. 可恢复的长时间训练任务
+
+- **做什么**：给训练流程加入早停和 checkpoint，减少无效训练时间。
+- **为什么值得做**：演讲中的曲线在约 10 次 iteration 后达到 95% 并趋于稳定，此时继续训练收益很低。
+- **怎么开始**：每轮用验证集计算 accuracy，达到目标阈值就 `break`；每隔几轮把 model 写到磁盘。
+
+## 关联 Session
+
+- [Get to know Create ML Components](/articles/wwdc2022-10019) — 先理解 Transformer、Estimator 和 `appending`，再读本场的时序组件与增量训练。
+- [Explore the machine learning development experience](/articles/wwdc2022-10017) — 从模型选择、转换、评估到性能调优，补齐端侧 ML 的完整落地流程。
+- [Optimize your Core ML usage](/articles/wwdc2022-10027) — 关注模型部署后的设备性能，与本场的训练流程形成前后衔接。
+- [Meet AsyncSequence](/articles/wwdc2021-10058) — 本场时序 transformer 的输入输出都围绕 AsyncSequence，先理解它能更快读懂数据流。

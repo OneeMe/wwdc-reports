@@ -1,0 +1,139 @@
+---
+title: "Profile and optimize power usage in your app"
+description: "learn how to optimize your app for maximum battery life. discover how to identify the root cause of power issues in your app — whether you can reproduce the issue while connected to xcode or on the go"
+date: 2026-06-10
+tags: ["系统服务", "开发工具"]
+thumbnail: "/images/sessions/2025/226.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/226/"
+sessionId: "wwdc2025-226"
+year: "2025"
+relatedSessions:
+  - title: "Deliver age-appropriate experiences in your app"
+    code: "299"
+    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
+  - title: "Filter and tunnel network traffic with NetworkExtension"
+    code: "234"
+    description: "learn about the apis in the networkextension framework that give your app the po"
+  - title: "Finish tasks in the background"
+    code: "227"
+    description: "discover background execution advancements and understand how the system schedul"
+  - title: "Get ahead with quantum-secure cryptography"
+    code: "314"
+    description: "learn how to protect your app"
+---
+
+## Highlight
+
+> Power Profiler 现在可以脱离 Xcode，在设备上直接采集功耗 trace，覆盖那些只在通勤、CarPlay、户外才会出现的耗电问题。
+
+---
+
+## 核心内容
+
+很多 app 的耗电 bug 都有同一种症状：在工程师桌面上跑得好好的，到了用户手里就把电池吃光。Wiam 在演讲里举了自己的例子——`Destination Video` app 的同事抱怨这个 app 长期霸占电池排行榜第一，但她自己怎么试都复现不了。原因很直白，同事在通勤路上用，位置一直变；她坐在工位上，位置几乎不动，触发耗电的代码路径根本走不到。
+
+WWDC25 的解法是把 Power Profiler 从 Xcode 里搬到了设备本身。开发者可以直接在 iPhone 上启动 Performance Trace，让 QA 或 beta 用户跑几个小时，然后把 trace 文件传回 Mac 用 Instruments 打开。整个流程不需要插线、不需要 Xcode 在场，覆盖了过去最难复现的几类场景：CarPlay 导航、AR 户外使用、长时间后台耗电。再加上原本桌面侧的 Power Profiler 模板（包含系统级功耗、CPU/GPU/Display/Network 四个子系统的 power impact，以及 Time Profiler），开发者第一次有了从工位到野外的完整功耗证据链。
+
+---
+
+## 详细内容
+
+整段演讲围绕四个具体场景：可复现问题、不可复现问题、方案对比、主动监控。
+
+**场景一：可复现的 CPU 尖峰（[02:24](https://developer.apple.com/videos/play/wwdc2025/226/?time=144)）**。Wiam 给 app 加了一个 Library pane，Xcode Organizer 的 energy report 立刻报警 CPU 用量飙升。她在 Instruments 选 blank 模板，加上 Power Profiler 和 CPU Profiler，连无线设备 Profile 一遍。结果在 CPU power impact 这条 lane 上，打开 Library pane 之前的平均值是 1，打开之后跳到 21（[05:20](https://developer.apple.com/videos/play/wwdc2025/226/?time=320)）。Time Profiler 的 Heaviest Stack Trace 直接指向 `VideoCardView`——`LibraryThumbnailView` 用 VStack 一次性把上千个视频卡片全建出来了。
+
+修复方式就是把 VStack 换成 LazyVStack（[07:30](https://developer.apple.com/videos/play/wwdc2025/226/?time=450)）：
+
+```swift
+// Before: 一次性创建所有 VideoCardView
+struct LibraryThumbnailView: View {
+    let videos: [Video]
+
+    var body: some View {
+        ScrollView {
+            VStack {
+                ForEach(videos) { video in
+                    VideoCardView(video: video)
+                }
+            }
+        }
+    }
+}
+
+// After: 仅渲染可见区域内的视图
+struct LibraryThumbnailView: View {
+    let videos: [Video]
+
+    var body: some View {
+        ScrollView {
+            LazyVStack {
+                ForEach(videos) { video in
+                    VideoCardView(video: video)
+                }
+            }
+        }
+    }
+}
+```
+
+关键点：
+
+- `VStack` 在 body 求值时立即创建并保留所有子视图，列表越长，启动开销和内存占用越大。
+- `LazyVStack` 只对当前可见或即将滚入视口的 item 创建 view，滚出后销毁。
+- 数据源 `videos` 不变，View 树结构不变，仅改容器类型——这正是 SwiftUI 提供 Lazy 容器的原因。
+- 修改后再次 Profile，相同区间 CPU power impact 平均值从 21 降到 4.3（[08:32](https://developer.apple.com/videos/play/wwdc2025/226/?time=512)）。
+
+**场景二：设备端采集（[09:27](https://developer.apple.com/videos/play/wwdc2025/226/?time=567)）**。开启路径：Settings -> Developer -> Performance Trace -> 打开 Power Profiler 开关 -> 选定目标 app（仅限 Xcode、TestFlight、企业证书安装的 app）。然后从屏幕右上角下拉打开 Control Center，把 Performance Trace 图标加入并点击开始。可以连续录数小时，再次点击图标停止。生成的 trace 文件 AirDrop 给 Mac，用 Instruments 直接打开。设备端模式的 Time Profiler 采样率较低，目的是减少观察者效应。
+
+Wiam 用同事发回的 trace 定位到 `videoSuggestionsForLocation` 占用大量 CPU 时间（[13:32](https://developer.apple.com/videos/play/wwdc2025/226/?time=812)）。这个函数负责基于位置推荐附近视频，每次位置变化都会被调用。问题代码每次执行都重新读 `RecommendationRules` 这个体积很大的 JSON 文件并 decode 一次：
+
+```swift
+// 问题：每次位置更新都重新读文件 + 全量解析 JSON
+func videoSuggestionsForLocation(_ location: CLLocation) -> [Video] {
+    let url = Bundle.main.url(forResource: "RecommendationRules", withExtension: "json")!
+    let data = try! Data(contentsOf: url)
+    let rules = try! JSONDecoder().decode([RecommendationRule].self, from: data)
+    return filter(videos: allVideos, with: rules, near: location)
+}
+
+// 优化：rules 在运行期不变，懒加载 + 缓存
+private static let recommendationRules: [RecommendationRule] = {
+    let url = Bundle.main.url(forResource: "RecommendationRules", withExtension: "json")!
+    let data = try! Data(contentsOf: url)
+    return try! JSONDecoder().decode([RecommendationRule].self, from: data)
+}()
+
+func videoSuggestionsForLocation(_ location: CLLocation) -> [Video] {
+    return filter(videos: allVideos, with: Self.recommendationRules, near: location)
+}
+```
+
+关键点：
+
+- 文件 I/O 和 JSON 解析在高频回调里是典型的功耗陷阱，越大的 JSON、越频繁的位置更新，影响越严重。
+- 把 rules 提到 `static let` + 立即执行的闭包里，等价于线程安全的懒加载（Swift 保证 `let` 静态属性的初始化只发生一次）。
+- 修复后请同事在相同的通勤场景再录一份 trace 做对比，确认问题修复且没有引入新的功耗回归（[15:51](https://developer.apple.com/videos/play/wwdc2025/226/?time=951)）。
+
+**场景三：方案对比（[16:19](https://developer.apple.com/videos/play/wwdc2025/226/?time=979)）**。两个候选实现 A、B，可能 A 在小数据下更省 CPU，B 在大数据下更省网络。直接看代码无法判断净效益。做法是分别 Profile，多次运行取平均，控制 thermal 状态、设备状态、系统压力、app 内功能开关一致，再做横向对比。
+
+**场景四：纵深防御（[18:25](https://developer.apple.com/videos/play/wwdc2025/226/?time=1105)）**。Apple 的官方建议是把功耗工具串成流水线：写代码时看 Xcode Energy Gauges 实时反馈 -> 怀疑问题时上 Instruments Power Profiler 深挖 -> CI 用 XCTests 自动检测 -> 上线后用 Xcode Organizer / MetricKit 监控真实用户 -> 用 App Store Connect API 拉远端聚合数据。
+
+---
+
+## 核心启发
+
+- **现在就跑一次 Power Profiler trace**：连上设备，Profile 一遍主要使用路径，看 CPU/GPU power impact 有没有意外尖峰。这是成本最低的功耗审计，没找到问题也是好结果。
+- **把 VStack/HStack 默认替换成 LazyVStack/LazyHStack**：除非数据量明确小于 20 项，列表/网格就用 Lazy 容器。这是 Wiam 案例里 21 -> 4.3 的关键修改，几乎零代码成本。
+- **设备端 Performance Trace 用于 dogfood / QA**：让团队成员在真实通勤、户外、CarPlay 场景下采集 trace 回传。把这个流程写进 beta 测试文档，能挖出工位上永远复现不了的耗电 bug。
+- **位置/timer/通知等高频回调禁止做文件 I/O 和 JSON 解析**：把不可变数据用 `static let` 闭包做懒加载缓存，是修复这类问题最直接的模式。
+- **每次性能修改后录一份对比 trace**：确认修复同时确认没有引入新回归。Power Profiler 的对比方法论需要控制 thermal、设备状态等变量，多次运行取平均。
+
+---
+
+## 关联 Session
+
+- [Optimize CPU performance with Instruments](/articles/wwdc2025-308) — 配套的 CPU 优化方法论，本场视频里直接推荐过。
+- [Finish tasks in the background](/articles/wwdc2025-227) — 后台任务的功耗治理，和本文场景互补。
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — 加密改造对功耗的潜在影响，可用 Power Profiler 验证。
+- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — Network 子系统功耗排查的代表性场景。
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — 系统服务类 session 的设计参考。

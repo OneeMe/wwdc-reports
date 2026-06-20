@@ -1,0 +1,139 @@
+---
+title: "Discover Metal 4"
+description: "learn how to get started leveraging the powerful new features of metal 4 in your existing metal apps. we"
+date: 2026-06-10
+tags: ["Metal 4", "GPU", "MetalFX", "Machine Learning"]
+thumbnail: "/images/sessions/2025/205.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/205/"
+sessionId: "wwdc2025-205"
+year: "2025"
+relatedSessions:
+  - title: "Explore Metal 4 games"
+    code: "254"
+    description: "learn to optimize your game engine with the latest advancements in metal 4. we"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Go further with Metal 4 games"
+    code: "258"
+    description: "metalfx frame interpolation, denoising upscaler, ray tracing"
+  - title: "Level up your games"
+    code: "220"
+    description: "techniques to debug and further optimize your games"
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+---
+
+## Highlight
+
+> Metal 4 把命令队列、命令缓冲区、编码器全部换成新的 MTL4 系列对象，命令缓冲区与队列解耦，可在多线程并行编码；同时新增 MTL4ArgumentTable、residency sets、placement sparse resources、Barrier API、MTL4Compiler 等机制，并把张量（tensor）与机器学习编码器作为一等资源接入。
+
+---
+
+## 核心内容
+
+老 Metal 应用最大的痛点是绑定模型跟不上现代渲染的资源规模。一个场景里成千上万个材质、几何缓冲区、纹理，全得挤进固定数量的 bind point；每个 draw call 都在 CPU 上重新设置绑定，编码线程很容易成为瓶颈。Apple 用 bindless 的方式缓解过一次：把所有资源塞进 argument buffer，每个对象只绑一个。但绑定管理、内存常驻、shader 编译、ML 操作仍然分散在各处，写起来繁琐。
+
+Metal 4 的解法是把整条链路推倒重做。命令编码侧推出 MTL4CommandQueue 和 MTL4CommandBuffer，并把 command buffer 与 queue 解耦——你向 device 申请 buffer，向任意 queue 提交，天然支持多线程并行编码（[02:22](https://developer.apple.com/videos/play/wwdc2025/205/?time=142)）。编码器也做了合并：新的 unified compute encoder 同时处理 compute、blit、加速结构构建（[02:53](https://developer.apple.com/videos/play/wwdc2025/205/?time=173)）；MTL4RenderCommandEncoder 带 attachment map，可以在同一个 encoder 里切换 color attachment，省掉重复分配（[03:06](https://developer.apple.com/videos/play/wwdc2025/205/?time=186)）。命令缓冲区的内存由 MTL4CommandAllocator 直接管理，你说了算（[03:44](https://developer.apple.com/videos/play/wwdc2025/205/?time=224)）。
+
+资源管理方面，绑定表升级为 MTL4ArgumentTable，按需声明大小，bindless 场景只需要 1 个 buffer binding（[05:43](https://developer.apple.com/videos/play/wwdc2025/205/?time=343)）。常驻管理用 residency sets——把资源集合一次性挂到 MTL4CommandQueue 上，所有提交到该队列的命令都自动可见（[06:55](https://developer.apple.com/videos/play/wwdc2025/205/?time=415)）。Remedy 的《Control Ultimate Edition》集成 residency sets 后，常驻管理的开销显著下降，关闭光追时内存占用也更低（[07:22](https://developer.apple.com/videos/play/wwdc2025/205/?time=442)）。需要超出物理内存的场景，用 placement sparse resources——分配资源时不分页，按需从 placement heap 里申请页（[08:32](https://developer.apple.com/videos/play/wwdc2025/205/?time=512)）。并发同步换成 Barrier API，stage 到 stage，对应 DirectX/Vulkan 里的 barrier 概念（[09:02](https://developer.apple.com/videos/play/wwdc2025/205/?time=542)）。
+
+最有意思的是 ML 被一等公民化。Metal 4 新增 tensor 资源类型，支持任意维度（[14:22](https://developer.apple.com/videos/play/wwdc2025/205/?time=862)），并提供 machine learning command encoder，能把整个 CoreML 网络作为一条命令插进 command buffer，和渲染命令共享 barrier 同步（[15:05](https://developer.apple.com/videos/play/wwdc2025/205/?time=905)）。小网络则可以用 Metal performance primitives 在 shader 里就地推理，比如 neural material evaluation——采样 latent 纹理、推理、着色全部融合进一次 dispatch（[16:01](https://developer.apple.com/videos/play/wwdc2025/205/?time=961)）。
+
+---
+
+## 详细内容
+
+**命令编码：新对象与并行编码**
+
+Metal 4 的编码模型基于一组新对象：MTL4CommandQueue、MTL4CommandBuffer、MTL4CommandAllocator、MTL4RenderCommandEncoder、新的 unified compute encoder。沿用现有的 MTLDevice，无需替换设备对象（[02:08](https://developer.apple.com/videos/play/wwdc2025/205/?time=128)）。
+
+```swift
+// 伪代码示意：均使用 transcript 中明确提到的 API 名
+let queue = device.makeMTL4CommandQueue()
+let allocator = device.makeMTL4CommandAllocator()
+let cmdBuffer = device.makeMTL4CommandBuffer(allocator: allocator)
+
+let renderEncoder = cmdBuffer.makeMTL4RenderCommandEncoder(descriptor: rpDesc)
+// attachment map 允许在同一个 encoder 内切换 color attachment
+renderEncoder.setAttachmentMap(mapA)
+renderEncoder.drawPrimitives(...)
+renderEncoder.setAttachmentMap(mapB)
+renderEncoder.drawPrimitives(...)
+renderEncoder.endEncoding()
+
+queue.commit([cmdBuffer])
+```
+
+关键点：
+- `MTL4CommandQueue`：新队列对象，与 command buffer 解耦，可被多个线程同时使用。
+- `MTL4CommandAllocator`：直接管理 command buffer 的内存使用，避免框架内部隐式分配。
+- `makeMTL4CommandBuffer(allocator:)`：command buffer 由 device 创建而非 queue 创建，所以可以并行编码后再决定提交到哪个 queue（[02:29](https://developer.apple.com/videos/play/wwdc2025/205/?time=149)）。
+- `MTL4RenderCommandEncoder` + attachment map：单个 render encoder 内动态切换 color attachment，省去为不同输出再开一个 encoder（[03:16](https://developer.apple.com/videos/play/wwdc2025/205/?time=196)）。
+
+**绑定：MTL4ArgumentTable**
+
+Argument table 按 stage 声明，可以跨 stage 共享。bindless 场景下一个 buffer binding 就够了（[06:00](https://developer.apple.com/videos/play/wwdc2025/205/?time=360)）。
+
+**常驻：residency sets**
+
+residency set 一次配置、长期使用。常驻内容很少变动时，可以在 app 启动阶段填充；流式加载场景则放到独立线程更新，与编码并行（[07:09](https://developer.apple.com/videos/play/wwdc2025/205/?time=429)）。
+
+**稀疏资源：placement sparse**
+
+placement sparse 资源声明时不带页面，运行时按需从 placement heap 分配页（[08:43](https://developer.apple.com/videos/play/wwdc2025/205/?time=523)）。注意：placement sparse 的映射操作需要 MTL4CommandQueue，而旧的渲染队列还是 MTLCommandQueue——用 MTLEvent 在两条队列间同步（[21:26](https://developer.apple.com/videos/play/wwdc2025/205/?time=1286)）。
+
+**同步：Barrier API**
+
+Barrier 是 stage 到 stage 的。例：在 compute encoder 里 dispatch 一个灰度转换 shader，紧接着 render encoder 的 fragment 阶段要读它，就需要一个 dispatch-to-fragment barrier（[10:01](https://developer.apple.com/videos/play/wwdc2025/205/?time=601)）。具体例子见官方 sample “processing a texture in a compute function”。
+
+**编译：MTL4Compiler 与 flexible render pipeline states**
+
+MTL4Compiler 从 device 上独立出来，明确控制 CPU 上的编译时机。它继承调用线程的 QoS，多线程并发编译时高优先级线程的请求会被优先处理（[11:45](https://developer.apple.com/videos/play/wwdc2025/205/?time=705)）。flexible render pipeline states 让多个仅 color state 不同的 pipeline 共享一份编译好的 Metal IR——先建未特化 pipeline，再按需特化（[12:41](https://developer.apple.com/videos/play/wwdc2025/205/?time=761)）。
+
+**机器学习：tensor、ML encoder、shader ML**
+
+大网络走 ML command encoder：把 CoreML 包用 Metal 工具链转成 Metal package，再喂给 encoder，和渲染命令共享 barrier（[15:32](https://developer.apple.com/videos/play/wwdc2025/205/?time=932)）。小网络走 shader ML：用 Metal performance primitives 在 shader 内直接做矩阵/卷积运算，OS 编译器会针对当前设备 inline 优化代码（[17:00](https://developer.apple.com/videos/play/wwdc2025/205/?time=1020)）。
+
+**MetalFX：新增帧插值和去噪**
+
+MetalFX 在原有时间放大基础上，今年加了 frame interpolation（合成中间帧、拉高刷新率）和 denoising upscaler（边升采样边对低采样数光追结果去噪）（[18:24](https://developer.apple.com/videos/play/wwdc2025/205/?time=1104)、[18:53](https://developer.apple.com/videos/play/wwdc2025/205/?time=1133)）。
+
+**调试工具与起步**
+
+Xcode 26 自带 Metal 4 项目模板，新建 Game 工程时选 Metal 4 即可（[22:50](https://developer.apple.com/videos/play/wwdc2025/205/?time=1370)）。API/Shader Validation、Metal Debugger、Metal Performance HUD、Metal System Trace 全部支持 Metal 4。
+
+---
+
+## 核心启发
+
+- **做什么**：把现有 Metal 应用的 shader 编译路径迁到 MTL4Compiler
+  - 为什么值得做：风险最低、收益直接。MTL4Compiler 独立于 device，继承调用线程 QoS，多线程并发编译时高优先级请求优先处理，对启动期 hitches 改善显著。
+  - 怎么开始：用 device 申请一个 MTL4Compiler，把原来调 makePipelineState 的地方改走新接口；先不动 shader、不动 pipeline 描述，只换编译入口。
+
+- **做什么**：用 residency sets 替换零散的 useResource / makeResident 调用
+  - 为什么值得做：Remedy 在《Control Ultimate Edition》上的实测，关掉光追后内存占用明显下降，常驻管理 CPU 开销同步降低。集成成本低。
+  - 怎么开始：按资源生命周期把资源分组（永久、关卡、流式），每组建一个 residency set。永久组在 app 启动时填充并挂到 MTL4CommandQueue 上；流式组放到加载线程更新。
+
+- **做什么**：把超出物理内存的纹理改造成 placement sparse
+  - 为什么值得做：让同一份资产覆盖更多设备档位。低端机只常驻低 LOD 的页，高端机常驻全部，无需出多份资产。
+  - 怎么开始：从最大的几张纹理（地形 virtual texture、UI atlas）入手。声明为 placement sparse、建 placement heap、按可见性脚本控制页的分配与释放。映射操作走 MTL4CommandQueue，用 MTLEvent 与原有 MTLCommandQueue 同步。
+
+- **做什么**：用 MetalFX 时间放大 + 帧插值组合达成高刷
+  - 为什么值得做：渲染 1/4 像素 + 插一帧，理论上把渲染负载砍掉 7/8。对追求 120Hz 的游戏来说，性价比最高的一步。
+  - 怎么开始：先接 MetalFX 时间放大（从 2x 倍率起步），确认无明显伪影后再接 frame interpolation；用 Metal Performance HUD 实时观察真实帧率与延迟。
+
+- **做什么**：用 Shader ML + Metal performance primitives 实现 neural material
+  - 为什么值得做：latent 纹理体积远小于传统 PBR 纹理集，纹理带宽下降；推理与采样、着色融合进一次 dispatch，不必在 device memory 上反复来回搬数据。
+  - 怎么开始：先用 PyTorch / CoreMLtools 训一个 small material decoder，导出 CoreML 包；在 shader 里用 Metal performance primitives 调用，把采样到的 latent 当 tensor 输入，输出 albedo / normal / roughness。
+
+---
+
+## 关联 Session
+
+- [Explore Metal 4 games](/articles/wwdc2025-254) — 把 Metal 4 的命令编码和编译特性应用到游戏引擎的实战课。
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — 详解 tensor、ML encoder 与 shader ML 的具体用法。
+- [Go further with Metal 4 games](/articles/wwdc2025-258) — MetalFX 帧插值、去噪放大与 Metal 4 光追的进阶用法。
+- [Level up your games](/articles/wwdc2025-220) — Metal 调试工具链、性能分析与优化技巧。
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — SceneKit 弃用后，把 3D 项目迁移到 RealityKit 的路径。

@@ -1,0 +1,288 @@
+---
+title: "Explore new advances in App Intents"
+description: "explore all the new enhancements available in the app intents framework in this year"
+date: 2026-06-10
+tags: ["机器学习"]
+thumbnail: "/images/sessions/2025/275.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/275/"
+sessionId: "wwdc2025-275"
+year: "2025"
+relatedSessions:
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+  - title: "Get to know App Intents"
+    code: "244"
+    description: "learn how app intents power system experiences across platforms"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+---
+
+## Highlight
+
+> 这次 App Intents 的升级覆盖面很广，核心变化是 Interactive Snippets。Snippet 之前只能展示确认信息或结果，现在可以嵌入按钮和 Toggle，用户点击后直接触发已有的 App Intent，系统会在后台执行 Intent 然后刷新 Snippet 视图。整个过程不需要你写额外的胶水代码——已有的 Intent 直接复用。
+
+---
+
+## 核心内容
+
+过去想让 App 的功能在系统其他地方被触发，开发者要在 Shortcuts、Spotlight、Visual Intelligence 之间来回适配。Snippet 也只是一个静态结果卡：用来确认请求或回显结果，没法做交互。用户看到结果想进一步操作，就必须打开主 App。这中间的"再开一次 App"步骤，把很多场景的体验拖慢了。
+
+iOS 26 把 Snippet 改造成了 Interactive Snippet。示例中的 TravelTracking App 找到最近地标后，Snippet 会显示一颗心形按钮；用户点击按钮，系统会运行 App 里已有的 `UpdateFavoritesIntent`，等它完成后再用同一个 SnippetIntent 重新渲染视图，心形从空心变成实心。整个交互发生在 Snippet 内部，App 不必前台启动。系统也帮你串好了刷新流程：每次刷新都会用你声明的参数重新拉取 AppEntity，再调用 SnippetIntent 的 `perform` 方法重绘视图，SwiftUI 的 `contentTransition` 修饰器负责动画过渡。
+
+除了 Snippet，本场 Session 还讲了 Visual Intelligence 的图像搜索接入（IntentValueQuery + SemanticContentDescriptor）、On-screen Entity（用 NSUserActivity 把当前视图关联给 ChatGPT）、Spotlight 上直接执行 Action、UndoableIntent、IntentModes（声明 Intent 是后台还是前台执行）、ComputedProperty / DeferredProperty 两个新宏，以及 AppIntentsPackage 让 Intent 可以放进 Swift Package 和静态库。
+
+---
+
+## 详细内容
+
+**SnippetIntent 是一个新协议**。它把"用什么参数渲染"和"怎么渲染"绑在同一个类型里。原 Intent 只需要在返回类型里加上 `ShowsSnippetIntent`，并在 `.result(...)` 里传入 SnippetIntent 实例（[04:08](https://developer.apple.com/videos/play/wwdc2025/275/?time=248)）：
+
+```swift
+struct ClosestLandmarkIntent: AppIntent {
+    static let title: LocalizedStringResource = "Find Closest Landmark"
+
+    @Dependency var modelData: ModelData
+
+    func perform() async throws -> some ReturnsValue<LandmarkEntity> & ShowsSnippetIntent & ProvidesDialog {
+        let landmark = await self.findClosestLandmark()
+
+        return .result(
+            value: landmark,
+            dialog: IntentDialog(
+                full: "The closest landmark is \(landmark.name).",
+                supporting: "\(landmark.name) is located in \(landmark.continent)."
+            ),
+            snippetIntent: LandmarkSnippetIntent(landmark: landmark)
+        )
+    }
+}
+```
+
+关键点：
+
+- 返回类型组合了三个协议：`ReturnsValue<LandmarkEntity>`（返回值）、`ShowsSnippetIntent`（要展示 Snippet）、`ProvidesDialog`（同时提供语音回显）。
+- `dialog` 由 `full` 和 `supporting` 两段文本组成，前者用于完整朗读，后者用于较小的展示场景。
+- `snippetIntent` 参数告诉系统：每次刷新 Snippet 时，把这个 LandmarkEntity 重新喂回去。
+
+SnippetIntent 本身就是一个独立的 AppIntent（[04:31](https://developer.apple.com/videos/play/wwdc2025/275/?time=271)）：
+
+```swift
+struct LandmarkSnippetIntent: SnippetIntent {
+    static let title: LocalizedStringResource = "Landmark Snippet"
+
+    @Parameter var landmark: LandmarkEntity
+    @Dependency var modelData: ModelData
+
+    func perform() async throws -> some IntentResult & ShowsSnippetView {
+        let isFavorite = await modelData.isFavorite(landmark)
+
+        return .result(
+            view: LandmarkView(landmark: landmark, isFavorite: isFavorite)
+        )
+    }
+}
+```
+
+关键点：
+
+- `@Parameter` 标记的属性会被系统在每次刷新时填充，AppEntity 类型会重新走 Query。
+- `@Dependency` 注入运行时依赖，不参与序列化。
+- `perform` 不应修改 App 状态，因为系统可能为了响应深色模式切换等事件多次调用它。
+- 返回类型加 `ShowsSnippetView`，并在 `.result(view:)` 中传入 SwiftUI 视图。
+
+**Snippet 内的按钮直接复用已有 Intent**（[05:45](https://developer.apple.com/videos/play/wwdc2025/275/?time=345)）：
+
+```swift
+struct LandmarkView: View {
+    let landmark: LandmarkEntity
+    let isFavorite: Bool
+
+    var body: some View {
+        // ...
+        Button(intent: UpdateFavoritesIntent(landmark: landmark, isFavorite: !isFavorite)) { /* ... */ }
+
+        Button(intent: FindTicketsIntent(landmark: landmark)) { /* ... */ }
+        // ...
+    }
+}
+```
+
+关键点：
+
+- `Button(intent:)` 这个初始化器最早是在 2023 年随交互式 Widget 一起出现的，这里直接复用。
+- 用户点按后系统执行 Intent，结束后立刻用之前声明的 SnippetIntent 重渲染视图。
+- 同样的 API 也适用于 Toggle。
+
+**确认型 Snippet 用 `requestConfirmation`**（[06:53](https://developer.apple.com/videos/play/wwdc2025/275/?time=413)）：
+
+```swift
+struct FindTicketsIntent: AppIntent {
+
+    func perform() async throws -> some IntentResult & ShowsSnippetIntent {
+        let searchRequest = await searchEngine.createRequest(landmarkEntity: landmark)
+
+        // Present a snippet that allows people to change
+        // the number of tickets.
+        try await requestConfirmation(
+            actionName: .search,
+            snippetIntent: TicketRequestSnippetIntent(searchRequest: searchRequest)
+        )
+
+        // Resume searching...
+    }
+}
+```
+
+关键点：
+
+- `requestConfirmation` 会阻塞 `perform` 直到用户确认或取消，取消时抛错，不要 catch，让它正常终止。
+- `actionName: .search` 决定了确认按钮的文案。
+- 用户在 Snippet 里改的数量等状态可以通过 AppEntity（`SearchRequestEntity`）保存，下次刷新会从 Query 里重新读到最新值。
+
+**主动刷新 Snippet 用静态 `reload()`**（[08:01](https://developer.apple.com/videos/play/wwdc2025/275/?time=481)）：
+
+```swift
+func performRequest(request: SearchRequestEntity) async throws {
+    // Set to pending status...
+
+    TicketResultSnippetIntent.reload()
+
+    // Kick off search...
+
+    TicketResultSnippetIntent.reload()
+}
+```
+
+关键点：调用 `reload()` 会触发系统重新跑该 SnippetIntent 的整套刷新流程，适合"开始搜索"和"搜索完成"这种关键状态切换点。
+
+**Visual Intelligence 图像搜索通过 `IntentValueQuery` 接入**（[09:24](https://developer.apple.com/videos/play/wwdc2025/275/?time=564)）：
+
+```swift
+struct LandmarkIntentValueQuery: IntentValueQuery {
+
+    @Dependency var modelData: ModelData
+
+    func values(for input: SemanticContentDescriptor) async throws -> [LandmarkEntity] {
+        guard let pixelBuffer: CVReadOnlyPixelBuffer = input.pixelBuffer else {
+            return []
+        }
+
+        let landmarks = try await modelData.searchLandmarks(matching: pixelBuffer)
+
+        return landmarks
+    }
+}
+```
+
+关键点：
+
+- `SemanticContentDescriptor` 携带选区像素，可用 VideoToolbox 或 CoreImage 转成 CGImage。
+- 返回的 AppEntity 必须配套实现 `OpenIntent`，否则 App 不会出现在搜索面板里。
+- 返回几页结果即可，搜索时间不要太长。
+
+**多种结果类型用 `@UnionValue`**（[11:40](https://developer.apple.com/videos/play/wwdc2025/275/?time=700)）：
+
+```swift
+@UnionValue
+enum VisualSearchResult {
+    case landmark(LandmarkEntity)
+    case collection(CollectionEntity)
+}
+
+struct LandmarkIntentValueQuery: IntentValueQuery {
+    func values(for input: SemanticContentDescriptor) async throws -> [VisualSearchResult] {
+        // ...
+    }
+}
+
+struct OpenLandmarkIntent: OpenIntent { /* ... */ }
+struct OpenCollectionIntent: OpenIntent { /* ... */ }
+```
+
+关键点：每个 case 对应的 Entity 都要有自己的 OpenIntent。
+
+**ComputedProperty 和 DeferredProperty 是新宏**（[24:23](https://developer.apple.com/videos/play/wwdc2025/275/?time=1463) / [24:48](https://developer.apple.com/videos/play/wwdc2025/275/?time=1488)）：
+
+```swift
+struct SettingsEntity: UniqueAppEntity {
+    @ComputedProperty
+    var defaultPlace: PlaceDescriptor {
+        UserDefaults.standard.defaultPlace
+    }
+
+    init() {}
+}
+
+struct LandmarkEntity: IndexedEntity {
+    @DeferredProperty
+    var crowdStatus: Int {
+        get async throws {
+            await modelData.getCrowdStatus(self)
+        }
+    }
+}
+```
+
+关键点：
+
+- `@ComputedProperty` 适合从 UserDefaults、内存这种廉价来源即时计算的属性，避免重复存储。
+- `@DeferredProperty` 适合涉及异步、网络或耗时 IO 的属性，只有在被显式请求时才会计算。
+- `IndexedEntity` 在 Spotlight 索引时会跳过 DeferredProperty，避免每次索引都触发慢操作。
+
+**App Intents 现在可以放在 Package 里**（[25:50](https://developer.apple.com/videos/play/wwdc2025/275/?time=1550)）：
+
+```swift
+// Framework or dynamic library
+public struct LandmarksKitPackage: AppIntentsPackage { }
+
+// App target
+struct LandmarksPackage: AppIntentsPackage {
+    static var includedPackages: [any AppIntentsPackage.Type] {
+        [LandmarksKitPackage.self]
+    }
+}
+```
+
+关键点：在 Framework / 静态库里声明一个 `AppIntentsPackage`，再让 App 的根 Package 把它列入 `includedPackages`，模块里的 Intent 就会被发现。
+
+---
+
+## 核心启发
+
+**1. 把"结果卡"改造成"控制面板"**
+
+为什么值得做：原本 Snippet 只是只读的结果回显，用户想进一步操作必须开 App，跳转成本高。Interactive Snippet 把"看一眼数据"和"立刻执行下一步"合在同一个视图里，符合 Apple 给的"轻量、即时、可扫视"原则。
+
+怎么开始：找出当前 App 里返回 Snippet 的 Intent，列出用户拿到结果后最常做的两三个动作（收藏、分享、删除、再搜一次），把这些动作对应的 Intent 用 `Button(intent:)` 直接塞进 SnippetView，不写任何额外路由代码。
+
+**2. 用 `@DeferredProperty` 修剪 AppEntity 的初始化成本**
+
+为什么值得做：Spotlight 索引、Shortcuts 列表、Snippet 渲染都会拉 AppEntity；如果某个属性需要发网络请求，初始化就会被拖慢。DeferredProperty 让昂贵字段只在 Intent 真正用到时才算。
+
+怎么开始：审视所有 AppEntity 的字段，把"需要 await/可能失败/依赖外部服务"的字段标成 `@DeferredProperty`，其它从 UserDefaults 或内存读出来的标 `@ComputedProperty`，去掉重复的存储。
+
+**3. 接入 Visual Intelligence 图像搜索，让 App 出现在系统截图面板**
+
+为什么值得做：iOS 26 用户高亮一张图就能调出系统搜索面板，App 是否出现在面板里取决于有没有实现 `IntentValueQuery`。早接入的 App 会拿到这条新流量入口。
+
+怎么开始：写一个 `IntentValueQuery`，接收 `SemanticContentDescriptor`，把 `pixelBuffer` 喂给现有的图像搜索后端；为返回的 Entity 类型实现 `OpenIntent`，让点击结果可以跳回 App 对应页面；如果有多种结果类型，用 `@UnionValue` 包一层。
+
+**4. 把 App Intents 拆进 Swift Package**
+
+为什么值得做：在大型项目或多 App 共享代码的场景下，App Intents 之前只能放在主 App target 里，难以复用。`AppIntentsPackage` 让 Framework / 静态库 也能贡献 Intent。
+
+怎么开始：把通用的 Entity、Query、Intent 抽到一个 `LandmarksKitPackage` 类型的 Package 里，让主 App 在自己的 `AppIntentsPackage` 中通过 `includedPackages` 显式引用。
+
+---
+
+## 关联 Session
+
+- [Design interactive snippets](/articles/wwdc2025-281) — 配套设计指南，强调 Snippet 高度上限与扫视体验
+- [Get to know App Intents](/articles/wwdc2025-244) — App Intents 框架入门，建议先看
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — Foundation Models 与 App Intents 配合让 Intent 具备 AI 能力
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — 深入讲解 Foundation Models 的引导生成和工具调用

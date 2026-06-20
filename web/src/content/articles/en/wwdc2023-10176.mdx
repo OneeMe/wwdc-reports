@@ -1,0 +1,242 @@
+---
+title: "Lift subjects from images in your app"
+description: "Discover how you can easily pull the subject of an image from its background in your apps. Learn how to lift the primary subject or to access the subject at a given point with VisionKit."
+date: "2023-06-06"
+tags: ["VisionKit", "Vision", "Machine Learning", "Core Image"]
+thumbnail: "/images/sessions/2023/10176.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10176/"
+sessionId: "wwdc2023-10176"
+year: "2023"
+relatedSessions:
+  - title: "What's new in VisionKit"
+    code: "10048"
+    description: "VisionKit 新功能总览"
+  - title: "Add HDR content to your app"
+    code: "10102"
+    description: "HDR 图像处理与 Core Image"
+  - title: "Person segmentation in Vision"
+    code: "10127"
+    description: "Vision 人像分割 API"
+  - title: "Create a more responsive camera experience"
+    code: "10105"
+    description: "相机与照片处理"
+---
+
+## Highlight
+
+> iOS 17 和 macOS Sonoma 开放系统级图像主体提取能力，VisionKit 提供开箱即用的交互式抠图 UI，Vision 框架提供底层分割掩码，两者都可与 Core Image 组合实现复杂的图像特效管线。
+
+## 核心内容
+
+iOS 16 相册里长按图片就能抠出主体，这个能力现在开放给开发者了。你可以选择两条路径：VisionKit 快速接入系统级交互，或者 Vision 框架获取底层分割数据做自定义处理。
+
+### VisionKit：几行代码获得系统级抠图交互
+
+（[02:28](https://developer.apple.com/videos/play/wwdc2023/10176/?time=148)）VisionKit 的处理在进程外执行，对主线程影响小，但图片分辨率有限制。
+
+iOS 上创建 `ImageAnalysisInteraction` 并添加到图片视图：
+
+```swift
+let interaction = ImageAnalysisInteraction()
+interaction.preferredInteractionTypes = .imageSubject
+imageView.addInteraction(interaction)
+```
+
+macOS 上对应使用 `ImageAnalysisOverlayView`：
+
+```swift
+let overlayView = ImageAnalysisOverlayView()
+overlayView.preferredInteractionTypes = .imageSubject
+imageContainerView.addSubview(overlayView)
+```
+
+关键点：
+- `.automatic` 包含抠图、实况文本和数据检测器，完全镜像系统行为
+- `.imageSubject` 只启用抠图，适合不需要文本交互的场景
+- 支持 `UIImageView` 以外的任意视图
+
+### 编程式访问主体数据
+
+（[03:27](https://developer.apple.com/videos/play/wwdc2023/10176/?time=207)）除了 UI 交互，VisionKit 也支持代码获取主体信息：
+
+```swift
+let analyzer = ImageAnalyzer()
+let analysis = try await analyzer.analyze(image, configuration: .init([.imageSubject]))
+
+// 获取所有主体
+let allSubjects = analysis.subjects
+
+// 按坐标查询主体
+if let subject = try await analysis.subject(at: tapPoint) {
+    // 用户点击的位置有主体
+}
+
+// 获取高亮（选中）的主体
+let highlighted = analysis.highlightedSubjects
+
+// 生成包含指定主体的图像
+let compositeImage = try await analysis.image(for: highlighted)
+```
+
+关键点：
+- `Subject` 结构体包含 `image`（主体图像）和 `bounds`（边界框）
+- `subject(at:)` 返回 nil 表示该坐标没有主体
+- `highlightedSubjects` 可读写，支持代码控制选中状态
+- `image(for:)` 将多个主体合成到一张透明背景图像中
+
+### Vision：底层分割 API 与 Core Image 组合
+
+（[07:32](https://developer.apple.com/videos/play/wwdc2023/10176/?time=452)）Vision 框架的 `VNGenerateForegroundInstanceMaskRequest` 提供更低层的控制能力。处理在进程内执行，不受分辨率限制。
+
+与 VisionKit 的对比：
+
+| 特性 | VisionKit | Vision |
+|------|-----------|--------|
+| UI | 内置系统级交互 | 无，需自建 |
+| 处理位置 | 进程外 | 进程内 |
+| 分辨率限制 | 有 | 无 |
+| 适用场景 | 快速接入 | 高级图像处理管线 |
+
+（[08:30](https://developer.apple.com/videos/play/wwdc2023/10176/?time=510)）Vision 的分割是类别无关的（class agnostic）。与人像分割只处理人不同，主体提取可以分割任何前景物体——建筑、食物、车辆都可以。
+
+## 详细内容
+
+### Vision 主体提取完整流程
+
+（[09:50](https://developer.apple.com/videos/play/wwdc2023/10176/?time=590)）Vision 的请求遵循标准模式：
+
+```swift
+import Vision
+import CoreImage
+
+// 1. 创建请求
+let request = VNGenerateForegroundInstanceMaskRequest()
+
+// 2. 创建请求处理器
+let handler = VNImageRequestHandler(cgImage: sourceCGImage)
+
+// 3. 在后台队列执行
+DispatchQueue.global(qos: .userInitiated).async {
+    try? handler.perform([request])
+    
+    guard let observation = request.results?.first else { return }
+    
+    // 4. 获取所有前景实例的掩码
+    let mask = try? observation.generateScaledMask(
+        for: observation.allInstances,
+        from: handler,
+        croppedToInstancesExtent: false
+    )
+}
+```
+
+关键点：
+- 主体检测是计算密集型任务，必须在后台线程执行
+- `results` 数组中只有一个 observation，包含所有实例信息
+- `allInstances` 返回包含所有前景实例索引的 `IndexSet`，背景索引 0 不包含在内
+
+### 实例掩码与点击测试
+
+（[09:14](https://developer.apple.com/videos/play/wwdc2023/10176/?time=554)）Vision 提供像素级的实例掩码（instance mask）。每个像素值对应实例索引：0 是背景，1、2、3... 是前景实例。索引顺序不保证，但连续编号。
+
+点击测试的实现：
+
+```swift
+func instanceAtPoint(_ point: CGPoint, instanceMask: VNPixelBufferObservation) -> IndexSet {
+    // point 已归一化到 [0, 1]，原点在左上角（UIKit 坐标系）
+    let pixelX = Int(point.x * CGFloat(instanceMask.width))
+    let pixelY = Int(point.y * CGFloat(instanceMask.height))
+    
+    instanceMask.lockPixelBuffer()
+    defer { instanceMask.unlockPixelBuffer() }
+    
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(instanceMask.pixelBuffer)
+    let baseAddress = CVPixelBufferGetBaseAddress(instanceMask.pixelBuffer)!
+    
+    // 单通道 UInt8，计算像素偏移
+    let offset = pixelY * bytesPerRow + pixelX
+    let label = baseAddress.load(fromByteOffset: offset, as: UInt8.self)
+    
+    // 0 是背景，返回所有实例；否则返回选中的单个实例
+    return label == 0 ? observation.allInstances : IndexSet(integer: Int(label))
+}
+```
+
+关键点：
+- 像素缓冲区的行可能有填充（padding），必须用 `bytesPerRow` 计算偏移
+- 访问像素缓冲区前必须 `lockPixelBuffer()`，结束后 `unlockPixelBuffer()`
+- 坐标系与 UIKit 一致，左上角为原点，无需额外转换
+
+### 与 Core Image 组合实现特效
+
+（[12:23](https://developer.apple.com/videos/play/wwdc2023/10176/?time=743)）Vision 输出的掩码可以直接用于 Core Image 的 `CIBlendWithMask` 滤镜：
+
+```swift
+func applyEffect(
+    sourceImage: CIImage,
+    mask: CIImage,
+    backgroundImage: CIImage,
+    effect: Effect
+) -> CIImage {
+    // 对背景应用特效（如暗化、模糊）
+    let processedBackground = applyBackgroundEffect(backgroundImage, effect: effect)
+    
+    // 使用 CIBlendWithMask 将主体合成到新背景
+    let blendFilter = CIFilter.blendWithMask()
+    blendFilter.inputImage = sourceImage
+    blendFilter.backgroundImage = processedBackground
+    blendFilter.maskImage = mask
+    
+    return blendFilter.outputImage!
+}
+```
+
+关键点：
+- Vision 输出 SDR 图像，Core Image 处理可以保留 HDR 信息
+- `croppedToInstancesExtent: false` 保持输出与输入相同分辨率，便于合成
+- `croppedToInstancesExtent: true` 输出紧贴主体的裁剪图像
+
+### 演讲者的特效管线
+
+（[13:48](https://developer.apple.com/videos/play/wwdc2023/10176/?time=828)）演讲者演示了一个完整的特效 App，流程如下：
+
+1. 对源图像执行 Vision 主体提取请求
+2. 可选：用户点击选择特定实例
+3. 生成选中实例的掩码
+4. 对背景应用选中特效（暗化、模糊、光晕等）
+5. 用 Core Image 将主体合成到处理后的背景上
+
+光晕效果的实现技巧：用纯白色图像作为主体、黑色作为背景，先模糊再与原掩码组合，产生主体周围的发光效果。
+
+## 核心启发
+
+**1. 拼图/贴纸类 App 的主体拖拽**
+
+- **做什么**：让用户从照片中抠出任意物体，作为拼图块或贴纸拖拽使用
+- **为什么值得做**：VisionKit 的 `ImageAnalysisInteraction` 只需几行代码就能获得系统级抠图交互，无需训练自定义模型
+- **怎么开始**：给 `UIImageView` 添加 `ImageAnalysisInteraction`，设置 `.imageSubject`，处理拖拽手势传递 `Subject.image`
+
+**2. 照片编辑 App 的一键背景替换**
+
+- **做什么**：用户选择照片后，自动提取主体并替换背景（纯色、渐变、自定义图片）
+- **为什么值得做**：Vision 的 `VNGenerateForegroundInstanceMaskRequest` 输出与 Core Image 无缝衔接，可以保留 HDR 信息
+- **怎么开始**：Vision 请求获取掩码 → `CIBlendWithMask` 合成新背景 → 支持点击选择特定实例
+
+**3. 电商 App 的商品白底图生成**
+
+- **做什么**：用户上传商品照片，自动去除背景生成白底商品图
+- **为什么值得做**：主体提取是类别无关的，衣服、鞋子、家具都能分割，省去手动抠图
+- **怎么开始**：VisionKit 的 `ImageAnalyzer` 异步分析，设置 `.imageSubject` 配置，获取主体图像后合成白色背景
+
+**4. 社交 App 的 AR 贴纸制作**
+
+- **做什么**：从照片中提取主体，生成透明 PNG 用于消息贴纸或 AR 场景
+- **为什么值得做**：`image(for:)` 方法直接输出透明背景的合成图像，格式即拿即用
+- **怎么开始**：用户选择照片 → `ImageAnalyzer.analyze()` → 选择主体 → `analysis.image(for: subjects)` → 保存为 PNG
+
+## 关联 Session
+
+- [What's new in VisionKit](/articles/wwdc2023-10048) — VisionKit 新功能总览，包含主体提取的更多上下文
+- [Add HDR content to your app](/articles/wwdc2023-10102) — Core Image 处理 HDR 图像的详细方法
+- [Person segmentation in Vision](/articles/wwdc2023-10127) — Vision 人像分割 API，与主体提取形成对比
+- [Create a more responsive camera experience](/articles/wwdc2023-10105) — 相机拍摄与照片处理流程

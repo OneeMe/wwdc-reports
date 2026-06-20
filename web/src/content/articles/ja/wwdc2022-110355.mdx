@@ -1,0 +1,286 @@
+---
+title: "Meet Swift Async Algorithms"
+description: "Discover the latest open source Swift package from Apple: Swift Async Algorithms. We'll explore algorithms from this package that you can use with AsyncSequence, including zip, merge, and throttle. Follow along with us as we use these algorithms to build a great messaging app. We'll also share best practices for combining multiple AsyncSequences and using the Swift Clock type to work with values over time."
+date: "2022-06-07"
+tags: ["Swift", "AsyncSequence", "Concurrency", "Algorithms"]
+thumbnail: "/images/sessions/2022/110355.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110355/"
+sessionId: "wwdc2022-110355"
+year: "2022"
+relatedSessions:
+  - title: "What's new in Swift"
+    code: "110354"
+    description: "Swift 5.7 新特性总览，包含 Clock API"
+  - title: "Meet distributed actors in Swift"
+    code: "110356"
+    description: "Swift 分布式 actor 模型"
+  - title: "Design protocol interfaces in Swift"
+    code: "110353"
+    description: "Swift 5.7 泛型与协议改进"
+---
+
+## Highlight
+
+> Swift Async Algorithms 是一个开源包，为 AsyncSequence 提供了 Zip、Merge、Debounce、Chunk 等高级算法，同时利用 Swift 5.7 的 Clock API 实现了基于时间的流控制。
+
+## 核心内容
+
+### 从回调到 AsyncSequence
+
+你的即时通讯 App 里，消息到达目前是靠回调驱动的。每个账号有自己的消息回调，多账号时需要手动协调。代码里充斥着嵌套的 completion handler，状态管理越来越复杂。
+
+（[01:15](https://developer.apple.com/videos/play/wwdc2022/110355/?time=75)）Swift 的 AsyncSequence 把异步值流变成了可以 `for-await-in` 遍历的序列。Swift Async Algorithms 包在此基础上提供了更高级的算法。
+
+```swift
+struct Account {
+  var messages: AsyncStream<Message>
+}
+
+actor AccountManager {
+  var primaryAccount: Account
+  var secondaryAccount: Account?
+}
+
+protocol MessagePreview {
+  func displayPreviews(_ manager: AccountManager) async
+}
+```
+
+关键点：
+- `AsyncStream` 把回调转换为 AsyncSequence，保留消息顺序
+- `for-await-in` 语法让异步遍历看起来像同步代码
+
+### Zip：并发等待多个异步结果
+
+（[02:16](https://developer.apple.com/videos/play/wwdc2022/110355/?time=136)）用户发送视频时，你需要同时生成预览图和转码。两个操作独立进行，但上传时需要成对出现。
+
+以前的做法是用 `TaskGroup` 或 `async let` 手动协调。Zip 算法直接解决了这个问题：
+
+```swift
+// upload attachments of videos and previews such that every video has a preview
+// that are created concurrently so that neither blocks each other.
+
+for try await (vid, preview) in zip(videos, previews) {
+  try await upload(vid, preview)
+}
+```
+
+关键点：
+- `zip` 并发遍历两个 AsyncSequence，产生元组
+- 任意一方先完成会等待另一方，不会阻塞
+- 如果任一序列抛出错误，整个 Zip 会 rethrow
+
+### Merge：合并多个消息流
+
+（[04:04](https://developer.apple.com/videos/play/wwdc2022/110355/?time=244)）你的 App 支持多账号，每个账号有自己的消息流。用户希望在一个界面看到所有消息，不管来自哪个账号。
+
+Merge 算法把多个同类型的 AsyncSequence 合并成一个：
+
+```swift
+// Display previews of messages from either the primary or secondary account
+
+for try await message in merge(primaryAccount.messages, secondaryAccount.messages) {
+  displayPreview(message)
+}
+```
+
+关键点：
+- `merge` 要求所有输入序列的元素类型相同
+- 输出顺序取决于哪个序列先产生值
+- 任一序列出错时，其他序列的迭代会被取消
+
+### Clock API：与时间打交道
+
+（[05:43](https://developer.apple.com/videos/play/wwdc2022/110355/?time=343)）异步代码里处理时间一直是个麻烦事。`DispatchQueue.asyncAfter` 不够灵活，`Timer` 需要手动管理生命周期。
+
+Swift 5.7 引入了 Clock、Instant、Duration 三个时间原语：
+
+```swift
+// Sleep until a given deadline
+
+let clock = SuspendingClock()
+var deadline = clock.now + .seconds(3)
+try await clock.sleep(until: deadline)
+```
+
+关键点：
+- `Clock` 协议定义了 `now` 和 `sleep(until:)` 两个原语
+- `Duration` 支持 `.seconds()`、`.milliseconds()` 等构造方式
+
+两种内置 Clock 有不同的行为：
+
+```swift
+let clock = SuspendingClock()
+let elapsed = await clock.measure {
+  await someLongRunningWork()
+}
+// Elapsed time reads 00:05.40
+
+let clock = ContinuousClock()
+let elapsed = await clock.measure {
+  await someLongRunningWork()
+}
+// Elapsed time reads 00:19.54
+```
+
+（[06:56](https://developer.apple.com/videos/play/wwdc2022/110355/?time=416)）`SuspendingClock` 在机器休眠时暂停计时，`ContinuousClock` 像秒表一样持续走动。如果你的工作被暂停了 14 秒，SuspendingClock 只计 5.4 秒，ContinuousClock 计 19.54 秒。
+
+关键点：
+- 动画、设备相关的时间逻辑用 `SuspendingClock`
+- 面向人类的时间测量用 `ContinuousClock`
+
+### Debounce：搜索输入防抖
+
+（[08:27](https://developer.apple.com/videos/play/wwdc2022/110355/?time=507)）用户在搜索框里快速输入时，你不希望每个字符变化都触发一次搜索请求。
+
+Debounce 算法等待一段静默期后才发出值：
+
+```swift
+class SearchController {
+  let searchResults = AsyncChannel<SearchResult>()
+
+  func search<SearchValues: AsyncSequence>(_ searchValues: SearchValues)
+    where SearchValues.Element == String
+  {
+    let queries = searchValues
+      .debounce(for: .milliseconds(300))
+
+    for await query in queries {
+      let results = try await performSearch(query)
+      await channel.send(results)
+    }
+  }
+}
+```
+
+关键点：
+- `debounce(for:)` 默认使用 `ContinuousClock`
+- 事件快速涌入时，每次新事件都会重置计时器
+- 只有 300 毫秒内没有新事件时，才会发出最后一个值
+
+### Chunk：消息批量发送
+
+（[09:46](https://developer.apple.com/videos/play/wwdc2022/110355/?time=586)）用户打字很快时，与其每条消息单独发请求，不如攒一批一起发送。
+
+Chunked 算法按时间或数量把序列分块：
+
+```swift
+let batches = outboundMessages.chunked(
+  by: .repeating(every: .milliseconds(500))
+)
+
+let encoder = JSONEncoder()
+for await batch in batches {
+  let data = try encoder.encode(batch)
+  try await postToServer(data)
+}
+```
+
+关键点：
+- `chunked(by:)` 支持按时间、按数量、按内容分块
+- 错误会被 rethrow，保持代码安全
+- 500 毫秒一批，既减少请求数又不让用户等太久
+
+### 从 AsyncSequence 回到集合
+
+（[10:47](https://developer.apple.com/videos/play/wwdc2022/110355/?time=647)）有时候你需要把 AsyncSequence 转回普通集合。Swift Async Algorithms 提供了初始化器：
+
+```swift
+// Create a message with awaiting attachments to be encoded
+init<Attachments: AsyncSequence>(_ attachments: Attachments) async rethrows {
+  self.attachments = try await Array(attachments)
+}
+```
+
+关键点：
+- `Array(asyncSequence)`、`Set(asyncSequence)`、`Dictionary(asyncSequence)` 都支持
+- 只适用于已知有限的 AsyncSequence
+- 让你可以逐步迁移代码，不用一次性全部改成异步
+
+## 详细内容
+
+### Zip 的并发实现细节
+
+Zip 不是简单的顺序遍历。它在内部并发等待每个输入序列的下一个值：
+
+```swift
+// 伪代码展示 Zip 的并发特性
+let videoStream = transcodeVideos()      // AsyncSequence<Video>
+let previewStream = generatePreviews()   // AsyncSequence<Preview>
+
+for try await (video, preview) in zip(videoStream, previewStream) {
+  // video 和 preview 来自同一个索引位置
+  // 如果 video 先好，会等待 preview；反之亦然
+  try await upload(video, preview)
+}
+```
+
+关键点：
+- Zip 内部使用结构化并发同时读取多个序列
+- 任一序列结束时，Zip 也结束（不会等待其他序列的剩余元素）
+- 错误传播是即时的，不会等待其他序列当前操作完成
+
+### Merge 与 Zip 的选择
+
+```swift
+// Zip：需要配对使用，数量必须一致
+for try await (a, b) in zip(streamA, streamB) {
+  // a 和 b 是第 N 个元素
+}
+
+// Merge：谁先产生值就先用谁，数量可以不同
+for try await value in merge(streamA, streamB) {
+  // value 来自 streamA 或 streamB，取决于谁先产生
+}
+```
+
+（[05:08](https://developer.apple.com/videos/play/wwdc2022/110355/?time=308)）Merge 要求所有序列的元素类型相同，输出是单一元素流。Zip 产生元组，保留每个序列的元素类型信息。
+
+### Clock 的 measure 方法
+
+```swift
+let clock = ContinuousClock()
+let duration = await clock.measure {
+  // 要测量的工作
+  await fetchData()
+  await processData()
+}
+print("耗时: \(duration)")
+```
+
+关键点：
+- `measure` 自动记录开始和结束时间
+- 返回的 `Duration` 可以直接打印或比较
+- 闭包里的异常会向上传播
+
+## 核心启发
+
+**1. 用 AsyncStream 替换回调驱动的消息系统**
+
+把现有的 delegate/callback 消息系统迁移到 AsyncStream。每个消息源变成一个 AsyncSequence，消费者用 `for-await-in` 遍历。多源合并用 Merge，配对操作用 Zip。
+
+入口：`AsyncStream`、`AsyncThrowingStream`
+
+**2. 用 Debounce + Clock 替换 Timer 和 GCD 延迟**
+
+所有用 `Timer.scheduledTimer` 或 `DispatchQueue.asyncAfter` 实现的防抖、节流逻辑，都可以换成 Swift Async Algorithms 的 Debounce/Throttle。代码更简洁，生命周期自动管理。
+
+入口：`searchQuery.debounce(for: .milliseconds(300))`
+
+**3. 用 Chunk 实现消息批量处理**
+
+聊天 App、日志上传、数据分析等场景，把高频小请求攒成批量请求。Chunked 算法支持按时间窗口和按数量两种策略，比手动维护缓冲区简单得多。
+
+入口：`messages.chunked(by: .repeating(every: .seconds(1)))`
+
+**4. 选择合适的 Clock**
+
+检查项目中所有时间相关逻辑，区分"面向设备"和"面向人类"的场景。动画、超时检测用 SuspendingClock；用户等待时间、计费逻辑用 ContinuousClock。
+
+入口：`SuspendingClock()`、`ContinuousClock()`
+
+## 关联 Session
+
+- [What's new in Swift](/articles/wwdc2022-110354) — Swift 5.7 新特性总览，包含 Clock API 的引入背景
+- [Meet distributed actors in Swift](/articles/wwdc2022-110356) — 分布式 actor 与 AsyncSequence 结合构建实时系统
+- [Design protocol interfaces in Swift](/articles/wwdc2022-110353) — Swift 5.7 泛型改进，AsyncSequence 受益于 `some`/`any` 语法

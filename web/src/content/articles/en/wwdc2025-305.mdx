@@ -1,0 +1,103 @@
+---
+title: "Optimize your custom environments for visionOS"
+description: "discover how you can use procedural tools to create beautiful immersive environments for your visionos app or game. we"
+date: 2026-06-10
+tags: ["Design", "图形与游戏", "空间计算"]
+thumbnail: "/images/sessions/2025/305.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/305/"
+sessionId: "wwdc2025-305"
+year: "2025"
+relatedSessions:
+  - title: "Better together: SwiftUI and RealityKit"
+    code: "274"
+    description: "discover how to seamlessly blend swiftui and realitykit in visionos 26. we"
+  - title: "Build a SwiftUI app with the new design"
+    code: "323"
+    description: "explore the ways liquid glass transforms the look and feel of your app. discover"
+  - title: "Build a UIKit app with the new design"
+    code: "284"
+    description: "update your uikit app to take full advantage of the new design system. we"
+  - title: "Explore prompt design & safety for on-device foundation models"
+    code: "248"
+    description: "design generative ai experiences that leverage the strengths of the foundation m"
+---
+
+## Highlight
+
+> Session 用月球环境作为案例，走了一遍完整的 3D 环境优化流程。从 1 亿多面的预渲染级资产出发，通过几何优化（自适应减面、Billboard 远景替换、遮挡剔除）、UV 投影（多视角球面投影 + 屏幕空间 texel 密度分配）、纹理烘焙（球面渲染 + 表面直接投影）三个阶段，最终压到 18 万面、250MB 纹理内存、100 draw calls 以内。
+
+---
+
+## 核心内容
+
+做一个 visionOS 沉浸式环境，最大的痛点是「电影级画质」和「实时渲染预算」之间的鸿沟。月球这个 demo 场景，预渲染版本有 1 亿多个三角形，几十 GB 的 PBR 贴图，path-traced 光照——直接搬到 Vision Pro 上根本跑不动。换个角度想：用户被 Immersive Boundary（沉浸边界）限制在几米的范围内活动，那你只需要把"用户能看到的部分"渲染到位就够了，看不到的、看不清的，全部可以砍掉。
+
+Apple 这次直接把整套工具链放出来了。Alex（Apple Technical Artist）发布了 14 个 Houdini Digital Asset（HDA），全部基于程序化节点构建，可下载、可复用、可配置。Session 把月球场景当样板，走完了「几何优化 → UV 投影 → 纹理烘焙 → USD 层级」四步，最终压到 18 万三角形、250MB 纹理、单帧 100 draw call 以下。整套流程的核心思想就一句：以 Immersive Boundary 上的采样点为依据，所有优化都从"用户视角能看到什么"出发。
+
+---
+
+## 详细内容
+
+### 1. Immersive Boundary 是优化的起点（[04:39](https://developer.apple.com/videos/play/wwdc2025/305/?time=279)）
+
+Vision Pro 的全沉浸模式下，用户能在几米范围内自由移动，超出后画面渐隐。这个边界就是优化预算的依据。Boundary Camera HDA 会在场景里摆出多组虚拟相机，让你随时切换到"用户视角"看效果；Boundary Samples HDA 在边界内生成一批采样点，作为后续所有几何/UV/剔除工具的输入。
+
+**关键点：**
+- 全沉浸渲染每个像素都要跑，比 mixed immersion 贵得多，预算必须省着花。
+- 几乎所有 HDA 都接受一组 sample points 作为输入——多视角评估，避免单视角带来的瑕疵。
+- 采样点越多越精确，但计算时间也成正比，先少后多迭代。
+
+### 2. 三步几何优化：自适应减面 + Billboard + Occlusion Culling
+
+**Adaptive Reduce HDA**（[09:52](https://developer.apple.com/videos/play/wwdc2025/305/?time=592)）：基于 Houdini 原生 PolyReduce，但它会读取 Boundary Samples 的位置，按"哪个三角形对剪影贡献大"来决定保留哪些。silhouette 参数控制剪影边缘的密度权重，distance weighting 控制远处衰减。月球场景里，2200 万面的岩石用一个 HDA 就压下来了。
+
+**Vista Billboard HDA**（[12:54](https://developer.apple.com/videos/play/wwdc2025/305/?time=774)）：1 公里外的物体，深度视差几乎感知不到，直接转成 Billboard。和游戏里常见的透明片有区别，这个工具靠 ray cast 把真实顶点投到一个球面/柱面上，再重新三角化，得到的是带真实剪影的扁平几何，没有透明材质开销。月球远景从几百万面降到几千面。
+
+**Occlusion Culling HDA**（[14:48](https://developer.apple.com/videos/play/wwdc2025/305/?time=888)）：从每个采样点向四周打数百万条 ray，命中过的三角形保留，没命中的直接删除。配合 Backface Removal（dot product 判断永远背向边界的面）一起跑。月球 Backface 砍 6 万面，Occlusion 再砍 11 万面，最终从 35 万降到 18 万面。
+
+### 3. 屏幕空间 UV：spherical projection + Multi-Partition（[17:22](https://developer.apple.com/videos/play/wwdc2025/305/?time=1042)）
+
+近处（边界 5 米内）继续用 area-based UV，texel 密度按表面积均匀分配；边界外的远景换思路——按"用户屏幕里这块面占多少像素"来分配 texel。这就是 spherical projection：把一个虚拟球面套在用户头上，把环境投射到这个球上，UV 和预渲染图片用同一个投影参数。
+
+单一球面投影会出现 UV 折叠、远处贴图错位的问题。解法分两步：
+
+- **Mesh Partition HDA**：把网格切成尽可能少的小块，保证每块至少能从一个角度被完整看见。一块"主角石头"会被切成正反两半，各自分别投影。
+- **Multi-Projection HDA**：对每个 partition 找一个"它在屏幕里看起来最大"的位置作为投影源，把所有 partition 的 UV 各自做一次球面投影，最后打包到一张 atlas 里。
+
+最终整个月球环境只用两张贴图：边界内一张（surface area 缩放）、边界外一张（screen space 缩放），尺寸接近，但后者覆盖了几公里范围。
+
+### 4. 烘焙与 USD 层级（[24:20](https://developer.apple.com/videos/play/wwdc2025/305/?time=1460)）
+
+烘焙复合了两种技术：spherical render（从单视角把渲染结果投到 UV 上）+ surface projection（从源高模直接投到优化后低模 UV，类似游戏里的法线烘焙）。前者保美术意图，后者保覆盖度。最后做成 unlit material 直接用，几十 GB 的源贴图被压到几百 MB。
+
+USD 部分用两个 HDA 做空间分块：**Boundary Partition HDA** 切边界内的密集几何，**Frustum Partition HDA** 把边界外按屏幕投影面积切成大小相近的 tile。所有分块作为 GeometrySubset 写进 USD，运行时 RealityKit/Unity 就能基于 bounding box 做 Frustum Culling，把不在视锥里的 subset 直接从 GPU 卸下来。月球场景任意时刻屏幕上不到 10 万面、entity 数量低于 200 个、单帧 draw call 少于 100。
+
+---
+
+## 核心启发
+
+- **做什么：把 Immersive Boundary 当作"渲染预算的物理依据"，所有几何与贴图密度都按这个边界做衰减。**
+  - 为什么值得做：Vision Pro 全沉浸模式每个像素都要渲染，预算紧张；Boundary 给了一个明确的可量化空间，让"哪里值得花资源"变得可计算。
+  - 怎么开始：先下载 Apple 的 Immersive Optimization Toolkit（developer.apple.com/download/files/Immersive-Optimization-Toolkit.zip），用 Boundary Samples HDA 在你的场景里生成采样点，再把 Adaptive Reduce 接上去看效果。
+
+- **做什么：远景一律换 Billboard，但用真实顶点投影法保留剪影。**
+  - 为什么值得做：1 公里外人眼几乎感知不到深度差异，但传统透明 Billboard 又有 alpha 开销。Vista Billboard HDA 给的是真实几何剪影，零透明、零深度违和。
+  - 怎么开始：用 Vista Billboard HDA 处理 Terrain 节点之后的远景，距离阈值从 1 公里开始调，看 silhouette 损失能不能接受。
+
+- **做什么：UV 分两套——近处按表面积、远处按屏幕空间。**
+  - 为什么值得做：远处物体占屏幕像素少，给它们和近处一样的 texel 密度是浪费；屏幕空间分配能把整个公里级场景压进一张贴图。
+  - 怎么开始：用 Mesh Partition + Multi-Projection 两个 HDA，先把远景拆成可以被单视角看完整的小块，再做多视角球面投影，最后用 Houdini 的 Layout/Pack 打包到 atlas。
+
+- **做什么：USD 用 GeometrySubset 显式分块，让 RealityKit 做 Frustum Culling。**
+  - 为什么值得做：优化后整个场景常常只剩一个 mesh，运行时无法按可见性卸载。手动用 subset 分块后，bounding box 就成了可见性判定单元。
+  - 怎么开始：用 Boundary Partition / Frustum Partition HDA 写出 group 属性，导入 Solaris 时启用 Subset Groups 并声明分组名即可。
+
+---
+
+## 关联 Session
+
+- [Better together: SwiftUI and RealityKit](/articles/wwdc2025-274) — visionOS 26 里 SwiftUI 与 RealityKit 的混合开发新方式
+- [Build a SwiftUI app with the new design](/articles/wwdc2025-323) — Liquid Glass 设计语言对 SwiftUI 应用的影响
+- [Optimize your 3D assets for spatial computing](/articles/wwdc2024-10186) — 上一年的 3D 资产优化基础课，本 Session 是它的进阶
+- [Construct an immersive environment for visionOS](/articles/wwdc2024-10087) — visionOS 沉浸式环境的构建基础
+- [Enabling video reflections in an immersive environment](/articles/wwdc2025-237) — 在沉浸式环境里加视频反射

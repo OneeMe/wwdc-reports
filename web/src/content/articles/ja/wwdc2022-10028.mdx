@@ -1,0 +1,279 @@
+---
+title: "Create custom catalogs at scale with ShazamKit"
+description: "learn how shazamkit can help you build custom catalogs and support exact matching of any audio source within your app — all on-device. find out how you can easily generate audio signatures and build catalogs at scale through the new shazamkit cli. we'll also show you how you can quickly update your app to sync with large amounts of audio content like multiple seasons of a tv show or multiple episodes of a podcast, and we'll share updates to the shazamkit api and shmediaitems to help your apps respond precisely to key moments in audio sources using time ranges."
+date: 2026-06-10
+tags: ["WWDC 2022", "ShazamKit", "Audio & Video"]
+thumbnail: "/images/sessions/2022/10028.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10028/"
+sessionId: "wwdc2022-10028"
+year: "2022"
+relatedSessions:
+  - title: "Explore ShazamKit"
+    code: "10044"
+    description: "理解 ShazamKit 的签名、目录、匹配会话和 Shazam 音乐目录，是本场 session 的前置内容。"
+  - title: "Create custom audio experiences with ShazamKit"
+    code: "10045"
+    description: "学习 WWDC21 自定义目录匹配的基础工作流，再理解本场 session 如何把它扩展到大量音频内容。"
+  - title: "Create a great ShazamKit experience"
+    code: "10051"
+    description: "继续了解 ShazamKit 在 2023 年的匹配体验、错误处理和用户体验建议。"
+  - title: "Create a more responsive media app"
+    code: "110379"
+    description: "了解媒体 App 如何用 AVFoundation 与系统能力提升播放和交互响应。"
+---
+
+## Highlight
+
+> ShazamKit 在 WWDC 2022 增加 Shazam CLI、`SHSignatureGenerator.signatureFromAsset`、Timed MediaItem 和频率偏移范围，让开发者可以批量生成自定义目录，并把匹配结果精确同步到音频的特定时间段。
+
+## 核心内容
+
+自定义 ShazamKit 目录的基本流程并不复杂。先把音频转成签名，再把签名和媒体元数据组合成自定义目录，最后在 App 里用目录做匹配。
+
+问题出现在规模上。session 一开始给了一个很具体的例子：如果你要让 10 季电视剧都能被匹配，手工处理采样率、音频 buffer、签名生成和媒体项关联，很快会失控（[02:12](https://developer.apple.com/videos/play/wwdc2022/10028/?time=132)）。内容每更新一次，这套工作还要重来。
+
+Apple 在这场 session 里补齐了三块能力。第一，macOS 13 自带 Shazam CLI，可以从媒体文件生成签名、创建目录、更新目录、显示目录内容。第二，`SHSignatureGenerator` 可以直接从 `AVAsset` 生成签名，不再需要开发者手动拉取音频 buffer。第三，媒体项可以带时间范围和频率偏移范围，让匹配结果只在指定片段或指定变体里返回。
+
+FoodMath 示例 App 展示了结果：视频播放到题目、倒计时或答案段落时，SwiftUI UI 会跟着出现和消失。App 端没有复杂计时逻辑，主要工作被放到目录的媒体项元数据里（[04:11](https://developer.apple.com/videos/play/wwdc2022/10028/?time=251)）。
+
+## 详细内容
+
+### 1. 用 AsyncSequence 接收匹配结果（[04:26](https://developer.apple.com/videos/play/wwdc2022/10028/?time=266)）
+
+过去使用 ShazamKit 时，常见写法是通过 delegate callback 接收匹配结果。这场 session 展示了新的 `session.results`。它是一个 `AsyncSequence`，返回匹配、无匹配或错误等结果。
+
+FoodMath App 只关心匹配成功的情况，所以代码用 `for await case .match` 过滤结果。每次匹配到媒体项，就把 `SHMatch` 归约成界面需要的 `MatchResult`。
+
+```swift
+class Matcher: NSObject, ObservableObject, SHSessionDelegate {
+    @Published var matchResult: MatchResult?
+    
+    private var session: SHSession!
+    private let audioEngine = AVAudioEngine()
+    private var matchingTask: Task<Void, Never>? = nil
+    
+    func match(catalog: SHCustomCatalog) throws {
+        
+        session = SHSession(catalog: catalog)
+        session.delegate = self
+        
+        let audioFormat = AVAudioFormat(standardFormatWithSampleRate: audioEngine.inputNode.outputFormat(forBus: 0).sampleRate,
+                                        channels: 1)
+        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 2048, format: audioFormat) { [weak session] buffer, audioTime in
+            session?.matchStreamingBuffer(buffer, at: audioTime)
+        }
+        
+        try AVAudioSession.sharedInstance().setCategory(.record)
+        AVAudioSession.sharedInstance().requestRecordPermission { [weak self] success in
+            guard success, let self = self else { return }
+            
+            Task.detached {
+                try? self.audioEngine.start()
+            }
+        }
+        
+        Task { @MainActor in
+            for await case .match(let match) in session.results {
+                self.matchResult = match.matchResult
+            }
+        }
+    }
+}
+```
+
+关键点：
+
+- `SHSession(catalog: catalog)` 用自定义目录创建匹配会话。
+- `installTap` 从麦克风输入节点取得音频 buffer。
+- `matchStreamingBuffer(buffer, at: audioTime)` 把实时音频交给 ShazamKit 匹配。
+- `requestRecordPermission` 在开始录音前请求麦克风权限。
+- `for await case .match(let match) in session.results` 只处理匹配成功事件。
+- `@MainActor` 保证 `matchResult` 更新发生在主线程，方便驱动 SwiftUI。
+
+`SHMatch` 里可能包含多个媒体项。FoodMath 的做法是从这些媒体项里取标题、集数、题目和答案范围，合成一个适合 UI 使用的结果对象。
+
+```swift
+extension SHMatch {
+
+    var matchResult: MatchResult {
+        mediaItems.reduce(into: MatchResult()) { result, mediaItem in
+            result.title = result.title ?? mediaItem.title
+            result.episode = result.episode ?? mediaItem.episode
+            result.equation = result.equation ?? mediaItem.equation
+            result.answerRange = result.answerRange ?? mediaItem.answerRange
+        }
+    }
+}
+```
+
+关键点：
+
+- `mediaItems.reduce(into:)` 遍历本次匹配返回的所有媒体项。
+- `result.title = result.title ?? mediaItem.title` 保留第一个可用标题。
+- `episode`、`equation`、`answerRange` 也是同样逻辑。
+- 这段代码依赖目录里的媒体项元数据，App 端不需要自己判断当前视频播放到了哪一秒。
+
+### 2. 用 Shazam CLI 批量创建和更新目录（[05:24](https://developer.apple.com/videos/play/wwdc2022/10028/?time=324)）
+
+Shazam CLI 随 macOS 13 提供。session 展示的流程很适合内容库：先用 `signature` 命令把视频或音频转成签名，再用 CSV 描述媒体项，接着用 `create` 命令把签名和媒体项组合成目录，后续内容更新时用 `update` 追加新内容。
+
+CSV 的表头会映射到 `SHMediaItem` 属性。FoodMath 示例里，CSV 存了标题，还用自定义 JSON 字段存了题目数据（[06:33](https://developer.apple.com/videos/play/wwdc2022/10028/?time=393)）。这样 App 匹配到某个时间段后，可以直接从媒体项字段里读出要显示的题目。
+
+概念流程，基于 session 中的 CLI 工作流：
+
+```text
+# Conceptual CLI workflow from transcript, not exact command syntax
+1. Run the signature command on the media file to create a signature file.
+2. Run the custom catalog create command with the signature file and CSV metadata.
+3. Run the update command when adding a new episode or media file.
+4. Run the display command to inspect catalog contents.
+```
+
+关键点：
+
+- `signature` 命令从带音轨的媒体文件生成签名。
+- `create` 命令把签名和 CSV 里的媒体项合成自定义目录。
+- `update` 命令给已有目录追加新媒体内容。
+- `display` 命令查看目录里已经包含哪些签名和媒体项。
+- 这里表达的是 transcript 级别的工作流，不是可直接复制执行的完整 CLI 语法。
+
+CLI 解决的是重复劳动。对于电视剧、多集播客、课程视频这类内容，脚本可以遍历每一集的文件夹，自动生成签名、绑定媒体项、更新目录，并在最后显示目录内容（[08:20](https://developer.apple.com/videos/play/wwdc2022/10028/?time=500)）。
+
+### 3. 直接从 AVAsset 生成签名（[11:18](https://developer.apple.com/videos/play/wwdc2022/10028/?time=678)）
+
+目录创建的第一步是签名。以前开发者可能需要自己读取媒体里的音频轨道，再处理采样率和 buffer。session 明确说，`SHSignatureGenerator` 现在有 `signatureFromAsset` 方法，所有平台可用。
+
+这个方法接受带音轨的 `AVAsset`。如果 asset 里有多条音轨，ShazamKit 会把它们混合起来，让签名捕获完整音频内容。
+
+概念流程，基于 session transcript：
+
+```text
+# Conceptual API flow from transcript, not exact Swift syntax
+1. Create an AVAsset for a media file that contains an audio track.
+2. Ask SHSignatureGenerator to create a signature from that asset using signatureFromAsset.
+3. Combine the generated signature with media items to form a reference signature.
+4. Store the reference signature in a custom catalog.
+```
+
+关键点：
+
+- `AVAsset` 表示本地或远程媒体资源。
+- `signatureFromAsset` 是 session 中提到的新能力；这里不展开未经代码片段验证的 Swift 调用签名。
+- 返回的签名用于和媒体项组合成 reference signature，再存入自定义目录。
+- 开发者不需要手动从媒体文件拉取音频 buffer。
+
+在 App 或工具链里，这个 API 适合放在批处理步骤中。它把“把媒体变成可匹配签名”这件事收敛成一个明确入口。
+
+### 4. Timed MediaItem 把内容绑定到音频时间段（[11:51](https://developer.apple.com/videos/play/wwdc2022/10028/?time=711)）
+
+FoodMath 能精确同步 UI，核心是 Timed MediaItem API。媒体项可以带一个或多个时间范围。ShazamKit 会在时间范围开始和结束时发送匹配回调，并且回调里只包含当前范围内的媒体项。
+
+这很适合“同一段音频里有多个要展示的内容”的场景。比如一节课视频有题目、倒计时、答案和章节标题；一个歌曲有多段副歌；一个播客在不同时间点要显示不同链接。
+
+```swift
+// Restrict this media item to only describe the first 5 seconds
+
+ let mediaItem = SHMediaItem(properties: [
+            .title: "Title",
+            .timeRanges:[0.0..<5.0]
+        ])
+
+ let timeRanges: [Range<TimeInterval>] = mediaItem.timeRanges
+```
+
+关键点：
+
+- `.title` 给媒体项设置标题元数据。
+- `.timeRanges:[0.0..<5.0]` 限定这个媒体项只描述签名的前 5 秒。
+- `timeRanges` 是 Swift range 数组，一个媒体项可以绑定多个片段。
+- `mediaItem.timeRanges` 可以把时间范围读回来。
+
+session 还给了三条返回规则（[12:40](https://developer.apple.com/videos/play/wwdc2022/10028/?time=760)）。时间范围外的媒体项不会返回；时间范围内的媒体项会返回，最近事件排在前面；没有时间范围的媒体项总是最后返回，且不保证顺序。FoodMath 用没有时间范围的媒体项存整集信息，例如 episode 名称。
+
+### 5. 大目录按运行时需要组合（[15:01](https://developer.apple.com/videos/play/wwdc2022/10028/?time=901)）
+
+一个大内容库不一定要塞进一个目录。session 建议让目录保持聚焦：可以按单曲、整张专辑、单集或一组相关内容拆分，避免把整个艺术家作品集这类过大的内容放进一个目录。
+
+原因很实际。每个媒体资产单独一个目录，App 需要知道当前应该加载哪个目录。所有内容放进一个目录，匹配范围更大，但下载体积和内存占用也更高。开发者需要在运行时加载的灵活性和目录大小之间取舍。
+
+```swift
+let parentCatalog = SHCustomCatalog()
+
+parentCatalog.add(from: URL(fileURLWithPath: "/path/to/Episode1.shazamcatalog"))
+parentCatalog.add(from: URL(fileURLWithPath: "/path/to/Episode2.shazamcatalog"))
+parentCatalog.add(from: URL(fileURLWithPath: "/path/to/Episode3.shazamcatalog"))
+```
+
+关键点：
+
+- `SHCustomCatalog()` 创建一个空目录。
+- `parentCatalog.add(from:)` 从本地目录文件加载内容。
+- 多次调用 `add(from:)` 可以把多个 episode 目录组合进同一个运行时目录。
+- 这种方式让 App 根据用户正在看的课程、专辑或节目季动态决定加载范围。
+
+session 的最佳实践是：每个媒体资产创建一个完整签名，不要把一段音频切成很多小签名（[14:16](https://developer.apple.com/videos/play/wwdc2022/10028/?time=856)）。较长签名能提供更多音频峰值，匹配准确率更好，也避免 query signature 跨多个 reference signature 的问题。
+
+### 6. 用 frequencySkew 区分听起来相同的音频（[16:06](https://developer.apple.com/videos/play/wwdc2022/10028/?time=966)）
+
+有些内容听起来相同，但 App 需要给出不同体验。session 举了两个例子：每集节目都有同一段片头音乐，或者一首歌采样了另一首歌。此时可以考虑频率偏移（frequency skew）。
+
+做法是把播放音频的频率轻微升高或降低。偏移足够小时，人耳不容易察觉，但 ShazamKit 可以报告 `frequencySkew`。session 建议偏移保持在 5% 以内，既降低可感知风险，也给多个变体留出区分空间（[16:58](https://developer.apple.com/videos/play/wwdc2022/10028/?time=1018)）。
+
+```swift
+func within(range: Range<Float>, for matchedMediaItem: SHMatchedMediaItem) -> Bool {
+        
+	range.contains(matchedMediaItem.frequencySkew)
+}
+```
+
+关键点：
+
+- `SHMatchedMediaItem` 表示匹配后返回的媒体项。
+- `matchedMediaItem.frequencySkew` 是 ShazamKit 报告的频率偏移量。
+- `range.contains(...)` 判断当前匹配是否落在 App 关心的偏移区间。
+- 这个判断适合在返回媒体项后做二次过滤或调试。
+
+更直接的方式是把频率偏移范围写进媒体项。ShazamKit 只会在匹配落入范围时返回该媒体项。
+
+```swift
+// Restrict this media item to only describe the first 5 seconds
+
+ let mediaItem = SHMediaItem(properties: [
+            .title: "Frequency Skewed Audio",
+            .frequencySkewRanges:[0.01..<0.02]
+        ])
+
+ let frequencySkewRanges: [Range<Float>] = mediaItem.frequencySkewRanges
+```
+
+关键点：
+
+- `.frequencySkewRanges` 给媒体项设置可返回的频率偏移区间。
+- `0.01..<0.02` 表示 1% 到 2% 的偏移范围。
+- `frequencySkewRanges` 可以把媒体项上的偏移范围读回来。
+- 未偏移音频或范围外偏移音频，不会返回这个受限媒体项。
+
+## 核心启发
+
+- **做什么**：给课程视频做随时间出现的测验卡片。  
+  **为什么值得做**：Timed MediaItem 可以把题目、倒计时、答案解释绑定到视频片段，匹配回调会在范围开始和结束时同步触发。  
+  **怎么开始**：为每集视频创建一个完整签名；在 CSV 或代码里给每个测验媒体项设置 `.timeRanges`；App 端用 `session.results` 更新 SwiftUI 状态。
+
+- **做什么**：给播客播放器加章节资料和链接提示。  
+  **为什么值得做**：一个签名可以包含多个媒体项，每个媒体项对应播客中的一个时间段。没有时间范围的媒体项还可以存节目全局信息。  
+  **怎么开始**：用 Shazam CLI 从音频文件生成签名；用 CSV 为章节标题、链接和时间范围建媒体项；匹配后从 `SHMatch.mediaItems` 读取当前章节数据。
+
+- **做什么**：让 App 按用户已下载的剧集加载匹配目录。  
+  **为什么值得做**：目录可以按 episode 拆分，运行时再用 `SHCustomCatalog.add(from:)` 组合，减少一次性下载和内存占用。  
+  **怎么开始**：每集生成一个 `.shazamcatalog`；用户进入某一季或某个播放列表时，把相关目录加入父目录再创建 `SHSession`。
+
+- **做什么**：区分共享同一段片头音乐的不同节目集。  
+  **为什么值得做**：frequency skew 可以在音频听感变化很小的情况下，为 ShazamKit 提供可检测的差异。  
+  **怎么开始**：用原始音频创建 reference signature；为不同变体设置 `.frequencySkewRanges`；播放端把对应音频做小幅频率偏移，并保持在 session 建议的 5% 以内。
+
+## 关联 Session
+
+- [Explore ShazamKit](/articles/wwdc2021-10044) — 理解 ShazamKit 的签名、目录、匹配会话和 Shazam 音乐目录，是本场 session 的前置内容。
+- [Create custom audio experiences with ShazamKit](/articles/wwdc2021-10045) — 学习 WWDC21 自定义目录匹配的基础工作流，再理解本场 session 如何把它扩展到大量音频内容。
+- [Create a great ShazamKit experience](/articles/wwdc2023-10051) — 继续了解 ShazamKit 在 2023 年的匹配体验、错误处理和用户体验建议。
+- [Create a more responsive media app](/articles/wwdc2022-110379) — 了解媒体 App 如何用 AVFoundation 与系统能力提升播放和交互响应。

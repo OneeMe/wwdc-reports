@@ -1,0 +1,208 @@
+---
+title: "Debug Swift debugging with LLDB"
+description: "Learn how you can set up complex Swift projects for debugging. We'll take you on a deep dive into the internals of LLDB and debug info. We'll also share best practices for complex scenarios such as debugging code built on build servers or code from custom build systems."
+date: "2022-06-06"
+tags: ["Developer Tools", "Swift", "LLDB", "Debugging"]
+thumbnail: "/images/sessions/2022/110370.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110370/"
+sessionId: "wwdc2022-110370"
+year: "2022"
+relatedSessions:
+  - title: "Discover breakpoint improvements"
+    code: "10132"
+    description: "WWDC21 的 LLDB 断点改进"
+  - title: "LLDB: Beyond 'po'"
+    code: "10209"
+    description: "深入理解 LLDB 表达式求值"
+  - title: "Advanced Debugging with Xcode and LLDB"
+    code: "10412"
+    description: "Xcode 和 LLDB 高级调试技巧"
+  - title: "Symbolication: Beyond the basics"
+    code: "10068"
+    description: "符号化深入解析"
+---
+
+## Highlight
+
+> LLDB 同时具备调试器和编译器的双重身份：调试器侧依赖 debug info 和 Swift 反射元数据提供变量查看能力，编译器侧依赖 Swift module 提供表达式求值能力；当 `po` 失效而变量视图正常时，问题出在 module 导入环节。
+
+## 核心内容
+
+你正在集成一个第三方框架。这个框架由 CI 系统夜间构建，你下载了 debug 版本，却在调试时遇到了诡异的问题：断点能命中，但 `po` 命令报错，连单步跟踪都只看到汇编代码。
+
+（[02:30](https://developer.apple.com/videos/play/wwdc2022/110370/?time=150)）这就是 session 中的实际场景。演讲者 Adrian 写了一个文字冒险游戏，集成 TerminalInterface 框架后，调试器突然"失灵"。
+
+### 为什么看不到源码
+
+（[03:54](https://developer.apple.com/videos/play/wwdc2022/110370/?time=234)）编译器生成机器码时会同时生成 debug info，把代码地址映射到源文件和行号。这些 debug info 最终被打包进 .dSYM bundle。LLDB 通过 Spotlight 定位 .dSYM，所以文件放在哪里并不重要。
+
+问题在于：框架在 CI 服务器上构建，debug info 里记录的是服务器上的源文件路径 `/Volumes/BUILD_SERVER/projects/...`，而你的本地路径完全不同。
+
+（[05:48](https://developer.apple.com/videos/play/wwdc2022/110370/?time=348)）LLDB 提供了 source map 机制来解决这个问题。你可以在 Scheme 编辑器中配置项目级别的 `.lldbinit` 文件，自动重映射路径：
+
+```
+settings set target.source-map /Volumes/BUILD_SERVER/projects /Users/demo/Desktop/Adventure/3rdparty
+```
+
+配置完成后，再次运行就能看到源码了。
+
+### 为什么 `po` 报错但变量视图正常
+
+（[08:33](https://developer.apple.com/videos/play/wwdc2022/110370/?time=513)）这是更深层的问题。`po`、`p` 等命令依赖 LLDB 的表达式求值器，而表达式求值器本质上是一个完整的 Swift 编译器。它需要导入 Swift module 才能理解类型信息。
+
+（[11:12](https://developer.apple.com/videos/play/wwdc2022/110370/?time=672)）Xcode 14 开始，LLDB 的调试器侧和编译器侧有了清晰的分离：
+- 调试器侧：从 debug info 和 Swift 反射元数据获取类型，驱动变量视图和 `v` 命令
+- 编译器侧：从 Swift module 获取类型，驱动 `expr`、`p`、`po` 命令
+
+这就是变量视图能工作但 `po` 报错的原因——module 导入失败了。
+
+（[11:38](https://developer.apple.com/videos/play/wwdc2022/110370/?time=698)）Xcode 14 新增了 `swift-healthcheck` 命令，可以诊断表达式求值器的配置问题。运行后发现 LLDB 无法导入 "TerminalUI" module，这是 TerminalInterface 框架的内部实现细节。
+
+### 静态库与 Swift module
+
+（[14:53](https://developer.apple.com/videos/play/wwdc2022/110370/?time=893)）问题的根源是：框架使用了一个静态库，而静态库的 Swift module 没有被注册到 linker。动态库和可执行文件会自动完成这个注册，但静态库只是对象文件的集合，需要链接它的目标手动注册。
+
+使用 Apple linker 时，需要通过 `-add_ast_path` 选项注册 Swift module：
+
+```
+ld … -add_ast_path /path/to/My.swiftmodule
+```
+
+（[15:57](https://developer.apple.com/videos/play/wwdc2022/110370/?time=957)）验证是否注册成功：
+
+```
+dsymutil -s MyApp | grep .swiftmodule
+```
+
+（[16:08](https://developer.apple.com/videos/play/wwdc2022/110370/?time=968)）在 Linux 平台上，可以使用 `-modulewrap` 将 Swift module 转换为对象文件，然后链接进二进制：
+
+```
+swiftc -modulewrap My.swiftmodule -o My.swiftmodule.o
+```
+
+修复后的框架重新注册了这个 module，`po` 和单步跟踪都恢复了正常。
+
+## 详细内容
+
+### Source Path Remapping
+
+（[06:37](https://developer.apple.com/videos/play/wwdc2022/110370/?time=397)）当代码在远程服务器或 CI 系统上构建时，debug info 中的源文件路径与本地路径不一致。LLDB 的 `target.source-map` 设置可以重映射这些路径。
+
+在 Xcode 中配置 `.lldbinit`：
+
+1. 打开 Product > Scheme > Edit Scheme
+2. 在 Diagnostics 标签页中指定 LLDB Init File 路径
+3. 在文件中写入：
+
+```lldb
+settings set target.source-map /Volumes/BUILD_SERVER/projects /Users/demo/Desktop/Adventure/3rdparty
+```
+
+关键点：
+- `settings set target.source-map` 接受两个参数：旧路径前缀和新路径前缀
+- 配置保存在项目的 `.lldbinit` 文件中，每次调试自动生效
+- 也支持在 .dSYM bundle 的 plist 文件中配置路径映射字典
+
+（[08:13](https://developer.apple.com/videos/play/wwdc2022/110370/?time=493)）更彻底的做法是在编译时使用 `-debug-prefix-map`，将机器相关的路径前缀替换为统一的占位符：
+
+```bash
+swiftc -debug-prefix-map $PWD=/BUILDROOT ...
+```
+
+这样所有构建机都使用相同的占位路径，LLDB 中只需配置一次映射。
+
+### LLDB 表达式求值器诊断
+
+（[11:59](https://developer.apple.com/videos/play/wwdc2022/110370/?time=719)）当 `po` 或 `p` 命令失败时，运行：
+
+```lldb
+swift-healthcheck
+```
+
+这个命令会输出 Swift 表达式求值器的配置日志，帮助你定位 module 导入失败等问题。
+
+### 变量查看命令的区别
+
+（[08:32](https://developer.apple.com/videos/play/wwdc2022/110370/?time=512)）LLDB 提供了多个查看变量的命令，它们背后的机制不同：
+
+```lldb
+# 打印对象描述（调用 description/debugDescription）
+po words
+expr -O -- words
+
+# 求值表达式（编译器侧）
+p words
+expr words
+
+# 查看变量（调试器侧，不编译）
+v words
+frame variable words
+```
+
+关键点：
+- `po` 和 `p` 依赖编译器侧的表达式求值器，需要完整的 Swift module
+- `v` 直接从 debug info 读取变量值，不依赖 module 导入
+- 当 `po` 失败但 `v` 正常时，问题一定出在 module 导入环节
+
+### 静态库的 Swift module 注册
+
+（[15:47](https://developer.apple.com/videos/play/wwdc2022/110370/?time=947)）对于自定义构建系统，确保静态库的 Swift module 被正确注册：
+
+```bash
+# 链接时注册 Swift module
+ld -o MyApp main.o -add_ast_path /path/to/My.swiftmodule
+
+# 验证注册是否成功
+dsymutil -s MyApp | grep .swiftmodule
+```
+
+关键点：
+- 动态库和可执行文件的构建系统会自动注册 Swift module
+- 静态库不会经过 linker，需要链接它的目标手动注册
+- Xcode 通常会自动处理，但自定义构建规则需要注意
+
+### 避免序列化调试选项
+
+（[18:23](https://developer.apple.com/videos/play/wwdc2022/110370/?time=1103)）Swift 编译器会将 Clang header 搜索路径序列化到二进制 .swiftmodule 文件中。这在跨机器调试时会造成问题。
+
+命令行禁用：
+```bash
+swiftc -no-serialize-debugging-options ...
+```
+
+Xcode 中设置：
+```
+SWIFT_SERIALIZE_DEBUGGING_OPTIONS=NO
+```
+
+禁用后，可以在 LLDB 中手动配置搜索路径：
+```lldb
+settings set target.swift-extra-clang-flags ...
+settings set target.swift-framework-search-paths ...
+settings set target.swift-module-search-paths ...
+```
+
+## 核心启发
+
+- **做什么**：为 CI/CD 构建流程配置自动化的 debug 产物分发
+- **为什么值得做**：开发团队可以直接调试 CI 构建的产物，无需本地重新编译
+- **怎么开始**：在构建脚本中使用 `-debug-prefix-map` 统一路径，配合 `.lldbinit` 的 `target.source-map` 设置
+
+- **做什么**：构建一个 LLDB 调试辅助工具，自动检测和修复 module 导入问题
+- **为什么值得做**：`swift-healthcheck` 提供了诊断信息，可以在此基础上构建更友好的诊断界面
+- **怎么开始**：解析 `swift-healthcheck` 的输出，检测常见的 module 路径问题，自动建议修复方案
+
+- **做什么**：为第三方二进制框架提供完整的调试支持包
+- **为什么值得做**：让集成你的框架的开发者能够单步跟踪和表达式求值
+- **怎么开始**：确保静态库的 Swift module 通过 `-add_ast_path` 注册，提供 `.swiftinterface` 作为备选
+
+- **做什么**：在 Xcode 项目中配置团队共享的 `.lldbinit`
+- **为什么值得做**：统一团队的调试环境配置，避免每个人手动设置 source map
+- **怎么开始**：在 Scheme 的 Diagnostics 标签页中指定项目级别的 LLDB Init File
+
+## 关联 Session
+
+- [Discover breakpoint improvements](/articles/wwdc2021-10132) — WWDC21 的 LLDB 断点改进
+- [LLDB: Beyond 'po'](/articles/wwdc2019-10209) — 深入理解 LLDB 表达式求值
+- [Advanced Debugging with Xcode and LLDB](/articles/wwdc2018-10412) — Xcode 和 LLDB 高级调试技巧
+- [Symbolication: Beyond the basics](/articles/wwdc2021-10068) — 符号化深入解析

@@ -1,0 +1,247 @@
+---
+title: "Swift 中的 async/await"
+description: "了解 Swift 5.5 引入的 async/await 语法，学习如何编写更易读的异步代码，以及如何将现有的 completion handler 迁移到异步函数。"
+date: "2021-06-08"
+tags: ["Swift"]
+thumbnail: "/images/sessions/2021/10132.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10132/"
+sessionId: "wwdc2021-10132"
+year: "2021"
+relatedSessions:
+  - title: "探索 Swift 结构化并发"
+    code: "10134"
+    description: "Task、TaskGroup 和结构化并发的深入讲解"
+  - title: "SwiftUI 中的并发"
+    code: "10019"
+    description: "async/await 在 SwiftUI 中的具体应用"
+  - title: "Core Data 并发与 Swift"
+    code: "10017"
+    description: "Core Data 如何适配新的并发模型"
+  - title: "Swift 中的 ARC"
+    code: "10216"
+    description: "对象生命周期与并发安全"
+---
+
+# Swift 中的 async/await
+
+## Highlight
+
+> async/await 让异步代码的写法与同步代码一样直观。一个原本需要 20 行嵌套闭包的缩略图获取函数，用 async/await 只需 6 行线性代码，错误处理通过 `throws` 自然传播，不再需要层层判断 `error != nil`。
+
+## 核心内容
+
+异步编程是日常开发中绕不开的话题，但基于 completion handler 的写法有一个通病：代码随着异步步骤的增加呈指数级膨胀。一个网络请求、一次图片解码、一轮缩略图生成——三步操作嵌套下来，缩进已经深不见底，错误处理分散在各个角落，稍不留神就漏掉某个分支。
+
+Swift 5.5 引入的 async/await 从根本上改变了这一局面。核心思路很简单：用 `async` 标记异步函数，用 `await` 挂起当前执行流等待结果，编译器负责管理线程切换和状态保存。代码读起来像同步逻辑，执行起来却是非阻塞的。
+
+## 详细内容
+
+### 从 Completion Handler 到 async/await
+
+以一个获取缩略图的功能为例。传统的 completion handler 写法（03:43）：
+
+```swift
+func fetchThumbnail(for id: String, completion: @escaping (UIImage?, Error?) -> Void) {
+    let request = thumbnailURLRequest(for: id)
+    let task = URLSession.shared.dataTask(with: request) { data, response, error in
+        if let error = error {
+            completion(nil, error)
+        } else if (response as? HTTPURLResponse)?.statusCode != 200 {
+            completion(nil, FetchError.badID)
+        } else {
+            guard let image = UIImage(data: data!) else {
+                completion(nil, FetchError.badImage)
+                return
+            }
+            image.prepareThumbnail(of: CGSize(width: 40, height: 40)) { thumbnail in
+                guard let thumbnail = thumbnail else {
+                    completion(nil, FetchError.badImage)
+                    return
+                }
+                completion(thumbnail, nil)
+            }
+        }
+    }
+    task.resume()
+}
+```
+
+这段代码有 20 行，错误处理分散在三处，每个分支都要手动调用 `completion`。改用 `Result` 类型（08:00）虽然让错误处理更规范，但代码量并没有减少：
+
+```swift
+func fetchThumbnail(for id: String, completion: @escaping (Result<UIImage, Error>) -> Void) {
+    // ... 同样的嵌套结构，只是 completion(.failure(error)) 替代了 completion(nil, error)
+}
+```
+
+async/await 版本（08:30）将同样的逻辑压缩到 6 行：
+
+```swift
+func fetchThumbnail(for id: String) async throws -> UIImage {
+    let request = thumbnailURLRequest(for: id)
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw FetchError.badID }
+    let maybeImage = UIImage(data: data)
+    guard let thumbnail = await maybeImage?.thumbnail else { throw FetchError.badImage }
+    return thumbnail
+}
+```
+
+关键变化：
+- `async` 标记函数为异步，`throws` 与 `async` 自然组合
+- `await` 挂起当前执行，线程被释放去做其他工作
+- 错误通过 `throws` 向上传播，不再需要每个分支手动处理
+- 代码的执行顺序就是阅读顺序，从左到右、从上到下
+
+### 异步属性
+
+UIKit 的 `prepareThumbnail` 有同步和异步两个版本。可以为 `UIImage` 定义一个异步计算属性（13:15）：
+
+```swift
+extension UIImage {
+    var thumbnail: UIImage? {
+        get async {
+            let size = CGSize(width: 40, height: 40)
+            return await self.byPreparingThumbnail(ofSize: size)
+        }
+    }
+}
+```
+
+使用时直接 `await image.thumbnail`，与访问普通属性一样自然。
+
+### 异步序列
+
+处理批量数据时，async/await 与 `for` 循环结合形成异步序列（14:17）：
+
+```swift
+for await id in staticImageIDsURL.lines {
+    let thumbnail = await fetchThumbnail(for: id)
+    collage.add(thumbnail)
+}
+let result = await collage.draw()
+```
+
+`staticImageIDsURL.lines` 是一个 `AsyncSequence`，每次迭代 `await` 读取下一行。整个循环是顺序执行的，但每一次 `await` 都会释放线程。
+
+### 测试异步代码
+
+测试 completion handler 风格的代码需要 `XCTestExpectation`（21:22）：
+
+```swift
+func testFetchThumbnails() throws {
+    let expectation = XCTestExpectation(description: "mock thumbnails completion")
+    self.mockViewModel.fetchThumbnail(for: mockID) { result, error in
+        XCTAssertNil(error)
+        expectation.fulfill()
+    }
+    wait(for: [expectation], timeout: 5.0)
+}
+```
+
+async/await 版本（21:56）直接调用即可：
+
+```swift
+func testFetchThumbnails() async throws {
+    XCTAssertNoThrow(try await self.mockViewModel.fetchThumbnail(for: mockID))
+}
+```
+
+### 从同步代码调用异步函数
+
+SwiftUI 的 `onAppear` 是同步上下文，需要创建 `Task` 来调用异步函数（22:30）：
+
+```swift
+struct ThumbnailView: View {
+    @ObservedObject var viewModel: ViewModel
+    var post: Post
+    @State private var image: UIImage?
+
+    var body: some View {
+        Image(uiImage: self.image ?? placeholder)
+            .onAppear {
+                Task {
+                    self.image = try? await self.viewModel.fetchThumbnail(for: post.id)
+                }
+            }
+    }
+}
+```
+
+### 桥接现有 API：CheckedContinuation
+
+对于尚未提供 async 版本的第三方 API，使用 `withCheckedThrowingContinuation` 包装（26:59）：
+
+```swift
+// 现有的 completion handler API
+func getPersistentPosts(completion: @escaping ([Post], Error?) -> Void) { ... }
+
+// 包装为 async 版本
+func persistentPosts() async throws -> [Post] {
+    return try await withCheckedThrowingContinuation { continuation in
+        self.getPersistentPosts { posts, error in
+            if let error = error {
+                continuation.resume(throwing: error)
+            } else {
+                continuation.resume(returning: posts)
+            }
+        }
+    }
+}
+```
+
+对于 delegate 回调模式，将 continuation 存储为实例变量（31:44）：
+
+```swift
+class ViewController: UIViewController {
+    private var activeContinuation: CheckedContinuation<[Post], Error>?
+
+    func sharedPostsFromPeer() async throws -> [Post] {
+        try await withCheckedThrowingContinuation { continuation in
+            self.activeContinuation = continuation
+            self.peerManager.syncSharedPosts()
+        }
+    }
+}
+
+extension ViewController: PeerSyncDelegate {
+    func peerManager(_ manager: PeerManager, received posts: [Post]) {
+        self.activeContinuation?.resume(returning: posts)
+        self.activeContinuation = nil  // 防止多次调用 resume
+    }
+}
+```
+
+### SDK 中的异步 API
+
+iOS 15 SDK 为大量现有 API 提供了 async 替代版本（25:56）。例如 ClockKit 的 complication 数据源：
+
+```swift
+extension ComplicationController: CLKComplicationDataSource {
+    func currentTimelineEntry(for complication: CLKComplication) async -> CLKComplicationTimelineEntry? {
+        let date = Date()
+        let thumbnail = try? await self.viewModel.fetchThumbnail(for: post.id)
+        guard let thumbnail = thumbnail else { return nil }
+        return self.createTimelineEntry(for: thumbnail, date: date)
+    }
+}
+```
+
+## 核心启发
+
+1. **优先迁移"组装逻辑"**：先把调用多个异步操作的顶层函数改为 async/await，底层工具函数可以逐步跟进。这样改动范围最小，收益最大。
+
+2. **用 `withCheckedContinuation` 包装遗留 API**：对于第三方库或尚未更新的内部 API，用 continuation 桥接。注意在回调中立即调用 `resume`，不要在中间插入额外逻辑。
+
+3. **测试代码直接受益**：async/await 让异步测试代码与同步测试代码写法一致，不再需要 `XCTestExpectation` 和 `wait(for:timeout:)`。
+
+4. **关注 SDK 的 async 替代版本**：iOS 15 起，URLSession、Core Data、ClockKit 等都提供了 async API。迁移时优先使用原生 async 版本，而非自己包装。
+
+5. **`Task` 是同步到异步的桥梁**：在 `onAppear`、`IBAction` 等同步上下文中，用 `Task { }` 创建异步执行环境。`Task.init` 继承当前 actor 上下文，大多数情况下是正确选择。
+
+## 关联 Session
+
+- [WWDC2021 10134 - 探索 Swift 结构化并发](https://developer.apple.com/videos/play/wwdc2021/10134/) — Task、TaskGroup 和结构化并发的深入讲解
+- [WWDC2021 10019 - SwiftUI 中的并发](https://developer.apple.com/videos/play/wwdc2021/10019/) — async/await 在 SwiftUI 中的具体应用
+- [WWDC2021 10017 - Core Data 并发与 Swift](https://developer.apple.com/videos/play/wwdc2021/10017/) — Core Data 如何适配新的并发模型
+- [WWDC2021 10216 - Swift 中的 ARC](https://developer.apple.com/videos/play/wwdc2021/10216/) — 对象生命周期与并发安全

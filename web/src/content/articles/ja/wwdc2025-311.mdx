@@ -1,0 +1,182 @@
+---
+title: "Safely mix C, C++, and Swift"
+description: "learn how to mix c, c++, and swift while improving the safety of your apps. we"
+date: 2026-06-10
+tags: ["Swift"]
+thumbnail: "/images/sessions/2025/311.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/311/"
+sessionId: "wwdc2025-311"
+year: "2025"
+relatedSessions:
+  - title: "Improve memory usage and performance with Swift"
+    code: "312"
+    description: "discover ways to improve the performance and memory management of your swift cod"
+  - title: "Explore Swift and Java interoperability"
+    code: "307"
+    description: "learn how you can mix swift and java in a single codebase. we"
+  - title: "Embracing Swift concurrency"
+    code: "268"
+    description: "join us to learn the core swift concurrency concepts. concurrency helps you impr"
+  - title: "What's new in Swift"
+    code: "245"
+    description: "join us for an update on the swift language. we"
+---
+
+## Highlight
+
+> 如果你的项目里有 C/C++ 遗留代码或者依赖了第三方 C 库，那你一定对 `UnsafeMutablePointer` 不陌生。Swift 是安全的语言，但一旦跨进 C/C++ 的领地，buffer overflow 和 use-after-free 就像地雷一样埋着。
+
+---
+
+## 核心内容
+
+假设你写了一个分享宠物照片的 App，主体是 Swift，但为了做图像滤镜复用了一段老的 C/C++ 代码。Swift 调用 `invertImage(&imageData, imageSize)` 时，`&imageData` 在背后悄悄变成了 `UnsafeMutablePointer`，`imageSize` 是另一个独立参数。哪天手抖把 size 写成 `1000000000000`，编译器一声不吭，运行时直接越界写入。这类 bug 正是攻击者最喜欢的入口。
+
+Swift 6.2 给出两步解法。第一步是 Strict Memory Safety 编译模式：在 build settings 里打开后，编译器会对每一处 unsafe 调用发出警告，包括那些"看起来很 Swift"实际上偷偷构造了 unsafe pointer 的代码。第二步是给 C/C++ 的头文件加注解（`__counted_by`、`__noescape`、`__lifetimebound`、`SWIFT_NONESCAPABLE`、`SWIFT_SHARED_REFERENCE`），把原本隐式的"指针有多大、能活多久"写成显式合约。一旦合约写下，Swift 编译器就会把这些 C/C++ 函数自动桥接成接收 `Span`/`MutableSpan` 的安全签名，越界和 use-after-free 在编译期就被拦下。
+
+---
+
+## 详细内容
+
+**1. 打开 Strict Memory Safety，让隐藏的 unsafe 浮出水面**（[04:01](https://developer.apple.com/videos/play/wwdc2025/311/?time=241)）
+
+```
+// Swift
+var imageData = [UInt8](repeating: 0, count: imageDataSize)
+filterImage(&imageData, imageData.count)
+//warning: Expression uses unsafe constructs but is not marked with 'unsafe'
+```
+
+关键点：
+
+- `&imageData` 在编译时被转成 `UnsafeMutablePointer`，肉眼读 Swift 代码看不出来。
+- 打开 Strict Memory Safety 后，编译器会对这一行直接给出 warning，并附带说明触发原因。
+- 它只发警告、不阻断构建，适合当作"安全审计扫描器"逐步推进。
+
+**2. 用 `__counted_by` 把 buffer 大小绑给指针**（[09:58](https://developer.apple.com/videos/play/wwdc2025/311/?time=598)）
+
+```
+// C/C++
+void invertImage(uint8_t *__counted_by(imageSize) imagePtr __noescape, size_t imageSize);
+```
+
+关键点：
+
+- `__counted_by(imageSize)` 告诉编译器 `imagePtr` 指向的 buffer 长度等于参数 `imageSize`。
+- 加了这个注解，Swift 侧不再看到一对裸的 `pointer + size`，而是直接收一个 `MutableSpan<UInt8>`。
+- `__noescape` 声明该指针在函数返回后不会被持有，是后面 lifetime 检查的基础。
+- 注解必须同时加在声明和定义上，否则 Swift 端不会按新签名导入。
+
+**3. 调用端：从裸指针变成 Span**（[08:54](https://developer.apple.com/videos/play/wwdc2025/311/?time=534)）
+
+```
+// Swift
+var imageDataSpan = imageData.mutableSpan
+invertImage(&imageDataSpan)
+```
+
+关键点：
+
+- 不再传 `&imageData` 加 size，改传 `mutableSpan`。
+- `MutableSpan` 自带正确的 bounds 信息，写错 size 这种 bug 在类型层面就不可能发生。
+- 编译器在桥接时会自动取出 pointer 和 size 喂给底层 C 函数。
+
+**4. 用 `__noescape` 关掉 use-after-free**（[15:18](https://developer.apple.com/videos/play/wwdc2025/311/?time=918)）
+
+```
+// C++
+CxxSpanOfByte cachedView;
+void applyGrayscale(CxxSpanOfByte imageView __noescape) {
+  // Apply effect on image ...
+}
+```
+
+关键点：
+
+- C++ 的 `std::span` 没有 lifetime 信息，把它存进全局 `cachedView` 就埋下 dangling pointer。
+- `__noescape` 是函数作者向编译器立的合约：保证参数不会在返回后被持有。
+- 加了注解之后，Swift 端会把它视为 `MutableSpan`，存到外部变量会触发 `lifetime dependent value escapes its scope` 编译错误（[14:08](https://developer.apple.com/videos/play/wwdc2025/311/?time=848)）。
+
+**5. 用 `__lifetimebound` 表达"返回值依赖参数"**（[18:47](https://developer.apple.com/videos/play/wwdc2025/311/?time=1127)）
+
+```
+// C++
+CxxSpanOfByte scanImageRow(CxxSpanOfByte imageView __lifetimebound,
+                           size_t width, size_t rowIndex);
+```
+
+关键点：
+
+- 函数返回的是 `imageView` 内部某一行的视图，生命周期必须不超过 `imageView`。
+- `__lifetimebound` 把这层依赖告诉编译器，Swift 侧才能正确导入返回的 `MutableSpan`。
+- 没有这个注解时，Swift 会报 `a function with a ~Escapable result requires '@lifetime(...)'`（[18:06](https://developer.apple.com/videos/play/wwdc2025/311/?time=1086)）。
+
+**6. 自定义 C++ 类型：`SWIFT_NONESCAPABLE` 与 `SWIFT_SHARED_REFERENCE`**（[22:29](https://developer.apple.com/videos/play/wwdc2025/311/?time=1349)）
+
+```
+// C++
+struct ImageView {
+  std::span<uint8_t> pixelBytes;
+  int width;
+  int height;
+} SWIFT_NONESCAPABLE;
+
+struct ImageBuffer {
+  std::vector<uint8_t> data;
+  int width;
+  int height;
+  std::atomic<unsigned> refCount;
+} SWIFT_SHARED_REFERENCE(retain_image_buffer, release_image_buffer);
+```
+
+关键点：
+
+- `SWIFT_NONESCAPABLE` 把 view 类型导成 Swift 里的 non-escapable，禁止逃逸。
+- `SWIFT_SHARED_REFERENCE` 让带引用计数的 C++ 类型自动接入 Swift 的 ARC，retain/release 由 Swift 管。
+- 配套的 `SWIFT_RETURNS_RETAINED` / `SWIFT_RETURNS_UNRETAINED` 用来标记返回值是否已 retained，避免 +1/+0 错配（[23:57](https://developer.apple.com/videos/play/wwdc2025/311/?time=1437)）。
+
+**7. C++ 项目本身的硬化：bounds-safe buffer usage**（[28:59](https://developer.apple.com/videos/play/wwdc2025/311/?time=1739)）
+
+```
+// C++
+void fill_array_with_indices(uint8_t *buffer, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    buffer[i] = i; // error: unsafe buffer access
+  }
+}
+```
+
+关键点：
+
+- 在 build settings 把 `Enforce Bounds-Safe Buffer Usage` 设为 Yes，编译器会把裸指针下标访问标为错误。
+- 配合 `std::span` 改写后，`buffer[i]` 的访问会被运行时 bounds 检查兜底。
+- C 项目可以用 `-fbounds-safety` 扩展，对 `__counted_by` 标注的指针做编译期 + 运行时双重检查（[30:11](https://developer.apple.com/videos/play/wwdc2025/311/?time=1811)）。
+
+---
+
+## 核心启发
+
+- **做什么**：在安全敏感的 App（涉及账号、支付、用户文件）里立刻打开 Strict Memory Safety。
+  - 为什么值得做：它只发警告不阻断构建，能一次性扫出所有跨语言调用点，等于免费的安全审计基线。
+  - 怎么开始：Xcode → Build Settings → 搜索 "Strict Memory Safety" → 设为 Yes，rebuild 后按 warning 列表排优先级。
+
+- **做什么**：从 leaf functions 开始为 C/C++ 头文件加 `__counted_by` + `__noescape` 注解。
+  - 为什么值得做：leaf 函数没有下游依赖，注解错了影响面小；自下而上推进，调用端能立刻享受 Span 化收益。
+  - 怎么开始：先选一个不调用其他 C/C++ 函数的小函数（比如图像处理中的 `invert`、`grayscale`），在声明和定义同时加注解，确认 Swift 调用端能传 `MutableSpan`。
+
+- **做什么**：把项目中带引用计数的 C++ 类型迁到 `SWIFT_SHARED_REFERENCE`。
+  - 为什么值得做：手写桥接层是 use-after-free 重灾区，交给 ARC 之后 retain/release 配对由编译器保证。
+  - 怎么开始：找出现有的 `retain_xxx` / `release_xxx` 函数对，给类型加 `SWIFT_SHARED_REFERENCE(retain_xxx, release_xxx)`，再用 `SWIFT_RETURNS_RETAINED` 标注返回 +1 引用的工厂函数。
+
+- **做什么**：C++ 子项目开启 Standard Library Hardening + Enforce Bounds-Safe Buffer Usage。
+  - 为什么值得做：把"裸指针 + size"的老代码硬性逼向 `std::span`，从源头堵越界。
+  - 怎么开始：在 build settings 把 `Enforce Bounds-Safe Buffer Usage` 设为 Yes，按编译错误把 hot path 的接口逐步换成 `std::span<T>`。
+
+---
+
+## 关联 Session
+
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Span / MutableSpan 的设计动机，本文桥接的就是它
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — 同一系列的跨语言互操作，思路可对照
+- [Embracing Swift concurrency](/articles/wwdc2025-268) — 注解后的 Span 在并发场景下的生命周期含义
+- [What's new in Swift](/articles/wwdc2025-245) — Swift 6.2 整体新特性概览，包含 Strict Memory Safety 入口

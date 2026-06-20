@@ -1,0 +1,195 @@
+---
+title: "Extend your Xcode Cloud workflows"
+description: "discover how xcode cloud can adapt to your development needs. we"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10200.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10200/"
+sessionId: "wwdc2024-10200"
+year: "2024"
+relatedSessions:
+  - title: "Meet Xcode Cloud"
+    code: "10234"
+    description: "introducing xcode cloud and how to get started with continuous integration for your app"
+  - title: "Create practical workflows in Xcode Cloud"
+    code: "10201"
+    description: "learn how to create and configure workflows for real-world development scenarios"
+  - title: "Customize your advanced Xcode Cloud workflows"
+    code: "10203"
+    description: "deep dive into custom scripts and advanced workflow configuration"
+  - title: "Meet Swift OpenAPI Generator"
+    code: "10156"
+    description: "generate swift code from openapi specifications to call rest apis"
+---
+
+## Highlight
+
+> Xcode Cloud 新增手动触发条件、自定义别名和 Webhook，让工作流可以从代码推送一路自动化到生产部署。
+
+---
+
+## 核心内容
+
+很多团队的 Xcode Cloud 工作流只做一件事：推代码到 main 分支，跑测试，发 TestFlight。这在项目初期够用，但当应用开始依赖后端服务，就需要跑集成测试——而集成测试依赖测试服务器，耗时更长，还可能因为网络问题失败。你不想让这类测试在每次 push 时都跑，但又需要在服务端变更时能验证兼容性。
+
+Apple 在 Xcode 15.1 引入了手动触发条件（Manual Start Conditions），让你创建只在需要时才运行的工作流。比如专门为集成测试建一个工作流，只在服务端部署后手动触发。接着，Xcode 15.3 带来了自定义别名（Custom Aliases），你可以定义一个团队级别的 Xcode/macOS 版本别名，比如叫 "Team Preference"，所有工作流都引用这个别名。升级工具链时只改一处，所有工作流同步更新。再配合 ci_scripts 自定义脚本，在测试前检查服务器是否在线，不在线就提前终止构建。
+
+但这只解决了"什么时候跑"的问题。服务端代码变更后，还需要有人手动去触发集成测试工作流。Session 的后半部分展示了如何用 App Store Connect API 自动触发构建，再通过 Webhook 把测试结果传给部署服务，实现从代码推送到生产部署的完整自动化链路。
+
+---
+
+## 详细内容
+
+### 工作流的四个要素
+
+每个工作流由四部分组成：Environment（环境变量和 Xcode/macOS 版本）、Start Conditions（触发条件，支持分支/PR/Tag 事件、定时调度、手动触发）、Build Actions（构建、测试、分析、归档）、Post Actions（Slack 通知、TestFlight 分发等）。
+
+### 自定义脚本（ci_scripts）
+
+自定义脚本放在项目根目录的 `ci_scripts` 文件夹中，文件名决定执行时机。`ci_pre_xcodebuild.sh` 在 xcodebuild 执行前运行，适合做前置检查。脚本中可以使用工作流的环境变量，比如 `CI_XCODEBUILD_ACTION` 和 `CI_WORKFLOW_ID`（[10:02](https://developer.apple.com/videos/play/wwdc2024/10200/?time=602)）。
+
+```sh
+#!/bin/sh
+
+set -e
+
+if [[ $CI_XCODEBUILD_ACTION == "test-without-building" && $CI_WORKFLOW_ID == "82D89C93-B69C-46B5-A794-A2BCFD3EE487" ]]
+then
+    curl https://example.com/health --fail
+fi
+```
+
+关键点：
+
+- `set -e` 让脚本遇到错误立即退出，工作流也会随之停止——服务器不可达时这正是我们想要的行为
+- `$CI_XCODEBUILD_ACTION` 是 Xcode Cloud 提供的环境变量，值为 `test-without-building` 表示当前是测试动作
+- `$CI_WORKFLOW_ID` 用来限定脚本只在特定工作流中生效，避免影响其他工作流；获取方式是在 Xcode 的 Cloud reports navigator 中右键工作流选择 Copy Workflow ID
+- `curl --fail` 在 HTTP 状态码非 2xx 时返回非零退出码，触发 `set -e` 终止脚本
+
+### App Store Connect API 触发构建
+
+通过 App Store Connect API 的 `CiBuildRuns` 端点可以远程启动构建。需要三次 API 调用：先用 workflowID 查出 repositoryID，再用 repositoryID 查出目标分支的 gitReferenceID，最后用两者创建构建（[14:01](https://developer.apple.com/videos/play/wwdc2024/10200/?time=841)）。
+
+```swift
+extension Client {
+    func repoID(workflowID: String) async throws -> String {
+        return try await ciWorkflowsGetInstance(
+            path: .init(id: workflowID),
+            query: .init(include: [.repository])
+        ).ok.body.json.data.relationships!.repository!.data!.id
+    }
+
+    func branchID(repoID: String, name: String) async throws -> String {
+        return try await scmRepositoriesGitReferencesGetToManyRelated(
+            path: .init(id: repoID)
+        )
+        .ok.body.json.data
+        .filter { $0.attributes!.kind == .BRANCH && $0.attributes!.name == name }
+        .first!.id
+    }
+
+    func startBuild(workflowID: String, gitReferenceID: String) async throws {
+        _ = try await ciBuildRunsCreateInstance(
+            body: .json(.init(
+                data: .init(
+                    _type: .ciBuildRuns,
+                    relationships: .init(
+                        workflow: .init(data: .init(
+                            _type: .ciWorkflows,
+                            id: workflowID
+                        )),
+                        sourceBranchOrTag: .init(data: .init(
+                            _type: .scmGitReferences,
+                            id: gitReferenceID
+                        ))
+                    )
+                )
+            ))
+        ).created
+    }
+}
+```
+
+关键点：
+
+- `ciWorkflowsGetInstance` 查询工作流详情，`include: [.repository]` 让响应附带关联的仓库信息，从中取 `repositoryID`
+- `scmRepositoriesGitReferencesGetToManyRelated` 获取仓库所有 Git 引用，按 `kind == .BRANCH` 和 `name` 过滤找到目标分支
+- `ciBuildRunsCreateInstance` 创建构建运行，需要指定 workflow 和 sourceBranchOrTag 两个关联关系
+- API 用 OpenAPI 规范定义，可以用 Swift OpenAPI Generator 生成强类型客户端代码
+
+主函数把三步串联起来（[14:43](https://developer.apple.com/videos/play/wwdc2024/10200/?time=883)）：
+
+```swift
+static func main() async throws {
+    let client = try Client(
+        serverURL: Servers.server1(),
+        configuration: .init(dateTranscoder: .iso8601WithFractionalSeconds),
+        transport: URLSessionTransport(),
+        middlewares: [AuthMiddleware(token: ProcessInfo.processInfo.environment["TOKEN"]!)]
+    )
+
+    let workflowID = "82D89C93-B69C-46B5-A794-A2BCFD3EE487"
+    let repoID = try await client.repoID(workflowID: workflowID)
+
+    let branchName = "main"
+    let branchID = try await client.branchID(repoID: repoID, name: branchName)
+
+    try await client.startBuild(workflowID: workflowID, gitReferenceID: branchID)
+}
+```
+
+关键点：
+
+- 通过 `AuthMiddleware` 注入 API Token，Token 从环境变量 `TOKEN` 读取，避免硬编码
+- 通过 API 启动的构建被视作手动触发，因此工作流必须配置了匹配该 Git 引用的手动触发条件
+
+### Webhook 接收构建结果
+
+Webhook 让外部服务在构建事件发生时收到通知。Xcode Cloud 向你配置的 HTTP 端点发送包含构建详情的 JSON（[17:09](https://developer.apple.com/videos/play/wwdc2024/10200/?time=1029)）。
+
+```swift
+struct WebhookPayload: Content {
+    let ciWorkflow: CiWorkflow
+    let ciBuildRun: CiBuildRun
+
+    struct CiWorkflow: Content {
+        let id: String
+    }
+
+    struct CiBuildRun: Content {
+        let id: String
+        let executionProgress: String
+        let completionStatus: String
+    }
+}
+```
+
+关键点：
+
+- `executionProgress` 表示构建是进行中还是已完成（值为 `RUNNING` 或 `COMPLETE`）
+- `completionStatus` 表示构建是成功还是失败（值为 `SUCCEEDED` 或 `FAILED`）
+- 通过比较 `ciWorkflow.id` 和目标工作流 ID，可以只响应特定工作流的事件
+- 在 App Store Connect 的 Settings > Webhooks 中配置端点 URL 即可启用
+
+完整链路：服务端代码部署到测试环境后，通过 API 触发集成测试工作流 → 测试完成后 Webhook 通知部署服务 → 测试通过则自动部署到生产环境，失败则阻断部署。
+
+---
+
+## 核心启发
+
+1. **为集成测试建独立工作流**：把依赖外部服务的测试从主工作流中拆出来，用手动触发条件控制执行时机。为什么值得做：避免每次 push 都跑慢且脆弱的集成测试，节省构建时间，减少因网络抖动导致的误报。怎么开始：复制现有工作流，删除自动触发条件，改为 Manual Start，切换 Test Action 指向集成测试的 Test Plan。
+
+2. **用自定义别名统一工具链版本**：定义 "Team Preference" 之类的 Xcode 和 macOS 别名，所有工作流引用这个别名。为什么值得做：升级 Xcode 版本时只改一处，不会出现某个工作流忘改导致的不一致构建。怎么开始：在 Xcode 的 Manage Custom Aliases 中创建别名，然后逐个更新工作流的 Environment 配置。
+
+3. **用 ci_scripts 做前置健康检查**：在 `ci_pre_xcodebuild.sh` 中 curl 依赖服务的健康检查端点，不可达就提前终止。为什么值得做：服务器挂了还要跑完整测试纯属浪费构建时间，提前失败更快暴露问题。怎么开始：在项目根目录创建 `ci_scripts/ci_pre_xcodebuild.sh`，用 `CI_WORKFLOW_ID` 限定只在特定工作流生效，加上 `set -e` 和 `curl --fail`。
+
+4. **用 API + Webhook 打通上下游自动化**：服务端部署后通过 App Store Connect API 触发客户端集成测试，测试结果通过 Webhook 回传给部署服务决定是否发布。为什么值得做：消除人工衔接环节，客户端和服务端的发布流程自动闭环。怎么开始：用 Swift OpenAPI Generator 生成 API 客户端，写一个三步脚本（查 repo → 查 branch → 启动构建），再用 Vapor 搭一个 Webhook 监听服务。
+
+---
+
+## 关联 Session
+
+- [Create practical workflows in Xcode Cloud](/articles/wwdc2024-10201) — 用实际场景演示如何创建和配置 Xcode Cloud 工作流
+- [Customize your advanced Xcode Cloud workflows](/articles/wwdc2024-10203) — 深入讲解自定义脚本和高级工作流配置
+- [Meet Swift OpenAPI Generator](/articles/wwdc2024-10156) — 从 OpenAPI 规范生成 Swift 代码，Session 中 API 客户端的生成工具
+- [Meet Xcode Cloud](/articles/wwdc2024-10234) — Xcode Cloud 入门介绍，了解基本概念和快速上手

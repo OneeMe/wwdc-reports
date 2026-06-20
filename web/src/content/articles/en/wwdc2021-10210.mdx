@@ -1,0 +1,408 @@
+---
+title: "Explore advanced project configuration in Xcode"
+description: "working with more complex xcode projects? you've come to the right place. discover how you can configure your project to build for multiple apple platforms, filter content per-platform, create custom build rules and file dependencies, and more. we'll take you through multi-platform framework targets, detail how to optimize your project and scheme configuration, and show you how to make effective use of configuration settings files. we'll explore configuring schemes for parallel builds and implicit dependencies, script phases, custom build rules, setting up input and output file dependencies, build phase file lists, and deduplicating work via aggregate targets. lastly, find out more about the build settings editor, how levels work, and configuration settings file syntax."
+date: "2021-06-06"
+tags: ["Developer Tools", "Xcode"]
+thumbnail: "/images/sessions/2021/10210.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10210/"
+sessionId: "wwdc2021-10210"
+year: "2021"
+relatedSessions:
+  - title: "Meet Xcode Cloud"
+    code: "10267"
+    description: "介绍 Apple 的持续集成和持续交付服务，用来构建、测试和分发 App。"
+  - title: "Explore Xcode Cloud workflows"
+    code: "10268"
+    description: "讲解如何用 Xcode Cloud workflows 自动执行构建、分析、测试、归档和分发。"
+  - title: "Customize your advanced Xcode Cloud workflows"
+    code: "10269"
+    description: "讲解 Xcode Cloud 与源码管理、脚本和 Apple Developer 服务的高级集成。"
+  - title: "Detect bugs early with the static analyzer"
+    code: "10202"
+    description: "介绍 Xcode 静态分析器如何在运行前发现无限循环、未使用代码等问题。"
+  - title: "Diagnose unreliable code with test repetitions"
+    code: "10296"
+    description: "介绍 Xcode 测试重复运行功能，用来定位不稳定测试和偶发失败。"
+---
+
+## Highlight
+
+> Xcode 13 增加多平台 framework target、构建规则、脚本输入输出依赖、xcfilelist 和 xcconfig 语法能力，让复杂项目能用更少 target 管理跨平台构建并减少重复工作。
+
+## 核心内容
+
+一个跨平台 App 做久了，项目文件会变得难维护。
+
+Fruta 这个示例项目同时构建 macOS、iOS 和 watchOS。它有三个 framework target，每个平台一个。它们包含同一组共享代码，差别只在一个 macOS 专用文件。
+
+这种结构的问题很直接。每改一次 build setting，要同步三个 target。每加一个源文件，要确认三个 Compile Sources build phase 都加上。遗漏一次，某个平台就会在构建时失败。
+
+Xcode 13 给出的第一步，是把多个平台的 framework 合成一个多平台 framework target。开发者把 Supported Platforms 设为 Any Platform，Xcode 会自动开启 Allow Multiplatform Builds。这个 target 会按需要为每个支持的平台构建一次。
+
+平台差异仍然能保留。Fruta 的 `Ingredient+macOS.swift` 只该参与 macOS 构建，所以在 Compile Sources 里给这个文件设置 platform filter，只勾选 macOS。
+
+项目变大后，构建速度也会出问题。以前很多团队会把自定义脚本塞进 Run Script phase。脚本一次处理所有文件，Xcode 很难知道哪些输入影响哪些输出，也很难并行执行。
+
+这场 session 的第二个重点，是把能拆开的工作移到 build rule。每个 `.recipe` 文件独立生成一个 `.compiledrecipe` 文件。构建系统可以按输入文件拆分任务，并根据依赖关系调度。
+
+剩下不能拆分的工作，继续放在 script phase。比如把多个说明文件合并成一个归档文件。关键是声明 input file list 和 output file。Xcode 知道脚本读哪些文件、写哪个文件，才能保证顺序正确，并避免保守串行。
+
+最后一个问题来自 build settings。复杂项目常见的做法，是在 Xcode UI 里点很多配置。时间久了，谁覆盖了谁很难查。Xcode 的 Levels 视图能显示默认值、project xcconfig、project 设置、target xcconfig、target 设置和最终解析值。`.xcconfig` 文件则把配置放进文本文件，方便复用、审查和组合。
+
+## 详细内容
+
+### 多平台 framework target
+
+（[01:10](https://developer.apple.com/videos/play/wwdc2021/10210/?time=70)）Xcode 13 支持多平台框架目标（multiplatform framework target）。Fruta 原来有 macOS、iOS、watchOS 三个 framework target。演讲中把 macOS framework target 的 Supported Platforms 改成 Any Platform，Xcode 自动把 Allow Multiplatform Builds 设为 Yes。
+
+```text
+Supported Platforms = Any Platform
+Allow Multiplatform Builds = Yes
+```
+
+关键点：
+
+- `Supported Platforms = Any Platform`：让同一个 framework target 支持多个 Apple 平台。
+- `Allow Multiplatform Builds = Yes`：通知构建系统按需要为每个支持平台构建这个 target。
+- 这个设置减少了重复的 build phases 和 build settings。
+
+（[03:06](https://developer.apple.com/videos/play/wwdc2021/10210/?time=186)）平台专用源码通过 platform filter 处理。Fruta 的 `Ingredient+macOS.swift` 只在 macOS 构建中编译。
+
+```text
+Compile Sources:
+  Ingredient+macOS.swift
+    Filters: macOS
+```
+
+关键点：
+
+- `Compile Sources`：控制哪些源文件参与当前 target 的编译。
+- `Ingredient+macOS.swift`：示例里的 macOS 专用文件。
+- `Filters: macOS`：只让该文件进入 macOS 构建。
+
+### Scheme 构建顺序和隐式依赖
+
+（[04:59](https://developer.apple.com/videos/play/wwdc2021/10210/?time=299)）Xcode 的 scheme build options 里，Apple 建议使用 Dependency Order。它会按依赖图并行构建 target。Manual Order 已废弃，演讲中明确说它会拖慢构建，还可能在 scheme 顺序和项目依赖不一致时产生 cycle errors。
+
+```text
+Scheme > Edit Scheme > Build:
+  Build Order = Dependency Order
+  Find Implicit Dependencies = On
+```
+
+关键点：
+
+- `Build Order = Dependency Order`：让 Xcode 按依赖图安排构建顺序。
+- `Find Implicit Dependencies = On`：让 Xcode 根据 linker flags 和 linked libraries 自动推断 target 依赖。
+- 这个组合适合跨 project 的依赖场景，因为有些依赖无法直接添加 explicit target dependency。
+
+### 用 build rule 并行处理独立输入文件
+
+（[06:29](https://developer.apple.com/videos/play/wwdc2021/10210/?time=389)）Fruta 的 Process Recipes 脚本原来按顺序处理多个 recipe 文件。每个 recipe 的计算彼此独立，所以演讲把它移到 build rule。
+
+```text
+File Pattern: *.recipe
+Output Files:
+$(DERIVED_FILE_DIR)/$(INPUT_FILE_BASE).compiledrecipe
+```
+
+关键点：
+
+- `File Pattern: *.recipe`：匹配要由该 rule 处理的输入文件。
+- `$(DERIVED_FILE_DIR)`：Apple 建议把生成文件写到构建系统管理的目录。
+- `$(INPUT_FILE_BASE)`：取当前输入文件的基础名称。
+- `.compiledrecipe`：每个输入文件对应一个输出文件。
+
+（[08:22](https://developer.apple.com/videos/play/wwdc2021/10210/?time=502)）build rule 的脚本每次处理一个输入文件。演讲中的脚本把当前输入路径和第一个输出路径传给外部脚本。
+
+```bash
+"$SRCROOT/Scripts/gen-code.sh" "$SCRIPT_INPUT_FILE" "$SCRIPT_OUTPUT_FILE_0"
+```
+
+关键点：
+
+- `"$SRCROOT/Scripts/gen-code.sh"`：调用项目里的外部脚本，脚本内容留在项目文件外，便于源码管理。
+- `"$SCRIPT_INPUT_FILE"`：当前 rule 正在处理的输入文件绝对路径。
+- `"$SCRIPT_OUTPUT_FILE_0"`：Output Files 表里第一个输出路径。
+- 双引号：处理路径中的空格和特殊字符。
+
+（[08:45](https://developer.apple.com/videos/play/wwdc2021/10210/?time=525)）build rule 默认会对每个架构运行一次。演讲举例说，Mac App target 如果有 arm64 和 x86_64，再乘以四个输入，就会执行八次。Fruta 的输出和 CPU 架构无关，所以取消 Run once per architecture。
+
+```text
+Build Rule:
+  Run once per architecture = Off
+```
+
+关键点：
+
+- `Run once per architecture = Off`：避免同一份架构无关输出被重复生成。
+- 适用场景：生成文本、资源索引、配置文件这类和 CPU 架构无关的产物。
+- 如果输出是 object code 这类架构相关产物，应保留默认行为。
+
+### 给 script phase 声明输入和输出
+
+（[10:15](https://developer.apple.com/videos/play/wwdc2021/10210/?time=615)）有些工作需要一次读取所有输入。Fruta 把多个说明文件合并成一个文件，这类工作适合继续放在 script phase。
+
+```bash
+# Package up the recipes.
+
+echo "packaging..."
+
+for i in $(seq 0 $(expr ${SCRIPT_INPUT_FILE_LIST_COUNT} - 1)) ; do
+    infile_="SCRIPT_INPUT_FILE_LIST_$i"
+    eval infile=\$$infile_
+
+    while IFS= read -r file; do
+        cat "$file" >> "$SCRIPT_OUTPUT_FILE_0"
+    done < "$infile"
+done
+```
+
+关键点：
+
+- `SCRIPT_INPUT_FILE_LIST_COUNT`：输入文件列表的数量。
+- `SCRIPT_INPUT_FILE_LIST_$i`：按索引取第 i 个输入文件列表变量名。
+- `eval infile=\$$infile_`：把变量名解析成真实文件列表路径。
+- `while IFS= read -r file`：逐行读取 xcfilelist 里的文件路径。
+- `cat "$file" >> "$SCRIPT_OUTPUT_FILE_0"`：把每个输入文件内容追加到第一个输出文件。
+
+（[11:34](https://developer.apple.com/videos/play/wwdc2021/10210/?time=694)）输入文件很多时，用 build phase file list（`.xcfilelist`）管理。它每行一个路径，也支持以 `#` 开头的注释。
+
+```text
+$(SRCROOT)/Recipes/Instructions/berry-blue.md
+$(SRCROOT)/Recipes/Instructions/carrot-chops.md
+$(SRCROOT)/Recipes/Instructions/hulking-lemonade.md
+$(SRCROOT)/Recipes/Instructions/kiwi-cutie.md
+$(SRCROOT)/Recipes/Instructions/lemonberry.md
+$(SRCROOT)/Recipes/Instructions/love-you-berry-much.md
+$(SRCROOT)/Recipes/Instructions/mango-jambo.md
+$(SRCROOT)/Recipes/Instructions/one-in-a-melon.md
+$(SRCROOT)/Recipes/Instructions/papas-papaya.md
+$(SRCROOT)/Recipes/Instructions/pina-y-coco.md
+```
+
+关键点：
+
+- `$(SRCROOT)`：项目源码根目录。
+- 每一行：一个 script phase 输入文件。
+- `.xcfilelist`：把大量输入从项目文件移到文本文件，减少 project file 冲突。
+
+（[11:57](https://developer.apple.com/videos/play/wwdc2021/10210/?time=717)）script phase 需要引用这个文件列表，并声明输出路径。
+
+```text
+Input File Lists:
+$(SRCROOT)/FileList.xcfilelist
+
+Output Files:
+$(PROJECT_TEMP_DIR)/instructions.mdarchive
+```
+
+关键点：
+
+- `Input File Lists`：告诉 Xcode 脚本会读取哪些输入列表。
+- `$(SRCROOT)/FileList.xcfilelist`：演讲中的文件列表路径。
+- `Output Files`：告诉 Xcode 脚本会写出哪些文件。
+- `$(PROJECT_TEMP_DIR)/instructions.mdarchive`：合并后的输出文件路径。
+
+（[12:50](https://developer.apple.com/videos/play/wwdc2021/10210/?time=770)）script phase 和 build rule 会收到一组环境变量。脚本应通过这些变量读取 Xcode 解析后的输入输出路径。
+
+```text
+SCRIPT_INPUT_FILE_COUNT
+SCRIPT_INPUT_FILE_n
+SCRIPT_INPUT_FILE_LIST_COUNT
+SCRIPT_INPUT_FILE_LIST_n
+SCRIPT_OUTPUT_FILE_COUNT
+SCRIPT_OUTPUT_FILE_n
+SCRIPT_OUTPUT_FILE_LIST_COUNT
+SCRIPT_OUTPUT_FILE_LIST_n
+```
+
+关键点：
+
+- `SCRIPT_INPUT_FILE_COUNT`：Input Files 表中的路径数量。
+- `SCRIPT_INPUT_FILE_n`：第 n 个输入文件的绝对路径，n 从 0 开始。
+- `SCRIPT_INPUT_FILE_LIST_n`：第 n 个已解析的输入文件列表路径。
+- `SCRIPT_OUTPUT_FILE_n`：第 n 个输出文件的绝对路径。
+- `SCRIPT_OUTPUT_FILE_LIST_n`：第 n 个已解析的输出文件列表路径。
+
+### 用 aggregate target 避免重复工作
+
+（[13:15](https://developer.apple.com/videos/play/wwdc2021/10210/?time=795)）多平台 target 会为多个平台构建。Fruta 的 SmoothieKit 会为 iOS 和 watchOS 各构建一次，原来的 script phase 在两个构建里尝试写同一个输出路径。Xcode 要求整个构建中只有一个 task 可以产生某个给定路径的输出，所以构建失败。
+
+```text
+Aggregate target: Resources
+  Run Script: package recipes
+
+SmoothieKit target:
+  Target Dependencies: Resources
+```
+
+关键点：
+
+- `Aggregate target: Resources`：承载与具体平台无关的脚本工作。
+- `Run Script: package recipes`：把原 framework target 里的脚本、输入和输出移到 aggregate target。
+- `Target Dependencies: Resources`：让 SmoothieKit 依赖这个 aggregate target。
+- 结果：脚本只执行一次，iOS 和 watchOS 变体都能按正确顺序构建。
+
+### build settings 的层级和 xcconfig 语法
+
+（[16:46](https://developer.apple.com/videos/play/wwdc2021/10210/?time=1006)）Build Settings 的 Levels 视图展示多个配置层级。演讲给出的顺序包括 SDK 默认值、project level configuration settings file、project level settings、target configuration settings file、target level settings，以及最终 resolved value。
+
+```text
+Default value
+Project-level .xcconfig
+Project-level settings
+Target-level .xcconfig
+Target-level settings
+Resolved value
+```
+
+关键点：
+
+- `Default value`：当前 SDK 提供的默认值。
+- `Project-level .xcconfig`：项目级配置文件值。
+- `Project-level settings`：项目文件里的项目级设置。
+- `Target-level .xcconfig`：目标级配置文件值。
+- `Target-level settings`：项目文件里的目标级设置。
+- `Resolved value`：Xcode 解析后的最终值。
+
+（[18:17](https://developer.apple.com/videos/play/wwdc2021/10210/?time=1097)）`.xcconfig` 的基本形式是名称、赋值操作符和值。
+
+```xcconfig
+MY_BUILD_SETTING_NAME = "A build setting value"
+```
+
+关键点：
+
+- `MY_BUILD_SETTING_NAME`：build setting 名称。
+- `=`：赋值操作符。
+- `"A build setting value"`：设置值。
+
+（[18:30](https://developer.apple.com/videos/play/wwdc2021/10210/?time=1110)）`.xcconfig` 支持条件语法。演讲列出 configuration、architecture 和 SDK 条件，SDK 条件支持通配符匹配。
+
+```xcconfig
+MY_BUILD_SETTING_NAME = "A build setting value"
+MY_BUILD_SETTING_NAME[config=Debug] = -debug_flag
+MY_BUILD_SETTING_NAME[arch=arm64] = -arm64_only
+MY_BUILD_SETTING_NAME[sdk=iphone*] = -ios_only
+```
+
+关键点：
+
+- 第一行：默认值。
+- `[config=Debug]`：只在 Debug 配置生效。
+- `[arch=arm64]`：只在 arm64 架构生效。
+- `[sdk=iphone*]`：匹配 iPhone SDK，`*` 用于通配。
+
+（[19:50](https://developer.apple.com/videos/play/wwdc2021/10210/?time=1190)）build setting 可以组合其他 build setting。求值从内向外发生。
+
+```xcconfig
+IS_BUILD_SETTING_ENABLED = NO
+MY_BUILD_SETTING_NO = -use_this_one
+MY_BUILD_SETTING_YES = -use_this_instead
+MY_BUILD_SETTING = $(MY_BUILD_SETTING_$(IS_BUILD_SETTING_ENABLED))
+```
+
+关键点：
+
+- `IS_BUILD_SETTING_ENABLED = NO`：控制设置值。
+- `MY_BUILD_SETTING_NO`：控制值为 `NO` 时使用的实际设置。
+- `MY_BUILD_SETTING_YES`：控制值为 `YES` 时使用的实际设置。
+- `$(MY_BUILD_SETTING_$(IS_BUILD_SETTING_ENABLED))`：先求出内部的 `NO`，再解析 `MY_BUILD_SETTING_NO`。
+
+（[21:08](https://developer.apple.com/videos/play/wwdc2021/10210/?time=1268)）build setting 求值还支持路径操作符。
+
+```xcconfig
+$(MY_PATH:dir)
+$(MY_PATH:file)
+$(MY_PATH:base)
+$(MY_PATH:suffix)
+$(MY_PATH:standardizepath)
+```
+
+关键点：
+
+- `:dir`：取得目录。
+- `:file`：取得文件名。
+- `:base`：取得不含扩展名的基础名称。
+- `:suffix`：取得扩展名。
+- `:standardizepath`：标准化路径。
+
+（[21:21](https://developer.apple.com/videos/play/wwdc2021/10210/?time=1281)）每个路径操作符都有对应的替换形式，另有 default 操作符给空值提供默认值。
+
+```xcconfig
+$(MY_PATH:dir=/tmp)
+$(MY_PATH:file=/better.swift)
+$(MY_PATH:base=another)
+$(MY_PATH:suffix=m)
+$(MY_PATH:default=YES)
+```
+
+关键点：
+
+- `:dir=/tmp`：替换目录部分。
+- `:file=/better.swift`：替换文件名部分。
+- `:base=another`：替换基础名称。
+- `:suffix=m`：替换扩展名。
+- `:default=YES`：原值为空时使用 `YES`。
+
+（[21:36](https://developer.apple.com/videos/play/wwdc2021/10210/?time=1296)）`.xcconfig` 可以 include 其他文件。required include 要求文件存在，找不到会产生编译错误。optional include 只在文件存在时加载。
+
+```xcconfig
+#include "common.xcconfig"
+#include? "ci.xcconfig"
+```
+
+关键点：
+
+- `#include "common.xcconfig"`：必需包含，文件缺失会失败。
+- `#include? "ci.xcconfig"`：可选包含，文件不存在也不会失败。
+- 路径相对于 Xcode project file 的位置解析。
+
+（[22:20](https://developer.apple.com/videos/play/wwdc2021/10210/?time=1340)）演讲给了一个 CI 场景。开发机希望 Swift 编译器更快警告耗时表达式，CI 机器较慢，所以把阈值调高。做法是 common.xcconfig 可选包含 ci.xcconfig，再用 default 操作符设置默认值。
+
+```xcconfig
+// common.xcconfig
+#include? "ci.xcconfig"
+OTHER_SWIFT_FLAGS = $(inherited) -Xfrontend -warn-long-expression-type-checking=$(MAX_EXPRESSION_TIME:default=200)
+
+// ci.xcconfig
+MAX_EXPRESSION_TIME = 500
+```
+
+关键点：
+
+- `#include? "ci.xcconfig"`：只在 CI 机器上加载覆盖文件。
+- `OTHER_SWIFT_FLAGS = $(inherited) ...`：保留已有 Swift 编译参数，再追加新参数。
+- `$(MAX_EXPRESSION_TIME:default=200)`：本地没有设置时使用 200。
+- `MAX_EXPRESSION_TIME = 500`：CI 机器通过单独文件覆盖默认值。
+
+## 核心启发
+
+1. **做什么**：把 iOS、macOS、watchOS 的共享 framework 合并成一个多平台 target。
+   **为什么值得做**：Xcode 13 的 multiplatform framework target 能统一 build phases 和 build settings，减少同步错误。
+   **怎么开始**：选择现有 framework target，把 Supported Platforms 设为 Any Platform，再用 platform filter 处理平台专用文件。
+
+2. **做什么**：把资源代码生成脚本从 Run Script phase 拆成 build rule。
+   **为什么值得做**：每个输入文件独立生成输出时，build rule 可以让 Xcode 并行调度，并基于输入输出依赖判断是否重跑。
+   **怎么开始**：在 Build Rules 中添加 `*.recipe` 这类文件模式，输出写到 `$(DERIVED_FILE_DIR)`，脚本读取 `SCRIPT_INPUT_FILE` 并写入 `SCRIPT_OUTPUT_FILE_0`。
+
+3. **做什么**：给所有自定义脚本补齐 input file list 和 output files。
+   **为什么值得做**：Xcode 知道脚本读写哪些文件后，可以安排正确顺序，并减少保守串行。
+   **怎么开始**：创建 `.xcfilelist`，在 Run Script phase 的 Input File Lists 引用它，并在 Output Files 写入脚本产物路径。
+
+4. **做什么**：把平台无关的打包脚本移到 aggregate target。
+   **为什么值得做**：多平台 target 会为多个平台构建，同一个输出路径只能由一个 task 产生。aggregate target 可以让共享工作只执行一次。
+   **怎么开始**：创建 Resources 这类 aggregate target，把脚本、输入、输出迁过去，再让 framework target 添加 Target Dependency。
+
+5. **做什么**：用 `.xcconfig` 管理 Debug、本地和 CI 的编译参数。
+   **为什么值得做**：配置进入文本文件后，可以复用、审查和按环境组合。
+   **怎么开始**：把公共设置放进 `common.xcconfig`，用 `#include? "ci.xcconfig"` 加载 CI 覆盖值，用 `$(MAX_EXPRESSION_TIME:default=200)` 提供本地默认值。
+
+## 关联 Session
+
+- [Meet Xcode Cloud](/articles/wwdc2021-10267) — 了解 Xcode Cloud 如何把构建、测试和分发接入 Apple 的 CI/CD 服务。
+- [Explore Xcode Cloud workflows](/articles/wwdc2021-10268) — 学习用 workflow 自动执行分析、测试、归档和分发。
+- [Customize your advanced Xcode Cloud workflows](/articles/wwdc2021-10269) — 深入定制 Xcode Cloud 的脚本、源码管理和服务集成。
+- [Detect bugs early with the static analyzer](/articles/wwdc2021-10202) — 使用 Xcode 静态分析器在运行前发现代码问题。
+- [Diagnose unreliable code with test repetitions](/articles/wwdc2021-10296) — 用测试重复运行定位偶发失败和不稳定代码。

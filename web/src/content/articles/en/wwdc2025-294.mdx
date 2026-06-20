@@ -1,0 +1,330 @@
+---
+title: "What’s new in Metal rendering for immersive apps"
+description: "discover the latest improvements in metal rendering for immersive apps with compositor services. learn how to add hover effects to highlight your app"
+date: 2026-06-10
+tags: ["图形与游戏", "空间计算"]
+thumbnail: "/images/sessions/2025/294.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/294/"
+sessionId: "wwdc2025-294"
+year: "2025"
+relatedSessions:
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Set the scene with SwiftUI in visionOS"
+    code: "208"
+    description: "take your visionos app to the next level with new swiftui scene capabilities"
+  - title: "What's new in SwiftUI"
+    code: "256"
+    description: "explore the latest improvements to swiftui across apple platforms"
+---
+
+## Highlight
+
+> Compositor Services 今年把 `queryDrawable` 升级为 `queryDrawables`，并在此之上叠加了 hover effects、动态渲染质量、渐进式沉浸门户和 Mac 直接渲染到 Vision Pro 这四项新能力。
+
+---
+
+## 核心内容
+
+去年的 Vision Pro Metal immersive app，只能写出"全沉浸"或"混合沉浸"两种模式。一旦渲染成本上来，开发者就被卡死：场景越复杂，画面越糊，用户也无法在中途调节沉浸感。再加上交互全靠手动管理 hit-test，复杂场景里维护几十个可点击对象痛苦不堪。
+
+Apple 工程师 Ricardo 在这个 session 里把 Compositor Services 的 render loop 整体改了一遍。新的 `queryDrawables` 返回 drawable 数组——平时一个，用 Reality Composer Pro 录制高质量视频时会拿到两个（`.builtIn` 用于显示，`.capture` 用于录制）。这套新 API 是所有新功能的入口：hover effects 让系统自动高亮用户注视的对象；dynamic render quality 让你按场景类型在运行时调整分辨率；progressive immersion 让用户用 Digital Crown 控制沉浸度，门户外的像素直接不渲染；最重磅的是 macOS spatial rendering——Mac 直接把 Metal 内容流送到 Vision Pro，让重型 3D 渲染摆脱 Vision Pro 的功耗限制。
+
+---
+
+## 详细内容
+
+**1. 新的 render loop：从 `queryDrawable` 到 `queryDrawables`（[02:33](https://developer.apple.com/videos/play/wwdc2025/294/?time=153)）**
+
+```swift
+// Scene render loop
+
+extension Renderer {
+    func renderFrame(with scene: MyScene) {
+        guard let frame = layerRenderer.queryNextFrame() else { return }
+
+        frame.startUpdate()
+        scene.performFrameIndependentUpdates()
+        frame.endUpdate()
+
+        let drawables = frame.queryDrawables()
+        guard !drawables.isEmpty else { return }
+
+        guard let timing = frame.predictTiming() else { return }
+        LayerRenderer.Clock().wait(until: timing.optimalInputTime)
+        frame.startSubmission()
+        scene.render(to: drawable)
+        frame.endSubmission()
+    }
+}
+```
+
+关键点：
+- `queryDrawables()` 替换原来的单个 `queryDrawable()`，返回数组。
+- 数组通常只有一个元素，录制 RCP 高质量视频时会有两个（`.builtIn` + `.capture`），用 `target` 属性区分。
+- 必须先迁移到这个 API，后面所有新功能才能用。
+
+**2. Hover effects：layer 配置（[05:54](https://developer.apple.com/videos/play/wwdc2025/294/?time=354)）**
+
+```swift
+// Layer configuration
+
+struct MyConfiguration: CompositorLayerConfiguration {
+    func makeConfiguration(capabilities: LayerRenderer.Capabilities,
+                           configuration: inout LayerRenderer.Configuration) {
+        // Configure other aspects of LayerRenderer
+
+        let trackingAreasFormat: MTLPixelFormat = .r8Uint
+        if capabilities.supportedTrackingAreasFormats.contains(trackingAreasFormat) {
+            configuration.trackingAreasFormat = trackingAreasFormat
+        }
+    }
+}
+```
+
+关键点：
+- tracking areas texture 用 8-bit 格式（`.r8Uint`），最多支持 255 个并发交互对象。
+- 必须先用 `capabilities.supportedTrackingAreasFormats` 校验格式，再写入 configuration。
+
+**3. 给可交互对象注册 tracking area（[07:54](https://developer.apple.com/videos/play/wwdc2025/294/?time=474)）**
+
+```swift
+// Object render function
+
+extension MyObject {
+    func render(drawable: Drawable, renderEncoder: MTLRenderCommandEncoder) {
+        var renderValue: LayerRenderer.Drawable.TrackingArea.RenderValue? = nil
+        if self.isInteractive {
+            let trackingArea = drawable.addTrackingArea(identifier: self.identifier)
+            if self.usesHoverEffect {
+                trackingArea.addHoverEffect(.automatic)
+            }
+            renderValue = trackingArea.renderValue
+        }
+		self.draw(with: commandEncoder, trackingAreaRenderValue: renderValue)
+    }
+}
+```
+
+关键点：
+- `drawable.addTrackingArea(identifier:)` 注册一个唯一 ID 的 tracking area。
+- ID 必须与对象生命周期绑定，不要每帧重生成。
+- `.automatic` 让系统在用户注视该对象时自动叠加高亮。
+- 不可交互的对象传 `nil` render value 即可。
+
+**4. 把 render value 写到 fragment shader（[08:26](https://developer.apple.com/videos/play/wwdc2025/294/?time=506)）**
+
+```metal
+// Metal fragment shader
+
+struct FragmentOut
+{
+    float4 color [[color(0)]];
+    uint16_t trackingAreaRenderValue [[color(1)]];
+};
+
+fragment FragmentOut fragmentShader( /* ... */ )
+{
+    // ...
+
+    return FragmentOut {
+        float4(outColor, 1.0),
+        uniforms.trackingAreaRenderValue
+    };
+}
+```
+
+关键点：
+- color attachment 0 写颜色，color attachment 1 写 tracking area render value。
+- 用 MSAA 时，tracking areas texture 不能走常规 multisample resolve（会平均成无效值）；需要自定义 tile resolver，取采样窗口里出现最多的 render value。
+
+**5. 用 tracking area ID 处理 spatial event（[10:09](https://developer.apple.com/videos/play/wwdc2025/294/?time=609)）**
+
+```swift
+// Event processing
+
+extension Renderer {
+    func processEvent(_ event: SpatialEventCollection.Event) {
+       let object = scene.objects.first {
+           $0.identifier == event.trackingAreaIdentifier
+       }
+       if let object {
+           object.performAction()
+       }
+   }
+}
+```
+
+关键点：
+- spatial event 现在带 `trackingAreaIdentifier`（可空）。
+- 直接用 ID 反查对象，比以前的手工 hit-test 简洁很多。
+
+**6. Dynamic Render Quality：声明常量（[13:08](https://developer.apple.com/videos/play/wwdc2025/294/?time=788)）**
+
+```swift
+// Quality constants
+
+extension MyScene {
+    struct Constants {
+        static let menuRenderQuality: LayerRenderer.RenderQuality = .init(0.8)
+        static let worldRenderQuality: LayerRenderer.RenderQuality = .init(0.6)
+        static var maxRenderQuality: LayerRenderer.RenderQuality { menuRenderQuality }
+    }
+}
+```
+
+关键点：
+- 文本/UI 用 `.8`，复杂 3D 用 `.6`。
+- `maxRenderQuality` 决定 foveated texture 的最大尺寸，设得越高内存越吃。
+- 设置时先检查 `configuration.isFoveationEnabled`——dynamic quality 只在 foveated rendering 开启时才生效。
+- 调整运行时 `layerRenderer.renderQuality` 时系统会做平滑过渡，不是瞬切。
+
+**7. Progressive Immersion：layer 配置（[17:12](https://developer.apple.com/videos/play/wwdc2025/294/?time=1032)）**
+
+```swift
+// Layer configuration
+
+struct MyConfiguration: CompositorLayerConfiguration {
+    func makeConfiguration(capabilities: LayerRenderer.Capabilities,
+                           configuration: inout LayerRenderer.Configuration) {
+        // Configure other aspects of LayerRenderer
+        
+        if configuration.layout == .layered {
+            let stencilFormat: MTLPixelFormat = .stencil8 
+            if capabilities.drawableRenderContextSupportedStencilFormats.contains(
+                stencilFormat
+            ) {
+                configuration.drawableRenderContextStencilFormat = stencilFormat 
+            }
+            configuration.drawableRenderContextRasterSampleCount = 1
+        }
+    }
+}
+```
+
+关键点：
+- progressive 仅支持 `.layered` 布局。
+- stencil 用 `.stencil8`，sample count 设 1（不用 MSAA 时）。
+- 用 stencil 当 portal mask，门户外的像素直接跳过渲染。
+
+**8. Render context 与 portal mask（[17:40](https://developer.apple.com/videos/play/wwdc2025/294/?time=1060)）**
+
+```swift
+// Render loop
+
+struct Renderer {
+    let portalStencilValue: UInt8 = 200 // Value not used in other stencil operations
+
+    func renderFrame(with scene: MyScene,
+                     drawable: LayerRenderer.Drawable,
+                     commandBuffer: MTLCommandBuffer) {
+        let drawableRenderContext = drawable.addRenderContext(commandBuffer: commandBuffer)
+        let renderEncoder = configureRenderPass(commandBuffer: commandBuffer)
+        drawableRenderContext.drawMaskOnStencilAttachment(commandEncoder: renderEncoder,
+                                                          value: portalStencilValue)
+        renderEncoder.setStencilReferenceValue(UInt32(portalStencilValue))
+        
+        scene.render(to: drawable, renderEncoder: renderEncoder)
+
+        drawableRenderContext.endEncoding(commandEncoder: commandEncoder)
+        drawable.encodePresent(commandBuffer: commandBuffer)
+    }
+}
+```
+
+关键点：
+- `drawable.addRenderContext(commandBuffer:)` 给当前 command buffer 拿一个 render context。
+- `drawMaskOnStencilAttachment` 把门户形状写进 stencil；reference value 选一个其他地方没用的 stencil 值（这里用 200）。
+- 必须用 `drawableRenderContext.endEncoding`，不能直接 `commandEncoder.endEncoding`——边缘的淡出效果由系统在最后一步自动加上。
+
+**9. Mac → Vision Pro：app 结构（[20:55](https://developer.apple.com/videos/play/wwdc2025/294/?time=1255)）**
+
+```swift
+// App structure
+
+@main
+struct MyImmersiveMacApp: App {
+    @State var immersionStyle: ImmersionStyle = .full
+
+    var body: some Scene {
+        WindowGroup {
+            MyAppContent()
+        }
+
+        RemoteImmersiveSpace(id: "MyRemoteImmersiveSpace") {
+            MyCompositorContent()
+        }
+        .immersionStyle(selection: $immersionStyle, in: .full, .progressive)
+   }
+}
+```
+
+关键点：
+- 新场景类型 `RemoteImmersiveSpace` 让 Mac app 把 immersive 内容送到 Vision Pro。
+- Mac 上只支持 `.full` 和 `.progressive` 两种风格。
+
+**10. 把 ARKit session 接到 Vision Pro（[21:35](https://developer.apple.com/videos/play/wwdc2025/294/?time=1295)）**
+
+```swift
+// Compositor content and ARKit session
+
+struct MyCompositorContent: CompositorContent {
+    @Environment(\.remoteDeviceIdentifier) private var remoteDeviceIdentifier
+
+    var body: some CompositorContent {
+        CompositorLayer(configuration: MyConfiguration()) { @MainActor layerRenderer in
+            guard let remoteDeviceIdentifier else { return }
+            let arSession = ARKitSession(device: remoteDeviceIdentifier)
+            Renderer.startRenderLoop(layerRenderer, arSession)
+        }
+    }
+}
+```
+
+关键点：
+- `\.remoteDeviceIdentifier` 是 SwiftUI 环境变量，Mac 上拿到后传给 `ARKitSession(device:)`。
+- macOS 现在支持 ARKit 和 `WorldTrackingProvider`，可以查询 Vision Pro 的位姿。
+- 输入支持键盘鼠标、Game Controller，也能用 `onSpatialEvent` modifier 处理 pinch。
+- 用 `\.supportsRemoteScenes` 环境变量检测 Mac 是否支持，再决定是否调用 `openImmersiveSpace`。
+- C/C++ 渲染引擎可用 `cp_` 前缀的 C API；ARKit 提供 `cDevice` 属性把 `remoteDeviceIdentifier` 转成 `ar_device_t`。
+
+---
+
+## 核心启发
+
+- **做什么**：把现有 Vision Pro Metal app 迁移到 `queryDrawables`。
+  - 为什么值得做：所有新功能（hover、dynamic quality、progressive、Mac 远渲）都依赖这个新 API；早一天迁移早一天解锁。
+  - 怎么开始：在 render loop 里把 `queryDrawable` 替换成 `queryDrawables`，遍历数组渲染；用 `target` 属性区分 `.builtIn` 与 `.capture`。
+
+- **做什么**：给可交互对象加 hover effects，替换手写 hit-test。
+  - 为什么值得做：用户能看到自己注视的对象被高亮，pinch 命中率提升；事件处理改用 `trackingAreaIdentifier` 反查，代码量大幅下降。
+  - 怎么开始：layer 配置 `.r8Uint` tracking areas format → 渲染时 `drawable.addTrackingArea(identifier:)` 注册 → fragment shader 在 color attachment 1 输出 render value → spatial event 用 `trackingAreaIdentifier` 路由到对象。
+
+- **做什么**：按场景类型分层设置 render quality。
+  - 为什么值得做：菜单/UI 的文字清晰度直接受益，复杂 3D 场景又能控制功耗，避免帧率掉到 90fps 以下。
+  - 怎么开始：定义 menu 用 `.8`、world 用 `.6`；`maxRenderQuality` 设到实际用的最大值（不是 1.0），切场景时调用 `layerRenderer.renderQuality = ...`。
+
+- **做什么**：给重型 3D 工具（建模、CAD、医疗影像）加一个 `RemoteImmersiveSpace`。
+  - 为什么值得做：把渲染压力放回 Mac，能跑比 Vision Pro 原生 app 复杂得多的场景；现有 Mac app 几乎只需新增一个 scene，不必重写。
+  - 怎么开始：在 SwiftUI App 里加 `RemoteImmersiveSpace`，UI 端用 `\.supportsRemoteScenes` 判断能力；`CompositorContent` 里通过 `\.remoteDeviceIdentifier` 启动 `ARKitSession`，渲染逻辑沿用 visionOS 那套。
+
+- **做什么**：为想"少一点动晕"的玩家提供 progressive immersion 选项。
+  - 为什么值得做：用户用 Digital Crown 自调沉浸度，复杂运动场景里更舒服；门户外像素不渲染，等于免费拿到一笔性能预算。
+  - 怎么开始：`.immersionStyle(selection:, in: .progressive, .full)` → layer 配 `.stencil8` + `.layered` → 渲染时 `addRenderContext` + `drawMaskOnStencilAttachment`，记得用 `drawableRenderContext.endEncoding`。
+
+---
+
+## 关联 Session
+
+- [Discover Metal 4](/articles/wwdc2025-205) — Metal 4 新特性总览，迁移 immersive app 时同步看。
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — 把 ML 推理融进图形管线，适合配合 dynamic quality 做自适应渲染。
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — SceneKit 项目迁移路径，替代方案的另一条线。
+- [Set the scene with SwiftUI in visionOS](/articles/wwdc2025-208) — `RemoteImmersiveSpace` 等新 scene 类型的更全面介绍。
+- [What's new in SwiftUI](/articles/wwdc2025-256) — 在 AppKit/UIKit 老 Mac app 里嵌 SwiftUI scene 的方法。

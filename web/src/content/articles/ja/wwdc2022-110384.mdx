@@ -1,0 +1,194 @@
+---
+title: "Support multiple users in tvOS apps"
+description: "Discover how you can create personalized, individual experiences in your tvOS app. We'll show you how you can offer a single checkbox to store profile data, game save states, and more, providing each person with the same level of data separation they'd have on a personal device like iPhone. We'll also explore how the new user-independent keychain can help you maintain your existing sign on experience for multiple people in the same household."
+date: "2022-06-06"
+tags: ["tvOS", "App Services", "User Management"]
+thumbnail: "/images/sessions/2022/110384.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110384/"
+sessionId: "wwdc2022-110384"
+year: "2022"
+relatedSessions:
+  - title: "Simplify sign-in for your tvOS apps"
+    code: "10229"
+    description: "tvOS 15 引入的 iPhone 辅助登录功能"
+  - title: "Meet Passkeys"
+    code: "110385"
+    description: "Passkey 无密码认证技术"
+  - title: "Support multiple users in tvOS apps"
+    code: "10230"
+    description: "WWDC20 多用户支持基础介绍"
+---
+
+## Highlight
+
+> tvOS 16 通过 "Runs as Current User" entitlement 和 `kSecUseUserIndependentKeychain` 让 Apple TV 上的 App 既能像 iPhone 一样按用户隔离数据，又能让全家人共享一次登录凭证，切换用户时自动加载各自的 profile。
+
+## 核心内容
+
+### Apple TV 的多用户难题
+
+Apple TV 是客厅里的共享设备，一家人都用它看视频、玩游戏。但每个人的喜好不一样——爸爸爱看纪录片，妈妈追韩剧，孩子只看动画片。流媒体 App 通常用 profile 解决这个问题，每个人有自己的观看记录和推荐。
+
+在 iPhone 上这很简单：App 把 profile 选择存在 `UserDefaults` 里，下次打开自动加载。但 Apple TV 是共享设备，如果不做特殊处理，切换家庭成员时 App 不知道换了人，还会显示上一个人的 profile。
+
+tvOS 14 引入了 "Runs as Current User" entitlement，让 App 以当前系统用户身份运行，自动隔离数据。但这里有个矛盾：媒体 App 希望全家人共享一个账号（只付一份钱），但每个人都有自己的 profile。如果每个用户有独立的 Keychain，那每个人都要重新登录。
+
+tvOS 16 的解决方案是：用户独立的数据（profile 选择、观看记录）存到各自隔离的 `UserDefaults`，共享的登录凭证存到用户无关 Keychain。
+
+### 两种数据，两种存储策略
+
+**用户相关数据**：profile 选择、游戏进度、个人设置。启用 "Runs as Current User" 后，这些数据自动按用户隔离。iOS 上的代码不需要修改，直接拿到 tvOS 上就能工作。
+
+**用户无关数据**：登录凭证、家庭共享的订阅信息。用新的 `kSecUseUserIndependentKeychain` 标志存储，所有用户都能访问。
+
+### 切换用户的完整流程
+
+1. 长按 Siri Remote 的 TV 按钮打开控制中心
+2. 选择另一个家庭成员（tvOS 16 会自动显示 iCloud Family 成员，即使还没添加到 Apple TV）
+3. 系统显示切换提示，给当前 App 时间保存状态
+4. App 被重新启动，以新用户身份运行
+5. 从用户无关 Keychain 读取共享的登录凭证，跳过登录界面
+6. 从新用户的 `UserDefaults` 读取 profile 选择，自动加载对应内容
+
+第一次使用时，新用户需要选择一次 profile。之后每次切换都直接进内容，不需要任何额外操作。
+
+### 不再需要手动维护用户映射
+tvOS 16 废弃了 `TVUserManager` 中手动映射系统用户到 App profile 的方法。系统现在自动处理这层映射，开发者只需要写 iOS 风格的代码。
+
+## 详细内容
+
+### 启用 Runs as Current User
+
+（[08:22](https://developer.apple.com/videos/play/wwdc2022/110384/?time=502)）
+
+在 Xcode 中：
+
+1. 选中 tvOS target
+2. 打开 Signing & Capabilities 标签
+3. 点击 + Capability
+4. 搜索并添加 "User Management"
+5. 勾选 "Runs as Current User"
+
+不需要写任何代码。添加 entitlement 后，App 的进程会自动以当前选中的系统用户身份启动。`UserDefaults`、`Keychain`（默认）、iCloud 容器等都会按用户隔离。
+
+### 存储共享登录凭证
+
+（[05:25](https://developer.apple.com/videos/play/wwdc2022/110384/?time=325)）
+
+```swift
+func save(username: String, password: String) {
+    guard let passwordData = password.data(using: .utf8) else {
+        return
+    }
+
+    let attributes: [CFString: AnyObject] = [
+        kSecAttrService: "MyApp" as AnyObject,
+        kSecClass: kSecClassGenericPassword,
+        kSecAttrAccount: username,
+        kSecValueData: passwordData,
+        kSecUseUserIndependentKeychain: kCFBooleanTrue
+    ]
+
+    let status = SecItemAdd(attributes as CFDictionary, nil)
+    if status == errSecSuccess {
+        self.credentials = (username, password)
+    }
+}
+```
+
+**关键点：**
+- `kSecUseUserIndependentKeychain` 设为 `kCFBooleanTrue` 表示存入用户无关 Keychain
+- 所有用户都能读取和写入这个 Keychain 项
+- 其他属性（`kSecAttrService`、`kSecAttrAccount` 等）的用法不变
+- 查询时也要加上 `kSecUseUserIndependentKeychain: kCFBooleanTrue` 才能找到
+
+### 读取共享凭证
+
+```swift
+func loadCredentials() -> (username: String, password: String)? {
+    let query: [CFString: AnyObject] = [
+        kSecAttrService: "MyApp" as AnyObject,
+        kSecClass: kSecClassGenericPassword,
+        kSecReturnAttributes: kCFBooleanTrue,
+        kSecReturnData: kCFBooleanTrue,
+        kSecMatchLimit: kSecMatchLimitOne,
+        kSecUseUserIndependentKeychain: kCFBooleanTrue
+    ]
+
+    var result: AnyObject?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+    guard status == errSecSuccess,
+          let item = result as? [String: AnyObject],
+          let username = item[kSecAttrAccount as String] as? String,
+          let passwordData = item[kSecValueData as String] as? Data,
+          let password = String(data: passwordData, encoding: .utf8) else {
+        return nil
+    }
+
+    return (username, password)
+}
+```
+
+### 存储和读取用户 profile 选择
+
+```swift
+class ProfileData {
+    private let selectedProfileKey = "SelectedProfile"
+
+    func saveSelectedProfile(_ profileId: String) {
+        // 自动保存到当前用户的 UserDefaults
+        UserDefaults.standard.set(profileId, forKey: selectedProfileKey)
+    }
+
+    func loadSelectedProfile() -> String? {
+        return UserDefaults.standard.string(forKey: selectedProfileKey)
+    }
+}
+```
+
+**关键点：**
+- 代码和 iOS 上完全一样
+- 启用 "Runs as Current User" 后，系统自动把 `UserDefaults` 隔离到当前用户
+- 每个家庭成员有自己的 `UserDefaults` 沙盒
+- `TVUserManager` 的手动映射方法已废弃，不再需要
+
+### 应用类型决策表
+
+| 应用类型 | 推荐方案 |
+|---------|---------|
+| 媒体/流媒体（有 profile） | Runs as Current User + 用户无关 Keychain |
+| 游戏（个人进度） | 仅 Runs as Current User |
+| 通用内容（食谱、天气等） | 不需要任何改动 |
+
+## 核心启发
+
+**1. 为流媒体 App 构建无缝的多用户切换体验**
+
+- **做什么**：让 Apple TV 上的视频 App 记住每个家庭成员的 profile，切换用户时自动加载
+- **为什么值得做**：tvOS 16 只需要加一个 entitlement 和一个 Keychain 标志，就能实现 iPhone 级别的个性化体验
+- **怎么开始**：在 Xcode 中添加 User Management capability，启用 "Runs as Current User"；登录时用 `kSecUseUserIndependentKeychain` 存凭证；profile 选择存 `UserDefaults`
+
+**2. 为家庭健身 App 设计个人训练档案**
+
+- **做什么**：健身 App 在 Apple TV 上支持多个家庭成员，每个人都有自己的训练计划和进度
+- **为什么值得做**：健身数据天然需要按用户隔离，"Runs as Current User" 让游戏化进度、成就、排行榜都能独立计算
+- **怎么开始**：启用 entitlement 后，训练记录和成就存 `UserDefaults` 或 CloudKit（自动按用户隔离）；家庭订阅信息存用户无关 Keychain
+
+**3. 为教育 App 构建家长控制的多儿童模式**
+
+- **做什么**：儿童教育 App 在 Apple TV 上支持多个孩子，各自有学习进度和内容过滤设置
+- **为什么值得做**：每个孩子的年龄不同，适合的内容和难度也不同。系统级用户隔离让家长不需要在 App 内手动切换孩子账号
+- **怎么开始**：用 `UserDefaults` 存每个孩子的年龄、学习进度、内容偏好；家长控制密码存用户无关 Keychain 防止孩子绕过
+
+**4. 为游戏 App 实现家庭共享存档**
+
+- **做什么**：单机游戏在 Apple TV 上让每个家庭成员有自己的存档和进度
+- **为什么值得做**：只需要启用 "Runs as Current User"，不需要任何额外代码。Game Center、iCloud 存档、本地存档都自动隔离
+- **怎么开始**：添加 User Management capability，勾选 "Runs as Current User"。如果游戏有家庭共享订阅，用用户无关 Keychain 存订阅状态
+
+## 关联 Session
+
+- [Simplify sign-in for your tvOS apps](/articles/wwdc2022-10229) — tvOS 15 引入的 iPhone 辅助登录，让电视端登录像扫码一样简单
+- [Meet Passkeys](/articles/wwdc2022-110385) — 无密码认证技术，tvOS 16 已支持，替代传统密码登录
+- [Support multiple users in tvOS apps](/articles/wwdc2022-10230) — WWDC20 的基础介绍，了解 Runs as Current User 的底层机制
