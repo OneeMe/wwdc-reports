@@ -1,55 +1,181 @@
 ---
 title: "Optimize live streams with HLS Playlist Delta Updates"
-description: "discover playlist delta updates, an hls feature that optimizes the delivery of live streams with large playback windows and lots of metadata. we"
-date: 2026-06-10
-tags: ["WWDC 2020"]
+description: "discover playlist delta updates, an hls feature that optimizes the delivery of live streams with large playback windows and lots of metadata. we'll show you how playlist delta updates can reduce overheard when producing live streams, provide higher-quality variants for people with slower connections, and integrate advertising."
+date: 2020-06-10
+tags: ["WWDC 2020", "HLS", "Audio & Video", "Streaming"]
 thumbnail: "/images/sessions/2020/10230.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10230/"
 sessionId: "wwdc2020-10230"
 year: "2020"
 relatedSessions:
+  - title: "What's new in Low-Latency HLS"
+    code: "10228"
+    description: "了解 Low-Latency HLS 如何用 partial segment、blocking reload 和 preload hint 把直播延迟压到两秒以内。"
   - title: "Adapt ad insertion to Low-Latency HLS"
     code: "10232"
-    description: "find out how to integrate advertising into your low-latency hls streams through "
-  - title: "Author fragmented MPEG-4 content with AVAssetWriter"
-    code: "10011"
-    description: "transform your audio and video content into fragmented mpeg-4 files for a faster"
-  - title: "Build Metal-based Core Image kernels with Xcode"
-    code: "10021"
-    description: "learn how to integrate and load core image kernels written in the metal shading "
+    description: "继续看带广告的低延迟直播如何处理 DATERANGE metadata、服务端插入和跟踪事件。"
+  - title: "Improve stream authoring with HLS Tools"
+    code: "10225"
+    description: "学习用 Apple HLS Tools 检查 playlist、variant、segment 和 authoring 输出。"
   - title: "Deliver a better HLS audio experience"
     code: "10158"
-    description: "discover techniques for streaming high-quality audio to bandwidth-limited networ"
+    description: "从音频 codec、SCORE 和 playlist authoring 角度改善 HLS 音频体验。"
+  - title: "Author fragmented MPEG-4 content with AVAssetWriter"
+    code: "10011"
+    description: "学习如何用 AVAssetWriter 输出 HLS 所需的 fragmented MPEG-4 segment。"
 ---
 
 ## Highlight
 
-> 深入了解 Optimize live streams with HLS Playlist Delta Updates 的技术细节和最佳实践。
-
----
+> Apple 为 HLS 直播 playlist 提供 Delta Updates 与 2020 年新增的 DATERANGE 跳过能力，让客户端在重载大 DVR 窗口时只下载最近变化，减少 playlist 带宽并提升播放稳定性。
 
 ## 核心内容
 
-这场 Session 聚焦于 Low-Latency HLS 的一个关键优化机制：Playlist Delta Updates。在传统 HLS 中，每次客户端请求 playlist 时，服务器都会返回完整的 playlist 文件。对于直播流来说，playlist 每隔几秒就更新一次，大量客户端同时请求完整的 playlist 会给 CDN 带来不小的带宽压力——尤其是 Low-Latency HLS 的 playlist 更新频率更高（每秒级别）。
+直播播放器有一个很朴素的动作：反复请求 media playlist，确认有没有新 segment。窗口很小时，这件事成本不高。窗口变成一场长赛事、一个大 DVR 回看区，playlist 会越来越长；即使用 gzip，每次把完整文件重新拉一遍，也会消耗时间和带宽。
 
-Delta Updates 的思路很简单：客户端第一次请求时获取完整 playlist，后续请求只需要告诉服务器"我上次看到的 playlist 是什么状态"，服务器就只返回变化的部分。这通过 `#EXT-X-DATERANGE` 和 `_HLS_skip` 参数实现——客户端在请求 playlist 时带上 `_HLS_skip=YES` 参数，服务器会跳过已删除的 segment 条目，只保留新增的 partial segment。
+这个成本会反过来影响播放质量。网络差时，playlist reload 本身占掉吞吐，播放器可能切到更低码率的 variant。用户实际感受到的是画质下降、追直播变慢、广告或事件 metadata 跟不上。
 
-演讲者通过多个 playlist 示例展示了 Delta Updates 的工作流程，并详细讲解了服务端如何生成 Delta Playlist、客户端如何合并 Delta 和本地缓存的 playlist。Session 还讨论了 CDN 缓存策略——Delta Playlist 需要和完整 Playlist 分别缓存。
+Playlist Delta Updates 解决的是重载方式。客户端先拿一次完整 playlist，后续请求带上 HLS skip delivery directive。服务器返回一个 delta playlist，只包含新变化和一个 `#EXT-X-SKIP` 标签。客户端把 delta 和本地旧 playlist 合并，得到服务器上的当前完整 playlist。
 
+WWDC20 的新增点落在 `#EXT-X-DATERANGE`。很多直播会把广告、事件、章节或计时信息写进 DATERANGE；segment 可以跳过，metadata 仍然很大。2020 年的扩展让服务器声明 `CAN-SKIP-DATERANGES=YES`，客户端用 `_HLS_skip=v2` 请求，delta 里再用 `RECENTLY-REMOVED-DATERANGES` 告诉客户端哪些旧 DATERANGE 已被删除。
 
-### 最佳实践
+## 详细内容
 
-- `CAN-SKIP-UNTIL` 建议设为 target duration 的 3 倍（如 6 秒 target duration 则设 18 秒），在带宽节省和客户端恢复能力之间取得平衡
-- CDN 必须根据请求中的 `_HLS_skip` 参数区分缓存完整 playlist 和 Delta playlist
-- 监控 Delta Playlist 的平均大小，对比完整 Playlist，量化带宽节省效果
-- 客户端长时间暂停后恢复播放时，应请求完整 playlist 而非 Delta playlist，避免合并失败
-- 确保服务端的 Delta 生成逻辑是确定性的——同一时刻的相同请求应返回相同的 Delta
+### 1. 先让服务器声明可以跳过旧 segment
 
----
+（[01:11](https://developer.apple.com/videos/play/wwdc2020/10230/?time=71)）Delta Updates 是可选能力。服务器必须在 `#EXT-X-SERVER-CONTROL` 里声明 `CAN-SKIP-UNTIL`。这个值是 skip limit，表示 playlist 中多老的内容可以被 delta update 跳过。session 明确说它至少是六个 target duration。
 
-## 相关 Session
+```m3u8
+#EXTM3U
+#EXT-X-VERSION:9
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36.0
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:6.0,
+segment0.ts
+#EXTINF:6.0,
+segment1.ts
+#EXTINF:6.0,
+segment2.ts
+```
 
-- [Adapt ad insertion to Low-Latency HLS](/articles/wwdc2020-10232) — find out how to integrate advertising into your low-latency hls streams through 
-- [Author fragmented MPEG-4 content with AVAssetWriter](/articles/wwdc2020-10011) — transform your audio and video content into fragmented mpeg-4 files for a faster
-- [Build Metal-based Core Image kernels with Xcode](/articles/wwdc2020-10021) — learn how to integrate and load core image kernels written in the metal shading 
-- [Deliver a better HLS audio experience](/articles/wwdc2020-10158) — discover techniques for streaming high-quality audio to bandwidth-limited networ
+关键点：
+
+- `#EXT-X-VERSION:9` 表示 playlist 使用了 Delta Updates，旧客户端不能把 delta 当成普通 playlist 解析。
+- `#EXT-X-TARGETDURATION:6` 给出每个 segment 的目标时长。
+- `CAN-SKIP-UNTIL=36.0` 对应六个 target duration，满足 session 给出的最低要求。
+- `#EXT-X-MEDIA-SEQUENCE:0` 是客户端后续判断哪些 segment 已经从窗口移出的基准。
+- 客户端至少要先下载一次完整 playlist，再开始请求 delta。
+
+### 2. 客户端用 `_HLS_skip=YES` 请求 delta playlist
+
+（[01:35](https://developer.apple.com/videos/play/wwdc2020/10230/?time=95)、[03:31](https://developer.apple.com/videos/play/wwdc2020/10230/?time=211)）客户端下一次重载时，在 playlist URL 上加入 HLS skip delivery directive。服务器返回带 `#EXT-X-SKIP` 的 delta playlist，不再重复发送完整 playlist。
+
+```text
+GET /live/stream.m3u8?_HLS_skip=YES
+```
+
+```m3u8
+#EXTM3U
+#EXT-X-VERSION:9
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:1
+#EXT-X-SKIP:SKIPPED-SEGMENTS=19
+#EXTINF:6.0,
+segment20.ts
+#EXTINF:6.0,
+segment21.ts
+```
+
+关键点：
+
+- `_HLS_skip=YES` 是客户端请求 delta update 的 delivery directive。
+- `#EXT-X-MEDIA-SEQUENCE:1` 告诉客户端，完整 playlist 里的 segment 0 已经移出窗口。
+- `#EXT-X-SKIP:SKIPPED-SEGMENTS=19` 代替一批客户端已经见过的 segment URL 行，以及附着在这些行上的媒体 segment 标签。
+- `segment20.ts` 和 `segment21.ts` 是 skip limit 之后仍需要返回的最近内容。
+- 客户端拿本地旧 playlist 删除已滚出窗口的条目，再补上 delta 中的新条目，重建当前 playlist。
+
+### 3. 用 `CAN-SKIP-DATERANGES` 处理大量 metadata
+
+（[04:12](https://developer.apple.com/videos/play/wwdc2020/10230/?time=252)、[04:38](https://developer.apple.com/videos/play/wwdc2020/10230/?time=278)）2019 年的 Delta Updates 对 segment 很有效。问题是长直播经常还有很多 `#EXT-X-DATERANGE`。WWDC20 的扩展允许服务器声明自己也能跳过 DATERANGE，客户端用 `v2` 形式请求。
+
+```m3u8
+#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36.0,CAN-SKIP-DATERANGES=YES
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-DATERANGE:ID="ad-1",START-DATE="2020-06-22T10:00:00Z"
+#EXTINF:6.0,
+segment0.ts
+```
+
+```text
+GET /live/stream.m3u8?_HLS_skip=v2
+```
+
+关键点：
+
+- `#EXT-X-VERSION:10` 表示这个 playlist 使用了 DATERANGE skipping。
+- `CAN-SKIP-DATERANGES=YES` 是服务器对客户端的能力声明。
+- `_HLS_skip=v2` 是客户端请求跳过 DATERANGE 的新形式。
+- DATERANGE 可以出现在 playlist 的任意位置，session 示例把它们放在底部只是作者选择。
+- 服务器会跳过早于 skip limit 加入的 DATERANGE，避免 metadata 把 delta 再次撑大。
+
+### 4. 用 `RECENTLY-REMOVED-DATERANGES` 同步删除事件
+
+（[05:02](https://developer.apple.com/videos/play/wwdc2020/10230/?time=302)、[06:02](https://developer.apple.com/videos/play/wwdc2020/10230/?time=362)）DATERANGE 不只会新增，也会被作者从 playlist 删除。v2 delta 通过 `RECENTLY-REMOVED-DATERANGES` 把这些删除同步给客户端。
+
+```m3u8
+#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:1
+#EXT-X-SKIP:SKIPPED-SEGMENTS=19,RECENTLY-REMOVED-DATERANGES="ad-1"
+#EXTINF:6.0,
+segment21.ts
+#EXT-X-DATERANGE:ID="event-p",START-DATE="2020-06-22T10:02:00Z"
+#EXT-X-DATERANGE:ID="event-q",START-DATE="2020-06-22T10:03:00Z"
+```
+
+关键点：
+
+- `RECENTLY-REMOVED-DATERANGES="ad-1"` 告诉客户端，本地缓存里的 `ad-1` 要删除。
+- `event-p` 出现在 delta 中，表示它是在 skip limit 之后加入的近期 DATERANGE。
+- `event-q` 是新 DATERANGE，客户端合并后会保留它。
+- 早于 skip limit 且仍有效的 DATERANGE 不一定出现在 delta 里，客户端需要从本地旧 playlist 保留。
+- 合并结果要包含仍有效的 DATERANGE，并排除已删除的 ID。
+
+## 核心启发
+
+### 1. 给体育直播做大 DVR 窗口
+
+- **做什么**：保留几十分钟到数小时的回看窗口，让用户能拖回关键回合。
+- **为什么值得做**：playlist 变长后，Delta Updates 让客户端重载时只拿最近变化，降低大窗口的重复传输。
+- **怎么开始**：在 media playlist 的 `#EXT-X-SERVER-CONTROL` 加上 `CAN-SKIP-UNTIL`，确认客户端先拿完整 playlist，再观察 `_HLS_skip=YES` 请求的返回大小。
+
+### 2. 给带广告的直播减少 metadata 压力
+
+- **做什么**：把广告机会、广告段和追踪事件继续写入 `#EXT-X-DATERANGE`，但让 delta 跳过过早的 metadata。
+- **为什么值得做**：WWDC20 的 `CAN-SKIP-DATERANGES` 和 `_HLS_skip=v2` 专门处理大量 DATERANGE 的场景。
+- **怎么开始**：为支持该能力的流加 `CAN-SKIP-DATERANGES=YES`，在 delta 的 `#EXT-X-SKIP` 中返回 `RECENTLY-REMOVED-DATERANGES`，用测试播放器检查删除事件是否同步。
+
+### 3. 给弱网用户保住更高画质
+
+- **做什么**：在现有自适应码率阶梯之外，优化 playlist reload 的字节数，减少控制面流量对媒体吞吐的挤压。
+- **为什么值得做**：session 明确指出，大 playlist 的反复下载会让播放器在差网络下降到更低质量 tier。
+- **怎么开始**：记录完整 playlist 和 delta playlist 的压缩后大小，按 variant、网络类型和 DVR 窗口长度比较 reload 成本。
+
+### 4. 给 HLS 服务端增加合并一致性测试
+
+- **做什么**：自动验证“完整 playlist”与“旧 playlist 加 delta”得到同一个结果。
+- **为什么值得做**：delta playlist 不是独立 playlist，客户端播放正确性依赖合并结果。
+- **怎么开始**：在服务端测试里保存一个旧 playlist，请求 `_HLS_skip=YES` 或 `_HLS_skip=v2`，模拟删除 media sequence、保留近期 segment、移除 `RECENTLY-REMOVED-DATERANGES` 指定的 ID。
+
+## 关联 Session
+
+- [What's new in Low-Latency HLS](/articles/wwdc2020-10228) — 先理解 partial segment、blocking reload 和 preload hint，再看 playlist delta 如何减少重载成本。
+- [Adapt ad insertion to Low-Latency HLS](/articles/wwdc2020-10232) — DATERANGE skipping 与广告 metadata 同属低延迟直播的 playlist authoring 问题。
+- [Improve stream authoring with HLS Tools](/articles/wwdc2020-10225) — 用 HLS authoring 和 validation 工具检查 playlist 是否符合 Apple HLS 要求。
+- [Deliver a better HLS audio experience](/articles/wwdc2020-10158) — HLS 音频 session 展示了 playlist 属性、codec 和 variant 选择如何影响真实播放体验。
+- [Author fragmented MPEG-4 content with AVAssetWriter](/articles/wwdc2020-10011) — 如果需要自行产出 HLS segment，这场 session 解释了 AVAssetWriter 的 fMP4 输出路径。

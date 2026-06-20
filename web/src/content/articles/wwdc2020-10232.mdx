@@ -1,57 +1,199 @@
 ---
 title: "Adapt ad insertion to Low-Latency HLS"
-description: "find out how to integrate advertising into your low-latency hls streams through server-side ad insertion. we"
-date: 2026-06-10
-tags: ["WWDC 2020"]
+description: "find out how to integrate advertising into your low-latency hls streams through server-side ad insertion. we'll show you how to segment your ad content, and examine how ad insertion works with ll-hls features such as blocking playlist reload and blocking preload hints."
+date: "2020-06-10"
+tags: ["HLS", "Low-Latency HLS", "Streaming"]
 thumbnail: "/images/sessions/2020/10232.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10232/"
 sessionId: "wwdc2020-10232"
 year: "2020"
 relatedSessions:
-  - title: "Author fragmented MPEG-4 content with AVAssetWriter"
-    code: "10011"
-    description: "transform your audio and video content into fragmented mpeg-4 files for a faster"
-  - title: "Build Metal-based Core Image kernels with Xcode"
-    code: "10021"
-    description: "learn how to integrate and load core image kernels written in the metal shading "
-  - title: "Deliver a better HLS audio experience"
-    code: "10158"
-    description: "discover techniques for streaming high-quality audio to bandwidth-limited networ"
-  - title: "Discover Core Image debugging techniques"
-    code: "10089"
-    description: "find and fix rendering and optimization issues in your core image pipeline with "
+  - title: "What's new in Low-Latency HLS"
+    code: "10228"
+    description: "介绍 Low-Latency HLS 的 Partial Segment、playlist 更新和低延迟交付模型。"
+  - title: "Discover HLS Blocking Preload Hints"
+    code: "10229"
+    description: "讲解 preload hint 如何让客户端提前请求下一个 Partial Segment 或 MAP。"
+  - title: "Reduce latency with HLS Blocking Playlist Reload"
+    code: "10231"
+    description: "说明 Blocking Playlist Reload 如何让客户端等待下一个 playlist 版本。"
+  - title: "Optimize live streams with HLS Playlist Delta Updates"
+    code: "10230"
+    description: "展示大型直播窗口里如何用 Delta Updates 降低 playlist 传输成本。"
+  - title: "Improve stream authoring with HLS Tools"
+    code: "10225"
+    description: "介绍 HLS 工具链，用来验证 playlist、分片和低延迟流的 authoring 结果。"
 ---
 
 ## Highlight
 
-> 这场 Session 讨论了在 Low-Latency HLS 中实现广告插入（Ad Insertion）的特殊挑战。传统的 HLS 广告插入依赖 `#EXT-X-DATERANGE` 和 `#EXT-X-CUE-OUT` 等标签来标记广告时段，播放器会提前准备广告内容。但在 Low-Latency HLS 中，partial segment 和更高的更新频率让广告插入的时序控制变得更加复杂。
-
----
+> Low-Latency HLS 的服务器侧广告插入要把广告也按 Partial Segment 发布，并为广告和节目内容同时提供 Blocking Playlist Reload 与 preload hints，才能在广告切换时维持低延迟播放模型。
 
 ## 核心内容
 
-这场 Session 讨论了在 Low-Latency HLS 中实现广告插入（Ad Insertion）的特殊挑战。传统的 HLS 广告插入依赖 `#EXT-X-DATERANGE` 和 `#EXT-X-CUE-OUT` 等标签来标记广告时段，播放器会提前准备广告内容。但在 Low-Latency HLS 中，partial segment 和更高的更新频率让广告插入的时序控制变得更加复杂。
+普通直播 HLS 的广告插入靠 segment 边界工作。节目源带着可插入广告的 marker，packager 在广告开始前补一个短节目 segment，把边界对齐到 segment，再用 discontinuity tag 切到广告。广告结束后，它再补一个短广告 segment，然后切回节目。
 
-演讲者首先回顾了两种主要的广告插入方式：Client-Side Ad Insertion（CSAI，客户端拼装）和 Server-Side Ad Insertion（SSAI，服务端拼装）。在低延迟场景下，SSAI 更有优势——服务端在推送流时就把广告内容编织进主频道，播放器不需要额外的广告请求，避免了延迟。
+低延迟直播把这个模型变细了。客户端不再等完整 segment 出现，而是贴着 live edge 读取更短的 Partial Segment。一个 6 秒 parent segment 可以拆成多个 2 秒 partial，客户端两秒后就能拿到第一段媒体，不必等完整 6 秒。
 
-Session 的核心部分讲解了如何在 Low-Latency HLS 的 partial segment 级别实现精确的广告切换。关键是用 `#EXT-X-GAP` 标签标记广告边界，利用 `#EXT-X-DATERANGE` 的精确时间戳来控制切换时机，以及如何通过 `#EXT-X-PRELOAD-HINT` 让播放器提前加载广告内容。
+广告插入因此不能只发布完整广告 segment。广告开始后，packager 也要每隔一个 partial duration 发布广告 Partial Segment。parent segment 仍然存在，discontinuity、边界对齐、key rotation 的位置也不变。变化在 live edge：播放器看到的是更频繁出现的广告 partial。
 
-最后讨论了广告追踪（Ad Tracking）在低延迟场景下的实现，包括如何在 partial segment 级别触发 impression 和 quartile 事件。
+还有一个直播里常见的麻烦：early return。赛事直播中，制作方可能在广告尚未播完时切回现场。此时服务器要停止广告 partial，补出一个到当前点为止的短 parent segment，更新 preload hint，让客户端转向下一段节目 partial。
 
+## 详细内容
 
-### 最佳实践
+### Partial Segment 改变广告插入的节奏
 
-- 低延迟直播优先使用 Server-Side Ad Insertion，避免客户端广告请求带来的额外延迟
-- 广告的 partial segment duration 应与主内容一致，避免播放器 buffer 策略混乱
-- 使用 `#EXT-X-DATERANGE` 而非过时的 `#EXT-X-CUE-OUT` 标记广告时段
-- 广告创意预先编码为与主流相同的编解码器和分辨率，避免解码器重置
-- 广告追踪事件应与 partial segment 时间对齐，确保数据准确性
+（[01:51](https://developer.apple.com/videos/play/wwdc2020/10232/?time=111)）Low-Latency HLS 在 live edge 使用 Partial Segment。演讲用 6 秒 segment 与 2 秒 partial 举例：客户端两秒后可以拿到 segment 的第一部分，四秒后拿到更多内容，六秒后拿到最后一个 partial 和 parent segment。
 
----
+```text
+segment 5 的发布节奏：
 
-## 相关 Session
+00s: segment 5 开始生成
+02s: 发布 segment 5 的第一个 Partial Segment
+04s: 发布 segment 5 的第二个 Partial Segment
+06s: 发布 segment 5 的最后一个 Partial Segment，并发布 parent segment 5
+```
 
-- [Author fragmented MPEG-4 content with AVAssetWriter](/articles/wwdc2020-10011) — transform your audio and video content into fragmented mpeg-4 files for a faster
-- [Build Metal-based Core Image kernels with Xcode](/articles/wwdc2020-10021) — learn how to integrate and load core image kernels written in the metal shading 
-- [Deliver a better HLS audio experience](/articles/wwdc2020-10158) — discover techniques for streaming high-quality audio to bandwidth-limited networ
-- [Discover Core Image debugging techniques](/articles/wwdc2020-10089) — find and fix rendering and optimization issues in your core image pipeline with 
+关键点：
+
+- `parent segment` 是完整的常规 HLS segment。
+- `Partial Segment` 承载同一段媒体，但更早出现在 playlist。
+- 客户端用 Partial Segment 贴近 live edge 播放。
+- 广告内容也要遵守这个节奏，否则切到广告时会退回普通 HLS 的延迟模型。
+
+### 广告边界仍然靠短 segment 和 discontinuity 对齐
+
+（[02:54](https://developer.apple.com/videos/play/wwdc2020/10232/?time=174)）普通 HLS 的服务器侧广告插入先处理边界。marker 不一定落在常规 segment 边界上，packager 可能要生成一个短节目 segment，让广告开始点刚好落在 segment 边界。切换广告时，用 discontinuity tag 分隔节目和广告。
+
+```text
+节目 segment 3
+短节目 segment，用来对齐广告开始点
+#EXT-X-DISCONTINUITY
+广告 segment 1
+广告 segment 2
+短广告 segment，用来对齐广告结束点
+#EXT-X-DISCONTINUITY
+节目 segment 4
+```
+
+关键点：
+
+- marker 来自节目源，表示哪里可以插入广告。
+- 短节目 segment 让广告开始点变成明确边界。
+- discontinuity tag 标记节目内容与广告内容的切换。
+- 广告结束点也可能不在 segment 边界上，所以需要短广告 segment。
+
+### 广告也要先以 Partial Segment 发布
+
+（[04:20](https://developer.apple.com/videos/play/wwdc2020/10232/?time=260)）低延迟场景继续使用同一套广告边界，但发布顺序更细。广告开始后，packager 先按 partial duration 发布广告 partial；当一个 parent segment 的所有 partial 都到齐，再发布完整广告 parent segment。
+
+```text
+节目 partial
+短节目 partial + parent segment，用来对齐广告开始点
+#EXT-X-DISCONTINUITY
+广告 partial 1
+广告 partial 2
+广告 partial 3 + 广告 parent segment
+广告 partial 4
+广告 partial 5
+广告 partial 6 + 广告 parent segment
+短广告 partial + parent segment，用来对齐广告结束点
+#EXT-X-DISCONTINUITY
+节目 partial
+```
+
+关键点：
+
+- ad boundary、discontinuity 和 key rotation 的位置保持在同一条时间线上。
+- 低延迟差异发生在发布粒度：广告 segment 先拆成 Partial Segment 出现在 live edge。
+- packager 必须为节目和广告都维持同一个 low-latency timing model。
+- 如果广告只按完整 segment 发布，播放器会在广告段落失去低延迟优势。
+
+### Blocking Playlist Reload 也覆盖广告段落
+
+（[05:48](https://developer.apple.com/videos/play/wwdc2020/10232/?time=348)）演讲明确要求 origin 对广告也实现 Blocking Playlist Reload。客户端请求下一个 playlist 版本时，服务器不要立即返回旧 playlist，而是等到新的 partial 或 segment 可用后返回。
+
+```text
+客户端：请求下一个 playlist 版本
+origin：等待广告 Partial Segment 进入 playlist
+origin：返回包含广告 partial 的新版 playlist
+客户端：继续贴近 live edge 播放
+```
+
+关键点：
+
+- Blocking Playlist Reload 是 HLS Origin API 的组成部分。
+- 它保护的是 playlist 更新时机，不只适用于节目内容。
+- 广告段落若立即返回旧 playlist，客户端会拿到 stale playlist，低延迟播放会被拖慢。
+- 广告和节目共用同一套等待与发布节奏，播放器才不用在切换处改策略。
+
+### Preload hints 要提示广告 MAP 和广告 partial
+
+（[06:08](https://developer.apple.com/videos/play/wwdc2020/10232/?time=368)）Preload hinting 要求 playlist 写出下一个预计出现的资源 URL。广告切换时，playlist 可以先提示新的 media initialization section，再提示广告的第一个 Partial Segment。
+
+```text
+#EXT-X-PRELOAD-HINT:TYPE=MAP,URI="ad-init.mp4"
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="ad-part-1.m4s"
+
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="ad-init.mp4"
+#EXT-X-PART:URI="ad-part-1.m4s",DURATION=2.0
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="ad-part-2.m4s"
+```
+
+关键点：
+
+- `TYPE=MAP` 提示即将用于广告内容的新初始化信息。
+- `TYPE=PART` 提示下一个广告 Partial Segment。
+- 广告是预录内容，ad origin 不需要像实时节目源那样等待编码完成。
+- playlist 仍然要持续更新 hint，让客户端一直知道下一个要请求的广告资源。
+
+### Early return 时更新 hint，直接切回节目
+
+（[07:55](https://developer.apple.com/videos/play/wwdc2020/10232/?time=475)）early return 指直播制作方提前结束广告，立刻切回节目。服务器可以停止发布后续广告 partial，补出一个到当前已发布 partial 为止的短 parent segment，随后用 discontinuity 切回节目。
+
+```text
+广告 partial 1
+广告 partial 2
+短广告 parent segment，到广告 partial 2 结束
+#EXT-X-DISCONTINUITY
+节目 partial 1
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="program-part-2.m4s"
+```
+
+关键点：
+
+- 已经发出的旧 hint 可能指向下一段广告 partial。
+- 服务器知道要提前返回节目后，把 hint 改成下一段节目 partial。
+- 客户端看到新的 hint，就停止沿着广告库存继续加载。
+- 这个处理让突发直播内容可以立刻回到节目，同时保留低延迟加载路径。
+
+## 核心启发
+
+- **做什么**：给低延迟直播 packager 增加广告 partial 发布链路。  
+  **为什么值得做**：演讲明确指出广告在 LL-HLS 中要先以 Partial Segment 出现在 live edge。  
+  **怎么开始**：复用节目内容的 partial duration，把广告素材切成同样节奏的 partial，并在完整 parent segment 可用时一并发布。
+
+- **做什么**：把广告切换点做成可观测的 playlist 校验项。  
+  **为什么值得做**：广告开始和结束都依赖短 segment、discontinuity 与边界对齐。  
+  **怎么开始**：在自动化检查里扫描广告 marker 附近的 playlist，确认短 segment、`#EXT-X-DISCONTINUITY`、广告 MAP 和广告 partial 的顺序正确。
+
+- **做什么**：为 SSAI（Server-Side Ad Insertion，服务器侧广告插入）实现 hint 重写能力。  
+  **为什么值得做**：early return 会让已经发布的广告 hint 失效，服务器必须把它改向节目 partial。  
+  **怎么开始**：在决策引擎发出提前返回信号时，让 packager 生成短广告 parent segment，并把下一条 `#EXT-X-PRELOAD-HINT` 改成节目 URI。
+
+- **做什么**：把广告 origin 和节目 origin 的阻塞语义分开配置。  
+  **为什么值得做**：演讲指出广告为预录内容，ad origin 不需要强制阻塞等待；playlist origin 仍要为广告和节目执行 Blocking Playlist Reload。  
+  **怎么开始**：把 playlist 生成服务作为低延迟控制点，让它负责 blocking reload 和 hint；广告媒体文件可以由普通静态 origin 或 CDN 提供。
+
+- **做什么**：在播放器测试中加入广告段落的 live-edge 延迟曲线。  
+  **为什么值得做**：广告如果退回完整 segment 发布，用户会在广告处看到延迟跳变。  
+  **怎么开始**：记录节目 partial、广告 partial、parent segment 和 playlist 返回时间，分别计算广告前、广告中、广告后的 live-edge 距离。
+
+## 关联 Session
+
+- [What's new in Low-Latency HLS](/articles/wwdc2020-10228) — 理解 Partial Segment、live edge 和 Low-Latency HLS 基础模型。
+- [Discover HLS Blocking Preload Hints](/articles/wwdc2020-10229) — 深入 preload hint，广告切换中的 MAP 与 PART 提示依赖这套机制。
+- [Reduce latency with HLS Blocking Playlist Reload](/articles/wwdc2020-10231) — 解释 playlist 请求如何阻塞等待下一次更新，是广告段落保持低延迟的前提。
+- [Optimize live streams with HLS Playlist Delta Updates](/articles/wwdc2020-10230) — 适合处理大型直播 playlist 的传输成本，与低延迟直播部署相关。
+- [Improve stream authoring with HLS Tools](/articles/wwdc2020-10225) — 用 HLS 工具验证 playlist、媒体分片和低延迟 authoring 结果。

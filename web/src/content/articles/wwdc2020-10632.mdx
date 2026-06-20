@@ -1,8 +1,16 @@
 ---
 title: "Optimize Metal Performance for Apple silicon Macs"
-description: "apple silicon macs are a transformative new platform for graphics-intensive apps — and we"
-date: 2026-06-10
-tags: ["WWDC 2020"]
+description: |
+  apple silicon macs are a transformative new platform for graphics-intensive apps — and we're going to show you how to fire up the gpu to create blazingly fast apps and games.
+
+  discover how to take advantage of apple's unique tile-based deferred rendering (tbdr) gpu architecture within apple silicon macs and learn how to schedule workloads to provide maximum throughput, structure your rendering pipeline, and increase overall efficiency. and dive deep with our graphics team as we explore shader optimizations for the apple gpu shader core.
+
+  we've designed this session in tandem with “bring your metal app to apple silicon macs,” and recommend you watch that first.
+
+  For more, watch “Harness Apple GPUs with Metal” to learn how TBDR applies to a variety of modern rendering techniques.
+
+tags: ["WWDC 2020", "Metal", "Performance"]
+date: 2020-06-10
 thumbnail: "/images/sessions/2020/10632.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10632/"
 sessionId: "wwdc2020-10632"
@@ -10,48 +18,322 @@ year: "2020"
 relatedSessions:
   - title: "Bring your Metal app to Apple silicon Macs"
     code: "10631"
-    description: "meet the tile based deferred rendering (tbdr) gpu architecture for apple silicon"
-  - title: "Build customized ML models with the Metal Performance Shaders Graph"
-    code: "10677"
-    description: "discover the metal performance shaders (mps) graph, which extends metal"
-  - title: "Capture and stream apps on the Mac with ReplayKit"
-    code: "10633"
-    description: "learn how you can integrate replaykit into your mac apps and games to easily sha"
-  - title: "Design for Game Center"
-    code: "10145"
-    description: "get your game"
+    description: "理解 Apple GPU 的 TBDR 架构和 Apple silicon Mac 移植差异"
+  - title: "Harness Apple GPUs with Metal"
+    code: "10602"
+    description: "学习用 Metal 面向 Apple GPU 架构组织现代渲染技术"
+  - title: "Optimize Metal apps and games with GPU counters"
+    code: "10603"
+    description: "用 GPU counters 定位 Metal 性能瓶颈并验证优化效果"
+  - title: "Gain insights into your Metal app with Xcode 12"
+    code: "10605"
+    description: "用 Xcode 12 的 Metal 调试和性能工具检查图形问题"
+  - title: "Build GPU binaries with Metal"
+    code: "10615"
+    description: "优化 Metal shader 编译和 GPU binary 交付流程"
 ---
 
 ## Highlight
 
-> 这场 Session 是 "Bring your Metal app to Apple silicon Macs" 的后续，聚焦于移植完成后的性能优化。演讲者假设你已经完成了基本的移植工作，现在要挖掘 Apple GPU 架构的性能潜力。
-
----
+> Apple 讲解了 Apple silicon Mac 上 Metal 的性能调优路径：减少渲染 pass 依赖和带宽、使用 tile shader 保留片上数据，并按 Apple shader core 特性改写 shader。
 
 ## 核心内容
 
-这场 Session 是 "Bring your Metal app to Apple silicon Macs" 的后续，聚焦于移植完成后的性能优化。演讲者假设你已经完成了基本的移植工作，现在要挖掘 Apple GPU 架构的性能潜力。
+很多 Mac 图形 App 已经有成熟的渲染器。它们在 Intel 或 AMD GPU 上运行多年，常见优化也围绕 Immediate Mode Rendering（立即模式渲染）展开。迁移到 Apple silicon Mac 后，App 可以先通过 Rosetta 运行，再重新编译为原生版本，但这只解决“能跑”的问题。真正影响帧率和功耗的是渲染器是否理解 Apple GPU 的 Tile-Based Deferred Rendering（TBDR，基于 tile 的延迟渲染）架构。
 
-首先回顾了 Apple GPU 的 TBDR（Tile-Based Deferred Rendering）架构。与 Intel/AMD 的 IMR 架构不同，TBDR 将渲染工作分成多个 tile，每个 tile 在片上缓存中完成所有渲染操作后再写回主内存。这意味着中间渲染结果（如 G-Buffer）不需要占用主内存带宽。理解这个架构是所有优化的基础。
+TBDR 的关键变化是 tile memory（片上 tile 内存）。Apple GPU 会先处理一个 render pass 的顶点，把几何体分到屏幕 tile 中，再在片上完成每个 tile 的 fragment 工作。load action 和 store action 决定附件如何进出 tile memory。过去拆成多个 pass、频繁清空、频繁保存中间结果的做法，在这里会直接变成系统内存带宽压力。
 
-Session 的核心部分讲解了四类关键优化：Memoryless Render Target（消除中间结果写回）、Tile Shader（在 tile 级别执行自定义计算）、统一内存的利用（CPU 和 GPU 直接共享数据），以及 Shader Core 的高效利用（SIMD 对齐和寄存器管理）。
+这场 session 的叙事很清楚：先找出 GPU 时间线上的空洞，再减少 render pass 带来的 load/store，接着用 hidden surface removal（隐藏面移除）少做无效 shading，最后把 deferred shading、light culling、shader 数据类型都改成适合 Apple GPU 的形状。
 
-演讲者通过多个真实案例对比了优化前后的性能数据——在某些场景下，仅通过启用 memoryless render target 就能减少 40% 的带宽消耗。Tile Shader 的使用甚至可以将多 pass 渲染合并为单 pass。
+对开发者来说，重点不在 API 名称替换。更实际的工作是重排工作负载，合并本来属于同一个逻辑 pass 的渲染，给中间附件选择 `.memoryless`，再用 Metal System Trace、GPU frame debugger 和 pipeline statistics 验证结果。
 
+## 详细内容
 
-### 最佳实践
+### 1. 让 vertex、fragment、compute 尽量重叠
 
-- 所有中间渲染目标标记为 memoryless，只在最终输出时写回主内存
-- 将多 pass 渲染合并为使用 Tile Shader 的单 pass 渲染
-- 统一内存设备上使用 `.shared` storage mode 避免不必要的内存拷贝
-- 线程组大小选择 32 或 64 的倍数，匹配 Apple GPU 的 SIMD 宽度
-- 使用 GPU Counters 持续监控带宽利用率，目标控制在 50% 以下
+（[04:17](https://developer.apple.com/videos/play/wwdc2020/10632/?time=257)）Apple GPU 有独立硬件通道处理 vertex、fragment 和 compute 工作。Metal 会在没有数据依赖时自动重叠它们。性能问题常出现在“看起来共享资源，实际数据无关”的 false dependency（伪依赖）上。
 
----
+（[06:05](https://developer.apple.com/videos/play/wwdc2020/10632/?time=365)）如果 Render Pass 0 写入的资源被 Render Pass 1 的 vertex 阶段读取，Metal 会按资源级别建立依赖。即使两个 pass 使用的是同一资源里的不同区域，调度器也无法知道数据无关。解决方式有两类：把数据拆到不同资源；或把资源设为 untracked，再由开发者用 Metal fence 或 event 插入必要同步。
 
-## 相关 Session
+（[07:23](https://developer.apple.com/videos/play/wwdc2020/10632/?time=443)）另一个低成本方法是 pass re-ordering（pass 重排）。独立的 compute 或 render pass 应尽早 encode，用它们填满时间线空洞。Metal 有时会重排独立 pass，但它能看到的信息有限，显式重排更可靠。
 
-- [Bring your Metal app to Apple silicon Macs](/articles/wwdc2020-10631) — meet the tile based deferred rendering (tbdr) gpu architecture for apple silicon
-- [Build customized ML models with the Metal Performance Shaders Graph](/articles/wwdc2020-10677) — discover the metal performance shaders (mps) graph, which extends metal
-- [Capture and stream apps on the Mac with ReplayKit](/articles/wwdc2020-10633) — learn how you can integrate replaykit into your mac apps and games to easily sha
-- [Design for Game Center](/articles/wwdc2020-10145) — get your game
+这一段没有官方代码片段。transcript 明确给出的 key API 是 untracked resource、Metal fence 和 event：当同一资源被相邻 pass 复用，但数据无关时，可以关闭资源跟踪，再由应用插入同步。下面用最小片段表达这个用法边界。
+
+```swift
+// Transcript-supported synchronization sketch
+let scratchBuffer = device.makeBuffer(
+    length: scratchLength,
+    options: [.storageModePrivate, .hazardTrackingModeUntracked]
+)!
+let fence = device.makeFence()
+renderEncoder.updateFence(fence, after: .fragment)
+nextRenderEncoder.waitForFence(fence, before: .vertex)
+```
+
+关键点：
+
+- `.hazardTrackingModeUntracked` 对应 transcript 中的 “marked as untracked”，让 Metal 不再为 `scratchBuffer` 自动建立依赖。
+- `device.makeFence()` 对应 transcript 提到的 Metal fences，用来把同步责任交回应用。
+- `updateFence(... after: .fragment)` 表示前一个 pass 的 fragment 写入完成后更新 fence。
+- `waitForFence(... before: .vertex)` 表示后一个 pass 的 vertex 读取前等待 fence，避免真正的数据依赖被误删。
+
+### 2. 用 parallel render command encoder 合并逻辑上相同的 pass
+
+（[09:08](https://developer.apple.com/videos/play/wwdc2020/10632/?time=548)）Apple GPU 的 render pass attachment 在 tile storage 中处理。附件每次 load 和 store 都会消耗系统内存带宽。常见问题是为了 CPU 多线程 encoding，把同一个 G-Buffer 的不同部分拆成多个 command buffer。GPU 看到的是多个 render pass，于是重复 load/store 同一批 attachment。
+
+（[10:49](https://developer.apple.com/videos/play/wwdc2020/10632/?time=649)）Metal 的 parallel render command encoder 解决的是这个场景：CPU 仍然能多线程 encode，GPU 端仍然是一个 render pass。
+
+```swift
+// Encoding with parallel render commands
+
+let parallelDescriptor = MTLRenderPassDescriptor()
+// … setup render pass as usual …
+
+let parallelEncoder = commandBuffer.makeParallelRenderCommandEncoder(descriptor:parallelDescriptor)
+
+let subEncoder0 = parallelEncoder.makeRenderCommandEncoder()
+let subEncoder1 = parallelEncoder.makeRenderCommandEncoder()
+
+let syncPoint = DispatchGroup()
+DispatchQueue.global(qos: .userInteractive).async(group: syncPoint) {
+    /* … encode with subEncoder0 … */ }
+DispatchQueue.global(qos: .userInteractive).async(group: syncPoint) {
+    /* … encode with subEncoder1 … */ }
+
+syncPoint.wait()
+parallelEncoder.end()
+```
+
+关键点：
+
+- `MTLRenderPassDescriptor()` 和普通 render pass 使用同样的附件配置，所有 sub-encoder 共享这份配置。
+- `makeParallelRenderCommandEncoder` 创建一个并行 encoder，Metal 会把其中的 sub-encoder 合成为单个 render pass 执行。
+- `makeRenderCommandEncoder()` 的创建顺序决定 sub-encoder 命令的执行顺序，所以要先按预期顺序创建。
+- 两个 `DispatchQueue.global` block 把 encoding 分发到不同 worker thread，保留 CPU 并行度。
+- `syncPoint.wait()` 保证所有子任务完成后再调用 `parallelEncoder.end()`，否则 parallel encoder 还没有完整命令流。
+
+### 3. 减少 attachment ping-pong 和多余 store
+
+（[12:12](https://developer.apple.com/videos/play/wwdc2020/10632/?time=732)）另一个带宽陷阱是只因为 load/store action 变化就拆 pass。例如 forward renderer 先画 opaque，再画 translucent，如果附件集合相同，可以把两段 draw 合在同一个 pass 中，只在最后 store 一次 color。深度附件如果 pass 外不再使用，store action 应设为 `.dontCare`，纹理也可以设为 `.memoryless`。
+
+（[13:29](https://developer.apple.com/videos/play/wwdc2020/10632/?time=809)）Attachment ping-pong 更隐蔽。比如每盏灯都先生成 screen-space attenuation texture，再 composite 到主场景。每盏灯一个 pass 会让主场景附件反复 load/store。Metal 每个 pass 最多支持 8 个 color attachment，可以把主场景和 attenuation 放进同一个 pass。
+
+```swift
+// Multiple render target setup
+
+let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(…)
+let lightingTexture = device.makeTexture(descriptor: textureDescriptor)
+
+textureDescriptor.storageMode = .memoryless
+let attenuationTexture = device.makeTexture(descriptor: textureDescriptor)
+
+let renderPassDesc = MTLRenderPassDescriptor()
+renderPassDesc.colorAttachments[0].texture      = lightingTexture
+renderPassDesc.colorAttachments[0].loadAction   = .clear
+renderPassDesc.colorAttachments[0].storeAction  = .store
+renderPassDesc.colorAttachments[1].texture      = attenuationTexture
+renderPassDesc.colorAttachments[1].loadAction   = .clear
+renderPassDesc.colorAttachments[1].storeAction  = .dontCare
+
+let renderPass = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc);
+```
+
+关键点：
+
+- `lightingTexture` 是主场景输出，pass 结束后仍需要，所以 `storeAction` 是 `.store`。
+- `textureDescriptor.storageMode = .memoryless` 用在中间 attenuation texture 上，避免给只在 pass 内使用的数据分配系统内存 backing。
+- `colorAttachments[0]` 和 `colorAttachments[1]` 同时出现在一个 render pass descriptor 中，消除 ping-pong。
+- `attenuationTexture` 的 `storeAction` 是 `.dontCare`，因为它不在 pass 外被读取。
+- `makeRenderCommandEncoder` 用这份 descriptor 启动单个 pass，减少中间 load/store。
+
+（[15:17](https://developer.apple.com/videos/play/wwdc2020/10632/?time=917)）清屏也应该折叠进真正需要它的 render pass。独立 clear pass 只为了清空附件，会产生额外内存流量。MSAA resolve 也类似，sample data 通常只在 pass 内有用，应在前一个 pass 内 resolve，multi-sampled attachment 可以设为 memoryless。
+
+### 4. 让 hidden surface removal 少做无效 fragment 工作
+
+（[17:09](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1029)）Apple GPU 的 hidden surface removal（HSR，隐藏面移除）目标是只 shade 可见像素。draw 顺序会影响效率：先 opaque，再 feedback，最后 translucent。Opaque draw 内部顺序通常由材质系统决定；feedback 和 translucent 需要关心自己的顺序。
+
+（[19:01](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1141)）fragment function 写 buffer 或非 render pass texture 时，Metal 默认要执行这些 fragment 来保证 memory write 确定性。如果被遮挡 fragment 的写入对结果没有意义，可以给 fragment function 添加 early fragment test attribute，让深度测试失败的 fragment 不再执行。
+
+（[19:47](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1187)）Write mask（写掩码）也会降低 HSR 效率。被保留的通道需要从下层 fragment 生成，造成额外 shading。
+
+```swift
+let descriptor = MTLRenderPipelineDescriptor();
+// ...
+descriptor.colorAttachments[0].writeMask = .red | .green;
+```
+
+关键点：
+
+- `MTLRenderPipelineDescriptor` 控制 pipeline 的 color attachment 行为。
+- `writeMask = .red | .green` 表示 fragment function 只更新红、绿通道。
+- 蓝色和 alpha 通道要保留旧值，Apple GPU 可能需要 shade underlapping fragment 来得到这些值。
+- 如果确实需要写掩码，可以使用；如果只是 shader 漏写某个附件，应改为写满全部附件。
+
+（[21:15](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1275)）G-Buffer 生成阶段经常无意中漏写某个 attachment。session 给出的修复方式是给所有 render pass attachment 都写值，即使某个阶段只需要初始化为 0。
+
+```swift
+struct FragInput { ... };
+struct FragOutput { float3 albedo; float3 normals; float3 lighting; };
+
+fragment FragOutput GenerateGbuffer(
+                         FragInput in [[stage_in]]) {
+    FragOutput out;
+    out.albedo = sampleAlbedo(in);
+    out.normals = interpolateNormals(in);
+    out.lighting = float3(0, 0, 0);
+    return out;
+}
+```
+
+关键点：
+
+- `FragOutput` 明确列出 albedo、normals、lighting 三个输出，和 G-Buffer attachment 对齐。
+- `sampleAlbedo(in)` 写入材质颜色。
+- `interpolateNormals(in)` 写入法线。
+- `out.lighting = float3(0, 0, 0)` 主动初始化 lighting attachment，避免因未写入导致写掩码行为。
+- `return out` 一次返回完整输出，让 HSR 更容易处理 opaque fragment。
+
+### 5. 用 tile shader 把 deferred shading 留在片上
+
+（[23:22](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1402)）Deferred shading 通常先生成 G-Buffer，再读取 G-Buffer 算 lighting。传统两 pass 写法会把 albedo、normal、roughness 等附件写到系统内存，再马上读回来。Apple GPU 上更好的方式是用 programmable blending 和 memoryless render target，让 G-Buffer 数据留在 tile memory。
+
+（[28:29](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1709)）当 renderer 混合 render 和 compute，例如 tile-based light culling，普通 compute encoder 会把流程拆成多个 pass。Apple GPU 从 A11 Bionic 起支持 tile-based compute dispatch。Tile shader 可以在 render command encoder 内按 tile 执行，读取 imageblock、threadgroup memory 和 device memory。
+
+（[30:19](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1819)）下面的 render pass descriptor 把 G-Buffer 设为 memoryless 和 `.dontCare` store，只把最终 lighting texture store 出去。
+
+```swift
+let renderPassDesc = MTLRenderPassDescriptor()
+
+renderPassDesc.tileWidth = 32
+renderPassDesc.tileHeight = 32
+
+renderPassDesc.threadgroupMemoryLength = MemoryLayout<LightInfo>.size * 8
+
+renderPassDesc.colorAttachments[0].texture      = albedoMemorylessTexture
+renderPassDesc.colorAttachments[0].loadAction   = .clear
+renderPassDesc.colorAttachments[0].storeAction  = .dontCare
+renderPassDesc.colorAttachments[1].texture      = normalsMemorylessTexture
+renderPassDesc.colorAttachments[1].loadAction   = .clear
+renderPassDesc.colorAttachments[1].storeAction  = .dontCare
+renderPassDesc.colorAttachments[2].texture      = roughnessMemorylessTexture
+renderPassDesc.colorAttachments[2].loadAction   = .clear
+renderPassDesc.colorAttachments[2].storeAction  = .dontCare
+renderPassDesc.colorAttachments[3].texture      = lightingTexture
+renderPassDesc.colorAttachments[3].loadAction   = .clear
+renderPassDesc.colorAttachments[3].storeAction  = .store
+```
+
+关键点：
+
+- `tileWidth` 和 `tileHeight` 定义片上 tile 尺寸，示例使用 32×32，和 light culling scheme 对齐。
+- `threadgroupMemoryLength` 为每个 tile 的 light list 分配 threadgroup memory，示例按 8 个 `LightInfo` 计算。
+- albedo、normals、roughness 三个 attachment 使用 memoryless texture，pass 结束不写回系统内存。
+- 这些中间 attachment 的 `storeAction` 都是 `.dontCare`，因为后续阶段在同一个 render pass 内消费它们。
+- `lightingTexture` 是最终输出，所以它的 `storeAction` 是 `.store`。
+
+（[32:20](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1940)）Tile shader 还可以重排 imageblock layout。例子从 deferred shading 的 imageblock 转成 multi-layer alpha blending 需要的 layout，把 lighting 和 depth 保存到新的结构中。
+
+```swift
+// Transitioning from deferred rendering to multi-layer alpha blending layout
+struct DeferredShadingFragment {
+    rgba8unorm<half4> albedo;
+    rg11b10f<half3>   normal;
+    float             depth;
+    rgb9e5<half3>     lighting;
+};
+struct MultiLayerAlphaBlendFragments {
+    half4 color_and_transmittence[3];
+    float depth[3];
+};
+struct FragmentOutput {
+    MultiLayerAlphaBlendFragments v [[imageblock_data]];
+};
+fragment FragmentOutput my_tile_shader(DeferredShadingFragment input [[imageblock_data]]) {
+    FragmentOutput output;
+    output.v.color_and_transmittence[0] = half4(input.lighting, 0.0h);
+    output.v.depth[0]                   = input.depth;
+    return output;
+}
+```
+
+关键点：
+
+- `DeferredShadingFragment` 描述旧 imageblock layout，包含 albedo、normal、depth、lighting。
+- `MultiLayerAlphaBlendFragments` 描述新 layout，为多层透明混合准备 color/transmittence 和 depth 数组。
+- `[[imageblock_data]]` 标记 tile memory 中的数据输入和输出。
+- `my_tile_shader` 从旧 layout 读取 lighting 和 depth，写入新 layout 的第 0 层。
+- `0.0h` 使用 half literal，和后面 shader core 章节的 16-bit 建议一致。
+
+### 6. 按 Apple shader core 改写 shader 数据访问
+
+（[34:11](https://developer.apple.com/videos/play/wwdc2020/10632/?time=2051)）Metal Shading Language 的 address space 会影响性能。`device` 适合读写、大量、大小不固定、每个线程访问不同元素的数据。`constant` 适合只读、大小有限、同一 draw 或 dispatch 中多个线程反复读取的数据。
+
+（[36:03](https://developer.apple.com/videos/play/wwdc2020/10632/?time=2163)）要让 compiler 更容易把 constant buffer preload 到 uniform register，应把常量组织成单个 struct，通过 `constant` address space 传引用；数组大小最好在编译期已知。
+
+```metal
+#define MAX_LIGHTS 8
+
+struct LightingConstants {
+    LightInfo lights[MAX_LIGHTS];
+};
+
+fragment half4 shade(
+    constant LightingConstants& constants [[buffer(0)]],
+    uint lightIndex
+) {
+    LightInfo light = constants.lights[lightIndex];
+    return half4(light.color, 1.0h);
+}
+```
+
+关键点：
+
+- `MAX_LIGHTS` 让数组大小在编译期可见，符合 session 对 constant array 的建议。
+- `LightingConstants` 把常量数据封装成单个 struct。
+- `constant LightingConstants&` 使用 constant address space，并按引用传入。
+- `constants.lights[lightIndex]` 访问固定大小数组中的 light 数据。
+- `1.0h` 是 half literal，避免把 half 表达式提升到 32-bit float。
+
+（[37:43](https://developer.apple.com/videos/play/wwdc2020/10632/?time=2263)）Apple GPU 对 16-bit 类型优化更好。能用 `half` 和 `short` 时，不要默认使用 `float` 和 `int`。16-bit 类型减少寄存器压力，提高 shader core occupancy，也常有更好的 ALU 利用率。
+
+（[40:04](https://developer.apple.com/videos/play/wwdc2020/10632/?time=2404)）还有三个容易被忽略的内存访问问题：避免动态索引的 stack-allocated array；内存索引尽量用 signed type，让 compiler 不必保留 unsigned wrapping 语义；结构体中一起读取的字段尽量相邻，或直接改成 vector type，帮助 compiler 合并 load。
+
+## 核心启发
+
+### 1. 做一个 render pass 带宽审计面板
+
+- **做什么**：在引擎调试菜单中列出每帧 render pass 数量、每个 attachment 的 load/store action、memoryless 使用情况。
+- **为什么值得做**：session 把 load/store traffic 定义为 Apple GPU 上主要带宽来源，拆 pass、独立 clear、MSAA sample store 都会放大成本。
+- **怎么开始**：从 frame graph 或 render pass descriptor 收集 attachment 配置，把 `.store`、`.load`、非 memoryless 中间纹理高亮，再用 Metal System Trace 对照验证。
+
+### 2. 给 G-Buffer pipeline 增加 single-pass Apple GPU 路径
+
+- **做什么**：为 deferred renderer 增加 Apple GPU 专用路径，把 G-Buffer、light culling 和 lighting 尽量放进一个 render pass。
+- **为什么值得做**：programmable blending、memoryless render target 和 tile shader 可以让中间 G-Buffer 留在 tile memory，减少系统内存读写。
+- **怎么开始**：先把 albedo、normal、roughness 改成 memoryless attachment，再用 tile shader 在 render command encoder 内构建 per-tile light list，只 store 最终 lighting texture。
+
+### 3. 做一个 HSR 友好的 draw 排序检查器
+
+- **做什么**：在 renderer 的调试构建中标记 opaque、feedback、translucent draw，并检查是否按这个顺序提交。
+- **为什么值得做**：Apple GPU 的 hidden surface removal 能省掉被遮挡 fragment 的 shading；错误顺序、无意 write mask、fragment resource write 都会降低效率。
+- **怎么开始**：在 material 或 pipeline metadata 中记录 blending、discard、depth output、write mask 等状态，发现 opaque 阶段漏写 attachment 时提示补零输出。
+
+### 4. 增加 shader address space 和 16-bit 类型 lint
+
+- **做什么**：为 Metal shader 增加静态检查，提示可改成 `constant` 的只读数据、可改成 `half`/`short` 的局部计算、缺少 `h` 后缀的 half literal。
+- **为什么值得做**：session 指出 constant preload、16-bit ALU 和较低寄存器压力会影响 Apple shader core 性能。
+- **怎么开始**：先扫描 shader 中的 buffer 参数、数组大小、float literal 和 unsigned loop index，把候选点输出为 warning，再用 GPU frame debugger 看 pipeline statistics。
+
+### 5. 为移植后的 Mac 游戏做 Rosetta 到原生的性能对照
+
+- **做什么**：同一场景分别记录 Rosetta、原生未优化、原生 Apple GPU 优化后的 GPU 时间线和带宽指标。
+- **为什么值得做**：session 开头说明 Rosetta 和 consistency feature 会带来性能成本，原生编译后仍需要面向 TBDR 调整 pass 和 shader。
+- **怎么开始**：用固定 camera path 捕获 Metal System Trace，逐项应用 pass merge、memoryless、HSR 排序和 shader 类型优化，保留每一步数据。
+
+## 关联 Session
+
+- [Bring your Metal app to Apple silicon Macs](/articles/wwdc2020-10631) — 先理解 Apple GPU 的 TBDR 架构、storage mode 和移植差异，再进入本场性能优化。
+- [Harness Apple GPUs with Metal](/articles/wwdc2020-10602) — 从更通用的角度讲 Apple GPU 与 Metal 渲染技术的配合。
+- [Optimize Metal apps and games with GPU counters](/articles/wwdc2020-10603) — 用 GPU counters 量化本场提到的 workload overlap、带宽和 shader core 问题。
+- [Gain insights into your Metal app with Xcode 12](/articles/wwdc2020-10605) — 用 Xcode 的 Metal debugger 和 performance tools 定位图形问题。
+- [Build GPU binaries with Metal](/articles/wwdc2020-10615) — 优化 shader 编译与 GPU binary 分发，补齐性能优化后的交付链路。
