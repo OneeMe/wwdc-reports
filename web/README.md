@@ -2,7 +2,7 @@
 
 Astro 构建的 wwdc-quick-look 静态站点，部署在 Cloudflare Pages。
 
-文章评论使用 GitHub Issues 作为数据源，并通过仓库根目录的 Cloudflare Pages Functions 暴露 `/api/comments/*`。Functions 保存 GitHub OAuth secret，前端只访问同源 API。
+文章评论使用开源项目 [utterances](https://utteranc.es/) 嵌入 GitHub Issues。站点不保存 GitHub OAuth secret，也不维护自定义评论 API；登录、Markdown 渲染、评论提交和 Issue 关联都由 utterances 处理。
 
 ## 开发
 
@@ -27,33 +27,28 @@ npm run preview  # 本地预览构建结果
    - **Production branch**: `main`
    - **Build command**: `cd web && npm run build`
    - **Build output directory**: `web/dist`
-   - **Functions directory**: `functions`
 4. 保存并部署
 
 ### 评论系统配置
 
-在 Cloudflare Pages → Settings → Variables and Secrets 中配置：
+评论由 `web/src/components/GitHubComments.astro` 里的 utterances script 加载，当前配置：
 
-| 名称 | 类型 | 说明 |
-| --- | --- | --- |
-| `GITHUB_COMMENTS_CLIENT_ID` | Variable | GitHub OAuth App Client ID |
-| `GITHUB_COMMENTS_CLIENT_SECRET` | Secret | GitHub OAuth App Client Secret |
-| `GITHUB_COMMENTS_SESSION_SECRET` | Secret | 用于加密登录 cookie，建议至少 32 字符 |
-| `GITHUB_COMMENTS_REPO` | Variable | 评论 Issue 所在仓库，默认 `SwiftGGTeam/wwdc-quick-look` |
-| `GITHUB_COMMENTS_SCOPE` | Variable | OAuth scope，默认 `public_repo` |
-| `GITHUB_COMMENTS_LABEL` | Variable | 评论 Issue 标签，默认 `article-comment` |
+| 配置 | 值 |
+| --- | --- |
+| GitHub repo | `SwiftGGTeam/wwdc-quick-look` |
+| Issue mapping | `articleSlug`，例如 `wwdc2026-101` |
+| Label | `article-comment` |
+| Theme | `github-light` |
 
-GitHub OAuth App 的 callback URL 需要设置为：
+发布前需要确认：
 
-```text
-https://wwdc-quick-look.swiftgg.team/api/comments/auth/callback
-```
-
-本地调试 Cloudflare Pages Functions 时，使用 `.dev.vars` 或 Cloudflare Dashboard 配置同名变量；不要把 secret 提交到仓库。
+1. GitHub 仓库已启用 Issues。
+2. 已安装并授权 [utterances GitHub App](https://github.com/apps/utterances) 访问 `SwiftGGTeam/wwdc-quick-look`。
+3. 如果希望自动加标签，仓库里存在 `article-comment` label。
 
 ### 自动触发
 
-推送至 `main` 分支且变更涉及 `web/**` 或 `functions/**` 路径时，Cloudflare 会自动构建并部署。无需配置 GitHub Actions；评论系统所需密钥只配置在 Cloudflare Pages。
+推送至 `main` 分支且变更涉及 `web/**` 路径时，Cloudflare 会自动构建并部署。无需配置 GitHub Actions 或 Cloudflare secret。
 
 ## 项目结构
 
@@ -68,7 +63,4 @@ web/
 │   └── i18n/        # 文案配置
 ├── astro.config.mjs # Astro 配置
 └── package.json
-
-functions/
-└── api/comments/    # Cloudflare Pages Functions 评论 API
 ```
