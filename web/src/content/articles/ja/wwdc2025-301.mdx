@@ -1,0 +1,338 @@
+---
+title: "Deep dive into the Foundation Models framework"
+description: "level up with the foundation models framework. learn how guided generation works under the hood, and use guides, regexes, and generation schemas to get custom structured responses. we"
+date: 2026-06-10
+tags: ["机器学习"]
+thumbnail: "/images/sessions/2025/301.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/301/"
+sessionId: "wwdc2025-301"
+year: "2025"
+relatedSessions:
+  - title: "Bring advanced speech-to-text to your app with SpeechAnalyzer"
+    code: "277"
+    description: "discover the new speechanalyzer api for speech to text. we"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+  - title: "Develop for Shortcuts and Spotlight with App Intents"
+    code: "260"
+    description: "learn about how building app intents that make actions available and work best w"
+---
+
+## Highlight
+
+> Foundation Models 通过约束解码（constrained decoding）在 token 层面屏蔽不符合 schema 的候选，让设备端 LLM 输出可直接解析为 Swift 类型。
+
+---
+
+## 核心内容
+
+让 LLM 吐出结构化数据是个老大难。常见做法是在 prompt 里描述字段、再写一堆解析代码——脆弱、易错、字段名错一个就整体失败。Session 演示者 Louis 在做一款像素风咖啡店游戏时也碰到这个问题：barista 对话可以是纯文本，可一旦想要 NPC 携带姓名、咖啡订单、等级、属性数组等结构化数据，纯 prompt 拼接就撑不住了。
+
+Foundation Models 给出的答案是 `@Generable` 宏。把 Swift 的 struct/enum 标上这个宏，编译期就能生成对应的 schema；推理时模型按 schema 走约束解码——每生成一个 token，框架都会把不符合 schema 的候选 token 在概率分布上掩掉，模型只能从合法 token 里挑（[09:21](https://developer.apple.com/videos/play/wwdc2025/301/?time=561)）。这意味着 `firstName` 这种幻觉字段在物理上就不可能出现。如果 schema 要等到运行时才知道（比如游戏里玩家自定义关卡实体），还可以用 `DynamicGenerationSchema` 在运行时拼出来。再往上是 Tool Calling：模型自己决定何时调用你的函数，参数也是 Generable，框架保证你拿到的永远是合法输入。
+
+---
+
+## 详细内容
+
+### Session：有状态的对话与 transcript
+
+每次 `respond(to:)` 都会被记进 session 的 transcript，包含全部 prompt 与 response。这是有上下文记忆的代价——token 越堆越多，最终撞上上下文窗口（[03:07](https://developer.apple.com/videos/play/wwdc2025/301/?time=187)）。
+
+```swift
+import FoundationModels
+
+func respond(userInput: String) async throws -> String {
+  let session = LanguageModelSession(instructions: """
+    You are a friendly barista in a world full of pixels.
+    Respond to the player's question.
+    """
+  )
+  let response = try await session.respond(to: userInput)
+  return response.content
+}
+```
+
+关键点：
+
+- `LanguageModelSession(instructions:)` 用多行字符串注入系统级指令，告诉模型本次会话的角色与目标。
+- `session.respond(to:)` 是 async throws，调用前先把指令和 prompt 转成 token，模型再生成 token，框架再 detoken 成字符串。
+- `response.content` 拿到最终文本，整个过程在设备端跑，无网络。
+
+### 上下文超限：保留指令与最近一条响应
+
+撞上 `exceededContextWindowSize` 时不要把整段 transcript 丢掉，否则角色"瞬间失忆"。Louis 的做法是只保留第一条（指令）和最后一条（最近一次成功响应）（[03:55](https://developer.apple.com/videos/play/wwdc2025/301/?time=235)）。
+
+```swift
+var session = LanguageModelSession()
+
+do {
+  let answer = try await session.respond(to: prompt)
+  print(answer.content)
+} catch LanguageModelSession.GenerationError.exceededContextWindowSize {
+  session = newSession(previousSession: session)
+}
+
+private func newSession(previousSession: LanguageModelSession) -> LanguageModelSession {
+  let allEntries = previousSession.transcript.entries
+  var condensedEntries = [Transcript.Entry]()
+  if let firstEntry = allEntries.first {
+    condensedEntries.append(firstEntry)
+    if allEntries.count > 1, let lastEntry = allEntries.last {
+      condensedEntries.append(lastEntry)
+    }
+  }
+  let condensedTranscript = Transcript(entries: condensedEntries)
+  return LanguageModelSession(transcript: condensedTranscript)
+}
+```
+
+关键点：
+
+- `previousSession.transcript.entries` 拿到旧 session 的全部条目，第一条永远是 instructions。
+- `condensedEntries` 只保留首条与末条，把上下文压回到一个安全的 token 量级。
+- 用 `Transcript(entries:)` 包成新 transcript 喂给新 session，角色保留人格设定与最近记忆，其余自然遗忘。
+
+如果一两条不够用，可考虑用 Foundation Models 自己对中间 transcript 做摘要再续上。
+
+### Sampling：随机性与可重现
+
+模型逐 token 生成，每步都有一个概率分布。默认随机采样让游戏对话有变化；做演示时切换为 greedy 拿到稳定输出（[06:14](https://developer.apple.com/videos/play/wwdc2025/301/?time=374)）。
+
+```swift
+// Deterministic output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(sampling: .greedy)
+)
+
+// Low-variance output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(temperature: 0.5)
+)
+
+// High-variance output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(temperature: 2.0)
+)
+```
+
+关键点：
+
+- `sampling: .greedy` 每步选概率最高的 token，相同 prompt + session state 下输出一致；OS 升级换模型版本后此承诺失效。
+- `temperature: 0.5` 输出仅小幅波动，适合"基本稳定但不机械"的场景。
+- `temperature: 2.0` 高方差输出，适合做创意填充；过高也会让结构变脆。
+
+### Generable：结构化输出的正路
+
+`@Generable` 宏在编译期为类型生成 schema 与初始化器，调用 `respond(generating:)` 时框架自动把模型输出 parse 成 Swift 实例（[08:14](https://developer.apple.com/videos/play/wwdc2025/301/?time=494)）。
+
+```swift
+@Generable
+struct NPC {
+  @Guide(description: "A full name")
+  let name: String
+  @Guide(.range(1...10))
+  let level: Int
+  @Guide(.count(3))
+  let attributes: [Attribute]
+  let encounter: Encounter
+
+  @Generable
+  enum Attribute {
+    case sassy
+    case tired
+    case hungry
+  }
+  @Generable
+  enum Encounter {
+    case orderCoffee(String)
+    case wantToTalkToManager(complaint: String)
+  }
+}
+```
+
+关键点：
+
+- `@Generable` 同时支持 struct 与 enum，enum case 可以带 associated value，让 NPC 的"遭遇"分支化。
+- `@Guide(description:)` 用自然语言约束属性语义，等价于把字段说明写进 prompt，但绑定关系更强。
+- `@Guide(.range(1...10))` 走约束解码，模型在数值 token 上只能输出 1–10 的整数。
+- `@Guide(.count(3))` 把数组长度锁死为 3。
+- 属性按声明顺序生成：`name → level → attributes → encounter`。被依赖的属性要写在前面（[12:00](https://developer.apple.com/videos/play/wwdc2025/301/?time=720)）。
+
+正则 guide 也可用，把字符串结构直接交给 regex builder：
+
+```swift
+@Generable
+struct NPC {
+  @Guide(Regex {
+    Capture {
+      ChoiceOf {
+        "Mr"
+        "Mrs"
+      }
+    }
+    ". "
+    OneOrMore(.word)
+  })
+  let name: String
+}
+```
+
+关键点：模型在 string token 序列上按正则状态机推进，永远只能产出 `Mr. Brewster` / `Mrs. Brewster` 形态的名字。
+
+### DynamicGenerationSchema：运行时拼 schema
+
+游戏里玩家自定义实体——例如让玩家造一个"谜题"结构（一个问题 + 多个候选答案），编译期没法写死。这时用 `DynamicGenerationSchema`（[15:10](https://developer.apple.com/videos/play/wwdc2025/301/?time=910)）。
+
+```swift
+struct LevelObjectCreator {
+  var properties: [DynamicGenerationSchema.Property] = []
+
+  mutating func addStringProperty(name: String) {
+    let property = DynamicGenerationSchema.Property(
+      name: name,
+      schema: DynamicGenerationSchema(type: String.self)
+    )
+    properties.append(property)
+  }
+
+  mutating func addArrayProperty(name: String, customType: String) {
+    let property = DynamicGenerationSchema.Property(
+      name: name,
+      schema: DynamicGenerationSchema(
+        arrayOf: DynamicGenerationSchema(referenceTo: customType)
+      )
+    )
+    properties.append(property)
+  }
+}
+
+var riddleBuilder = LevelObjectCreator(name: "Riddle")
+riddleBuilder.addStringProperty(name: "question")
+riddleBuilder.addArrayProperty(name: "answers", customType: "Answer")
+
+var answerBuilder = LevelObjectCreator(name: "Answer")
+answerBuilder.addStringProperty(name: "text")
+answerBuilder.addBoolProperty(name: "isCorrect")
+
+let schema = try GenerationSchema(
+  root: riddleBuilder.root,
+  dependencies: [answerBuilder.root]
+)
+
+let session = LanguageModelSession()
+let response = try await session.respond(
+  to: "Generate a fun riddle about coffee",
+  schema: schema
+)
+let generatedContent = response.content
+let question = try generatedContent.value(String.self, forProperty: "question")
+let answers = try generatedContent.value([GeneratedContent].self, forProperty: "answers")
+```
+
+关键点：
+
+- `DynamicGenerationSchema(type: String.self)` 引用内置类型；`DynamicGenerationSchema(referenceTo: "Answer")` 引用另一个动态 schema。
+- 各个动态 schema 之间彼此独立，最后通过 `GenerationSchema(root:dependencies:)` 校验拼装；引用了不存在的类型会在这一步抛错。
+- 输出类型变成 `GeneratedContent`，用 `value(_:forProperty:)` 按属性名取值，类型由调用方指定。约束解码依然保证字段不会被瞎编。
+
+### Tool Calling：模型主动调你的函数
+
+Tool 让模型在生成过程中调用你的代码取数据。Louis 想接入通讯录，让 NPC 用玩家联系人的名字（[18:47](https://developer.apple.com/videos/play/wwdc2025/301/?time=1127)）。
+
+```swift
+import FoundationModels
+import Contacts
+
+struct FindContactTool: Tool {
+  let name = "findContact"
+  let description = "Finds a contact from a specified age generation."
+
+  @Generable
+  struct Arguments {
+    let generation: Generation
+
+    @Generable
+    enum Generation {
+      case babyBoomers
+      case genX
+      case millennial
+      case genZ
+    }
+  }
+
+  func call(arguments: Arguments) async throws -> ToolOutput {
+    let store = CNContactStore()
+    let keysToFetch = [CNContactGivenNameKey, CNContactBirthdayKey] as [CNKeyDescriptor]
+    let request = CNContactFetchRequest(keysToFetch: keysToFetch)
+
+    var contacts: [CNContact] = []
+    try store.enumerateContacts(with: request) { contact, stop in
+      if let year = contact.birthday?.year {
+        if arguments.generation.yearRange.contains(year) {
+          contacts.append(contact)
+        }
+      }
+    }
+    guard let pickedContact = contacts.randomElement() else {
+      return ToolOutput("Could not find a contact.")
+    }
+    return ToolOutput(pickedContact.givenName)
+  }
+}
+```
+
+关键点：
+
+- `name` 用动词短语，例如 `findContact`；`description` 控制在一句话内——这两个字段会被 verbatim 塞进 prompt，越长 latency 越高（[19:08](https://developer.apple.com/videos/play/wwdc2025/301/?time=1148)）。
+- `Arguments` 必须 `@Generable`，模型生成参数时走约束解码，永远拿不到 `genAlpha` 这种未定义 case。
+- `call(arguments:)` 是 async throws；因为通讯录访问会触发系统权限弹窗，玩家拒绝时框架仍可走非个性化路径。
+
+把 tool 实例传进 session：
+
+```swift
+let session = LanguageModelSession(
+  tools: [FindContactTool()],
+  instructions: "Generate fun NPCs"
+)
+```
+
+关键点：session 持有 tool 的 instance，整个会话生命周期共用。要去重已使用的联系人，把 `FindContactTool` 改成 class，在 `call` 里维护 `pickedContacts: Set<String>` 即可（[21:55](https://developer.apple.com/videos/play/wwdc2025/301/?time=1315)）。
+
+Tool 调用流程（[23:03](https://developer.apple.com/videos/play/wwdc2025/301/?time=1383)）：模型分析 prompt → 决定是否调用 tool → 生成 `Arguments`（约束解码保证合法）→ 框架调你的 `call` → `ToolOutput` 写回 transcript → 模型据此继续生成回复。**单次请求中 tool 可被多次调用，且并行执行**——`call` 里访问共享状态务必加锁。
+
+---
+
+## 核心启发
+
+- **做什么**：给现有 App 加一个 `@Generable` 结构化输出层。
+  - 为什么值得做：以前要么调云端 LLM 配 JSON Schema，要么自己写脆弱解析；Foundation Models 在设备端就能给类型安全的输出，零网络、零成本、隐私不出端。
+  - 怎么开始：挑一个现有的"自然语言进、固定结构出"的功能（笔记摘要、邮件分类、清单生成），把目标类型标 `@Generable`，对枚举值用 `@Guide` 收紧范围，先跑 greedy 采样验证 schema 命中率。
+
+- **做什么**：把游戏/小工具里的"配置编辑器"接 `DynamicGenerationSchema`。
+  - 为什么值得做：用户自定义结构是 LLM 的痛点，硬编码 schema 没法覆盖；动态 schema 让玩家或运营在运行时定义实体，模型还是被约束解码兜底。
+  - 怎么开始：把现有"用户自定义字段"的 UI 映射成 `DynamicGenerationSchema.Property` 列表，根字段引用用 `referenceTo:` 串起来，调用 `GenerationSchema(root:dependencies:)` 在保存时就校验合法性。
+
+- **做什么**：用 Tool Calling 把端上私有数据（Contacts、Calendar、HealthKit、Photos）接进 LLM。
+  - 为什么值得做：这些数据放云端 LLM 有合规风险，本地 tool 调用既保留隐私又能让模型自主决定何时取数。
+  - 怎么开始：先写一个最小 `Tool`（name 一个动词、description 一句话、Arguments Generable），在 `call` 里调系统 API；把 tool 传给 session 后用一个引导 prompt 测模型是否会主动调用；再补 class 化和并行安全。
+
+- **做什么**：为长对话做 transcript 压缩兜底。
+  - 为什么值得做：on-device 模型上下文比云端模型小得多，长会话必撞 `exceededContextWindowSize`，用户体感是"AI 突然失忆"。
+  - 怎么开始：catch `exceededContextWindowSize`，先实现"保留首条 + 最近一条"的简化策略；遇到对中间内容依赖大的场景，再让 Foundation Models 自己对中段 transcript 做摘要后续上。
+
+---
+
+## 关联 Session
+
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — 跟着代码走一遍 Foundation Models 在 SwiftUI App 中的接入。
+- [Meet the Foundation Models framework](/articles/wwdc2025-286) — Foundation Models 的入门视频，建议先看再来本节深入。
+- [Explore prompt design & safety for on-device foundation models](/articles/wwdc2025-248) — 设备端模型的 prompt 工程与安全设计要点。
+- [Design interactive snippets](/articles/wwdc2025-281) — App Intents 的 snippet 视图，可与 Generable 输出结合做轻量交互卡片。
+- [Develop for Shortcuts and Spotlight with App Intents](/articles/wwdc2025-260) — App Intents 是把 Foundation Models 能力暴露给系统级入口的关键路径。

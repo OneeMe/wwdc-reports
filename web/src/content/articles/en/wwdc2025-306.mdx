@@ -1,0 +1,170 @@
+---
+title: "Optimize SwiftUI performance with Instruments"
+description: "discover the new swiftui instrument. we"
+date: 2026-06-10
+tags: ["Swift", "SwiftUI", "开发工具"]
+thumbnail: "/images/sessions/2025/306.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/306/"
+sessionId: "wwdc2025-306"
+year: "2025"
+relatedSessions:
+  - title: "Code-along: Cook up a rich text experience in SwiftUI with AttributedString"
+    code: "280"
+    description: "learn how to build a rich text experience with swiftui"
+  - title: "Embracing Swift concurrency"
+    code: "268"
+    description: "join us to learn the core swift concurrency concepts. concurrency helps you impr"
+  - title: "Explore Swift and Java interoperability"
+    code: "307"
+    description: "learn how you can mix swift and java in a single codebase. we"
+  - title: "Improve memory usage and performance with Swift"
+    code: "312"
+    description: "discover ways to improve the performance and memory management of your swift cod"
+---
+
+## Highlight
+
+> Session 介绍了 Instruments 26 中全新的 SwiftUI Instrument，以及它如何帮助诊断两类性能问题：长 body 更新（view body 执行时间过长导致 hitch）和不必要的更新（过多 view body 更新挤占帧预算）。
+
+---
+
+## 核心内容
+
+Steven 在演示 Landmarks 应用时遇到了一个常见问题：列表滚动起来不够顺滑，但他不知道卡顿到底来自哪里。在 SwiftUI 里调试性能曾经非常痛苦——给 body 打断点，调用栈里全是 AttributeGraph 的递归调用，根本看不出哪个 View 因为什么原因被重新执行了。开发者只能靠猜测改代码，再凭手感判断有没有变快。
+
+Instruments 26 给了一个直接的答案。新的 SwiftUI Instrument 把 SwiftUI 内部的更新过程暴露了出来：Update Groups 显示 SwiftUI 在什么时候做工作，Long View Body Updates 标出哪些 View 的 body 跑得太久（红色和橙色按可能造成 hitch 的程度排序），Cause & Effect Graph 把"用户操作 → 状态变更 → View body 重新执行"这条因果链画成可点击的图。Steven 录一次 trace 就直接定位到 `LandmarkListItemView` 的 `distance` 计算属性——每次 body 都在创建一个 `MeasurementFormatter` 和一个 `NumberFormatter`，单次只需要一毫秒，但乘以屏幕上几十个 cell，足以让一帧错过 deadline。
+
+---
+
+## 详细内容
+
+帧预算的常识是这样的（[09:55](https://developer.apple.com/videos/play/wwdc2025/306/?time=595)）：每一帧应用先处理事件，再跑 UI 更新（包括所有需要重跑的 view body），然后交给系统渲染。所有这些必须在 frame deadline 之前完成。一个 body 跑超时，下一帧就来不及交给渲染器，画面就停在前一帧——这就是 hitch。
+
+Steven profile 出来的问题代码长这样（[08:47](https://developer.apple.com/videos/play/wwdc2025/306/?time=527)）：
+
+```swift
+struct LandmarkListItemView: View {
+    @Environment(ModelData.self) private var modelData
+    let landmark: Landmark
+
+    var body: some View {
+        Image(landmark.thumbnailImageName)
+            // ...
+            .overlay(alignment: .bottom) {
+                if let distance {
+                    Text(distance)
+                }
+            }
+    }
+
+    private var distance: String? {
+        guard let currentLocation = modelData.locationFinder.currentLocation else { return nil }
+        let distance = currentLocation.distance(from: landmark.clLocation)
+
+        let numberFormatter = NumberFormatter()
+        numberFormatter.numberStyle = .decimal
+        numberFormatter.maximumFractionDigits = 0
+
+        let formatter = MeasurementFormatter()
+        formatter.locale = Locale.current
+        formatter.unitStyle = .medium
+        formatter.unitOptions = .naturalScale
+        formatter.numberFormatter = numberFormatter
+        return formatter.string(from: Measurement(value: distance, unit: UnitLength.meters))
+    }
+}
+```
+
+关键点：
+
+- `body` 通过 `distance` 计算属性间接读取了距离字符串，每次 body 重跑都会触发一次完整的格式化流程。
+- `NumberFormatter` 和 `MeasurementFormatter` 是 Foundation 里出了名的"创建昂贵"对象，把它们放在 body 调用路径上意味着每次 body 都付一次创建 + 配置 + 字符串生成的代价。
+- Time Profiler 直接指向了 `distance` 这一帧，最重的子帧是这两个 formatter——这是教科书式的"body 内做计算"反模式。
+
+修复方式是把格式化挪进 `LocationFinder`，并缓存结果（[12:13](https://developer.apple.com/videos/play/wwdc2025/306/?time=733)）：
+
+```swift
+@Observable
+class LocationFinder: NSObject {
+    var currentLocation: CLLocation?
+    private let formatter: MeasurementFormatter
+
+    var landmarks: [Landmark] = [] {
+        didSet { updateDistances() }
+    }
+
+    private var distanceCache: [Landmark.ID: String] = [:]
+
+    private func updateDistances() {
+        guard let currentLocation else { return }
+        self.distanceCache = landmarks.reduce(into: [:]) { result, landmark in
+            let distance = self.formatter.string(
+                from: Measurement(
+                    value: currentLocation.distance(from: landmark.clLocation),
+                    unit: UnitLength.meters
+                )
+            )
+            result[landmark.id] = distance
+        }
+    }
+
+    func distance(from landmark: Landmark) -> String? {
+        distanceCache[landmark.id]
+    }
+}
+```
+
+关键点：
+
+- `formatter` 在 `init` 里创建一次，存为属性，避免 body 每次都重建。
+- `distanceCache: [Landmark.ID: String]` 把已经格式化好的字符串按 landmark id 存起来，body 现在只是查字典。
+- 只有 `currentLocation` 或 `landmarks` 变化时才调用 `updateDistances()`，把代价从"每次 body"摊到"每次位置变化"。
+
+第二个问题更隐蔽——不必要的更新（[16:51](https://developer.apple.com/videos/play/wwdc2025/306/?time=1011)）。Steven 加了一个收藏按钮，结果点击任意一个 landmark 的爱心时，整个列表里所有 `LandmarkListItemView` 的 body 都被重跑了一遍。Cause & Effect Graph 显示：`isFavorite(_:)` 方法访问了 `favoritesCollection.landmarks` 这个数组，于是每个 cell 的 body 都和"整个数组"建立了依赖。修复方法是给每个 landmark 创建独立的 view model，让依赖粒度落到单个对象上（[17:20](https://developer.apple.com/videos/play/wwdc2025/306/?time=1040)、[29:21](https://developer.apple.com/videos/play/wwdc2025/306/?time=1761)）：
+
+```swift
+@Observable @MainActor
+class ModelData {
+    @Observable class ViewModel {
+        var isFavorite: Bool
+        init(isFavorite: Bool = false) { self.isFavorite = isFavorite }
+    }
+
+    @ObservationIgnored private var viewModels: [Landmark.ID: ViewModel] = [:]
+
+    private func viewModel(for landmark: Landmark) -> ViewModel {
+        if viewModels[landmark.id] == nil {
+            viewModels[landmark.id] = ViewModel()
+        }
+        return viewModels[landmark.id]!
+    }
+
+    func isFavorite(_ landmark: Landmark) -> Bool {
+        viewModel(for: landmark).isFavorite
+    }
+}
+```
+
+关键点：
+
+- `@Observable class ViewModel` 把"是否收藏"这个状态拆成每 landmark 一份独立可观察对象。
+- `@ObservationIgnored private var viewModels` 让 `viewModels` 字典本身不参与依赖追踪——SwiftUI 不会因为字典变化而重跑所有 cell。
+- `isFavorite(_:)` 内部访问 `viewModel(for: landmark).isFavorite`，于是 cell 的 body 只依赖自己那一份 ViewModel，点击别的 landmark 的爱心时它不会被打扰。
+
+---
+
+## 核心启发
+
+- **把 formatter 和其他昂贵对象搬出 body**：为什么值得做——`NumberFormatter` 和 `MeasurementFormatter` 创建成本高，列表里几十个 cell × 每帧 = 主线程很容易超时；怎么开始——把这类对象作为属性持有，或者在 model 层缓存格式化结果，body 里只查缓存。
+- **用新 SwiftUI Instrument 跑一次基线 trace**：为什么值得做——靠肉眼或 print 调试很难看出哪个 view body 跑得久、哪些 view 在被无谓地重跑；怎么开始——在 Xcode 26 按 Command-I，选 SwiftUI 模板，先看 Long View Body Updates 里红色和橙色的条目，再看 Cause & Effect Graph 找到那些"我没改它，它怎么也更新了"的 View。
+- **拆细 @Observable 的依赖粒度**：为什么值得做——一个集合属性会让所有访问它的 View 都建立依赖，单元素变化就会触发整组 View 重跑；怎么开始——为每个元素创建独立的 `@Observable` 子对象，把不需要参与观察的容器字段标 `@ObservationIgnored`。
+- **频繁变化的值不要放进 Environment**：为什么值得做——`@Environment` 的值变化会让所有读取它的 View 都进入更新检查路径；怎么开始——把 timer、geometry proxy、滚动偏移这类高频值用局部 `@State` 或专用 `@Observable` 对象承载，按读取范围划定影响半径。
+
+---
+
+## 关联 Session
+
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — 用 SwiftUI 的 AttributedString 构建富文本编辑体验
+- [Embracing Swift concurrency](/articles/wwdc2025-268) — Swift 并发核心概念，理解主线程工作如何影响 UI 帧预算
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — 在同一个代码库里混用 Swift 和 Java
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Swift 代码层面的内存与性能优化方法

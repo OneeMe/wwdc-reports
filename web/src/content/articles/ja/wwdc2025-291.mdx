@@ -1,0 +1,193 @@
+---
+title: "SwiftData: Dive into inheritance and schema migration"
+description: "discover how to use class inheritance to model your data. learn how to optimize queries and seamlessly migrate your app"
+date: 2026-06-10
+tags: ["应用服务", "Swift"]
+thumbnail: "/images/sessions/2025/291.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/291/"
+sessionId: "wwdc2025-291"
+year: "2025"
+relatedSessions:
+  - title: "Discover Apple-Hosted Background Assets"
+    code: "325"
+    description: "building on background assets, this session will introduce the new capability to"
+  - title: "Dive deeper into Writing Tools"
+    code: "265"
+    description: "with writing tools, people can proofread, rewrite, and transform text directly w"
+  - title: "Dive into App Store server APIs for In-App Purchase"
+    code: "249"
+    description: "discover the latest updates for the app store server api, app store server notif"
+  - title: "Enhance child safety with PermissionKit"
+    code: "293"
+    description: "discover how permissionkit helps you enhance communication safety for children i"
+---
+
+## Highlight
+
+> iOS 26 起 SwiftData 支持 `@Model` class 之间的继承，配合 lightweight migration stage 把已有 schema 平滑迁到带子类的 V4。
+
+## 核心内容
+
+SampleTrips 这个示例 app 从 iOS 17 一路演进到 iOS 26。最初的模型只有一个 `Trip` 类，所有出行——家庭旅行、出差、休养——都塞进同一张表。问题随时间暴露：业务出差需要 `perdiem`（每日补贴）字段，个人旅行需要 `Reason` 枚举（family/reunion/wellness），但把它们都加到 `Trip` 上会让基类越来越臃肿，且大部分字段对另一类完全无意义。如果改成扁平化的多张表（`PersonalTrip`、`BusinessTrip` 各自独立），又会失去「列出我所有 trip」这种基类视角下的统一查询能力。
+
+iOS 26 给 SwiftData 加了 class inheritance：`@Model` 类可以互相继承。`Trip` 作为基类提供共享字段，`PersonalTrip`、`BusinessTrip` 作为子类各自加自己的属性。`@Query` 用基类类型时，结果里会带上所有子类实例（deep search）；用 `is` 关键字写 predicate 又能筛出某一种子类（shallow search）。Rishi Verma 同时给出了从 V1 到 V4 的完整迁移链：V1→V2 自定义去重、V2→V3 加 unique/index、V3→V4 用 lightweight migration 把子类直接接进来。
+
+## 详细内容
+
+**子类怎么写。** 子类需要标 `@available(iOS 26, *)`，否则在低版本上不会编译。
+
+```swift
+@Model
+class Trip {
+  var name: String
+  var destination: String
+  var startDate: Date
+  var endDate: Date
+
+  var bucketList: [BucketListItem] = [BucketListItem]()
+  var livingAccommodation: LivingAccommodation?
+}
+
+@available(iOS 26, *)
+@Model
+class BusinessTrip: Trip {
+  var perdiem: Double = 0.0
+}
+
+@available(iOS 26, *)
+@Model
+class PersonalTrip: Trip {
+  enum Reason: String, CaseIterable, Codable {
+    case family
+    case reunion
+    case wellness
+  }
+  var reason: Reason
+}
+```
+
+关键点（[03:28](https://developer.apple.com/videos/play/wwdc2025/291/?time=208)）：
+- `BusinessTrip: Trip` 直接继承基类的全部属性，无需重复声明。
+- 子类的新属性必须给默认值（`perdiem = 0.0`），否则迁移时旧数据没法填。
+- `Reason` 实现 `Codable` 才能被 SwiftData 持久化。
+
+**注册子类。** schema 注册时把子类列进 `modelContainer`：
+
+```swift
+.modelContainer(for: [Trip.self, BusinessTrip.self, PersonalTrip.self])
+```
+
+关键点（[04:03](https://developer.apple.com/videos/play/wwdc2025/291/?time=243)）：仅注册基类，子类的 fetch 会拿不到。
+
+**用 `is` 写 shallow search。** 分段控件按类型筛选时，predicate 里用 `$0 is PersonalTrip`：
+
+```swift
+let classPredicate: Predicate<Trip>? = {
+  switch segment.wrappedValue {
+  case .personal:
+    return #Predicate { $0 is PersonalTrip }
+  case .business:
+    return #Predicate { $0 is BusinessTrip }
+  default:
+    return nil
+  }
+}()
+_trips = Query(filter: classPredicate, sort: \.startDate, order: .forward)
+```
+
+关键点（[07:06](https://developer.apple.com/videos/play/wwdc2025/291/?time=426)）：
+- `Predicate<Trip>` 的类型参数是基类，所以同一个 `@Query` 既能拿全部 Trip，也能在运行时按类型过滤。
+- `default` 分支返回 `nil`，让查询不带类型过滤，等价于 deep search。
+
+**Migration plan 的整链。** 从 V1 到 V4 用 `SchemaMigrationPlan` 串起来：
+
+```swift
+enum SampleTripsMigrationPlan: SchemaMigrationPlan {
+  static var schemas: [any VersionedSchema.Type] {
+    var currentSchemas: [any VersionedSchema.Type] =
+      [SampleTripsSchemaV1.self, SampleTripsSchemaV2.self, SampleTripsSchemaV3.self]
+    if #available(iOS 26, *) {
+      currentSchemas.append(SampleTripsSchemaV4.self)
+    }
+    return currentSchemas
+  }
+
+  static var stages: [MigrationStage] {
+    var currentStages = [migrateV1toV2, migrateV2toV3]
+    if #available(iOS 26, *) {
+      currentStages.append(migrateV3toV4)
+    }
+    return currentStages
+  }
+}
+```
+
+关键点（[10:24](https://developer.apple.com/videos/play/wwdc2025/291/?time=624)）：
+- `schemas` 数组按发布顺序列出每一版 schema，SwiftData 据此找到用户当前所处的版本。
+- `stages` 是一段段迁移逻辑：V1→V2 和 V2→V3 各做去重，V3→V4 是 lightweight。
+- `#available` 把 V4 包起来，老系统装老 app 不会触碰未支持的子类类型。
+
+**lightweight stage 一行就够。** 加子类属于 schema 兼容变更，不需要写 willMigrate：
+
+```swift
+@available(iOS 26, *)
+static let migrateV3toV4 = MigrationStage.lightweight(
+  fromVersion: SampleTripsSchemaV3.self,
+  toVersion: SampleTripsSchemaV4.self
+)
+```
+
+关键点（[10:03](https://developer.apple.com/videos/play/wwdc2025/291/?time=603)）：lightweight migration 只声明起止版本，存储引擎自动改 schema、保留所有现有数据。
+
+**fetch 提速三件套。** 自定义迁移阶段和 widget 都能用同样的 `FetchDescriptor` 调优：
+
+```swift
+var fetchDesc = FetchDescriptor<SampleTripsSchemaV1.Trip>()
+fetchDesc.propertiesToFetch = [\.name]
+fetchDesc.relationshipKeyPathsForPrefetching = [\.livingAccommodation]
+```
+
+关键点（[13:11](https://developer.apple.com/videos/play/wwdc2025/291/?time=791)）：
+- `propertiesToFetch` 让查询只加载真正用到的列，迁移去重只需要 `name` 时大幅减少 IO。
+- `relationshipKeyPathsForPrefetching` 一次性把关系拉进来，避免后续 N+1 查询。
+- 配合 `fetchLimit = 1`（[13:28](https://developer.apple.com/videos/play/wwdc2025/291/?time=808)）让 widget 只拿最近一条 trip。
+
+**History token 的高效拉取。** 跨进程变更靠 SwiftData History，新增 `sortBy` 和 `fetchLimit` 让定位最新 token 不再全表扫描：
+
+```swift
+var historyDesc = HistoryDescriptor<DefaultHistoryTransaction>()
+historyDesc.sortBy = [.init(\.transactionIdentifier, order: .reverse)]
+historyDesc.fetchLimit = 1
+
+let transactions = try context.fetchHistory(historyDesc)
+if let transaction = transactions.last {
+  historyToken = transaction.token
+}
+```
+
+关键点（[16:24](https://developer.apple.com/videos/play/wwdc2025/291/?time=984)）：按 `transactionIdentifier` 倒序、limit 1，等价于 SQL 里的 `ORDER BY ... DESC LIMIT 1`，O(log n) 拿到最新 token，避免每次启动重新扫历史。
+
+## 核心启发
+
+- **做什么**：在已有 SwiftData app 中识别一组「is-a」关系的模型，引入子类。
+  - 为什么值得做：业务字段越加越多时，子类比 optional 字段更能表达领域语义，也省去了 `if let perdiem` 这类散落的判空。
+  - 怎么开始：列出当前模型里 optional 且仅对部分实例有意义的字段，把它们按使用场景聚类，候选项就是子类。
+
+- **做什么**：把「deep search vs shallow search」作为继承的判定标准。
+  - 为什么值得做：避免无脑用继承造成的查询性能问题；只用基类查询的场景应该把子类降级为属性，只用子类查询的场景应该扁平化模型。
+  - 怎么开始：扫一遍代码里所有 `@Query` 和 `FetchDescriptor`，统计基类查询和子类查询的比例，比例都不为零再考虑继承。
+
+- **做什么**：建立完整的 `SchemaMigrationPlan`，覆盖从 V1 到当前的所有版本。
+  - 为什么值得做：用户不会按版本顺序升级，可能从两年前的版本直接跳到最新版，缺一段 stage 就会丢数据或崩溃。
+  - 怎么开始：在 `VersionedSchema` 里给每次发版打 `Schema.Version`，并把对应的 `MigrationStage` 串进 plan 的 `stages` 数组。
+
+- **做什么**：在 widget、share extension 等只读、低内存场景里用 `propertiesToFetch` + `fetchLimit`。
+  - 为什么值得做：widget 内存预算只有几十 MB，全量加载 Trip 可能直接 OOM；只拉需要的列和最近一条数据足以渲染卡片。
+  - 怎么开始：每个 `FetchDescriptor` 检查一遍，UI 只显示某几个字段就把它们写进 `propertiesToFetch`，需要展示数量的也加 `fetchLimit`。
+
+## 关联 Session
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — 用 Apple 托管的 background assets 在 app 闲时预下载大资源
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — 在系统 Writing Tools 里集成校对、改写和文本变换
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — 通过 App Store Server API 管理订阅、退款与服务端通知
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — 用 PermissionKit 增强儿童在通讯场景中的安全保护

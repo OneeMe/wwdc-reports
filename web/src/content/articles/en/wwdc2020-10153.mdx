@@ -1,0 +1,257 @@
+---
+title: "Get models on device using Core ML Converters"
+description: "with core ml you can bring incredible machine learning models to your app and run them entirely on-device. and when you use core ml converters, you can incorporate almost any trained model from tensorflow or pytorch and take full advantage of the gpu, cpu, and neural engine. discover everything you need to begin converting existing models from other ml platforms and explore how to create custom operations that extend the capabilities of your models."
+date: 2020-06-10
+tags: ["WWDC 2020", "Core ML", "Machine Learning", "Core ML Tools"]
+thumbnail: "/images/sessions/2020/10153.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10153/"
+sessionId: "wwdc2020-10153"
+year: "2020"
+code: "10153"
+article:
+  type: "technical"
+  source: "session-transcript"
+  version: "1.0"
+relatedSessions:
+  - title: "Use model deployment and security with Core ML"
+    code: "10152"
+    description: "讲解 Core ML 模型部署、云端更新、模型加密和 Xcode 预览，是转换完成后进入生产环境的下一步。"
+  - title: "Control training in Create ML with Swift"
+    code: "10156"
+    description: "展示如何用 Swift 控制 Create ML 训练、checkpoint 和进度监听，适合和模型转换前的训练流程衔接。"
+  - title: "Build an Action Classifier with Create ML"
+    code: "10043"
+    description: "用 Create ML 训练动作分类 Core ML 模型，提供从数据准备到导出模型的具体案例。"
+  - title: "Explore the Action & Vision app"
+    code: "10099"
+    description: "把 Create ML、Core ML 和 Vision 组合成完整 app，展示模型进入应用场景后的工作流。"
+  - title: "Build customized ML models with the Metal Performance Shaders Graph"
+    code: "10677"
+    description: "介绍 MPS Graph 如何用张量计算图构建自定义 ML 模型，适合理解 Core ML 之下的 GPU 加速路径。"
+---
+
+## Highlight
+
+> Core ML Tools 在 WWDC 2020 将 TensorFlow 1、TensorFlow 2 和 PyTorch 模型转换统一到 `ct.convert`，并通过 MIL 处理动态 shape、优化 pass 与 composite op，把训练框架产出的模型转换为可部署到 Apple 设备的 `.mlmodel`。
+
+## 核心内容
+
+很多团队训练模型时，模型起点并不在 Apple 平台。视觉模型可能来自 TensorFlow 2 的 Keras API，推荐模型可能来自 PyTorch，语音模型可能还是 TensorFlow 1 的 frozen graph。过去要把这些模型带到 Core ML，开发者要记住多条转换路径：TensorFlow 走 `tfcoreml`，PyTorch 先导出 ONNX，再交给 ONNX Core ML。
+
+这条链路的麻烦在于中间格式会变成新的失败点。PyTorch 的某个新特性可能还没有被 ONNX exporter 覆盖，ONNX 标准也可能和框架演进不同步。Session 在 04:22 明确说，2020 年新的 PyTorch converter 移除了这层额外依赖，从 `torch_script_model` 可以一步进入 Core ML。
+
+Apple 的改变是把转换入口收束到 Core ML Tools 里的 `ct.convert`。同一个 API 可以接收 TensorFlow 1、TensorFlow 2 或 PyTorch 模型，converter 会把不同框架的表示先转换成 Model Intermediate Language（MIL，模型中间语言），再走公共优化和 Core ML 后端。
+
+这场 session 没停在 API 改名。它用三个例子说明转换器能处理什么：MobileNet 展示最短路径的 TensorFlow 2 和 PyTorch 转换；DeepSpeech 展示动态 shape 如何影响语音模型；T5 展示遇到 TensorFlow `Einsum` 这类 unsupported op 时，如何用 MIL composite op 把它改写成 Core ML 已支持的矩阵乘。
+
+## 详细内容
+
+### 统一的 TensorFlow 和 PyTorch 转换入口
+
+（[02:56](https://developer.apple.com/videos/play/wwdc2020/10153/?time=176)）TensorFlow 转换的变化很直接。过去要额外安装 `tfcoreml`，现在 TensorFlow converter 已经集成进 Core ML Tools。Session 还说明，TensorFlow 2 的支持从卷积模型扩展到 LSTM、transformer 等动态模型。
+
+```python
+import coremltools as ct
+import tensorflow as tf
+
+tf_model = tf.keras.applications.MobileNet()
+mlmodel = ct.convert(tf_model)
+```
+
+关键点：
+
+- `coremltools` 是唯一需要直接调用的转换包。
+- `tf.keras.applications.MobileNet()` 返回 TensorFlow 2 模型对象。
+- `ct.convert(tf_model)` 会自动识别模型类型、输入 shape 和输出，再通过 MIL 完成转换。
+
+（[07:41](https://developer.apple.com/videos/play/wwdc2020/10153/?time=461)）PyTorch 的入口也变成同一个 `ct.convert`。区别是 TorchScript 模型通常不带完整输入 shape，示例用 `ct.TensorType` 显式传给 converter。
+
+```python
+import coremltools as ct
+import torch
+import torchvision
+
+torch_model = torchvision.models.mobilenet_v2()
+
+torch_model.eval()
+example_input = torch.rand(1, 3, 256, 256)
+traced_model = torch.jit.trace(torch_model, example_input)
+
+mlmodel = ct.convert(
+    traced_model,
+    inputs=[ct.TensorType(shape=example_input.shape)]
+)
+```
+
+关键点：
+
+- `torch_model.eval()` 把模型切到推理模式，避免训练态行为进入 traced model。
+- `torch.jit.trace` 用一个示例输入生成 TorchScript 表示。
+- `ct.TensorType(shape=example_input.shape)` 给 Core ML converter 补上输入张量形状。
+- 同一个 `ct.convert` 同时服务 TensorFlow 和 PyTorch，减少了按框架记 API 的成本。
+
+### 把模型接口整理成 App 能读懂的形态
+
+（[09:23](https://developer.apple.com/videos/play/wwdc2020/10153/?time=563)）PyTorch 示例转换完成后，Core ML 模型的输入叫 `input.1`，输出叫 `1648`。这些名字来自源模型张量，放进 App 里不够清楚。Session 用 `rename_feature` 把接口名字改成业务能理解的名字。
+
+```python
+spec = mlmodel.get_spec()
+ct.utils.rename_feature(spec, "input.1", "myInputName")
+ct.utils.rename_feature(spec, "1648", "myOutputName")
+mlmodel = ct.models.MLModel(spec)
+```
+
+关键点：
+
+- `get_spec()` 取出 Core ML 模型的 protobuf spec。
+- `rename_feature` 修改输入和输出 feature 名称。
+- `ct.models.MLModel(spec)` 用修改后的 spec 重新构造模型对象。
+
+（[10:37](https://developer.apple.com/videos/play/wwdc2020/10153/?time=637)）TensorFlow 1 的 MobileNet 例子还展示了另一类接口整理：模型实际处理图片时，转换时可以用 `ImageType` 描述输入预处理，用 `ClassifierConfig` 生成分类器模型，并把作者、授权和描述写进 `.mlmodel`。
+
+```python
+import coremltools as ct
+import tensorflow as tf
+
+mlmodel = ct.convert("mobilenet_frozen_graph.pb",
+                    inputs=[ct.ImageType(bias=[-1,-1,-1], scale=1/127.0)],
+                    classifier_config=ct.ClassifierConfig("labels.txt"))
+
+mlmodel.short_description = 'An image classifier'
+mlmodel.license = 'Apache 2.0'
+mlmodel.author = "Original Paper: A. Howard, M. Zhu, B. Chen, D. Kalenichenko, W. Wang, " \
+                 "T. Weyand, M. Andreetto, H. Adam"
+
+mlmodel.save("mobilenet.mlmodel")
+```
+
+关键点：
+
+- `ImageType` 告诉 converter 输入是图片，并声明 bias 与 scale 预处理。
+- `ClassifierConfig("labels.txt")` 把类别标签带进 Core ML 分类器接口。
+- `short_description`、`license` 和 `author` 会成为模型元数据。
+- `save("mobilenet.mlmodel")` 产出可放入 Xcode 的 Core ML 模型文件。
+
+### 处理 DeepSpeech 这类动态 shape 模型
+
+（[15:45](https://developer.apple.com/videos/play/wwdc2020/10153/?time=945)）DeepSpeech 示例的输入来自语音预处理。12 秒音频被转成 636 个序列，每个序列宽度为 19，包含 26 个 MFCC 系数。静态 TensorFlow graph 一次只能处理 16 个序列，App 或 notebook 需要把输入切成多个 chunk，并维护 LSTM state。
+
+```python
+outputs = ["logits", "new_state_c", "new_state_h"]
+mlmodel = ct.convert(tf_model, outputs=outputs)
+
+input_dict["previous_state_c"] = np.zeros([1, 2048]).astype(np.float32)
+input_dict["previous_state_h"] = np.zeros([1, 2048]).astype(np.float32)
+
+while (start + step) < max_time_steps:
+    input_dict["input_node"] = mfccs[:, start:(start + step), :, :]
+    preds = mlmodel.predict(input_dict)
+    input_dict["previous_state_c"] = preds["new_state_c"]
+    input_dict["previous_state_h"] = preds["new_state_h"]
+```
+
+关键点：
+
+- `outputs` 明确告诉 converter 保留 logits 和 LSTM 的两个 state 输出。
+- `previous_state_c` 与 `previous_state_h` 初始化为零，作为第一段音频的初始状态。
+- 每次 `predict` 只处理 16 个序列，并把新的 state 写回输入字典。
+- 这种方式能跑通静态模型，但调用方要管理分段和状态。
+
+（[19:23](https://developer.apple.com/videos/play/wwdc2020/10153/?time=1163)）同一个 DeepSpeech 模型重新导出动态 graph 后，Core ML model 可以接受任意序列长度。Session 还补充了一个反向能力：如果从动态 TensorFlow graph 开始，也可以通过 `inputs` 传入固定 shape，让 type and value inference 移除不需要的动态操作。
+
+```python
+import coremltools as ct
+
+input = ct.TensorType(name="input_node", shape=(1, 16, 19, 26))
+model = ct.convert(tf_model, outputs=outputs, inputs=[input])
+```
+
+关键点：
+
+- `name="input_node"` 对齐 TensorFlow graph 里的输入节点名。
+- `shape=(1, 16, 19, 26)` 把动态输入收窄为固定窗口。
+- converter 会传播 shape 信息，去掉多余的 dynamic reshape、get shape 等操作。
+- 静态模型通常更利于性能，动态模型适合输入长度天然变化的场景。
+
+### 用 MIL Builder 和 composite op 处理 unsupported op
+
+（[24:28](https://developer.apple.com/videos/play/wwdc2020/10153/?time=1468)）T5 示例在转换时遇到 TensorFlow `Einsum` unsupported op。Session 给出两条路：用 Core ML custom layer，在 App 里配 Swift 实现；或者把这个 op 拆成现有 MIL ops，作为 composite op 留在 `.mlmodel` 文件里。演示选择了第二条。
+
+```python
+from coremltools.converters.mil import Builder as mb
+
+@mb.program(input_specs=[mb.TensorSpec(shape=(1, 100, 100, 3))])
+def prog(x):
+    x = mb.relu(x=x)
+    x = mb.transpose(x=x, perm=[0, 3, 1, 2])
+    x = mb.reduce_mean(x=x, axes=[2, 3], keep_dims=False)
+    x = mb.log(x=x)
+    return x
+```
+
+关键点：
+
+- `Builder` 是 MIL 的 Python 构建入口。
+- `TensorSpec` 声明输入 shape，默认类型会被推断为 `Float32`。
+- `mb.relu`、`mb.transpose`、`mb.reduce_mean` 和 `mb.log` 逐步构成一段 MIL program。
+- MIL builder 会立刻做 type and shape inference，方便检查每一步输出。
+
+（[28:20](https://developer.apple.com/videos/play/wwdc2020/10153/?time=1700)）T5 使用的 `Einsum` 形式是 `bnqd,bnkd->bnqk`。Session 把它识别为对第二个输入做转置的 batched matrix multiplication，所以可以注册一个 TensorFlow op 转换函数，用 `mb.matmul` 表达。
+
+```python
+from coremltools.converters.mil import Builder as mb
+from coremltools.converters.mil import register_tf_op
+
+@register_tf_op
+def Einsum(context, node):
+    assert node.attr['equation'] == 'bnqd,bnkd->bnqk'
+
+    a = context[node.inputs[0]]
+    b = context[node.inputs[1]]
+
+    x = mb.matmul(x=a, y=b, transpose_x=False, transpose_y=True, name=node.name)
+
+    context.add(node.name, x)
+```
+
+关键点：
+
+- `register_tf_op` 把这个函数登记给 TensorFlow frontend。
+- `assert` 限定只处理 T5 里实际出现的 `Einsum` 参数化形式。
+- `context[node.inputs[0]]` 和 `context[node.inputs[1]]` 取出源 graph 的两个输入张量。
+- `mb.matmul(..., transpose_y=True)` 用 MIL 里已有的矩阵乘表达这个 `Einsum`。
+- `context.add` 把转换后的 MIL value 接回原节点名，后续转换流程继续执行。
+
+## 核心启发
+
+### 1. 把研究模型做成可离线运行的 App 原型
+
+- **做什么**：把团队已有的 TensorFlow 2 或 PyTorch 图像模型转成 `.mlmodel`，先做一个离线识别原型。
+- **为什么值得做**：本 session 的 MobileNet 示例说明，Keras 模型和 TorchScript 模型都能通过 `ct.convert` 进入 Core ML。
+- **怎么开始**：先在 notebook 里用 `ct.convert` 转换模型，再用 `mlmodel.save("model.mlmodel")` 导出，最后拖进 Xcode 观察输入输出接口。
+
+### 2. 为变长音频功能准备 Core ML 模型
+
+- **做什么**：实现一段本地语音命令识别或短音频转写，把音频特征送进 Core ML。
+- **为什么值得做**：DeepSpeech 示例展示了固定 shape 和动态 shape 两种 Core ML 输出，适合比较延迟、吞吐和调用复杂度。
+- **怎么开始**：先用固定窗口模型验证 `outputs=["logits", "new_state_c", "new_state_h"]` 的状态传递，再尝试导出动态 TensorFlow graph，让模型接收完整特征序列。
+
+### 3. 给转换失败的模型补一个 composite op
+
+- **做什么**：遇到 unsupported op 时，先判断它是否能拆成已有 MIL ops，再补一个最小转换函数。
+- **为什么值得做**：T5 的 `Einsum` 示例没有写 Swift custom layer，而是用 `mb.matmul` 留在 Core ML 模型文件内。
+- **怎么开始**：从错误 trace 找到 op 名和参数，使用 `register_tf_op` 注册同名函数，在函数里用 `Builder` 组合 MIL op。
+
+### 4. 建立模型转换后的交付流水线
+
+- **做什么**：把模型训练、转换、接口命名、Xcode 预览和部署拆成一条可重复的流程。
+- **为什么值得做**：Session 同时展示了 `rename_feature`、模型元数据、`ImageType` 和 classifier config，这些都影响 App 侧调用体验。
+- **怎么开始**：在转换脚本里固定输入输出名字，写入 `short_description`、`license` 和 `author`，并把转换后的模型交给 Core ML 部署流程继续发布。
+
+## 关联 Session
+
+- [Use model deployment and security with Core ML](/articles/wwdc2020-10152) — 讲解 Core ML 模型部署、云端更新、模型加密和 Xcode 预览，是转换完成后进入生产环境的下一步。
+- [Control training in Create ML with Swift](/articles/wwdc2020-10156) — 展示如何用 Swift 控制 Create ML 训练、checkpoint 和进度监听，适合和模型转换前的训练流程衔接。
+- [Build an Action Classifier with Create ML](/articles/wwdc2020-10043) — 用 Create ML 训练动作分类 Core ML 模型，提供从数据准备到导出模型的具体案例。
+- [Explore the Action & Vision app](/articles/wwdc2020-10099) — 把 Create ML、Core ML 和 Vision 组合成完整 app，展示模型进入应用场景后的工作流。
+- [Build customized ML models with the Metal Performance Shaders Graph](/articles/wwdc2020-10677) — 介绍 MPS Graph 如何用张量计算图构建自定义 ML 模型，适合理解 Core ML 之下的 GPU 加速路径。

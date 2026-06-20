@@ -1,0 +1,315 @@
+---
+title: "Swift concurrency: Behind the scenes"
+description: "dive into the details of swift concurrency and discover how swift provides greater safety from data races and thread explosion while simultaneously improving performance. we'll explore how swift tasks differ from grand central dispatch, how the new cooperative threading model works, and how to ensure the best performance for your apps."
+date: "2021-06-06"
+tags: ["Swift", "Concurrency", "Performance", "Actors"]
+thumbnail: "/images/sessions/2021/10254.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10254/"
+sessionId: "wwdc2021-10254"
+year: "2021"
+relatedSessions:
+  - title: "Meet async/await in Swift"
+    code: "10132"
+    description: "介绍 Swift async/await 语法、挂起行为，以及如何把 completion handler 迁移到 async 函数"
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "讲解 task group、async let、取消传播和结构化任务关系"
+  - title: "Protect mutable state with Swift actors"
+    code: "10133"
+    description: "介绍 actor 隔离、共享可变状态保护和 MainActor"
+  - title: "Understand and eliminate hangs from your app"
+    code: "10258"
+    description: "用工具定位卡顿和 hang，识别同步阻塞与 GCD 使用问题"
+---
+
+## Highlight
+
+> Swift Concurrency 通过 `await`、task group、actor 和协作式线程池，让 Swift 运行时知道任务依赖关系，从而减少线程爆炸、数据竞争和主线程切换开销。
+
+## 核心内容
+
+你在写一个新闻阅读器。
+
+用户点了刷新。App 要读取订阅源列表，发起很多网络请求，解析返回的数据，写入数据库，最后刷新界面。
+
+用 Grand Central Dispatch（GCD）写这件事很自然。数据库放到一个串行队列，网络回调放到并发队列。主线程不阻塞，数据库也有互斥保护。
+
+问题藏在网络回调里。
+
+每个 feed 的回调都会解析数据，然后同步进入数据库队列。如果数据库队列正在忙，当前线程会阻塞。GCD 看到并发队列还有工作，会继续创建线程。100 个 feed 可能把一个 6 核 iPhone 推到 100 个回调线程，这就是 thread explosion（线程爆炸）。
+
+线程多了，CPU 要频繁做线程上下文切换。每个阻塞线程还持有栈和内核数据结构。有些线程可能持有锁，让别的线程继续等待。
+
+Swift Concurrency 改了执行模型。
+
+`await` 是异步等待。函数可以在这里挂起，线程被释放去执行其他任务。运行时用 continuation（续体）记录后续工作。线程切换任务时，成本接近一次函数调用，而不是完整线程上下文切换。
+
+这需要一个前提：Swift 运行时必须知道任务之间的依赖关系。
+
+`await` 让 continuation 的依赖显式存在。task group 让父任务和子任务的依赖显式存在。actor 让可变状态的互斥访问显式存在。运行时拿到这些信息后，可以用协作式线程池，只创建接近 CPU 核心数的线程。
+
+这场 session 的重点，不是教你写 `async` 语法。它解释为什么 Swift Concurrency 能提升性能：语言特性把依赖关系交给运行时，运行时用这些依赖做更好的调度。
+
+## 详细内容
+
+### GCD 的隐藏成本
+
+（[04:57](https://developer.apple.com/videos/play/wwdc2021/10254/?time=297)）传统写法把 URLSession delegate queue 设为并发队列，然后在每个回调里同步进入数据库队列。
+
+```swift
+func deserializeArticles(from data: Data) throws -> [Article] { /* ... */ }
+func updateDatabase(with articles: [Article], for feed: Feed) { /* ... */ }
+
+let urlSession = URLSession(configuration: .default, delegate: self, delegateQueue: concurrentQueue)
+
+for feed in feedsToUpdate {
+    let dataTask = urlSession.dataTask(with: feed.url) { data, response, error in
+        // ...
+        guard let data = data else { return }
+        do {
+            let articles = try deserializeArticles(from: data)
+            databaseQueue.sync {
+                updateDatabase(with: articles, for: feed)
+            }
+        } catch { /* ... */ }
+    }
+    dataTask.resume()
+}
+```
+
+关键点：
+
+- `deserializeArticles(from:)` 把下载结果转成文章数组。
+- `updateDatabase(with:for:)` 把文章写入指定 feed 对应的数据库记录。
+- `URLSession` 使用 `concurrentQueue` 作为 delegate queue，多个回调可以并发执行。
+- `for feed in feedsToUpdate` 为每个订阅源创建一个 `dataTask`。
+- `guard let data = data else { return }` 没有数据时直接结束回调。
+- `databaseQueue.sync` 会同步等待数据库队列执行完更新。
+- 当多个回调同时进入 `databaseQueue.sync`，等待的线程会阻塞。
+- GCD 为了继续消化并发队列上的工作，可能创建更多线程。
+
+（[05:58](https://developer.apple.com/videos/play/wwdc2021/10254/?time=358)）GCD 的策略是：队列有工作，就找线程执行；并发队列可以同时执行多个工作项；线程阻塞时，如果队列还有工作，系统会再创建线程。
+
+这个策略能保持并发度，也可能带来线程爆炸。
+
+在 Apple Watch 这类双核设备上，两个线程阻塞后，GCD 会继续创建新线程处理剩余回调。CPU 开始在多个线程之间切换。在线程数量远大于核心数时，调度成本会超过实际业务工作。
+
+### task group 把并发表达给 Swift 运行时
+
+（[13:18](https://developer.apple.com/videos/play/wwdc2021/10254/?time=798)）Swift Concurrency 用 task group 表达这批 feed 更新任务。每个 feed 是一个 child task。下载、解析、数据库更新都写在一段顺序代码里。
+
+```swift
+func deserializeArticles(from data: Data) throws -> [Article] { /* ... */ }
+func updateDatabase(with articles: [Article], for feed: Feed) async { /* ... */ }
+
+await withThrowingTaskGroup(of: [Article].self) { group in
+    for feed in feedsToUpdate {
+        group.async {
+            let (data, response) = try await URLSession.shared.data(from: feed.url)
+            // ...
+            let articles = try deserializeArticles(from: data)
+            await updateDatabase(with: articles, for: feed)
+            return articles
+        }
+    }
+}
+```
+
+关键点：
+
+- `updateDatabase(with:for:) async` 把数据库更新声明成异步函数。
+- `withThrowingTaskGroup(of:)` 创建一个会传播错误的 task group。
+- `for feed in feedsToUpdate` 为每个订阅源加入一个子任务。
+- `group.async` 启动 child task，父任务知道这些子任务的存在。
+- `try await URLSession.shared.data(from:)` 在等待网络时挂起当前任务，线程可以去做别的工作。
+- `deserializeArticles(from:)` 是同步解析逻辑，下载完成后继续执行。
+- `await updateDatabase(with:for:)` 在数据库更新期间也可以挂起。
+- `return articles` 把每个子任务的结果交回 task group。
+
+这段代码的价值在依赖关系。
+
+父任务知道自己创建了哪些子任务。子任务知道自己在等待 URLSession 和数据库更新。Swift 编译器和运行时可以看到这些依赖。GCD 只能看到队列和阻塞线程，Swift 运行时能看到任务图。
+
+### `await` 如何释放线程
+
+（[15:16](https://developer.apple.com/videos/play/wwdc2021/10254/?time=916)）异步函数在 `await` 处可能挂起。挂起时，需要跨挂起点保存的状态会放进 heap 上的 async frame（异步帧）。不需要跨挂起点保存的局部变量仍然放在线程栈上。
+
+```swift
+// on Database
+func save(_ newArticles: [Article], for feed: Feed) async throws -> [ID] { /* ... */ }
+
+// on Feed
+func add(_ newArticles: [Article]) async throws {
+    let ids = try await database.save(newArticles, for: self)
+    for (id, article) in zip(ids, newArticles) {
+        articles[id] = article
+    }
+}
+
+func updateDatabase(with articles: [Article], for feed: Feed) async throws {
+    // skip old articles ...
+    try await feed.add(articles)
+}
+```
+
+关键点：
+
+- `save(_:for:) async throws -> [ID]` 是数据库保存操作，返回新文章对应的 ID。
+- `add(_:) async throws` 是 `Feed` 上的异步方法。
+- `try await database.save(...)` 是挂起点。数据库保存期间，当前线程不需要阻塞等待。
+- `newArticles` 在 `await` 前传入，在 `await` 后的 `zip(ids, newArticles)` 还要使用，所以会被保存在 async frame 中。
+- `zip(ids, newArticles)` 是同步操作，会在线程栈上创建普通栈帧。
+- `try await feed.add(articles)` 让 `updateDatabase` 也可以在等待 feed 更新时挂起。
+
+运行时把这些 async frame 组成 continuation。
+
+数据库请求没完成时，线程可以去执行其他任务。请求完成后，可能是原来的线程继续执行，也可能是另一个空闲线程恢复执行。代码不能假设 `await` 前后在同一个线程上。
+
+（[22:12](https://developer.apple.com/videos/play/wwdc2021/10254/?time=1332)）这带来三个迁移规则。
+
+```swift
+// Safe shape: keep the critical section synchronous and short.
+lock.lock()
+updateSharedState()
+lock.unlock()
+
+// Avoid this shape: do not hold a lock across await.
+lock.lock()
+try await database.save(newArticles, for: feed)
+lock.unlock()
+```
+
+关键点：
+
+- 同步代码里的短临界区可以使用锁，因为持锁线程能继续运行并释放锁。
+- `await` 会打破原子性，任务可能被主动挂起。
+- 持锁跨过 `await` 会让锁的释放依赖异步恢复，容易破坏 forward progress（向前推进）契约。
+- thread-specific data（线程特定数据）不会在 `await` 前后保留。
+- semaphore（信号量）和 condition variable（条件变量）会隐藏任务依赖，Swift 运行时无法据此调度。
+
+session 建议用 Instruments system trace 分析性能，也建议用一个调试运行时环境变量检查 unsafe blocking primitive（不安全阻塞原语）。如果协作式线程池里的线程看起来挂住，通常说明代码里存在隐藏阻塞。
+
+### actor 用非阻塞方式保护状态
+
+（[28:01](https://developer.apple.com/videos/play/wwdc2021/10254/?time=1681)）actor（参与者）提供互斥访问。一个 actor 同一时间最多执行一个方法调用，因此它的状态不会被并发访问。
+
+```swift
+// on Database
+func save(_ newArticles: [Article], for feed: Feed) async throws -> [ID] { /* ... */ }
+
+// on Feed
+func add(_ newArticles: [Article]) async throws {
+    let ids = try await database.save(newArticles, for: self)
+    for (id, article) in zip(ids, newArticles) {
+        articles[id] = article
+    }
+}
+```
+
+关键点：
+
+- `database.save(...)` 可以是对 database actor 的调用。
+- `await` 表示当前任务可能从 feed actor 跳到 database actor。
+- database actor 空闲时，当前线程可以直接执行 database actor 的方法。
+- database actor 忙碌时，当前任务挂起，线程释放去执行其他工作。
+- actor 仍然保持互斥：同一时间只有一个 work item 在 actor 上执行。
+
+这和串行队列不同。
+
+串行队列在争用时会阻塞调用线程。`dispatch async` 不阻塞，但无争用时也可能唤醒新线程做异步工作。actor 借助协作式线程池，在无争用时复用当前线程，在争用时挂起当前任务。
+
+（[34:24](https://developer.apple.com/videos/play/wwdc2021/10254/?time=2064)）actor 还支持 reentrancy（重入）。当 actor 上一个较早的 work item 在 `await` 处挂起时，新的 work item 可以继续执行。actor 仍然一次只执行一个 work item，但执行顺序不再严格遵守 FIFO（先进先出）。
+
+这个行为让运行时有机会优先执行高优先级工作，缓解 priority inversion（优先级反转）。
+
+### MainActor 跳转要批量化
+
+（[37:13](https://developer.apple.com/videos/play/wwdc2021/10254/?time=2233)）MainActor 抽象的是主线程。协作式线程池和主线程分离，所以从 MainActor 跳到其他 actor，再跳回 MainActor，会产生线程上下文切换。
+
+```swift
+// on database actor
+func loadArticle(with id: ID) async throws -> Article { /* ... */ }
+
+@MainActor func updateUI(for article: Article) async { /* ... */ }
+
+@MainActor func updateArticles(for ids: [ID]) async throws {
+    for id in ids {
+        let article = try await database.loadArticle(with: id)
+        await updateUI(for: article)
+    }
+}
+```
+
+关键点：
+
+- `loadArticle(with:)` 在 database actor 上读取单篇文章。
+- `updateUI(for:)` 标注 `@MainActor`，必须在主线程关联的 actor 上更新界面。
+- `updateArticles(for:)` 也标注 `@MainActor`，循环从主线程语境开始。
+- 每次循环先从 MainActor 跳到 database actor。
+- `await updateUI(for:)` 再跳回 MainActor。
+- 每个 `id` 至少带来两次上下文切换。
+
+少量循环问题不大。循环次数多、每次实际工作又很少时，切换成本会积累。
+
+（[38:18](https://developer.apple.com/videos/play/wwdc2021/10254/?time=2298)）改法是把单条处理改成批量处理。数据库一次返回文章数组，UI 一次更新文章数组。
+
+```swift
+// on database actor
+func loadArticles(with ids: [ID]) async throws -> [Article]
+
+@MainActor func updateUI(for articles: [Article]) async
+
+@MainActor func updateArticles(for ids: [ID]) async throws {
+    let articles = try await database.loadArticles(with: ids)
+    await updateUI(for: articles)
+}
+```
+
+关键点：
+
+- `loadArticles(with:)` 把循环推进 database actor，一次加载多篇文章。
+- `updateUI(for:)` 接收 `[Article]`，一次完成界面更新。
+- `updateArticles(for:)` 只需要一次跳到 database actor。
+- `await updateUI(for: articles)` 只需要一次回到 MainActor。
+- 批量化减少 MainActor 与协作式线程池之间的上下文切换。
+
+这条规则很实用：actor 之间的跳转很轻，但进出 MainActor 要谨慎。UI 更新要尽量合并。
+
+## 核心启发
+
+### 1. 做一个 feed 刷新器的并发重构
+
+- **做什么**：把原来基于 GCD 回调的订阅源刷新逻辑改成 task group。
+- **为什么值得做**：session 的新闻 App 示例正是这个场景。task group 让父子任务关系进入 Swift 运行时，减少隐藏阻塞带来的线程爆炸。
+- **怎么开始**：从 `withThrowingTaskGroup(of:)` 开始，把每个 feed 的下载、解析、保存放进 `group.async`，把数据库保存函数改成 `async`。
+
+### 2. 给本地数据库包一层 actor
+
+- **做什么**：把原来的数据库串行队列替换成 `Database` actor。
+- **为什么值得做**：actor 提供互斥访问，并在争用时挂起任务，不阻塞协作式线程池里的线程。
+- **怎么开始**：创建 `actor Database`，把读写方法改成 `async`，调用处用 `await database.save(...)` 或 `await database.loadArticles(...)`。
+
+### 3. 扫描 `await` 附近的锁和线程假设
+
+- **做什么**：检查项目里是否有持锁跨 `await`、依赖 thread-local state、用 semaphore 等待异步任务的代码。
+- **为什么值得做**：`await` 前后的执行线程可能不同，隐藏依赖会破坏协作式线程池的 forward progress 契约。
+- **怎么开始**：搜索 `await`、`NSLock`、`os_unfair_lock`、`DispatchSemaphore`，把临界区缩短到同步代码，异步依赖改成 `await`、task group 或 actor。
+
+### 4. 批量化主线程 UI 更新
+
+- **做什么**：把一条一条读取数据、一条一条更新 UI 的循环改成数组级 API。
+- **为什么值得做**：MainActor 与协作式线程池分离，频繁进出 MainActor 会产生线程上下文切换。
+- **怎么开始**：把 `loadArticle(with:) -> Article` 改成 `loadArticles(with:) -> [Article]`，把 `updateUI(for article:)` 改成 `updateUI(for articles:)`。
+
+### 5. 用 Instruments 验证迁移收益
+
+- **做什么**：迁移 Swift Concurrency 后，用 Instruments system trace 看线程数量、上下文切换和主线程活动。
+- **为什么值得做**：session 提醒开发者不要为了很小的同步工作创建任务。任务也有运行时管理成本。
+- **怎么开始**：先记录 GCD 版本的 trace，再记录 async/await 版本的 trace，对比线程数量和 context switch 密度。
+
+## 关联 Session
+
+- [Meet async/await in Swift](/articles/wwdc2021-10132) — Swift Concurrency 的入口，讲异步函数、挂起点和 completion handler 迁移。
+- [Explore structured concurrency in Swift](/articles/wwdc2021-10134) — 讲 task group、`async let` 和任务取消，补足本场提到的父子任务依赖。
+- [Protect mutable state with Swift actors](/articles/wwdc2021-10133) — 讲 actor 隔离、MainActor 和共享状态保护，是理解本场 actor 实现细节的前置内容。
+- [Understand and eliminate hangs from your app](/articles/wwdc2021-10258) — 从工具和反模式角度分析 hang，与本场的阻塞原语和 GCD 风险直接相关。

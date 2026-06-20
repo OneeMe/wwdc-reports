@@ -1,0 +1,347 @@
+---
+title: "Explore bindless rendering in Metal"
+description: "unleash the full potential of your shaders and implement modern rendering techniques by adding argument buffers to adopt bindless rendering. learn how to make your entire scene and resources available to the gpu to make the most out of raytracing and rasterization pipelines."
+date: "2021-06-06"
+tags: ["Graphics & Games", "Metal"]
+thumbnail: "/images/sessions/2021/10286.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10286/"
+sessionId: "wwdc2021-10286"
+year: "2021"
+relatedSessions:
+  - title: "Enhance your app with Metal ray tracing"
+    code: "10149"
+    description: "介绍 Metal 光线追踪的新能力，以及如何在应用和游戏中实现照片级 3D 场景。"
+  - title: "Explore hybrid rendering with Metal ray tracing"
+    code: "10150"
+    description: "讲解如何把光线追踪和光栅化渲染结合起来，实现混合渲染效果。"
+  - title: "Discover Metal debugging, profiling, and asset creation tools"
+    code: "10157"
+    description: "展示 Xcode 中面向 Metal 的调试、性能分析和资源创建工具。"
+  - title: "Discover compilation workflows in Metal"
+    code: "10229"
+    description: "讲解 Metal Shading Language 的编译工作流和灵活的 shader 开发流程。"
+---
+
+## Highlight
+
+> Apple 在 Metal 中用 Argument Buffers Tier 2 支持 bindless rendering，让开发者把场景资源组织成可导航的数据结构，并在光线追踪和光栅化 shader 中通过一个根缓冲区访问网格、材质和纹理。
+
+## 核心内容
+
+光线追踪反射最容易暴露传统绑定模型的限制。
+
+一条反射光线可能击中场景里的任何物体。命中之后，shader 不能只把像素涂成固定颜色。它需要知道命中点属于哪个实例、哪个网格、哪个三角形，还要读取顶点法线、材质和纹理，才能算出正确的反射颜色。
+
+传统做法是在每次 draw call 或 dispatch 前，把需要的纹理和缓冲区逐个绑定到固定槽位。这个模型适合资源集合明确的小任务。反射、漫反射全局光照、某些环境光遮蔽场景会访问大量对象。把整个场景的资源直接绑到管线，数量不现实。
+
+Apple 给出的方案是 bindless rendering（无绑定渲染）。开发者先用 Argument Buffers（参数缓冲区）把网格、材质、实例和变换矩阵组织起来。渲染时只把根缓冲区传给 shader。shader 根据交点信息在数据结构中导航，找到真正需要的资源。
+
+这个模型也适用于光栅化。PBR（Physically Based Rendering，基于物理的渲染）片段 shader 通常要读取 albedo、roughness、metallic、occlusion 等多张纹理。bindless 让材质自己引用纹理，draw call 不再需要逐个绑定每张图。
+
+这场 session 的重点不在某一个效果，而在资源组织方式。你要把场景数据做成 GPU 能走的图。光线追踪和光栅化 shader 都沿着同一套数据结构取资源。
+
+## 详细内容
+
+### 用 Argument Buffers 表达场景图
+
+（[03:00](https://developer.apple.com/videos/play/wwdc2021/10286/?time=180)）Metal 中实现 bindless 的基础是 Argument Buffers，bindless 场景需要 Argument Buffers Tier 2。演讲中说明，Tier 2 可用于 Apple6 和 Mac2 GPU families，并且可从所有 Metal shader 类型使用。
+
+一个常见组织方式是三层结构。
+
+第一层是 mesh argument buffer，保存网格或 submesh，引用顶点数组和索引数组。第二层是 material argument buffer，材质引用纹理，并保存内联常量。第三层是 instance argument buffer，每个实例引用一个 mesh、一个 material，并保存模型变换矩阵。
+
+演讲中的实例结构如下。
+
+```cpp
+struct Instance
+{
+    constant Mesh*     pMesh            [[id(0)]];
+    constant Material* pMaterial        [[id(1)]];
+    constant float4x4  modelTransform   [[id(2)]];
+};
+```
+
+关键点：
+
+- `Instance` 是一个可写入 argument buffer 的结构。
+- `pMesh` 用 `[[id(0)]]` 标出成员索引，指向网格数据。
+- `pMaterial` 用 `[[id(1)]]` 标出成员索引，指向材质数据。
+- `modelTransform` 用 `[[id(2)]]` 标出成员索引，保存本地空间到世界空间的 4x4 变换矩阵。
+- shader 拿到实例后，可以继续沿着指针访问 mesh 和 material。
+
+这个结构的价值在于链接。你不再把一堆纹理和缓冲区摊平到固定槽位。资源改为互相引用。shader 的入口只需要一个根指针。
+
+### 通过 MTLArgumentDescriptor 创建编码器
+
+（[11:48](https://developer.apple.com/videos/play/wwdc2021/10286/?time=708)）Argument buffer encoder 有两种创建方式。第一种是通过 `MTLFunction` 反射。shader 函数直接接收 argument buffer 参数时，可以让 `MTLFunction` 创建 encoder。
+
+这个办法处理整场景编码时会遇到限制。`MTLFunction` 的签名不知道间接引用的 buffer。资源加载和 pipeline state 创建分离时，反射也不方便。函数接收数组时，也不能靠这种方式反射出 encoder。
+
+Apple 给出的第二种方式是 `MTLArgumentDescriptor`。你为每个结构成员创建一个 descriptor，写明 binding index、data type 和 access，然后让 `MTLDevice` 创建 encoder。
+
+```objc
+MTLArgumentDescriptor* meshArg
+= [MTLArgumentDescriptor argumentDescriptor];
+
+meshArg.index    = 0;
+meshArg.dataType = MTLDataTypePointer;
+meshArg.access   = MTLArgumentAccessReadOnly;
+
+// Declare all other arguments (material and transform)
+
+id<MTLArgumentEncoder> instanceEncoder
+= [device newArgumentEncoderWithArguments:@[meshArg,
+                                            materialArg,
+                                            transformArg]];
+```
+
+关键点：
+
+- `argumentDescriptor` 创建一个成员描述。
+- `meshArg.index = 0` 对应 `Instance` 结构里 `[[id(0)]]` 的成员。
+- `MTLDataTypePointer` 表示这个成员是一个指针类型资源。
+- `MTLArgumentAccessReadOnly` 表示 shader 只读访问该资源。
+- `newArgumentEncoderWithArguments:` 根据 descriptor 数组创建 `MTLArgumentEncoder`。
+- `materialArg` 和 `transformArg` 需要按同样方式声明，对应 material 和 transform 成员。
+
+（[13:34](https://developer.apple.com/videos/play/wwdc2021/10286/?time=814)）拿到 encoder 后，把数据写进 buffer。编码数组时，每个元素的偏移量是 `index * encodedLength`。演讲强调，shader 侧不需要特殊处理这个数组，也不需要知道 buffer 长度。
+
+```objc
+// Offset for each array element
+NSUInteger offset = index * instanceEncoder.encodedLength;
+
+[instanceEncoder setArgumentBuffer:instancesBuffer offset:offset];
+```
+
+关键点：
+
+- `encodedLength` 是 encoder 给出的单个结构编码长度。
+- `index * encodedLength` 得到数组中第 `index` 个实例的位置。
+- `setArgumentBuffer:offset:` 把 encoder 的写入位置移动到该实例。
+- 后续对 encoder 设置 mesh、material、transform 时，会写入这个实例槽位。
+
+### 声明间接资源驻留
+
+（[06:15](https://developer.apple.com/videos/play/wwdc2021/10286/?time=375)）bindless 只把根缓冲区传给 pipeline。Metal 知道这个根缓冲区，但不知道 shader 会间接访问哪些纹理和 buffer。
+
+因此，应用必须把所有间接访问的资源声明为 resident（驻留）。驻留的含义是告诉 driver，让资源内存对 GPU 可用。遗漏这一步，是 GPU restart 和 command buffer failure 的常见原因。
+
+演讲给出两个入口：compute encoder 使用 `useResource:usage:`，render command encoder 使用 `useResource:usage:stages:`。
+
+```objc
+// Compute encoder
+[computeEncoder useResource:texture usage:MTLResourceUsageRead];
+
+// Render command encoder
+[renderEncoder useResource:texture
+                    usage:MTLResourceUsageRead
+                   stages:MTLRenderStageFragment];
+```
+
+关键点：
+
+- `useResource:usage:` 用在 compute encoder 上。
+- `texture` 是 shader 会通过 argument buffer 间接访问的资源。
+- `MTLResourceUsageRead` 表示本次访问只读取资源。
+- `useResource:usage:stages:` 用在 render command encoder 上。
+- `MTLRenderStageFragment` 把驻留声明限制到 fragment stage。
+
+（[07:12](https://developer.apple.com/videos/play/wwdc2021/10286/?time=432)）如果资源从 `MTLHeap` 分配，可以用 `useHeap` 一次声明整块 heap 驻留。演讲建议只读静态数据优先这么做。静态纹理和 mesh 在加载阶段放进 heap，渲染关键路径上只需要一次驻留声明。
+
+```objc
+[renderEncoder useHeap:staticResourceHeap
+                stages:MTLRenderStageFragment];
+```
+
+关键点：
+
+- `useHeap` 适合从同一个 `MTLHeap` 子分配出来的一组资源。
+- `staticResourceHeap` 应保存静态纹理和 mesh 这类只读资源。
+- `stages` 指定这些资源在哪个 render stage 使用。
+- 需要写入的资源仍要单独用 `useResource` 声明写访问。
+
+### 避免 heap 假共享带来的串行化
+
+（[07:35](https://developer.apple.com/videos/play/wwdc2021/10286/?time=455)）heap 的便利也有代价。Metal 2.3 起，heap 可以配置 hazard tracking（访问冲突跟踪）。问题是 Metal 把 heap 看成一个资源，同步发生在 heap 级别。
+
+演讲中的例子是两个 render pass。A 写入 tracked heap 里的 render texture。B 读取同一个 heap 里的另一个 buffer。这两个资源本来无关，但 Metal 只看到同一个 heap 上存在读写风险，于是可能把访问串行化。这就是 false sharing（假共享）。
+
+应对方式有两个。第一，把可更新资源和静态资源放进不同 heap。第二，把 heap 配置成不跟踪子分配资源，由引擎自己负责同步。演讲补充，Metal 默认行为是不跟踪 heap 中的子分配资源。
+
+```objc
+MTLHeapDescriptor *descriptor = [[MTLHeapDescriptor alloc] init];
+descriptor.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+
+id<MTLHeap> heap = [device newHeapWithDescriptor:descriptor];
+```
+
+关键点：
+
+- `MTLHeapDescriptor` 描述要创建的 heap。
+- `hazardTrackingMode` 控制 heap 是否跟踪资源访问冲突。
+- `MTLHazardTrackingModeUntracked` 表示应用接管同步责任。
+- `newHeapWithDescriptor:` 根据 descriptor 创建 heap。
+- 使用 untracked heap 后，开发者必须自己保证读写顺序正确。
+
+（[10:19](https://developer.apple.com/videos/play/wwdc2021/10286/?time=619)）如果需要 fence，演讲建议尽量按 stage 粒度指定。这样 vertex stage 和 rasterizer 仍可并行，只在依赖前一 pass fragment 输出时阻塞 fragment stage。
+
+### 在光线追踪 shader 中导航资源
+
+（[14:35](https://developer.apple.com/videos/play/wwdc2021/10286/?time=875)）光线追踪里的导航从交点结果开始。Metal 的 intersection result 提供 `instance_id`、`geometry_id` 和 `primitive_id`。它们用于在加速结构中定位命中的实例、几何体和图元。
+
+因此，bindless 场景结构最好镜像 ray tracing acceleration structure（光线追踪加速结构）。这样 shader 可以用交点信息一路找到资源。
+
+```cpp
+// Instance and Mesh
+
+constant Instance& instance = pScene->instances[intersection.instance_id];
+constant Mesh&     mesh     = instance.mesh[intersection.geometry_id];
+
+// Primitive indices
+
+ushort3 indices; // assuming 16-bit indices, use uint3 for 32-bit
+
+indices.x = mesh.indices[ intersection.primitive_id * 3 + 0 ];
+indices.y = mesh.indices[ intersection.primitive_id * 3 + 1 ];
+indices.z = mesh.indices[ intersection.primitive_id * 3 + 2 ];
+```
+
+关键点：
+
+- `pScene->instances` 是根场景结构中的实例数组。
+- `intersection.instance_id` 定位命中的实例。
+- `instance.mesh` 引用该实例对应的 mesh 数据。
+- `intersection.geometry_id` 定位命中的 geometry 或 submesh。
+- `intersection.primitive_id * 3` 找到三角形的三个索引。
+- `ushort3` 适合 16-bit 索引；32-bit 索引用 `uint3`。
+
+（[16:43](https://developer.apple.com/videos/play/wwdc2021/10286/?time=1003)）拿到索引后，shader 读取顶点属性，并用重心坐标插值。演讲示例读取三个顶点的法线，然后算出命中点法线。
+
+```cpp
+// Vertex data
+
+packed_float3 n0 = mesh.normals[ indices.x ];
+packed_float3 n1 = mesh.normals[ indices.y ];
+packed_float3 n2 = mesh.normals[ indices.z ];
+
+// Interpolate attributes
+
+float3 barycentrics = calculateBarycentrics(intersection);
+float3 normal       = weightedSum(n0, n1, n2, barycentrics);
+```
+
+关键点：
+
+- `mesh.normals[indices.x]` 读取三角形第一个顶点的法线。
+- `mesh.normals[indices.y]` 读取第二个顶点的法线。
+- `mesh.normals[indices.z]` 读取第三个顶点的法线。
+- `calculateBarycentrics(intersection)` 从交点计算重心坐标。
+- `weightedSum` 用重心坐标对三个法线加权求和。
+- `normal` 是命中点的插值法线，可用于反射着色。
+
+（[17:15](https://developer.apple.com/videos/play/wwdc2021/10286/?time=1035)）把这些步骤封装后，shader 的主逻辑就变得短。它从交点找到实例、mesh 和 material，然后把它们交给 shading 函数。
+
+```cpp
+if(i.type == intersection_type::triangle)
+{
+  constant Instance& inst     = get_instance(i);
+  constant Mesh&     mesh     = get_mesh(inst, i);
+  constant Material& material = get_material(inst, i);
+
+  color = shade_pixel(mesh, material, i);
+}
+
+outImage.write(color, tid);
+```
+
+关键点：
+
+- `i.type` 检查交点是否命中三角形。
+- `get_instance(i)` 根据交点的 `instance_id` 找到实例。
+- `get_mesh(inst, i)` 根据实例和交点的 `geometry_id` 找到 mesh。
+- `get_material(inst, i)` 找到实例关联的 material。
+- `shade_pixel` 使用 mesh、material 和交点信息计算颜色。
+- `outImage.write(color, tid)` 把结果写入输出纹理。
+
+### 在光栅化 PBR 中减少纹理绑定
+
+（[18:40](https://developer.apple.com/videos/play/wwdc2021/10286/?time=1120)）PBR 片段着色器通常要读取多张纹理。传统绑定模型下，每个 draw call 前都要把这些纹理绑定到固定槽位。下一次 draw call 换材质时，又要重新绑定一组纹理。
+
+演讲用 albedo、roughness、metallic、occlusion 四张纹理展示传统写法。
+
+```cpp
+fragment half4 pbrFragment(ColorInOut in [[stage_in]],
+                           texture2d< float > albedo    [[texture(0)]],
+                           texture2d< float > roughness [[texture(1)]],
+                           texture2d< float > metallic  [[texture(2)]],
+                           texture2d< float > occlusion [[texture(3)]])
+{
+	half4 color = calculateShading(in, albedo, roughness, metallic, occlusion);
+
+  return color;
+}
+```
+
+关键点：
+
+- `albedo` 绑定到 `texture(0)`。
+- `roughness` 绑定到 `texture(1)`。
+- `metallic` 绑定到 `texture(2)`。
+- `occlusion` 绑定到 `texture(3)`。
+- `calculateShading` 显式接收四张纹理。
+- 每个 draw call 都要保证槽位中放着当前材质需要的纹理。
+
+（[19:48](https://developer.apple.com/videos/play/wwdc2021/10286/?time=1188)）bindless 版本只接收场景根缓冲区。shader 从 instance 找到 material，材质再引用纹理和常量数据。
+
+```cpp
+fragment half4 pbrFragmentBindless(ColorInOut in [[stage_in]],
+                                   device const Scene* pScene [[buffer(0)]])
+{
+	device const Instance& instance = pScene->instances[in.instance_id];
+	device const Material& material = pScene->materials[instance.material_id];
+
+	half4 color = calculateShading(in, material);
+
+	return color;
+}
+```
+
+关键点：
+
+- `pScene` 是绑定到 `buffer(0)` 的根场景结构。
+- `in.instance_id` 定位当前片段所属实例。
+- `instance.material_id` 定位实例使用的材质。
+- `material` 内部引用纹理和常量数据。
+- `calculateShading(in, material)` 从材质中读取所需资源。
+- draw call 可共享同一个根缓冲区，纹理选择转移到 shader 导航过程。
+
+演讲还指出，这种结构为 instanced rendering（实例化渲染）提供优化空间。因为引擎只需要绑定一个根缓冲区，更多差异可以放进实例和材质数据中。
+
+## 核心启发
+
+1. **做什么**：给光线追踪反射加真实材质响应。
+   **为什么值得做**：反射光线命中任意物体时，bindless 让 shader 能取到对应 mesh、顶点法线和 material。
+   **怎么开始**：让 scene argument buffer 的实例层级匹配 acceleration structure，用 `intersection.instance_id`、`geometry_id`、`primitive_id` 导航到顶点和材质。
+
+2. **做什么**：把 PBR 材质系统改成材质自带纹理引用。
+   **为什么值得做**：albedo、roughness、metallic、occlusion 等纹理不用每次 draw call 逐个绑定。
+   **怎么开始**：定义 `Material` argument buffer，把纹理和常量放进材质结构，fragment shader 只接收 `Scene* pScene [[buffer(0)]]`。
+
+3. **做什么**：为静态模型和纹理建立加载期 heap。
+   **为什么值得做**：演讲建议只读静态数据最适合用 heap，渲染时可以用 `useHeap` 降低驻留声明成本。
+   **怎么开始**：在资源加载阶段计算总大小和 alignment，把 mesh 与静态纹理放入 `MTLHeap`，渲染前对 heap 调用 `useHeap`。
+
+4. **做什么**：在引擎里分离静态资源 heap 和动态资源 heap。
+   **为什么值得做**：可写资源和只读资源混在 tracked heap 中，可能触发 heap 级同步和假共享。
+   **怎么开始**：把 skinning 输出、动态纹理等可写资源放进单独 heap；静态纹理和 mesh 放进只读 heap。
+
+5. **做什么**：做一个 bindless 场景调试视图。
+   **为什么值得做**：Apple 的示例会直接显示反射 ray tracing shader 的输出，便于调试命中点的着色结果。
+   **怎么开始**：在 ray tracing pass 中把 `shade_pixel` 的结果写到调试纹理，用开关显示 intersection 命中区域。
+
+## 关联 Session
+
+- [Enhance your app with Metal ray tracing](/articles/wwdc2021-10149) — 介绍 Metal 光线追踪能力，是理解本 session 中交点和加速结构的基础。
+- [Explore hybrid rendering with Metal ray tracing](/articles/wwdc2021-10150) — 展示光线追踪和光栅化如何组合，适合继续实现反射效果。
+- [Discover Metal debugging, profiling, and asset creation tools](/articles/wwdc2021-10157) — 讲解 Xcode Metal 工具，可用于排查 GPU 资源、性能和 ray tracing 问题。
+- [Discover compilation workflows in Metal](/articles/wwdc2021-10229) — 讲解 Metal shader 编译流程，适合配合复杂的 argument buffer shader 管线使用。

@@ -1,0 +1,226 @@
+---
+title: "Efficiency awaits: Background tasks in SwiftUI"
+description: "background tasks help apps respond to system events and keep time-sensitive data up to date. learn how you can use the swiftui background tasks api to handle tasks succinctly. we"
+date: 2026-06-10
+tags: ["WWDC 2022"]
+thumbnail: "/images/sessions/2022/10142.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10142/"
+sessionId: "wwdc2022-10142"
+year: "2022"
+relatedSessions:
+  - title: "What's new in SwiftUI"
+    code: "10052"
+    description: "了解 SwiftUI 在 WWDC22 的全部更新，包括新的导航 API、布局协议和后台任务支持。"
+  - title: "Visualize and optimize Swift concurrency"
+    code: "110350"
+    description: "学习如何用 Instruments 可视化和优化 Swift Concurrency 代码，包括后台任务中的并发性能。"
+  - title: "Meet Swift Async Algorithms"
+    code: "110355"
+    description: "了解 Swift Async Algorithms 库，用于处理异步序列，与后台任务的流式数据处理场景互补。"
+  - title: "What's new in Swift"
+    code: "110354"
+    description: "Swift 语言年度更新概览，包含 Swift Concurrency 和 SwiftUI 生态的底层改进。"
+---
+
+## Highlight
+
+> SwiftUI 在 WWDC22 推出了 `backgroundTask` 场景修饰符，让后台任务处理全面拥抱 Swift Concurrency。过去嵌套 completion handler 和手动状态管理的后台刷新代码，现在可以用线性的 async/await 写法替代。Session 以暴风雨天气拍照应用 Stormy 为例，演示了从调度、执行到完成的完整后台任务生命周期。
+
+---
+
+## 核心内容
+
+后台任务一直是 App 开发中容易出错的领域。在 SwiftUI 出现之前，开发者用 `BGAppRefreshTask` 处理后台刷新，用 `BGProcessingTask` 处理耗时操作，两者都基于 UIKit 的 completion handler 模式——任务开始后需要手动管理状态、记住调用 completion handler、处理超时取消。一旦漏掉一步，系统就会认为 App 耗电过多并减少未来的后台执行机会。
+
+WWDC22 的 `backgroundTask` 修饰符改变了这个范式。它挂在 SwiftUI 的 `Scene` 上，接受一个任务类型标识符和一个异步闭包。当系统决定唤醒 App 时，闭包被调用；闭包返回时系统自动认为任务完成。中间的所有逻辑——网络请求、数据库写入、通知调度——都可以用 async/await 线性表达，不再需要嵌套闭包。
+
+Session 中使用的示例应用 Stormy 是一个暴风雨天气追踪 App。它的后台流程很简单：每天正午检查天气 API，如果预测当天下雨，就推送本地通知提醒用户出门拍照上传。这个流程在旧 API 下需要三步 completion 嵌套（获取后台任务 -> 请求网络 -> 调度通知），而用新 API 只需要一个 `backgroundTask` 闭包，内部三行 await 就完成了。
+
+另一个重要变化是跨平台统一。`backgroundTask` 在 watchOS 上处理后台刷新和后台健康数据更新，在 Widgets 上处理 Timeline 刷新，在 iOS/tvOS/Mac Catalyst 上处理通用后台任务。一套 API 覆盖所有场景，减少了平台特定代码。
+
+---
+
+## 详细内容
+
+### 注册后台任务
+
+后台任务的第一步是在 `Scene` 上注册处理器。`backgroundTask(_:action:)` 修饰符接受两个参数：任务类型标识符（字符串）和异步闭包。
+
+```swift
+@main
+struct StormyApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+        .backgroundTask(.appRefresh("com.example.stormy.refresh")) {
+            await refreshWeatherData()
+        }
+    }
+}
+```
+
+关键点：
+
+- `.appRefresh("identifier")` 是内置的 `BackgroundTask` 类型之一，对应旧版 `BGAppRefreshTask`，用于短时间的后台数据刷新。
+- 标识符字符串必须在 Info.plist 的 `BGTaskSchedulerPermittedIdentifiers` 中声明，否则系统不会唤醒你的 App。
+- 闭包返回时系统自动标记任务完成——不需要也不应该手动调用 `setTaskCompleted`。
+- 闭包抛出错误时，系统同样认为任务已完成（但可能影响未来调度优先级）。
+
+### 调度后台刷新
+
+注册处理器只是告诉系统「我能处理这种任务」。要真正触发后台唤醒，需要在前台时提交调度请求。
+
+```swift
+import BackgroundTasks
+
+func scheduleAppRefresh() {
+    let request = BGAppRefreshTaskRequest(identifier: "com.example.stormy.refresh")
+    request.earliestBeginDate = Date(timeIntervalSinceNow: 60 * 60) // 一小时后
+    do {
+        try BGTaskScheduler.shared.submit(request)
+    } catch {
+        print("调度失败: \(error)")
+    }
+}
+```
+
+关键点：
+
+- `BGAppRefreshTaskRequest` 的 `earliestBeginDate` 是系统最早唤醒 App 的时间，不是精确唤醒时间。系统会根据电池状态、使用习惯等因素自行决定实际执行时机。
+- 每次后台任务开始执行时，应该立即调度下一次刷新请求，形成「链式调度」——否则后台刷新链条会中断。
+- `BGTaskScheduler.shared.submit` 可以重复调用；重复提交同标识符的请求不会报错，系统只保留最新的一份。
+- 后台任务的实际执行有总预算限制，频繁请求不会增加执行次数。
+
+### 用 async/await 处理后台逻辑
+
+后台任务执行时，`backgroundTask` 的闭包在后台线程运行，但可以使用 async/await 做任何 Swift Concurrency 支持的操作。
+
+```swift
+func refreshWeatherData() async {
+    // 第一步：调度下一次刷新（链式调度）
+    scheduleAppRefresh()
+
+    // 第二步：请求天气数据
+    guard let weather = await fetchWeather() else { return }
+
+    // 第三步：检查是否下雨
+    guard weather.precipitation > 50 else { return }
+
+    // 第四步：推送本地通知
+    await scheduleRainNotification(for: weather.location)
+}
+```
+
+关键点：
+
+- `await fetchWeather()` 可以使用 `URLSession.shared.data(from:)` 的 async 版本，也可以用 background URLSession 的 delegate 模式。background URLSession 的好处是下载可以在 App 被挂起后继续，不占用后台任务的时间配额。
+- 闭包内的代码是完全线性的：先调度、再请求、再判断、再通知。没有 completion handler 嵌套。
+- Swift Concurrency 的 `Task.isCancelled` 和 `Task.checkCancellation()` 天然适配后台任务超时场景——系统给后台任务的执行时间有限（通常约 30 秒），超时后任务被取消，async 函数会抛出 `CancellationError`。
+- 不需要手动调用 `setTaskCompleted(success:)`——闭包正常返回即为成功，抛出错误即为失败。
+
+### 选择正确的后台任务类型
+
+SwiftUI 的 `BackgroundTask` 提供了几种内置类型，对应不同的使用场景：
+
+| 类型 | 对应旧 API | 用途 | 典型时长 |
+|------|-----------|------|---------|
+| `.appRefresh(_:)` | `BGAppRefreshTask` | 短时数据刷新 | ~30 秒 |
+| `.urlSession(_:)` | `BGURLSessionTask` | 后台文件下载 | 数分钟 |
+| `.processing(_:)` | `BGProcessingTask` | 数据库清理、索引 | 数分钟 |
+| `.widgetRefresh(_:)` | Widget Timeline | Widget 数据刷新 | 由系统决定 |
+
+```swift
+// 后台大文件下载
+.backgroundTask(.urlSession("com.example.download")) {
+    // URLSession 配置为 background 模式
+    // 下载完成后系统唤醒 App，此闭包被调用
+    await processDownloadedFiles()
+}
+
+// 数据库清理（耗时但不需要立即完成）
+.backgroundTask(.processing("com.example.cleanup")) {
+    await database.cleanup()
+}
+```
+
+关键点：
+
+- `.urlSession` 是特殊类型——真正的下载由 URLSession 守护进程在后台完成，App 本身可能已被挂起。只有当下载完成（或失败）时系统才唤醒 App 并调用闭包。
+- `.processing` 类型需要设备接通电源才能执行，适合数据库迁移、索引重建等耗电操作。
+- 所有这些任务类型共享 `backgroundTask(_:action:)` 修饰符的接口，只是标识符前缀不同。
+
+### 链式调度：防止后台刷新中断
+
+后台任务的一个常见陷阱是刷新链条中断。原因是开发者只在 App 进入后台时调度一次刷新，但当那次刷新执行完毕后没有再次调度，链条就断了。
+
+正确的做法是每次后台任务开始时立即调度下一次：
+
+```swift
+func refreshWeatherData() async {
+    // 立刻调度下一次——不管这次执行成功与否
+    scheduleAppRefresh()
+
+    // 然后是实际的刷新逻辑
+    await doActualWork()
+}
+```
+
+关键点：
+
+- `scheduleAppRefresh()` 放在闭包的第一行，确保即使后续逻辑出错或超时，下一次刷新请求也已经提交。
+- 也可以在前台的 `scenePhase` 变化时调度，作为后备策略：`onChange(of: scenePhase) { newPhase in if newPhase == .background { scheduleAppRefresh() } }`。
+
+### 优雅处理取消
+
+后台任务的执行时间由系统控制。如果超过预算时间，系统会取消当前任务。Swift Concurrency 的取消机制可以优雅处理这种情况：
+
+```swift
+.backgroundTask(.appRefresh("com.example.stormy.refresh")) {
+    scheduleAppRefresh()
+
+    do {
+        try Task.checkCancellation()
+        let weather = await fetchWeather()
+        try Task.checkCancellation()
+        await scheduleRainNotification(for: weather.location)
+    } catch is CancellationError {
+        // 任务被系统取消——已完成能完成的，下次继续
+    }
+}
+```
+
+关键点：
+
+- `Task.checkCancellation()` 在取消状态下会抛出 `CancellationError`，可以在多个检查点之间放置它来尽早退出。
+- 也可以检查 `Task.isCancelled` 的布尔值，在不需要抛出错误时使用。
+- 取消不代表 App 出错了——它只是系统决定不再给时间。已经在取消前完成的工作（如调度了下一次刷新）仍然有效。
+
+---
+
+## 核心启发
+
+- **做什么**：把现有 App 的后台刷新逻辑迁移到 `backgroundTask` 修饰符。
+  **为什么值得做**：旧版 BGTaskScheduler API 需要手动管理 completion handler 和可变状态，容易出错。新 API 用 async/await 做线性流程，闭包返回即完成。出错的后果是系统减少后台执行配额，直接影响推送通知、数据同步等核心功能。
+  **怎么开始**：在 App 的 Scene 上添加 `.backgroundTask(.appRefresh("your.id"))`，将旧的回调逻辑搬到 async 闭包里。在 Info.plist 的 `BGTaskSchedulerPermittedIdentifiers` 中声明标识符。在前台时调用 `BGTaskScheduler.shared.submit` 调度请求。
+
+- **做什么**：在所有后台任务闭包的第一行调度下一次刷新，实现链式调度。
+  **为什么值得做**：后台任务链条最常见的断裂原因就是执行完没有再次调度。一旦断裂，用户的数据就不再自动刷新，直到下次手动打开 App。
+  **怎么开始**：把 `scheduleAppRefresh()` 调用放在 `backgroundTask` 闭包的最顶部，在任何 await 之前。同时在前台的 `scenePhase` 变为 `.background` 时也调用一次作为后备。
+
+- **做什么**：将大文件下载改为 `.urlSession` 类型的后台任务。
+  **为什么值得做**：`.appRefresh` 只有约 30 秒执行时间，不适合大文件下载。`.urlSession` 让系统守护进程在 App 挂起后继续下载，完成后才唤醒 App 处理结果，既不超时也不耗后台预算。
+  **怎么开始**：配置一个 background 模式的 `URLSession`，用 `.backgroundTask(.urlSession("your.id"))` 注册处理器，在闭包中调用 `processDownloadedFiles()`。
+
+- **做什么**：在后台任务的长时间操作之间插入 `Task.checkCancellation()`。
+  **为什么值得做**：后台任务执行时间有系统配额。超时后任务被取消，但如果你的代码不检查取消状态，会继续执行直到下一个 await 点，浪费 CPU 且让系统认为你的 App 不遵守取消协议。
+  **怎么开始**：在每次 `await` 之前调用 `try Task.checkCancellation()`。如果取消失败只需 `catch is CancellationError` 后静默返回——已保存的进度不会丢失。
+
+---
+
+## 关联 Session
+
+- [What's new in SwiftUI](/articles/wwdc2022-10052) — SwiftUI 在 WWDC22 的全面更新，包括导航、布局和后台任务的新 API。
+- [Visualize and optimize Swift concurrency](/articles/wwdc2022-110350) — 用 Instruments 分析后台任务中的并发行为，定位 actor 争用和任务优先级问题。
+- [Meet Swift Async Algorithms](/articles/wwdc2022-110355) — Swift 异步序列库，后台任务的流式数据处理场景（如分页拉取）可以直接使用。
+- [What's new in Swift](/articles/wwdc2022-110354) — Swift 语言层面的年度更新，Swift Concurrency 的底层改进直接影响后台任务的稳定性。

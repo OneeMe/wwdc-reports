@@ -1,0 +1,259 @@
+---
+title: "What's new in Swift"
+description: "Swift 6 发布，引入 Swift 6 语言模式实现编译期 data-race 安全保证，同时推出 Embedded Swift 用于资源受限系统，以及 Typed Throws、Noncopyable 类型改进、C++ 互操作增强等语言特性。"
+date: 2026-06-10
+tags: ["WWDC 2024", "Swift", "Swift 6", "Concurrency"]
+thumbnail: "/images/sessions/2024/10136.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10136/"
+sessionId: "wwdc2024-10136"
+year: "2024"
+relatedSessions:
+  - title: "A Swift Tour: Explore Swift's features and design"
+    code: "10184"
+    description: "Swift 语言核心特性与设计哲学的入门介绍"
+  - title: "Migrate your app to Swift 6"
+    code: "10143"
+    description: "将现有应用迁移到 Swift 6 语言模式的实践指南"
+  - title: "Meet Swift Testing"
+    code: "10179"
+    description: "全新 Swift Testing 框架的使用方法与最佳实践"
+  - title: "Go small with Embedded Swift"
+    code: "10120"
+    description: "在微控制器和资源受限系统中使用 Embedded Swift"
+---
+
+## Highlight
+
+> Swift 6 引入新的语言模式，实现编译期 data-race 安全保证，同时推出 Embedded Swift 子集用于高度受限的嵌入式系统。
+
+---
+
+## 核心内容
+
+2024 年是 Swift 发布十周年。从 2014 年 WWDC 首次亮相，到 2015 年开源并登陆 Linux，再到 Swift 5 的稳定 ABI、async/await 并发模型、C++ 双向互操作、Macros —— Swift 已经走过了一段漫长的演进之路。Swift 6 的发布标志着这一语言在可移植性、性能和开发者体验上的全面升级。
+
+Swift 6 最核心的变化是新的语言模式：**编译期 data-race 安全保证**。Data-race 是并发编程中的常见陷阱 —— 多个线程同时访问可变数据时，一个线程尝试修改会导致未定义的行为。Swift 5.10 需要开启 `complete concurrency checking` 标志才能获得这一保证，而 Swift 6 语言模式将其设为默认行为。这意味着跨 actor 边界传递非 `Sendable` 值会成为编译错误，而不是运行时隐患。更重要的是，Swift 6 的 data-race 检测更加智能：当一个非 `Sendable` 值在传递到另一个 actor 后，原 isolation domain 不再引用它，编译器能够识别这是安全的。这种改进大幅减少了误报，让迁移过程更加顺畅。
+
+另一个重要方向是 **Embedded Swift**。这是一个针对高度受限系统的语言子集，可以生成极小的独立二进制文件（仅几 KB）。通过禁用反射、`any` 类型等需要运行时支持的语言特性，配合完整的泛型特化和静态链接，Embedded Swift 能够在 ARM 和 RISC-V 微控制器上运行，甚至用于 Apple 安全协处理器。对于习惯用 C/C++ 开发嵌入式系统的开发者，Embedded Swift 提供了更安全的替代方案，同时保持了与 C/C++ 的互操作性，支持渐进式迁移。
+
+---
+
+## 详细内容
+
+### Swift 6 语言模式与 Data-race 安全
+
+Swift 6 语言模式的核心目标是让 data-race 安全成为默认行为。以下示例展示了跨 actor 边界传递非 `Sendable` 类型的场景（[28:02](https://developer.apple.com/videos/play/wwdc2024/10136/?time=1682)）：
+
+```swift
+class Client {
+  init(name: String, balance: Double) {}
+}
+
+actor ClientStore {
+  static let shared = ClientStore()
+  private var clients: [Client] = []
+  func addClient(_ client: Client) {
+    clients.append(client)
+  }
+}
+
+@MainActor
+func openAccount(name: String, balance: Double) async {
+  let client = Client(name: name, balance: balance)
+  await ClientStore.shared.addClient(client)
+}
+```
+
+**关键点**：
+- `Client` 类未标记 `Sendable`，理论上跨 actor 传递不安全
+- 在 Swift 5.10 的完整并发检查下，这会产生警告
+- Swift 6 编译器识别出 `client` 在传递到 `ClientStore` 后，MainActor 不再引用它，因此没有 data-race
+- 如果在传递后又使用了 `client`，编译器会报错
+
+Swift 6 还引入了新的低级同步原语。`Atomic` 类型提供无锁的原子操作（[28:52](https://developer.apple.com/videos/play/wwdc2024/10136/?time=1732)）：
+
+```swift
+import Dispatch
+import Synchronization
+
+let counter = Atomic<Int>(0)
+
+DispatchQueue.concurrentPerform(iterations: 10) { _ in
+  for _ in 0 ..< 1_000_000 {
+    counter.wrappingAdd(1, ordering: .relaxed)
+  }
+}
+
+print(counter.load(ordering: .relaxed))
+```
+
+**关键点**：
+- `Atomic` 是泛型类型，适用于平台支持的高效无锁实现
+- 必须存储在 `let` 属性中以确保并发访问安全
+- 所有操作都需要显式的内存排序参数，类似 C/C++ 内存模型
+
+`Mutex` 类型提供互斥锁保护（[29:21](https://developer.apple.com/videos/play/wwdc2024/10136/?time=1761)）：
+
+```swift
+import Synchronization
+
+final class LockingResourceManager: Sendable {
+  let cache = Mutex<[String: Resource]>([:])
+
+  func save(_ resource: Resource, as key: String) {
+    cache.withLock {
+      $0[key] = resource
+    }
+  }
+}
+```
+
+**关键点**：
+- `Mutex` 同样应存储在 `let` 属性中
+- `withLock` 方法确保对受保护存储的互斥访问
+- 整个闭包执行期间持有锁
+
+### 非可复制类型（Noncopyable Types）
+
+Swift 6 扩展了非可复制类型的支持，使其可以在泛型上下文（如 `Optional`）中使用（[17:50](https://developer.apple.com/videos/play/wwdc2024/10136/?time=1070)）：
+
+```swift
+struct File: ~Copyable {
+  private let fd: CInt
+
+  init?(name: String) {
+    guard let fd = open(name) else {
+      return nil
+    }
+    self.fd = fd
+  }
+
+  func write(buffer: [UInt8]) {
+    // ...
+  }
+
+  deinit {
+    close(fd)
+  }
+}
+```
+
+**关键点**：
+- `~Copyable` 表示类型不可复制，适用于唯一所有权场景
+- Swift 5.10 仅支持具体类型，Swift 6 支持泛型上下文
+- 现在可以编写返回 `Optional<File>` 的可失败初始化器
+- `deinit` 确保文件描述符在作用域结束时关闭
+
+### Typed Throws
+
+Swift 6 引入了类型化抛出，让函数可以指定抛出的错误类型（[23:43](https://developer.apple.com/videos/play/wwdc2024/10136/?time=1423) 对比 [24:19](https://developer.apple.com/videos/play/wwdc2024/10136/?time=1459)）：
+
+```swift
+enum IntegerParseError: Error {
+  case nonDigitCharacter(String, index: String.Index)
+}
+
+// 传统 throws（类型擦除）
+func parse(string: String) throws -> Int {
+  for index in string.indices {
+    throw IntegerParseError.nonDigitCharacter(string, index: index)
+  }
+}
+
+// Typed throws（保留类型）
+func parse(string: String) throws(IntegerParseError) -> Int {
+  for index in string.indices {
+    throw IntegerParseError.nonDigitCharacter(string, index: index)
+  }
+}
+
+// 使用时 error 直接是 IntegerParseError 类型
+do {
+  let value = try parse(string: "1+234")
+}
+catch {
+  // error 的类型是 IntegerParseError，不是 any Error
+}
+```
+
+**关键点**：
+- `throws(ErrorType)` 语法指定抛出的错误类型
+- 无类型擦除，catch 块中 error 保持具体类型
+- `throws` 等价于 `throws(any Error)`，非抛出函数等价于 `throws(Never)`
+- 适用于内部函数或受约束环境（无运行时分配）
+
+### 跨平台与静态 Linux SDK
+
+Swift 6 推出了全新的静态 Linux SDK，支持从 macOS 交叉编译到 Linux（[9:15](https://developer.apple.com/videos/play/wwdc2024/10136/?time=555)）：
+
+```sh
+# 构建 macOS 版本
+swift build
+
+# 安装静态 Linux SDK
+swift sdk install ~/preview-static-swift-linux-0.0.1.tar.gz
+
+# 交叉编译到 ARM64 Linux（静态链接）
+swift build --swift-sdk aarch64-swift-linux-musl
+
+# 检查输出
+file .build/debug/CatService
+
+# 部署到 Linux
+scp .build/debug/CatService demo-linux-host:~/CatService
+
+# 在 Linux 上运行（无需安装 Swift 运行时）
+./CatService
+```
+
+**关键点**：
+- 静态链接意味着生成的二进制文件可以在任何 Linux 机器上运行
+- 不需要在目标机器上安装 Swift 运行时或依赖库
+- `musl` 是轻量级 C 标准库，用于静态链接
+- 支持 Fedora 和 Debian 等新 Linux 平台
+
+### Swift Testing
+
+全新的 Swift Testing 框架提供更现代的测试体验（[13:50](https://developer.apple.com/videos/play/wwdc2024/10136/?time=830)）：
+
+```swift
+import Testing
+
+@Test("Recognized rating", .tags(.critical))
+func rating(videoId: Int, videoName: String, expectedRating: String) {
+    let video = Video(id: videoId, name: videoName)
+    #expect(video.rating == expectedRating)
+}
+```
+
+**关键点**：
+- `@Test` 宏标记测试函数，可自定义显示名称
+- `.tags()` 用于组织和过滤测试
+- 参数化测试避免为多个输入重复代码
+- `#expect` 宏支持任意 Swift 表达式
+
+---
+
+## 核心启发
+
+**1. 渐进式迁移到 Swift 6 语言模式**
+
+不要急于切换整个项目。先在 Build Settings 中逐步启用并发检查（`SWIFT_STRICT_CONCURRENCY` 设为 `minimal` 或 `targeted`），每修复一批问题再提高严格级别。Swift 6 的智能 data-race 检查会大幅减少误报，让迁移更顺畅。对于暂时不想修改的类型，编译器会提供工具帮助处理。
+
+**2. 考虑 Embedded Swift 用于资源受限场景**
+
+如果你的项目涉及微控制器、嵌入式系统或需要极小二进制尺寸，Embedded Swift 提供了 C/C++ 之外的安全替代方案。Playdate 游戏机可以运行仅几 KB 的 Swift 游戏，Apple 安全协处理器也在使用它。配合 C++ 互操作，可以渐进式地在现有嵌入式代码中引入 Swift。
+
+**3. 利用静态 Linux SDK 简化部署流程**
+
+开发在 macOS，部署到 Linux —— 静态链接的二进制文件无需在目标机器上安装任何 Swift 运行时。这对于容器化部署、CI/CD 流程都非常友好。一行 `swift build --swift-sdk aarch64-swift-linux-musl` 就能生成可随处运行的可执行文件。
+
+---
+
+## 关联 Session
+
+- [A Swift Tour: Explore Swift's features and design](/articles/wwdc2024-10184) — Swift 语言核心特性与设计哲学的入门介绍
+- [Migrate your app to Swift 6](/articles/wwdc2024-10143) — 将现有应用迁移到 Swift 6 语言模式的实践指南
+- [Meet Swift Testing](/articles/wwdc2024-10179) — 全新 Swift Testing 框架的使用方法与最佳实践
+- [Go small with Embedded Swift](/articles/wwdc2024-10120) — 在微控制器和资源受限系统中使用 Embedded Swift
+- [Mix Swift and C++](/articles/wwdc2023-10162) — Swift 与 C++ 双向互操作的深入介绍（2023）

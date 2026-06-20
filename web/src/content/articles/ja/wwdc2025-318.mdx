@@ -1,0 +1,190 @@
+---
+title: "Share visionOS experiences with nearby people"
+description: "learn how to create shared experiences for people wearing vision pro in the same room. we"
+date: 2026-06-10
+tags: ["Audio & Video", "空间计算"]
+thumbnail: "/images/sessions/2025/318.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/318/"
+sessionId: "wwdc2025-318"
+year: "2025"
+relatedSessions:
+  - title: "Create a seamless multiview playback experience"
+    code: "302"
+    description: "learn how to build advanced multiview playback experiences in your app. we"
+  - title: "Enhance your app’s audio recording capabilities"
+    code: "251"
+    description: "learn how to improve your app"
+  - title: "Explore video experiences for visionOS"
+    code: "304"
+    description: "learn about the different ways you can create and present immersive video experi"
+  - title: "Learn about Apple Immersive Video technologies"
+    code: "403"
+    description: "explore the capabilities of apple immersive video and apple spatial audio format"
+---
+
+## Highlight
+
+> visionOS 26 引入了 **Nearby Window Sharing**：每个窗口右侧新增一个分享按钮，点击后选择附近的人，窗口就会以相同位置和大小出现在所有人的空间里。窗口栏变绿表示正在共享。
+
+---
+
+## 核心内容
+
+两个人都戴着 Vision Pro 坐在同一间客厅里，想一起看一部电影或者下一盘棋，过去只能各自打开自己设备里的 app，画面位置错开、声音不同步，连指着屏幕讨论都做不到。远程的 SharePlay 只把对方变成虚拟 Persona，物理上同处一室的体验反而被忽略了。
+
+visionOS 26 用 **Nearby Window Sharing** 解决这件事。每个窗口栏右侧多了一个分享按钮，点开后从列表里选择附近的人，窗口就会以**完全相同的位置和大小**出现在所有人的空间里，窗口栏变绿表示已经共享（[01:02](https://developer.apple.com/videos/play/wwdc2025/318/?time=62)）。任何人都可以拖动窗口、改变大小、贴到墙面，操作对所有人同步可见。手伸过窗口时内容自动淡出，保证手势可见。按下数字表冠重新居中，窗口又会回到适合所有人的位置。已经接入 SharePlay 的 app **零改动**就能支持，不接 SharePlay 的 app 也能以"只读模式"被共享。FaceTime 远程参与者会以 spatial Persona 自动排列在附近参与者旁边，体型类窗口共享时还会去填补 volume 周围的空缺位置。
+
+---
+
+## 详细内容
+
+要把 nearby sharing 做到位，session 给出了一条主线：先把 GroupActivity 暴露到 Share 菜单，再根据参与者位置增强体验，最后用 ARKit 把内容钉到物理空间。
+
+**第一步：把 activity 暴露到 Share 菜单**（[06:21](https://developer.apple.com/videos/play/wwdc2025/318/?time=381)）。volumetric 窗口的 Share 菜单只有在 app 暴露了 activity 之后才可用。SwiftUI 的写法是塞一个隐藏的 `ShareLink`：
+
+```swift
+import SwiftUI
+import GroupActivities
+
+struct BoardGameActivity: GroupActivity, Transferable {
+    var metadata: GroupActivityMetadata = {
+        var metadata = GroupActivityMetadata()
+        metadata.title = "Play Together"
+        return metadata
+    }()
+}
+
+struct BoardGameApp: App {
+    var body: some Scene {
+        WindowGroup {
+            BoardGameView()
+            ShareLink(item: BoardGameActivity(), preview: SharePreview("Play Together"))
+                .hidden()
+        }
+        .windowStyle(.volumetric)
+    }
+}
+```
+
+关键点：
+- `BoardGameActivity` 同时遵循 `GroupActivity` 和 `Transferable`，后者让它能被 `ShareLink` 识别。
+- `metadata.title` 是 Share 菜单里显示给用户的活动名称。
+- `ShareLink(item:)` 接收 activity 实例，加 `.hidden()` 是为了不影响 UI——它只用来把 activity 注册到 Share 菜单。
+- `.windowStyle(.volumetric)` 声明这是一个体型类窗口，分享时其他人也以 volume 形态看到。
+
+**第二步：监听 session 并加入**（[07:14](https://developer.apple.com/videos/play/wwdc2025/318/?time=434)）。从 Share 菜单激活 activity 会自动创建 `GroupSession`，效果等同手动调用 `activate()`：
+
+```swift
+func observeSessions() async {
+    for await session in BoardGameActivity.sessions() {
+        guard let systemCoordinator = await session.systemCoordinator else { continue }
+        systemCoordinator.configuration.supportsGroupImmersiveSpace = true
+        session.join()
+    }
+}
+```
+
+关键点：
+- `BoardGameActivity.sessions()` 是一个 async sequence，每次 activity 被激活都会推送一个新 session。
+- `systemCoordinator` 提供 SharePlay 的系统级配置入口。
+- `supportsGroupImmersiveSpace = true` 表示 immersive space 在所有人面前位置一致，否则每人原地启动。
+- `session.join()` 是真正进入 SharePlay 的调用，缺了这一行 session 就只是被观察到，不会启动。
+
+**第三步：识别附近参与者**（[09:59](https://developer.apple.com/videos/play/wwdc2025/318/?time=599)）。一旦有 FaceTime 远程参与者加入，需要区分本地和远程：
+
+```swift
+func observeParticipants(session: GroupSession<BoardGameActivity>) async {
+    for await activeParticipants in session.$activeParticipants.values {
+        let nearbyParticipants = activeParticipants.filter {
+            $0.isNearbyWithLocalParticipant && $0 != session.localParticipant
+        }
+    }
+}
+```
+
+关键点：
+- `session.$activeParticipants.values` 把参与者集合转成 async sequence，参与者增减都会推送。
+- `isNearbyWithLocalParticipant` 是 visionOS 26 新增的属性，判断对方是否和本地用户在同一物理空间。
+- 排除 `localParticipant` 自己，避免把自己也算进"附近的人"。
+- 拿到这个列表后可以做"附近 vs 远程"的对抗游戏分组。
+
+**第四步：读取参与者位置**（[11:42](https://developer.apple.com/videos/play/wwdc2025/318/?time=702)）。Immersive space 里参与者可能站在场景任何位置，不能假设都在原点：
+
+```swift
+func observeLocalParticipantState(session: GroupSession<BoardGameActivity>) async {
+    guard let systemCoordinator = await session.systemCoordinator else { return }
+
+    for await localParticipantState in systemCoordinator.localParticipantStates {
+        let localParticipantPose = localParticipantState.pose
+        // Place presented content relative to the local participant pose
+    }
+}
+```
+
+关键点：
+- `localParticipantStates` 是 system coordinator 上的 async sequence，状态变化时推送。
+- `pose` 属性给出参与者在 ImmersiveSpace 场景里的位姿，含位置和朝向。
+- pose **不实时跟踪**，只在分享开始、按数字表冠重新居中等关键事件后更新一次。
+- 拿到 pose 后可以在每人面前放置记分板、UI 控件，而不是把所有内容堆在场景原点。
+
+**第五步：多窗口选主**（[15:54](https://developer.apple.com/videos/play/wwdc2025/318/?time=954)）。app 里有多个 WindowGroup 时，`.groupActivityAssociation(.primary("InstructionalVideo"))` modifier 指定哪个窗口是 SharePlay 的主窗口。
+
+**第六步：共享 World Anchor**（[20:24](https://developer.apple.com/videos/play/wwdc2025/318/?time=1224)）。ARKit 在 visionOS 26 给 `WorldAnchor` 加了一个新初始化参数：
+
+```swift
+import ARKit
+
+class SharedAnchorController {
+    func createAnchor(at transform: simd_float4x4, provider: WorldTrackingProvider) async throws {
+        let anchor = WorldAnchor(originFromAnchorTransform: transform,
+                                 sharedWithNearbyParticipants: true)
+        try await provider.addAnchor(anchor)
+    }
+
+    func observeWorldTracking(provider: WorldTrackingProvider) async {
+       for await update in provider.anchorUpdates {
+            switch update.event {
+            case .added, .updated, .removed:
+                let anchorIdentifier = update.anchor.id
+            }
+        }
+    }
+}
+```
+
+关键点：
+- `sharedWithNearbyParticipants: true` 把锚点共享给附近参与者，所有人看到的物理位置一致。
+- 调用前应先用 `provider.worldAnchorSharingAvailability` 观察可用性，不可用时不要尝试共享。
+- `update.anchor.id` 在所有设备上一致，可以直接当作内容同步标识符。
+- 共享锚点 SharePlay 结束后**不会持久化**，与普通 world anchor 不同——这点容易踩坑。
+
+媒体播放方面，visionOS 26 的 `AVPlayer` 自动通过 `AVPlaybackCoordinator` 同步附近参与者的音视频，避免一台设备的声音先到、另一台后到形成回声。
+
+---
+
+## 核心启发
+
+- **做什么**：把已有 SharePlay app 拿到同一房间的两台 Vision Pro 上跑一遍，确认 nearby sharing 直接可用。
+  - 为什么值得做：Apple 明确说零改动可用，但实际效果（位置同步、Persona 排列、AVPlayer 同步）需要真机验证才能发现细节问题。
+  - 怎么开始：找一台 visionOS 26 设备，邀请同事戴第二台，用现有 ShareLink 启动 GroupSession，观察窗口栏变绿和位置一致性。
+
+- **做什么**：把纯 Immersive Space 体验改造成 "非沉浸窗口 + 沉浸场景" 双模式。
+  - 为什么值得做：Immersive Space 没有窗口栏，用户找不到 Share 按钮，只能依赖 app 自己提供入口。提供一个非沉浸的入门窗口可以让 Share 菜单始终可触达。
+  - 怎么开始：先做一个普通 WindowGroup 作为大厅页，用 `ShareLink(item: YourActivity())` 暴露 activity；所有人加入后再 transition 到 ImmersiveSpace，并设置 `supportsGroupImmersiveSpace = true`。
+
+- **做什么**：用 `ParticipantState.pose` 在每个附近参与者面前放置 UI。
+  - 为什么值得做：默认假设大家围在窗口正前方往往不成立——分享开始时人可能在房间任意位置，记分板放原点等于对着空气。
+  - 怎么开始：监听 `systemCoordinator.localParticipantStates`，在 pose 更新时把记分板、工具栏等内容钉在每人 pose 前方 0.5 米处，并在数字表冠重新居中事件后刷新位置。
+
+- **做什么**：把多人协作的物理布局（棋盘、桌面工具、3D 模型）锚定到 Shared World Anchor。
+  - 为什么值得做：让虚拟内容真正"贴"在房间的桌面上，而不是浮在每人各自的相对坐标系里，是同处一室体验最有说服力的部分。
+  - 怎么开始：先 `observe worldAnchorSharingAvailability`；可用时再用 `WorldAnchor(originFromAnchorTransform:sharedWithNearbyParticipants: true)` 创建锚点；用 `update.anchor.id` 作为同步标识，session 结束后记得重新创建（不持久化）。
+
+---
+
+## 关联 Session
+
+- [Create a seamless multiview playback experience](/articles/wwdc2025-302) — 在 app 里实现多视角同屏播放和切换。
+- [Enhance your app’s audio recording capabilities](/articles/wwdc2025-251) — 利用新的录音 API 改善 app 的音频采集质量。
+- [Explore video experiences for visionOS](/articles/wwdc2025-304) — visionOS 上呈现沉浸式视频的多种方式。
+- [Learn about Apple Immersive Video technologies](/articles/wwdc2025-403) — Apple Immersive Video 与 Spatial Audio 格式的能力概览。

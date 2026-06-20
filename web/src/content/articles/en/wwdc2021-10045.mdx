@@ -1,0 +1,184 @@
+---
+title: "Create custom audio experiences with ShazamKit"
+description: "Bring custom audio matching to your app with ShazamKit. Discover how you can use Shazam's exact audio matching to recognize audio against any source when you use custom catalogs on device."
+date: "2021-06-07"
+tags: ["Audio", "ShazamKit", "Education"]
+thumbnail: "/images/sessions/2021/10045.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10045/"
+sessionId: "wwdc2021-10045"
+year: "2021"
+relatedSessions:
+  - title: "Explore ShazamKit"
+    code: "10044"
+    description: "ShazamKit 基础：曲库识别、自定义目录和曲库管理"
+  - title: "Meet MusicKit for Swift"
+    code: "10194"
+    description: "强类型音乐对象，可与 ShazamKit 媒体项对接"
+  - title: "Classify sound in video with Sound Analysis"
+    code: "10036"
+    description: "检测和分类笑声、掌声等声音类别"
+---
+
+## Highlight
+
+> 这场 Code-along 演示了如何用 ShazamKit 的自定义目录（Custom Catalog）构建一个教育 companion app：Apple TV 播放教学视频，iPhone 通过麦克风识别音频并同步显示互动题目，支持暂停、快进和回放。
+
+## 核心内容
+
+远程教学最大的痛点是学生容易走神。老师在屏幕那头讲题，学生在这头刷社交媒体。如果学生的 iPhone 能跟着视频内容自动弹出互动题，情况会完全不同。
+
+ShazamKit 的自定义目录识别让这个场景成为现实。和 Shazam 曲库识别不同，自定义目录完全在设备本地运行，不需要网络。你可以把任意音频（教学视频、电视节目、播客）生成签名，存入目录，App 就能实时匹配。
+
+（[01:20](https://developer.apple.com/videos/play/wwdc2021/10045/?time=80)）这个 session 的 demo 是一个叫 FoodMath 的教育 App。Apple TV 播放数学教学视频，iPhone 通过麦克风监听电视声音，识别出当前播放的集数和进度，然后同步显示对应的数学题目。
+
+核心机制是：`predictedCurrentMatchOffset` 返回当前匹配点在参考签名中的时间偏移（秒）。App 用这个偏移量去查找对应的 `Question` 对象，决定该显示什么内容。即使学生暂停视频、快进或回放，App 都能实时跟上。
+
+（[14:15](https://developer.apple.com/videos/play/wwdc2021/10045/?time=855)）这种"音频即遥控器"的模式，让跨设备体验变得异常简洁。不需要蓝牙配对，不需要同一个 Wi-Fi，只要设备能听到声音，就能同步。
+
+## 详细内容
+
+### 从音频文件生成参考签名
+
+自定义目录的核心是 reference signature（参考签名）。你可以从音频文件生成，也可以直接加载 `.shazamsignature` 文件。
+
+```swift
+let signatureGenerator = SHSignatureGenerator()
+
+// 从 AVAudioEngine 的 inputNode 捕获音频
+audioEngine.inputNode.installTap(onBus: 0, bufferSize: 2048, format: audioFormat) { buffer, audioTime in
+    try? signatureGenerator.append(buffer, at: audioTime)
+}
+
+let signature = signatureGenerator.signature()
+```
+
+关键点：
+- `SHSignatureGenerator` 将音频缓冲区转换为 signature
+- `installTap` 从 `inputNode` 捕获音频，`buffer` 是 `AVAudioPCMBuffer`
+- `audioTime` 是缓冲区被捕获的时间点，用于确保音频连续性
+- 音频格式必须是 PCM，且采样率在支持的范围内
+- 生成的 signature 称为 reference signature，可以加入自定义目录
+
+### 构建自定义目录并关联元数据
+
+```swift
+// 从文件加载签名
+let signatureURL = Bundle.main.url(forResource: "FoodMath", withExtension: "shazamsignature")!
+let signature = try SHSignature(data: Data(contentsOf: signatureURL))
+
+// 定义自定义媒体项属性
+extension SHMediaItemProperty {
+    static let teacher = SHMediaItemProperty("teacher")
+    static let episode = SHMediaItemProperty("episode")
+}
+
+// 创建媒体项元数据
+let mediaItem = SHMediaItem(properties: [
+    .title: "Count on Me",
+    .subtitle: "Addition",
+    .teacher: "Neil",
+    .episode: 3
+])
+
+// 创建目录并添加签名
+let customCatalog = SHCustomCatalog()
+try customCatalog.addReferenceSignature(signature, representing: [mediaItem])
+```
+
+关键点：
+- `.shazamsignature` 是一种不透明文件格式，可以在设备间共享
+- `SHMediaItemProperty` 支持自定义键，但值必须是有效的 property list 类型
+- `addReferenceSignature` 将签名和元数据关联，匹配成功时返回这些元数据
+- 自定义目录完全在本地运行，不需要网络连接
+
+### 用麦克风实时匹配
+
+```swift
+let session = SHSession(catalog: customCatalog)
+session.delegate = self
+
+// 开始捕获麦克风音频
+audioEngine.inputNode.installTap(onBus: 0, bufferSize: 2048, format: audioFormat) { buffer, audioTime in
+    session.matchStreamingBuffer(buffer, at: audioTime)
+}
+
+try audioEngine.start()
+```
+
+关键点：
+- `SHSession(catalog:)` 指定自定义目录，而非默认的 Shazam 云端曲库
+- `matchStreamingBuffer` 专为实时音频流优化，会自动生成和更新签名
+- 传入 `audioTime` 很重要，session 会验证音频的连续性
+- 需要在 Info.plist 中添加麦克风使用描述
+
+### 处理匹配结果并同步内容
+
+```swift
+extension ViewController: SHSessionDelegate {
+    func session(_ session: SHSession, didFind match: SHMatch) {
+        guard let matchedMediaItem = match.mediaItems.first else { return }
+
+        // predictedCurrentMatchOffset 是自动更新的匹配时间偏移（秒）
+        let currentOffset = matchedMediaItem.predictedCurrentMatchOffset
+
+        // 找到当前偏移对应的 Question
+        let currentQuestion = questions.last { $0.offset <= currentOffset }
+
+        DispatchQueue.main.async {
+            self.updateUI(with: currentQuestion, mediaItem: matchedMediaItem)
+        }
+    }
+}
+```
+
+关键点：
+- `predictedCurrentMatchOffset` 是 `SHMatchedMediaItem` 的特有属性，表示当前在参考签名中的位置
+- 这个值会随着音频播放自动更新，不需要重新匹配
+- `session(_:didFind:)` 可能被多次调用，建议过滤重复的 Question
+- 通过时间偏移查找内容，实现精确到秒的同步
+
+### 目录的分发和缓存
+
+（[14:27](https://developer.apple.com/videos/play/wwdc2021/10045/?time=867)）自定义目录可以通过 `.shazamcatalog` 文件格式保存到磁盘，也可以通过网络分发。
+
+```swift
+// 保存目录到本地
+let catalogURL = documentsURL.appendingPathComponent("lessons.shazamcatalog")
+try customCatalog.write(to: catalogURL)
+
+// 从网络下载后加载
+let downloadedCatalog = try SHCustomCatalog(contentsOf: downloadedURL)
+```
+
+关键点：
+- 目录文件可以通过网络按需下载，减小 App 体积
+- 建议提供本地回退目录，网络不可用时也能正常使用
+- 可以按集/章节拆分目录，只下载当前需要的内容
+
+## 核心启发
+
+1. **健身课程同步助手**
+   - **做什么**：健身 App 根据用户播放的跟练视频自动显示当前动作的名称、次数和要点提示
+   - **为什么值得做**：不需要用户手动翻页或记住进度，视频播放到哪里，提示就显示到哪里
+   - **怎么开始**：将健身视频的音频生成自定义目录，每个动作片段关联对应的指导内容，用 `predictedCurrentMatchOffset` 驱动 UI 更新
+
+2. **播客章节导航**
+   - **做什么**：播客播放器根据当前播放内容自动显示章节标题、嘉宾信息和相关链接
+   - **为什么值得做**：播客通常没有精确的章节标记，ShazamKit 可以基于音频内容实现任意精度的时间定位
+   - **怎么开始**：将播客音频按章节生成签名目录，匹配后用 `predictedCurrentMatchOffset` 查找并显示对应章节的元数据
+
+3. **线下活动互动墙**
+   - **做什么**：展会或活动现场，观众打开 App 就能获取当前展品的详细信息和互动内容
+   - **为什么值得做**：不需要 NFC 标签或二维码，音频本身就成了内容入口，部署成本极低
+   - **怎么开始**：每个展位的介绍视频/音频生成签名存入目录，观众靠近时 App 自动识别并显示对应内容
+
+4. **多语言字幕同步**
+   - **做什么**：视频播放器根据当前播放进度自动加载和显示对应时间点的字幕
+   - **为什么值得做**：即使视频文件本身没有内嵌字幕轨道，也能通过音频匹配实现精确的字幕同步
+   - **怎么开始**：用视频的音频生成自定义目录，字幕文件按时间戳分段，匹配后根据 `predictedCurrentMatchOffset` 加载对应字幕
+
+## 关联 Session
+
+- [Explore ShazamKit](/articles/wwdc2021-10044) — ShazamKit 基础 API 和 Shazam 曲库识别
+- [Meet MusicKit for Swift](/articles/wwdc2021-10194) — ShazamKit 返回的媒体项可与 MusicKit 强类型对象对接
+- [Classify sound in video with Sound Analysis](/articles/wwdc2021-10036) — 如果需要识别声音类别（笑声、掌声等），用 SoundAnalysis 框架

@@ -1,0 +1,267 @@
+---
+title: "Optimize CPU performance with Instruments"
+description: "learn how to optimize your app for apple silicon with two new hardware-assisted tools in instruments. we"
+date: 2026-06-10
+tags: ["图形与游戏", "机器学习", "开发工具"]
+thumbnail: "/images/sessions/2025/308.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/308/"
+sessionId: "wwdc2025-308"
+year: "2025"
+relatedSessions:
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Engage players with the Apple Games app"
+    code: "215"
+    description: "meet the games app – a new destination for players to keep up with what"
+---
+
+## Highlight
+
+> Session 用一个二分查找的性能优化作为贯穿案例，演示了 Instruments 的三层性能分析工具：CPU Profiler（采样式分析，定位软件级开销）、Processor Trace（完整指令追踪，1% 开销的无采样偏差分析）、CPU Counters（硬件计数器，分析 CPU 微架构瓶颈）。
+
+---
+
+## 核心内容
+
+性能优化的痛点，是你不知道慢在哪里。Swift 源码经过编译器、Swift runtime、系统框架、内核多层抽象，最终才落到 CPU 的指令流水线上跑。每一层都可能藏着开销：泛型没特化、协议分派、隐式 Array 装箱、分支预测失败、缓存未命中。Time Profiler 看到的"热点函数"只是表象，真正吃 CPU 的，往往是你看不见的那部分。
+
+Apple 这次给 Instruments 引入了两个硬件辅助的新工具，从根上解决这个问题。Processor Trace（Instruments 16.3 引入）利用 M4、A18 的硬件能力，1% 的开销下记录用户态每一条执行过的指令，没有采样偏差，可以精确量化每个软件抽象层的 cycles 成本。CPU Counters 在今年加入了 preset 模式，把硬件性能计数器抽象成"指令交付（Instruction Delivery）/ 指令处理（Instruction Processing）/ 投机执行被丢弃（Discarded）/ 退出（Retired）"四类瓶颈，再用引导式工作流（Guided Methodology）告诉你下一步该切到哪个模式去采样。Session 用一个二分查找从原始版本一路优化到 25 倍加速，串起了从软件层定位 → 指令层验证 → 微架构调优的完整链路。
+
+---
+
+## 详细内容
+
+### 写一个吞吐量测试，作为优化的尺子
+
+优化第一步是建立可重复测量的基准，把改代码这件事放到后面。Session 给了一个简单到不用任何 benchmark 框架的写法（[07:49](https://developer.apple.com/videos/play/wwdc2025/308/?time=469)）：
+
+```swift
+import Testing
+import OSLog
+
+let signposter = OSSignposter(
+    subsystem: "com.example.apple-samplecode.MyBinarySearch",
+    category: .pointsOfInterest
+)
+
+func search(
+    name: StaticString,
+    duration: Duration,
+    _ search: () -> Void
+) {
+    var now = ContinuousClock.now
+    var outerIterations = 0
+
+    let interval = signposter.beginInterval(name)
+    let start = ContinuousClock.now
+    repeat {
+        search()
+        outerIterations += 1
+        now = .now
+    } while (start.duration(to: now) < duration)
+    let elapsed = start.duration(to: now)
+    let seconds = Double(elapsed.components.seconds) +
+            Double(elapsed.components.attoseconds) / 1e18
+    let throughput = Double(outerIterations) / seconds
+    signposter.endInterval(name, interval, "\(throughput) ops/s")
+    print("\(name): \(throughput) ops/s")
+}
+```
+
+关键点：
+
+- `OSSignposter` 用 `.pointsOfInterest` 类别——这是 Instruments 默认会显示的轨道，不用额外配置。
+- `signposter.beginInterval` / `endInterval` 在 Instruments 时间线上画出一段可点击的区间，方便后续 "Set Inspection Range and Zoom" 把分析范围锁定在搜索本身，跳过测试启动等噪声。
+- `ContinuousClock` 替代 `Date`：保证不会因为系统时间回拨产生负值，且开销低。
+- 跑满 `duration`（默认 1 秒）累加迭代次数，最后用 `outerIterations / seconds` 得到 throughput——粗糙但够用，用来对比"改之前 vs 改之后"。
+
+### 第一层：CPU Profiler 找软件级开销
+
+Session 一开始的二分查找写在框架里，签名是 `<E: Comparable, C: Collection<E>>`（[06:37](https://developer.apple.com/videos/play/wwdc2025/308/?time=397)）。CPU Profiler 在 deferred 模式下采样后，调用树里 1/4 的样本落在 protocol witness、Array 的 Objective-C 类型检查、内存分配上。
+
+为什么用 CPU Profiler 而不是 Time Profiler？（[09:02](https://developer.apple.com/videos/play/wwdc2025/308/?time=542)）Time Profiler 按定时器采样，会和系统周期性任务发生 aliasing（别名失真）；CPU Profiler 按每个 CPU 的周期计数器（cycle counter）采样，对 Apple Silicon 的非对称大小核更公平，频率高的核被采样更多，反映真实负担。
+
+解决方案是把容器换成 `Span`（[13:46](https://developer.apple.com/videos/play/wwdc2025/308/?time=826)）：
+
+```swift
+public func binarySearch<E: Comparable>(
+    needle: E,
+    haystack: Span<E>
+) -> Span<E>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let half = length / 2
+        let middle = haystack.indices.index(start, offsetBy: half)
+        let middleValue = haystack[middle]
+        if needle < middleValue {
+            length = half
+        } else if needle == middleValue {
+            return middle
+        } else {
+            start = haystack.indices.index(after: middle)
+            length -= half + 1
+        }
+    }
+
+    return start
+}
+```
+
+关键点：
+
+- `Span<E>` 表示连续内存的切片，本质是基址 + 长度，且禁止逃逸出函数作用域，避免了 Array 的引用计数和 ObjC 桥接成本。
+- 算法逻辑零改动，仅替换容器类型，吞吐量提升约 4 倍（[13:52](https://developer.apple.com/videos/play/wwdc2025/308/?time=832)）。
+
+### 第二层：Processor Trace 暴露泛型未特化
+
+CPU Profiler 已经看不出更多问题，切到 Processor Trace（[14:09](https://developer.apple.com/videos/play/wwdc2025/308/?time=849)）。它只在 M4、A18 上可用，需要在「隐私与安全 → 开发者工具」开启权限，建议追踪时间控制在几秒内（数据量可达 GB/s）。
+
+Processor Trace 的火焰图和采样型工具不一样：宽度代表真实执行时间，颜色按二进制来源区分（棕色=系统框架、品红=Swift runtime/标准库、蓝色=你的 app 或自定义框架）。在 10 次迭代里随便挑一次 binary search 调用，按 cycles 排序 Function Calls 表格，作者发现真正的瓶颈在 Comparable 的泛型分派上，而非原本以为的 bounds check——因为函数在框架里，编译器无法跨模块特化（[18:39](https://developer.apple.com/videos/play/wwdc2025/308/?time=1119)）。
+
+解决办法两选一：给框架函数加 `@inlinable`，或者直接手写一份 `Int` 特化版本（[19:17](https://developer.apple.com/videos/play/wwdc2025/308/?time=1157)）：
+
+```swift
+public func binarySearchInt(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let half = length / 2
+        let middle = haystack.indices.index(start, offsetBy: half)
+        let middleValue = haystack[middle]
+        if needle < middleValue {
+            length = half
+        } else if needle == middleValue {
+            return middle
+        } else {
+            start = haystack.indices.index(after: middle)
+            length -= half + 1
+        }
+    }
+    return start
+}
+```
+
+关键点：
+
+- 函数名换成 `binarySearchInt`，把 `<E: Comparable>` 写死成 `Int`，让编译器直接 inline 比较指令。
+- 牺牲了通用性，换来 1.7 倍提速（[19:23](https://developer.apple.com/videos/play/wwdc2025/308/?time=1163)）。
+- 适合性能关键路径上的少量函数，不要全代码库铺开。
+
+### 第三层：CPU Counters 做微架构调优
+
+软件层已经清干净，剩下的瓶颈在 CPU 内部。CPU Counters 今年加入 preset 模式（[22:35](https://developer.apple.com/videos/play/wwdc2025/308/?time=1355)），第一关用 "CPU Bottlenecks" 模式，会把 cycles 拆成四类：Instruction Delivery、Instruction Processing、Discarded、Retired。
+
+Session 的 Span+Int 版本在这个模式下显示 Discarded（投机执行后丢弃的指令）占比很高。Instruments 直接给出 remark，建议下一步切到 "Discarded Sampling" 模式，定位到具体指令——是 needle 与 middleValue 的比较被分支预测器猜错（[25:20](https://developer.apple.com/videos/play/wwdc2025/308/?time=1520)）。原因是被搜索的元素是随机的，分支结果毫无规律。
+
+修复手段是写一个无分支版本（[26:34](https://developer.apple.com/videos/play/wwdc2025/308/?time=1594)）：
+
+```swift
+public func binarySearchBranchless(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let remainder = length % 2
+        length /= 2
+        let middle = start &+ length
+        let middleValue = haystack[middle]
+        if needle > middleValue {
+            start = middle &+ remainder
+        }
+    }
+
+    return start
+}
+```
+
+关键点：
+
+- 循环体里只有一个 `if`，且仅赋值不改控制流——Swift 编译器会发射 conditional move 指令（cmov），消除掉难以预测的分支。
+- 去掉了 `needle == middleValue` 的早返回，因为提前返回必须用分支实现。
+- 用 `&+` 这类不检查溢出的运算符，避免编译器插入溢出检查的分支。
+- 相比 Span+Int 版本再快 2 倍；瓶颈从 Discarded 转移到 Instruction Processing（[27:24](https://developer.apple.com/videos/play/wwdc2025/308/?time=1644)）。
+
+切到 Instruction Processing 模式，remark 提示用 L1D Cache Miss Sampling，结果定位到对 haystack 的内存访问。背景知识（[27:57](https://developer.apple.com/videos/play/wwdc2025/308/?time=1677)）：L1 cache 在 CPU 内、最快但最小；L2 在 CPU 外；miss 后访问主存比 L1 慢 50 倍；缓存以 64/128 字节的 cache line 为单位拉取。二分查找的访问模式对缓存极不友好——每次访问的中点元素几乎都在不同的 cache line 上。
+
+最后一招是 Eytzinger 布局（以 16 世纪奥地利系谱学家命名），把数组按二叉树的广度优先顺序重排，让搜索的前几步都落在同一个 cache line（[29:27](https://developer.apple.com/videos/play/wwdc2025/308/?time=1767)）：
+
+```swift
+public func binarySearchEytzinger(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex.advanced(by: 1)
+    let length = haystack.count
+
+    while start < length {
+        let value = haystack[start]
+        start *= 2
+        if value < needle {
+            start += 1
+        }
+    }
+
+    return start >> ((~start).trailingZeroBitCount + 1)
+}
+```
+
+关键点：
+
+- 数组下标从 1 开始，左孩子是 `2*i`，右孩子是 `2*i+1`，类似堆的索引方式。
+- 循环结束时 `start` 越界，最后通过 `~start` 的尾零位数把指针"回退"到最近一个被走过的合法节点。
+- 重排数组的代价是顺序遍历不再缓存友好，所以这是一种取舍，不是无脑优化。
+- 比无分支版本再快 2 倍；总加速倍数约 25 倍（[31:04](https://developer.apple.com/videos/play/wwdc2025/308/?time=1864)）。
+
+---
+
+## 核心启发
+
+**1. 给关键路径搭一个 throughput harness**
+
+为什么值得做：CPU Profiler、Processor Trace、CPU Counters 三件套都需要一个能稳定复现热点的测试入口。没有可重复的基准，再花哨的工具也只是在猜。
+
+怎么开始：复用 Session 给的模板，套上 `OSSignposter` + `ContinuousClock` + 一个一秒级的 `repeat-while` 循环。在 Xcode 里用 `@Test` 标注，secondary-click 测试名就能直接 Profile。给关键算法每个写一个，长期保留。
+
+**2. 用 Processor Trace 验证泛型/协议是否真的特化**
+
+为什么值得做：跨模块的泛型函数大概率没有特化，但在 CPU Profiler 里很难直接看见，因为它没有具体的"protocol witness"火焰条。Processor Trace 能精确展示每一条 cycles，把这种隐性开销挑出来。
+
+怎么开始：在 M4 Mac 或 A18 iPhone 上启用「开发者工具」中的 Processor Trace 权限，把测试缩到 10 次迭代，按 Function Calls 表格按 cycles 排序。看到框架内的 generic 函数没被内联，就给它加 `@inlinable`，或在性能关键处手写类型特化版本。
+
+**3. 把 CPU Counters 的引导式工作流当成默认入口**
+
+为什么值得做：今年 CPU Counters 的 preset 模式 + Suggested Next Mode 列把"我该看哪个计数器"的门槛打掉了。从 CPU Bottlenecks 起步，跟着 remark 走 Discarded Sampling、Instruction Processing、L1D Cache Miss Sampling 等模式，能在不读完《Apple Silicon CPU Optimization Guide》的情况下定位绝大多数微架构问题。
+
+怎么开始：选模板时先选 CPU Counters → CPU Bottlenecks，跑一遍看主要瓶颈。secondary-click "Suggested Next Mode" 里的下一关，重新 Profile。每改一次代码都回到 CPU Bottlenecks 验证瓶颈是否转移。
+
+**4. 优化前先问"这工作能不能不做"**
+
+为什么值得做：Session 反复强调，最便宜的优化是删代码、延后执行、预计算或加缓存（[04:36](https://developer.apple.com/videos/play/wwdc2025/308/?time=276)）。微优化让代码更脆、可维护性更差，且依赖编译器的特定行为（auto-vectorization、ARC elision）。
+
+怎么开始：性能 review 时先列三个问题——"用户真需要这个结果吗""能不能 lazy 到第一次访问时再算""能不能编译期烘焙"。前面三关过不了，再考虑 Span / 特化 / 无分支 / 缓存友好布局这些手段。
+
+---
+
+## 关联 Session
+
+- [Visualize and optimize Swift concurrency](/articles/wwdc2025-266) — 用 Instruments 分析任务阻塞和线程切换，配合 CPU 性能分析互补。
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — 详解 Span、Inline Array 等连续内存类型，是本场把 Collection 换成 Span 的前置知识。
+- [Analyze hangs with Instruments](/articles/wwdc2025-248) — 用 Hangs 工具确认问题真出在 CPU 上，再决定要不要走本场的 CPU 优化路径。
+- [What's new in Swift](/articles/wwdc2025-245) — 包含 `@inlinable`、Span、Testing 框架等本场用到的语言特性更新。
+- [Discover Metal 4](/articles/wwdc2025-205) — 当 CPU 瓶颈解决后，重计算工作负载可考虑下沉到 GPU。

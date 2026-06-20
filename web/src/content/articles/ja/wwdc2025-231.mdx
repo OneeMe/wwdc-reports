@@ -1,0 +1,209 @@
+---
+title: "Meet WebKit for SwiftUI"
+description: "discover how you can use webkit to effortlessly integrate web content into your swiftui apps. learn how to load and display web content, communicate with webpages, and more."
+date: 2026-06-10
+tags: ["Safari与Web", "SwiftUI", "应用服务"]
+thumbnail: "/images/sessions/2025/231.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/231/"
+sessionId: "wwdc2025-231"
+year: "2025"
+relatedSessions:
+  - title: "Learn more about Declarative Web Push"
+    code: "235"
+    description: "learn how declarative web push can help you deliver notifications more reliably."
+---
+
+## Highlight
+
+> WebKit 团队在 SwiftUI 中提供了原生的 `WebView` 视图与 `WebPage` 可观察类，前者只需传入 URL 即可显示网页，后者负责加载、控制内容并与 JavaScript 通信。
+
+---
+
+## 核心内容
+
+过去在 SwiftUI 里嵌入 WebKit，开发者只能借助 `UIViewRepresentable` 或 `NSViewRepresentable` 把 `WKWebView` 包成 SwiftUI 视图，状态同步靠 Coordinator + delegate 转发，跨 iOS / macOS / visionOS 还要写一套平台分支。结果是几十行胶水代码才能展示一个 URL，监听标题或滚动位置又要再绕一圈。
+
+今年 WebKit 团队直接把整套 API 搬进 SwiftUI。`WebView` 是一个原生 SwiftUI 视图，传一个 URL 就能渲染，所有 WebKit 平台一份代码就够。`WebPage` 是新的 `Observable` 类，用来加载内容、读取属性、执行 JavaScript、定制导航策略。两者可以单独使用，也可以组合：把 `WebPage` 交给 `WebView`，页面标题、URL、加载进度、主题色都成为可观察属性，配合 `@Observable` 模型直接驱动界面。
+
+---
+
+## 详细内容
+
+最简单的用法是把 URL 直接交给 `WebView`，状态变化时它会自动重新加载（[03:01](https://developer.apple.com/videos/play/wwdc2025/231/?time=181)）。
+
+```swift
+struct ContentView: View {
+    @State private var url = URL(string: "https://www.example.com")!
+
+    var body: some View {
+        WebView(url: url)
+    }
+}
+```
+
+**关键点：**
+- `WebView(url:)` 是 SwiftUI 原生视图，URL 改变即触发导航。
+- 不需要再用 `UIViewRepresentable` 桥接，跨 iOS / iPadOS / macOS / visionOS 一份代码。
+
+要观察页面属性或控制内容，则需要 `WebPage`，再把它交给 `WebView`（[03:42](https://developer.apple.com/videos/play/wwdc2025/231/?time=222)）。
+
+```swift
+@Observable
+final class ArticleViewModel {
+    let webPage = WebPage()
+    let article: LakeArticle
+
+    init(article: LakeArticle) { self.article = article }
+
+    func loadArticle() {
+        webPage.load(URLRequest(url: article.url))
+    }
+}
+```
+
+**关键点：**
+- `WebPage` 是 `Observable` 类，封装加载、控制、JS 通信。
+- `load(_:)` 接收 `URLRequest`；同名 API 也支持直接传 HTML 字符串 + base URL，或 web archive 数据 + MIME type + 编码。
+
+要把 app bundle 内的本地 HTML/CSS 当作网页加载，可实现 `URLSchemeHandler` 协议，注册自定义 scheme（[06:36](https://developer.apple.com/videos/play/wwdc2025/231/?time=396)）。
+
+```swift
+struct LakesSchemeHandler: URLSchemeHandler {
+    func reply(for request: URLRequest)
+        -> some AsyncSequence<URLSchemeTaskResult, any Error>
+    {
+        // yield a URLResponse, then yield Data values
+        // can stream asynchronously thanks to AsyncSequence
+    }
+}
+
+let handler = LakesSchemeHandler()
+var configuration = WebPage.Configuration()
+if let scheme = URLScheme("lakes") {
+    configuration.urlSchemeHandlers[scheme] = handler
+}
+let page = WebPage(configuration: configuration)
+```
+
+**关键点：**
+- `URLScheme("lakes")`：传入已被 WebKit 占用的 scheme（如 `https`、`file`、`about`）会返回 `nil`。
+- `reply(for:)` 返回 `AsyncSequence<URLSchemeTaskResult, _>`，先 yield `URLResponse`，再 yield `Data`，自带流式与取消传播。
+- 注册到 `Configuration.urlSchemeHandlers`，再把 configuration 传给 `WebPage` 初始化。
+
+监听导航事件用新增的 `currentNavigationEvent` 属性，搭配 Swift 6.2 的 `Observations` 转成 `AsyncSequence`（[10:59](https://developer.apple.com/videos/play/wwdc2025/231/?time=659)）。
+
+```swift
+for await event in Observations({ webPage.currentNavigationEvent }) {
+    switch event {
+    case .finished(let id):
+        await parseSections()
+    case .failed(let id, let error),
+         .failedProvisionalNavigation(let id, let error):
+        handle(error)
+    default:
+        break
+    }
+}
+```
+
+**关键点：**
+- 一次导航顺序触发：`startedProvisionalNavigation` → `receivedServerRedirect`（可选） → `committed` → `finished`，任何阶段都可能 `failed` / `failedProvisionalNavigation`。
+- `currentNavigationEvent` 本身可观察，配合 `Observations` 写成 `for-await` 循环，比 delegate 模式更线性。
+
+执行 JavaScript 用 `callJavaScript`，可传入参数字典（[12:33](https://developer.apple.com/videos/play/wwdc2025/231/?time=753)、[18:29](https://developer.apple.com/videos/play/wwdc2025/231/?time=1109)）。
+
+```swift
+let raw = try await webPage.callJavaScript(
+    "return parseSections(document.documentElement.outerHTML);"
+)
+let sections = (raw as? [[String: String]]) ?? []
+
+let offset = try await webPage.callJavaScript(
+    "return document.getElementById(id).offsetTop;",
+    arguments: ["id": sectionId]
+)
+```
+
+**关键点：**
+- 返回值是 `Any?`，需要自行转成具体 Swift 类型。
+- `arguments` 字典的 key 在 JS 里以局部变量出现，value 自动转成 JS 值，方便复用同一段脚本。
+
+自定义导航策略用 `WebPage.NavigationDeciding` 协议；遇到外链就交给系统浏览器（[13:50](https://developer.apple.com/videos/play/wwdc2025/231/?time=830)）。
+
+```swift
+struct LakeNavigationDecider: WebPage.NavigationDeciding {
+    let onExternalLink: (URL) -> Void
+
+    func decidePolicy(
+        for action: WebPage.NavigationAction,
+        preferences: inout WebPage.NavigationPreferences
+    ) async -> WKNavigationActionPolicy {
+        let url = action.request.url
+        if url?.scheme == "lakes" || url?.host == "lakes.apple.com" {
+            return .allow
+        }
+        if let url { onExternalLink(url) }
+        return .cancel
+    }
+}
+```
+
+**关键点：**
+- 协议提供 navigation action、response、authentication 三个时机的策略钩子。
+- 取消导航后，把目标 URL 发回 SwiftUI 状态，再用环境值 `openURL` 打开默认浏览器。
+
+视图修饰符层面，`scrollBounceBehavior`、`findNavigator` 等已有 modifier 直接生效；新增 `webViewScrollPosition`、`onScrollGeometryChange`、`webViewScrollInputBehavior` 用于精细控制（[15:52](https://developer.apple.com/videos/play/wwdc2025/231/?time=952)、[19:29](https://developer.apple.com/videos/play/wwdc2025/231/?time=1169)）。
+
+```swift
+WebView(webPage)
+    .navigationTitle(webPage.title)
+    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+    .findNavigator(isPresented: $isFindPresented)
+    .webViewScrollInputBehavior(.enabled, for: .look) // visionOS look-to-scroll
+    .webViewScrollPosition($scrollPosition)
+    .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y } action: { _, y in
+        selectedSection = nearestSection(to: y)
+    }
+```
+
+**关键点：**
+- `webViewScrollPosition` 与 `ScrollPosition` 配合，`scrollTo` 即可程序化跳转。
+- `onScrollGeometryChange` 取出滚动偏移、内容尺寸变化，用来反向更新侧边栏选中项。
+- visionOS 上的 look-to-scroll 由 `webViewScrollInputBehavior(.enabled, for: .look)` 启用，默认关闭。
+
+---
+
+## 核心启发
+
+**1. 现有 `WKWebView` 包装层迁移到 `WebView` + `WebPage`**
+
+为什么值得做：去掉 `UIViewRepresentable` + Coordinator 胶水，平台分支也能合并；标题、URL、进度、主题色直接进 `@Observable` 数据流。
+
+怎么开始：先把展示型场景（详情页、说明页）换成 `WebView(url:)`；需要监听属性的页面再升级到 `WebPage` 并把它放进 ViewModel。
+
+**2. 用 `URLSchemeHandler` 替换本地资源的临时目录方案**
+
+为什么值得做：bundle 里的 HTML/CSS/图片可以走自定义 scheme 直接由 app 提供，不用提前解压到 tmp 再用 `file://` 加载，权限和路径问题一并消失，还自带 `AsyncSequence` 流式响应。
+
+怎么开始：实现 `URLSchemeHandler.reply(for:)`，先返回 `URLResponse`，再分块返回 `Data`；通过 `WebPage.Configuration.urlSchemeHandlers` 注册；把内置内容的链接改写成自定义 scheme。
+
+**3. 用 `Observations` + `for-await` 重写导航与状态监听**
+
+为什么值得做：`WKNavigationDelegate` 的回调散落在多个方法里，难以拼成一条线性逻辑。`currentNavigationEvent` 配合 Swift 6.2 `Observations` 可以在一个 task 里把整次加载流程读完。
+
+怎么开始：给视图加 `.task { for await event in Observations({ page.currentNavigationEvent }) { ... } }`；按 `finished / failed` 分支更新 UI，需要时再用 `Observations` 监听 `title`、`estimatedProgress`、`themeColor`。
+
+**4. 用 `callJavaScript(_:arguments:)` 把网页变成可查询的数据源**
+
+为什么值得做：很多 app 内嵌网页只是为了渲染，但页面里其实有结构化信息可抓（目录、表单字段、滚动位置）。用带参数的 JS 调用可以写一份通用脚本被多处复用。
+
+怎么开始：在网页里准备纯函数（如 `parseSections`、`offsetTop`），在 Swift 端用 `callJavaScript` 传 `arguments` 字典调用，把返回值 `as?` 成 Swift 类型驱动 SwiftUI 列表。
+
+---
+
+## 关联 Session
+
+- [Learn more about Declarative Web Push](/articles/wwdc2025-235) — 让网页推送通知不再依赖 service worker JavaScript，直接通过声明式 JSON 投递。
+- [What's new in SwiftUI](/articles/wwdc2025-256) — 概览今年 SwiftUI 的新视图、新修饰符与可观察集成点。
+- [Explore concurrency in SwiftUI](/articles/wwdc2025-266) — 讲解 `@Observable`、`Observations` 与 `for-await` 在 SwiftUI 中的使用方式。
+- [What's new in Swift](/articles/wwdc2025-245) — 介绍 Swift 6.2 的 `Observations` API 与并发改进，本 session 的 `for-await` 监听依赖于此。

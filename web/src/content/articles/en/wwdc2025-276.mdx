@@ -1,0 +1,106 @@
+---
+title: "What’s new in BNNS Graph"
+description: "the bnns graph builder api now enables developers to write graphs of operations using the familiar swift language to generate pre- and post-processing routines and small machine-learning models. bnns "
+date: 2026-06-10
+tags: ["机器学习"]
+thumbnail: "/images/sessions/2025/276.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/276/"
+sessionId: "wwdc2025-276"
+year: "2025"
+relatedSessions:
+  - title: "Bring advanced speech-to-text to your app with SpeechAnalyzer"
+    code: "277"
+    description: "discover the new speechanalyzer api for speech to text. we"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+---
+
+## Highlight
+
+> 去年 BNNSGraph 首次亮相，提供了一种从 CoreML 包加载图并执行推理的文件式 API。今年的 BNNSGraphBuilder 是一个全新的 Swift DSL，让你直接在 Swift 代码里定义计算图——从输入参数声明、操作符调用到输出返回，全在一个 makeContext 闭包里完成。
+
+## 核心内容
+
+去年的 Bitcrusher demo 演示了 BNNSGraph 如何替代手写离散层的繁琐流程，但仍需要走 PyTorch → CoreML 包 → mlmodelc 这条管道。对一个只有十几个张量操作的音频效果器来说，维护一个独立的 Python 文件、再 build 出 CoreML 包，成本远大于收益。预处理和后处理这种小图谱场景里，开发者反复在「写 Swift 代码逐个调用 BNNS 原语」与「绕一圈 PyTorch 编译模型」之间纠结。
+
+今年 Apple 把整个流程压扁。BNNSGraphBuilder 让你在 Swift 闭包里直接定义计算图：声明 `argument`、调用算子、返回输出张量，一次 `BNNSGraph.makeContext` 调用即可生成可执行的 context。代码与项目的其他 Swift 代码同处一份源文件，编译期完成类型检查，张量形状可在 Swift 运行时已知后传入图中享受静态尺寸的性能。配合 BNNSGraph 原有的层融合、copy elision、权重重排等优化，小模型与预/后处理图谱不再需要 PyTorch 这一中间环节。
+
+## 详细内容
+
+整套 API 的入口是 `BNNSGraph.makeContext` 这个新增的类型方法，闭包参数 `builder` 用来声明输入、组装算子、返回输出。下面这段是 Session 在 8:31 给出的最小可运行示例（[8:31](https://developer.apple.com/videos/play/wwdc2025/276/?time=511)），实现了两个 8 元素向量的逐元素乘积，并求平均值：
+
+```swift
+let context = try BNNSGraph.makeContext { builder in
+    let x = builder.argument(name: "x",
+                             dataType: Float.self,
+                             shape: [8])
+    let y = builder.argument(name: "y",
+                             dataType: Float.self,
+                             shape: [8])
+
+    let product = x * y
+    let mean = product.mean(axes: [0], keepDimensions: true)
+
+    // Prints "shape: [1] | stride: [1]".
+    print("mean", mean)
+
+    return [product, mean]
+}
+
+var args = context.argumentNames().map { name in
+    context.tensor(argument: name, fillKnownDynamicShapes: false)!
+}
+args[0].allocate(as: Float.self, count: 8)   // product
+args[1].allocate(as: Float.self, count: 1)   // mean
+args[2].allocate(initializingFrom: [1, 2, 3, 4, 5, 6, 7, 8] as [Float])
+args[3].allocate(initializingFrom: [8, 7, 6, 5, 4, 3, 2, 1] as [Float])
+
+try context.executeFunction(arguments: &args)
+```
+
+关键点：
+
+- `BNNSGraph.makeContext { builder in ... }` 把 Swift 闭包编译成可复用的 context，通常在 app 启动时只构建一次。
+- `builder.argument(name:dataType:shape:)` 声明输入张量；`shape: [8]` 是静态形状，运行时无须动态推断。
+- `x * y` 直接使用 Swift 运算符触发逐元素乘法，等价于 BNNS 的 element-wise multiply 原语。
+- `product.mean(axes:keepDimensions:)` 调用归约算子；`keepDimensions: true` 保留归约轴，得到 `[1]` 形状。
+- `print("mean", mean)` 在编译期/构图阶段打印中间张量的 shape 与 stride，便于调试。
+- `return [product, mean]` 决定输出张量；`context.argumentNames()` 把输出排在前、输入排在后。
+- `executeFunction(arguments:)` 真正执行图，结果写入预先 allocate 的输出张量。
+
+类型系统在编译期就拒绝隐式混合数据类型。Session 12:04 给出的强类型示例（[12:04](https://developer.apple.com/videos/play/wwdc2025/276/?time=724)）演示了 `bases.pow(y: exponents.cast(to: Float16.self))` 的写法——Float16 的 base 与 Int32 的 exponent 必须显式 `cast`，否则 `makeContext` 编译失败。比较运算 `mask0 .< mask1` 返回的布尔张量同样要 `cast(to: Float16.self)` 才能与 FP16 张量相乘。
+
+切片用 Swift 下标语法实现（[14:15](https://developer.apple.com/videos/play/wwdc2025/276/?time=855)）。`BNNSGraph.Builder.SliceRange(startIndex:endIndex:)` 支持负索引表示从尾部计数，`SliceRange.fillAll` 表示该维度整段保留。底层 BNNSGraph 把切片视作对原数据的引用，零拷贝、零额外分配。
+
+后处理示例（[19:04](https://developer.apple.com/videos/play/wwdc2025/276/?time=1144)）展示了 `softmax(axis:)` 与 `topK(_:axis:findLargest:)` 的组合，后者返回一个同时包含 `values` 与 `indices` 的元组——典型的分类模型解码流程。
+
+迁移 Bitcrusher 的对比尤为直观（[21:03](https://developer.apple.com/videos/play/wwdc2025/276/?time=1263)）。原来的 PyTorch 版本要继承 `nn.Module`、写 `forward`、再走 coremltools 转换；Swift 版本里 `source * saturationGain`、`destination.tanh()`、`destination.round()` 这些操作直接对张量调用，与 PyTorch 几乎一一对应，但全部在一个 Swift 文件内完成。把 `BITCRUSHER_PRECISION` 从 `Float32` 改成 `Float16`（[22:34](https://developer.apple.com/videos/play/wwdc2025/276/?time=1354)）即可切换精度，Session 实测 FP16 性能优于 FP32。
+
+## 核心启发
+
+- **做什么**：把 ML 模型的预/后处理从 Python 迁到 Swift 用 BNNSGraphBuilder 重写。
+  为什么值得做：预处理（裁剪、归一化、阈值化）和后处理（softmax、topK、NMS）通常只有十几个算子，却长期占用一份独立的 Python 工程。迁到 Swift 后与业务代码同源管理，编译期类型检查能拦掉大量形状错误。
+  怎么开始：挑一段最小的预处理流程（比如「中心裁剪 + 归一化」），用 `BNNSGraph.makeContext` 重写，对照原 Python 输出验证数值一致性。
+
+- **做什么**：为 Logic Pro / Garage Band 实现自定义 Audio Unit 时直接用 Swift 写 DSP 图。
+  为什么值得做：BNNS 面向 CPU、低延迟、可控内存与线程，正是音频实时处理需要的特性。Bitcrusher 这类效果器全部用 BNNSGraphBuilder 表达后，无需维护 PyTorch 工程。
+  怎么开始：把现有的 saturation / quantization / dry-wet 混合公式翻译成 `*`、`tanh()`、`round()` 等 builder 操作，`BITCRUSHER_PRECISION` 默认设为 `Float16`。
+
+- **做什么**：在小模型场景里用 BNNSGraphBuilder 替代 CoreML 包路径。
+  为什么值得做：CoreML 包路径成熟稳健，但需要 Python 工程链；当模型只有几层、且参数会随运行时变量调整时，文件式 API 变成负担。Swift DSL 可在运行时根据已知值生成静态形状的图，享受比 flexible shape 更好的性能。
+  怎么开始：先用 `print(mean)` 等中间张量调试形状；确认无误后用 `context.executeFunction(arguments:)` 跑通端到端推理。
+
+## 关联 Session
+
+- [Bring advanced speech-to-text to your app with SpeechAnalyzer](/articles/wwdc2025-277) — 新的 SpeechAnalyzer API，端到端语音转文本。
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — 在 SwiftUI 应用里用 Foundation Models 构建生成式 AI 特性。
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — 深入 Foundation Models：guided generation、tool use 与流式输出。
+- [Explore large language models on Apple silicon with MLX](/articles/wwdc2025-298) — 用 MLX 在 Apple silicon 上探索大语言模型。
+- [Get started with MLX for Apple silicon](/articles/wwdc2025-315) — MLX 入门：在 Apple silicon 上做高性能机器学习。

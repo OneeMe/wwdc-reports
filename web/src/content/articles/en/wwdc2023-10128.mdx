@@ -1,0 +1,263 @@
+---
+title: "Your guide to Metal ray tracing"
+description: "Discover how you can enhance the visual quality of your games and apps with Metal ray tracing. We'll take you through the fundamentals of the Metal ray tracing API. Explore the latest enhancements and techniques that will enable you to create larger and more complex scenes, reduce memory usage and build times, and efficiently render visual content like hair and fur."
+date: "2023-06-06"
+tags: ["Metal", "Ray Tracing", "Graphics", "GPU"]
+thumbnail: "/images/sessions/2023/10128.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10128/"
+sessionId: "wwdc2023-10128"
+year: "2023"
+relatedSessions:
+  - title: "Discover ray tracing with Metal"
+    code: "10687"
+    description: "2020 年 Metal 光线追踪入门 session"
+  - title: "Maximize your Metal ray tracing performance"
+    code: "10128"
+    description: "2022 年 Metal 光线追踪性能优化 session"
+  - title: "Render Metal with ray tracing"
+    code: "10148"
+    description: "Metal 光线追踪渲染实战"
+---
+
+## Highlight
+
+> Metal 在 WWDC2023 扩展了光线追踪 API，新增曲线几何体（Curve Primitives）用于毛发渲染、多级实例化（Multi-level Instancing）用于复杂场景、以及 GPU 驱动的间接实例加速结构构建，让游戏和生产级渲染器都能处理更大规模场景。
+
+## 核心内容
+
+### 从三角形到曲线：毛发渲染的痛点
+
+用三角形模拟头发和毛发是图形开发者的噩梦。一根头发需要几十个三角形才能看起来不太假，一个角色可能有上百万根头发。内存占用爆炸，加速结构构建时间漫长，拉近镜头还能看到锯齿。
+
+Metal 2023 引入了曲线几何体（Curve Primitives），直接支持贝塞尔、Catmull-Rom、B-Spline 和线性四种曲线基函数。曲线在镜头拉近时保持光滑，内存占用比三角形少，加速结构构建也更快。
+
+### 场景规模瓶颈：实例化的演进
+
+渲染像《海洋奇缘》岛屿这样的复杂场景时，直接把所有几何体塞进一个加速结构会耗尽内存。实例化（Instancing）让同一个对象重复出现在不同位置，只存一份几何体数据。
+
+2023 年的多级实例化更进一步：实例加速结构可以包含其他实例加速结构。一棵棕榈树可以由树干和叶子的实例组成，整个森林再实例化这棵树。Moana 场景因此节省了数百万个实例。
+
+### 动态场景的 GPU 驱动优化
+
+游戏每帧重建实例加速结构，CPU 端填写实例描述符成为瓶颈。间接实例加速结构描述符（Indirect Instance Acceleration Structure Descriptor）让实例剔除、描述符填充和最终实例计数都在 GPU 上完成，彻底绕过 CPU。
+
+## 详细内容
+
+### 曲线几何体描述符
+
+（[06:42](https://developer.apple.com/videos/play/wwdc2023/10128/?time=402)）
+
+Metal 2023 新增 `MTLAccelerationStructureCurveGeometryDescriptor`，专门用于毛发、植被等曲线几何体：
+
+```swift
+let geometryDescriptor = MTLAccelerationStructureCurveGeometryDescriptor()
+
+geometryDescriptor.controlPointBuffer = controlPointBuffer
+geometryDescriptor.radiusBuffer = radiusBuffer
+geometryDescriptor.indexBuffer = indexBuffer
+
+geometryDescriptor.controlPointCount = controlPointCount
+geometryDescriptor.segmentCount = segmentCount
+geometryDescriptor.curveType = .round
+geometryDescriptor.curveBasis = .bezier
+geometryDescriptor.segmentControlPointCount = 4
+```
+
+**关键点：**
+- `controlPointBuffer`：存储控制点位置
+- `radiusBuffer`：每个控制点的半径，沿曲线插值
+- `indexBuffer`：每个曲线段的起始控制点索引
+- `curveType`：`.round` 为圆柱形截面，`.flat` 用于远景优化性能
+- `curveBasis`：可选 `.bezier`、`.catmullRom`、`.bspline`、`.linear`
+- `segmentControlPointCount`：每段曲线的控制点数量（2、3 或 4）
+
+### 构建加速结构
+
+（[07:29](https://developer.apple.com/videos/play/wwdc2023/10128/?time=449)）
+
+创建原始加速结构（Primitive Acceleration Structure）的三步流程：
+
+```swift
+// 1. 创建描述符
+let accelerationStructureDescriptor = MTLPrimitiveAccelerationStructureDescriptor()
+accelerationStructureDescriptor.geometryDescriptors = [geometryDescriptor]
+
+// 2. 查询内存需求
+let sizes = device.accelerationStructureSizes(descriptor: accelerationStructureDescriptor)
+let heapSize = device.heapAccelerationStructureSizeAndAlign(size: sizes.accelerationStructureSize)
+
+// 3. 分配并构建
+var accelerationStructure = heap.makeAccelerationStructure(size: heapSize.size)
+let scratchBuffer = device.makeBuffer(length: sizes.buildScratchBufferSize,
+                                      options: .storageModePrivate)!
+
+let commandEncoder = commandBuffer.makeAccelerationStructureCommandEncoder()!
+commandEncoder.build(accelerationStructure: accelerationStructure,
+                     descriptor: accelerationStructureDescriptor,
+                     scratchBuffer: scratchBuffer,
+                     scratchBufferOffset: 0)
+commandEncoder.endEncoding()
+```
+
+**关键点：**
+- 从 heap 分配加速结构可减少后续资源管理开销
+- `scratchBuffer` 仅在构建过程中使用，构建完成后可复用
+- 多个构建操作可以编码到同一个 command encoder 中并行执行
+
+### 实例加速结构与多级实例化
+
+（[11:30](https://developer.apple.com/videos/play/wwdc2023/10128/?time=690)）
+
+实例加速结构引用多个原始加速结构，通过变换矩阵放置到场景中：
+
+```swift
+var instanceASDesc = MTLInstanceAccelerationStructureDescriptor()
+instanceASDesc.instanceCount = instanceCount
+instanceASDesc.instancedAccelerationStructures = [mountainAS, treeAS, leafAS]
+instanceASDesc.instanceDescriptorType = .userID
+
+// 分配实例描述符缓冲区
+let size = MemoryLayout<MTLAccelerationStructureUserIDInstanceDescriptor>.stride
+let instanceDescriptorBuffer = device.makeBuffer(length: size * instanceCount,
+                                                 options: .storageModeShared)!
+instanceASDesc.instanceDescriptorBuffer = instanceDescriptorBuffer
+
+// 填充实例描述符
+var instanceDesc = MTLAccelerationStructureUserIDInstanceDescriptor()
+instanceDesc.accelerationStructureIndex = 0
+instanceDesc.transformationMatrix = transformMatrix
+instanceDesc.mask = 0xFFFFFFFF
+```
+
+**关键点：**
+- `instancedAccelerationStructures` 数组中的索引通过 `accelerationStructureIndex` 引用
+- `mask` 用于光线掩码过滤，实现选择性相交
+- 多级实例化时，实例加速结构可以包含其他实例加速结构，最大层级通过 `max_levels` 标签指定
+
+### GPU 驱动的间接实例构建
+
+（[14:06](https://developer.apple.com/videos/play/wwdc2023/10128/?time=846)）
+
+间接实例加速结构允许 GPU 完全控制实例生成：
+
+```swift
+var instanceASDesc = MTLIndirectInstanceAccelerationStructureDescriptor()
+instanceASDesc.instanceDescriptorType = .indirect
+instanceASDesc.maxInstanceCount = maxInstances
+instanceASDesc.instanceCountBuffer = instanceCountBuffer
+instanceASDesc.instanceDescriptorBuffer = instanceDescriptorBuffer
+```
+
+**关键点：**
+- `maxInstanceCount` 是预设上限，实际数量由 GPU 写入 `instanceCountBuffer`
+- 适合 GPU 剔除（culling）后动态确定实例数量的场景
+- 间接实例描述符通过 `accelerationStructureID` 直接引用加速结构，而非数组索引
+
+### 加速结构优化：Refit 与 Compaction
+
+（[19:22](https://developer.apple.com/videos/play/wwdc2023/10128/?time=1162)）
+
+几何体轻微移动时，无需重建整个加速结构，使用 refit 更新包围盒：
+
+```swift
+let scratchBuffer = device.makeBuffer(length: sizes.refitScratchBufferSize,
+                                      options: .storageModePrivate)!
+
+commandEncoder.refit(sourceAccelerationStructure: accelerationStructure,
+                     descriptor: asDescriptor,
+                     destinationAccelerationStructure: accelerationStructure,
+                     scratchBuffer: scratchBuffer,
+                     scratchBufferOffset: 0)
+```
+
+构建完成后，使用 compaction 回收多余内存：
+
+```swift
+// 查询压缩后大小
+sizeCommandEncoder.writeCompactedSize(accelerationStructure: accelerationStructure,
+                                      buffer: sizeBuffer,
+                                      offset: 0,
+                                      sizeDataType: .ulong)
+
+// 分配新加速结构后执行压缩
+compactCommandEncoder.copyAndCompact(sourceAccelerationStructure: accelerationStructure,
+                                     destinationAccelerationStructure: compactedAccelerationStructure)
+```
+
+**关键点：**
+- Refit 比重建快得多，适合每帧更新的动态几何体
+- Compaction 可回收构建时保守分配的内存，对原始加速结构效果最明显
+- 压缩完成后可释放原始加速结构
+
+### Shader 中的光线相交
+
+（[21:48](https://developer.apple.com/videos/play/wwdc2023/10128/?time=1308)）
+
+在 Metal Shading Language 中执行光线相交：
+
+```metal
+[[kernel]]
+void trace_rays(acceleration_structure<instancing> as, /* ... */) {
+  intersector<instancing, max_levels<3>, triangle_data, curve_data> i;
+
+  i.assume_geometry_type(geometry_type::curve | geometry_type::triangle);
+  i.assume_curve_type(curve_type::round);
+  i.assume_curve_basis(curve_basis::bezier);
+  i.assume_curve_control_point_count(3);
+
+  ray r(origin, direction);
+
+  intersection_result<instancing, max_levels<3>, triangle_data, curve_data> result = i.intersect(r, as);
+
+  if (result.type == intersection_type::triangle) {
+    float distance = result.distance;
+    float2 coords = result.triangle_barycentric_coord;
+    // shade triangle...
+  } else if (result.type == intersection_type::curve) {
+    float distance = result.distance;
+    float param = result.curve_parameter;
+    // shade curve...
+  }
+
+  // 获取实例层级信息
+  for (uint i = 0; i < result.instance_count; ++i) {
+    uint id = result.instance_id[i];
+  }
+}
+```
+
+**关键点：**
+- `instancing` 标签启用实例加速结构相交
+- `max_levels<3>` 指定最大实例化层级数
+- `triangle_data` 提供重心坐标，`curve_data` 提供曲线参数
+- `assume_geometry_type` 等假设声明可提升相交性能
+- `result.instance_id` 数组包含光线穿过的所有实例 ID
+
+## 核心启发
+
+1. **毛发/植被渲染器**
+   - **做什么**：用曲线几何体替换头发和草的三角形模型
+   - **为什么值得做**：内存减少 50% 以上，近景无锯齿，加速结构构建更快
+   - **怎么开始**：用 `MTLAccelerationStructureCurveGeometryDescriptor` 定义曲线，选择 `.catmullRom` 基函数获得最自然的外观
+
+2. **大规模开放世界游戏**
+   - **做什么**：用多级实例化构建森林、城市等重复性场景
+   - **为什么值得做**：Moana 场景节省数百万实例，3 级实例化在减少构建时间的同时对追踪时间影响很小
+   - **怎么开始**：将静态内容放入多级实例加速结构，动态内容单独管理，每帧只重建动态部分
+
+3. **GPU 驱动的剔除系统**
+   - **做什么**：在 GPU 上完成视锥剔除和 LOD 选择，直接生成实例加速结构
+   - **为什么值得做**：`MTLIndirectInstanceAccelerationStructureDescriptor` 消除 CPU-GPU 往返，适合数千实例场景
+   - **怎么开始**：编写 compute shader 输出间接实例描述符和实例计数到 buffer，直接用于加速结构构建
+
+4. **生产级路径追踪器**
+   - **做什么**：结合 refit 和 compaction 优化动态场景渲染
+   - **为什么值得做**：refit 处理变形网格，compaction 回收静态几何体内存，两者配合大幅降低每帧开销
+   - **怎么开始**：静态几何体构建后执行 compaction，动态几何体每帧 refit，定期全量重建
+
+## 关联 Session
+
+- [Discover ray tracing with Metal](/articles/wwdc2020-10687) — 2020 年 Metal 光线追踪基础入门
+- [Maximize your Metal ray tracing performance](/articles/wwdc2022-10128) — 光线追踪性能优化深度讲解
+- [Render Metal with ray tracing](/articles/wwdc2023-10148) — 光线追踪渲染实战代码
+- [Metal for accelerating ray tracing](/articles/wwdc2023-10128) — 官方示例代码与文档

@@ -1,0 +1,174 @@
+---
+title: "Capture cinematic video in your app"
+description: "discover how the cinematic video api enables your app to effortlessly capture cinema-style videos. we"
+date: 2026-06-10
+tags: ["Photos & Camera", "Audio & Video"]
+thumbnail: "/images/sessions/2025/319.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/319/"
+sessionId: "wwdc2025-319"
+year: "2025"
+relatedSessions:
+  - title: "Enhance your app with machine-learning-based video effects"
+    code: "300"
+    description: "discover how to add effects like frame rate conversion, super resolution, and no"
+  - title: "Enhancing your camera experience with capture controls"
+    code: "253"
+    description: "learn how to customize capture controls in your camera experiences. we"
+---
+
+## Highlight
+
+> 在 `AVCaptureDeviceInput` 上把 `isCinematicVideoCaptureEnabled` 设为 true，整个 capture session 的输出都会自动获得电影模式效果。
+
+---
+
+## 核心内容
+
+电影里的浅景深和 rack focus 是导演引导观众视线的核心手法。但在真实片场，焦点切换需要专门的 focus puller，因为这是一项需要长期训练的精细工作（[01:14](https://developer.apple.com/videos/play/wwdc2025/319/?time=74)）。普通开发者想在 App 里实现这种效果，过去基本无从下手。
+
+iPhone 13 Pro 引入电影模式后，Apple 用算法替代了人工 focus puller：主体进入画面会自动 rack focus，主体转头看别处时焦点会切换到另一个候选目标，需要时再切回（[01:31](https://developer.apple.com/videos/play/wwdc2025/319/?time=91)）。今年 iOS 26 把这套能力开放成 Cinematic Video API。Roy 用一个完整的相机 App 演示了配置流程：选 Dual Wide 或 TrueDepth 摄像头、找支持 Cinematic 的 format、拼装 capture session、加 metadata output、用 SwiftUI 画检测框、绑定点击和长按手势驱动三种对焦模式。整条链路下来，开发者只需一行 `isCinematicVideoCaptureEnabled = true` 就能让 movie file output、video data output、preview layer 同时获得电影效果。
+
+---
+
+## 详细内容
+
+**第一步：挑能拍 Cinematic 的设备和 format。** Cinematic Video 仅支持后置 Dual Wide 和前置 TrueDepth，分辨率覆盖 1080p / 4K @ 30fps，色彩支持 SDR 的 420 video range / full range 与 10-bit HDR 的 x420（[05:37](https://developer.apple.com/videos/play/wwdc2025/319/?time=337)）。
+
+```swift
+// Select a format that supports Cinematic Video capture
+for format in camera.formats {
+    if format.isCinematicVideoCaptureSupported {
+       try! camera.lockForConfiguration()
+       camera.activeFormat = format
+       camera.unlockForConfiguration()
+       break
+    }
+}
+```
+
+关键点：
+- `isCinematicVideoCaptureSupported` 是 `AVCaptureDevice.Format` 上的新属性，遍历找到第一个为 true 的 format 即可。
+- 修改 `activeFormat` 必须包在 `lockForConfiguration` / `unlockForConfiguration` 之间。
+- 必须先选对 format 再启用 Cinematic capture，否则后续步骤会失败。
+
+**第二步：在 input 上启用电影模式。**（[06:00](https://developer.apple.com/videos/play/wwdc2025/319/?time=360)）
+
+```swift
+let videoInput = try! AVCaptureDeviceInput(device: camera)
+captureSession.addInput(videoInput)
+
+let audioInput = try! AVCaptureDeviceInput(device: microphone)
+captureSession.addInput(audioInput)
+
+// Enable Cinematic Video capture
+if (videoInput.isCinematicVideoCaptureSupported) {
+  videoInput.isCinematicVideoCaptureEnabled = true
+}
+```
+
+关键点：
+- 一行 `isCinematicVideoCaptureEnabled = true` 就把整个 session 的所有 output 切到 Cinematic 通路。
+- `AVCaptureMovieFileOutput` 的产物会带 disparity data + metadata + 原始视频，可以用 2023 年发布的 Cinematic Framework 做非破坏性 bokeh 编辑。
+- `AVCaptureVideoDataOutput` 的帧已经把浅景深烘焙进去，适合直接转推或上传。
+- `AVCaptureVideoPreviewLayer` 实时渲染 bokeh，做取景器只要把它挂上 session。
+
+**第三步：让 SwiftUI 显示 preview。** `AVCaptureVideoPreviewLayer` 是 `CALayer` 子类，需要用 `UIViewRepresentable` 包一层（[07:11](https://developer.apple.com/videos/play/wwdc2025/319/?time=431)）。
+
+```swift
+class CameraPreviewUIView: UIView {
+    override class var layerClass: AnyClass {
+        AVCaptureVideoPreviewLayer.self
+    }
+    var previewLayer: AVCaptureVideoPreviewLayer {
+        layer as! AVCaptureVideoPreviewLayer
+    }
+}
+```
+
+关键点：
+- 重写 `layerClass` 让 view 的 backing layer 直接是 `AVCaptureVideoPreviewLayer`，免去手动管理 sublayer。
+- 暴露 `previewLayer` getter 方便上层读取，做坐标转换会用到。
+
+**第四步：拿 metadata 画检测框。** Cinematic 算法依赖人脸等检测信息，Apple 把所需类型集中到一个新属性里（[09:12](https://developer.apple.com/videos/play/wwdc2025/319/?time=552)）。
+
+```swift
+let metadataOutput = AVCaptureMetadataOutput()
+captureSession.addOutput(metadataOutput)
+metadataOutput.metadataObjectTypes = metadataOutput.requiredMetadataObjectTypesForCinematicVideoCapture
+metadataOutput.setMetadataObjectsDelegate(self, queue: sessionQueue)
+```
+
+关键点：
+- `requiredMetadataObjectTypesForCinematicVideoCapture` 是新的列表属性，必须用它，传别的类型会抛异常。
+- delegate 回调里把 metadata 灌进 `@Observable` 类，SwiftUI view 自动重绘。
+- 画框时坐标空间要转：`previewLayer.layerRectConverted(fromMetadataOutputRect: metadata.bounds)`，AVFoundation 用左上角原点，SwiftUI `position` 用中心点，记得换成 midX / midY。
+
+**第五步：三种手动对焦 API。**（[10:53](https://developer.apple.com/videos/play/wwdc2025/319/?time=653)）
+
+```swift
+open func setCinematicVideoTrackingFocus(detectedObjectID: Int, focusMode: AVCaptureDevice.CinematicVideoFocusMode)
+open func setCinematicVideoTrackingFocus(at point: CGPoint, focusMode: AVCaptureDevice.CinematicVideoFocusMode)
+open func setCinematicVideoFixedFocus(at point: CGPoint, focusMode: AVCaptureDevice.CinematicVideoFocusMode)
+```
+
+关键点：
+- 第一个：按 `detectedObjectID` 锁定到具体被识别出的主体。
+- 第二个：对画面中某个点对焦，算法会在该点附近找显著对象。
+- 第三个：固定焦距，按 disparity 锁住该点所在的平面。
+- `CinematicVideoFocusMode` 三档：`.none`、`.weak`、`.strong`。strong 即使有更显眼的候选也不切换，weak 允许算法接管。
+
+**第六步：把手势接到对焦上。** 演示中点击空白区域走 weak focus，点击已 weak 的检测框升级成 strong，点击没对焦的检测框走 weak（[15:30](https://developer.apple.com/videos/play/wwdc2025/319/?time=930)）。
+
+```swift
+func focusTap(at point:CGPoint) {
+    try! camera.lockForConfiguration()
+    if let metadataObject = findTappedMetadataObject(at: point) {
+        if metadataObject.cinematicVideoFocusMode == .weak {
+            camera.setCinematicVideoTrackingFocus(detectedObjectID: metadataObject.objectID, focusMode: .strong)
+        } else {
+            camera.setCinematicVideoTrackingFocus(detectedObjectID: metadataObject.objectID, focusMode: .weak)
+        }
+    } else {
+        let transformedPoint = previewLayer.metadataOutputRectConverted(fromLayerRect: CGRect(origin:point, size:.zero)).origin
+        camera.setCinematicVideoTrackingFocus(at: transformedPoint, focusMode: .weak)
+    }
+    camera.unlockForConfiguration()
+}
+```
+
+关键点：
+- 用 `findTappedMetadataObject` 反查点击是否落在某个检测框上。
+- 命中已 weak 的框就升级成 strong（实线黄框），命中其他状态先变 weak（虚线黄框）。
+- 没命中任何框：把屏幕坐标转成 metadata output 坐标，调 `setCinematicVideoTrackingFocus(at:focusMode:)`。
+- 长按则用 `setCinematicVideoFixedFocus`，把焦距钉死在该 disparity 平面。
+
+**第七步：bokeh 强度和场景监控。** `AVCaptureDeviceInput.simulatedAperture` 用 f-stop 表达，f 数越小光圈越大、bokeh 越强；用 format 上的 `minSimulatedAperture / maxSimulatedAperture / defaultSimulatedAperture` 限定 slider 范围（[08:05](https://developer.apple.com/videos/play/wwdc2025/319/?time=485)）。光线不足时通过 KVO `cinematicVideoCaptureSceneMonitoringStatuses`，包含 `.notEnoughLight` 时在 UI 提示用户（[17:10](https://developer.apple.com/videos/play/wwdc2025/319/?time=1030)）。录制中可以再挂一个 `AVCapturePhotoOutput` 抓静态照片，照片同样带电影效果。
+
+---
+
+## 核心启发
+
+- **做什么：把已有的相机类 App 升级一个「电影模式」开关**
+  - 为什么值得做：API 极薄，一行 `isCinematicVideoCaptureEnabled = true` 就拿到 disparity + metadata + 烘焙后视频；产品差异点直接拉开。
+  - 怎么开始：先用 `AVCaptureDevice.Format.isCinematicVideoCaptureSupported` 过滤 format，再切 input；保留原模式做 A/B，让用户在拍摄前选。
+
+- **做什么：做一个「短视频后期可调焦点」的剪辑工具**
+  - 为什么值得做：Movie file output 输出的视频带 disparity data，搭配 2023 年发布的 Cinematic Framework 可以做非破坏性 bokeh 编辑，焦点和模糊度都能改。
+  - 怎么开始：录制端用 `AVCaptureMovieFileOutput`，剪辑端引入 Cinematic Framework；MVP 先支持时间轴上添加几个 focus keyframe。
+
+- **做什么：把人脸 / 宠物检测的 weak / strong 焦点逻辑做成 vlog 模板**
+  - 为什么值得做：用户最常拍人和宠物，自动 rack focus 就是 vlog 体验的天花板；strong 锁定可避免主体被路人抢焦。
+  - 怎么开始：监听 metadata，遇到主角脸默认 strong，遇到副角脸默认 weak；提供「锁定主角」按钮直接调 `setCinematicVideoTrackingFocus(detectedObjectID:focusMode:.strong)`。
+
+- **做什么：补一层光线监控提示**
+  - 为什么值得做：电影模式对光线敏感，光弱时 bokeh 质量明显下降；用户看不到提示就会以为 App 坏了。
+  - 怎么开始：用 KVO 监听 `cinematicVideoCaptureSceneMonitoringStatuses`，包含 `.notEnoughLight` 时在取景器边角显示警告，count 归零时收起。
+
+---
+
+## 关联 Session
+
+- [Enhance your app with machine-learning-based video effects](/articles/wwdc2025-300) — 用机器学习给视频加帧率转换、超分辨率、降噪等效果，可与电影模式串联做后期。
+- [Enhancing your camera experience with capture controls](/articles/wwdc2025-253) — 自定义相机 App 的 capture controls，让电影模式的开关更顺手。
+- [Support Cinematic mode videos in your app](/articles/wwdc2023-10146) — 2023 年发布的 Cinematic Framework，配合本 session 的 movie file 做非破坏性 bokeh 编辑。
+- [Enhance your app's audio content creation capabilities](/articles/wwdc2025-251) — Spatial audio 录制，配合电影模式的 first order ambisonics 提升沉浸感。

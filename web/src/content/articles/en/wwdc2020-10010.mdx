@@ -1,0 +1,173 @@
+---
+title: "Export HDR media in your app with AVFoundation"
+description: "discover how to author and export high dynamic range (hdr) content in your app using avfoundation. learn about high dynamic range and how you can take advantage of it in your app. we'll show you how to implement feature sets that allow people to export hdr content, go over supported hdr formats, review current restrictions, and explore the apple platforms that support hdr export."
+date: 2020-06-10
+tags: ["AVFoundation", "HDR Video", "HEVC", "WWDC 2020"]
+thumbnail: "/images/sessions/2020/10010.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10010/"
+sessionId: "wwdc2020-10010"
+year: "2020"
+relatedSessions:
+  - title: "Edit and play back HDR video with AVFoundation"
+    code: "10009"
+    description: "讲解 HDR 视频的编辑、播放、AVMutableVideoComposition、Core Image filter 和自定义 compositor。"
+  - title: "Author fragmented MPEG-4 content with AVAssetWriter"
+    code: "10011"
+    description: "讲解如何用 AVAssetWriter 生成 fragmented MPEG-4，适合继续处理 HLS 输出。"
+  - title: "Optimize the Core Image pipeline for your video app"
+    code: "10008"
+    description: "讲解视频 App 中 Core Image 管线、CIContext 复用和 Metal 队列性能。"
+  - title: "Decode ProRes with AVFoundation and VideoToolbox"
+    code: "10090"
+    description: "讲解 macOS 上使用 AVFoundation 和 VideoToolbox 解码、显示 ProRes 内容的媒体管线。"
+---
+
+## Highlight
+
+> Apple 在 WWDC 2020 为开发者开放 HDR 导出能力：AVAssetExportSession 的 HEVC 与 Apple ProRes preset 会保留 HLG/HDR10 源格式，AVAssetWriter 可以通过 sourceFormatHint 或 AVOutputSettingsAssistant 配置 codec、色彩属性和 Main10 profile。
+
+## 核心内容
+
+视频 App 以前导出一段素材，主要关心分辨率、码率、帧率和文件格式。HDR 让这个流程多了几个硬条件：SDR 通常限制在 100 nits，HDR 可以到 10,000 nits；HDR 又常和 Wide Color gamut、10-bit 分发格式绑定。导出时如果丢掉传输函数、色彩原色或 profile，用户看到的高光、暗部细节和颜色都会偏离原始素材。
+
+这场 session 把问题拆成两条路径。第一条路径是 `AVAssetExportSession`，适合文件转码、简单分享、`AVComposition` 的时间组合，以及 `AVVideoComposition` 的空间组合。Apple 已经升级 HEVC 与 Apple ProRes presets，源素材是 HDR10 就导出 HDR10，源素材是 HLG 就导出 HLG，源素材是 SDR 仍然导出 SDR。
+
+第二条路径是 `AVAssetWriter`。它适合需要控制 codec、bit rate、frame rate、尺寸、色彩空间、动态范围，甚至在多编码器 Mac 上选择具体 encoder 的 App。session 给出的建议很直接：可以把源视频的 `videoFormatDescription` 作为 hint，也可以用 `AVOutputSettingsAssistant` 生成接近 `AVAssetExportSession` 的默认设置，再按产品需求改少量字段。
+
+## 详细内容
+
+### 1. 先确定导出的 HDR 目标（[06:15](https://developer.apple.com/videos/play/wwdc2020/10010/?time=375)）
+
+AVFoundation 在导出侧支持 HLG 与 HDR10。HLG 没有额外 HDR metadata，并且设计目标包含 SDR 兼容；HDR10 使用 PQ transfer function，并可携带静态 metadata。Dolby Vision 在 session 里作为动态 metadata 格式解释概念，但导出支持部分明确列出的是 HLG 与 HDR10。
+
+关键设置：
+
+- codec 选择 `HEVC` 或 `Apple ProRes`。
+- transfer function 选择 `HLG` 或 `PQ`。
+- HDR 内容常用 Wide Color gamut，transcript 中提到 `BT.2020`。
+- HEVC HDR 导出需要 `HEVC_Main10_AutoLevel`；8-bit HEVC HDR 不受支持。
+
+### 2. 用 AVAssetExportSession 保留源 HDR 格式（[09:02](https://developer.apple.com/videos/play/wwdc2020/10010/?time=542)）
+
+如果 App 的导出需求接近文件转码，`AVAssetExportSession` 是最短路径。session 的重点是：使用 HEVC 或 Apple ProRes preset 时，HDR 导出不需要额外改代码。
+
+```swift
+guard let exportSession = AVAssetExportSession(asset: sourceAsset,
+                      presetName: AVAssetExportPresetHEVCHighestQuality) else {
+    // Handle error
+}
+
+exportSession.outputURL = outputURL
+exportSession.outputFileType = AVFileTypeQuickTimeMovie
+
+exportSession.exportAsynchronouslyWithCompletionHandler {
+    // Handle completion
+}
+```
+
+关键点：
+
+- `AVAssetExportPresetHEVCHighestQuality` 选择 HEVC 高质量 preset，session 说明现有 HEVC preset 会保留源 HDR 格式。
+- `outputURL` 和 `outputFileType` 是导出目标；示例使用 QuickTime movie。
+- `exportAsynchronouslyWithCompletionHandler` 启动异步导出，完成处理仍由 App 自己接管。
+- 如果需要把 HDR 转成 SDR，session 建议使用 H.264 presets，同时获得更好的向后兼容性。
+
+混合素材时，`AVAssetExportSession` 会检查所有 source assets。只要发现 HDR 内容，输出文件会是 HDR，SDR 素材会被转换到 HDR。不同 HDR 格式混在一起时，默认策略先偏向 HLG，再偏向带 metadata 的 HDR 格式。
+
+### 3. 用 AVAssetWriter 和 sourceFormatHint 简化配置（[13:24](https://developer.apple.com/videos/play/wwdc2020/10010/?time=804)）
+
+`AVAssetWriter` 给开发者更多控制权，但输出设置字典也更容易写错。第一种简化方式是把源素材的 `videoFormatDescription` 传给 `AVAssetWriterInput`。
+
+```swift
+let assetWriter = try AVAssetWriter(url: outputURL, fileType: AVFileTypeQuickTimeMovie)
+
+let outputSettings: [String: AnyObject] = [
+            AVVideoCodecKey: AVVideoCodecTypeHEVC
+        ]
+
+let assetWriterInput = AVAssetWriterInput(mediaType: AVMediaTypeVideo,
+                                     outputSettings: outputSettings,
+                                   sourceFormatHint: videoFormatDescription)
+
+assetWriter.add(assetWriterInput)
+
+guard assetWriter.startWriting() else {
+    throw assetWriter.error!
+}
+```
+
+关键点：
+
+- `AVAssetWriter` 仍然指定输出 URL 和 QuickTime movie 文件类型。
+- `outputSettings` 里只显式给出 `AVVideoCodecKey`。
+- `sourceFormatHint` 传入源视频的 format description，AVAssetWriter 会基于源特性补出合理默认值。
+- `startWriting()` 失败时要读取 `assetWriter.error`，这段示例没有隐藏错误处理。
+
+### 4. 用 AVOutputSettingsAssistant 生成可修改的设置模板（[14:13](https://developer.apple.com/videos/play/wwdc2020/10010/?time=853)）
+
+第二种简化方式是 `AVOutputSettingsAssistant`。它的 preset 像 `AVAssetExportSession`，但返回的是可交给 `AVAssetWriterInput` 的设置字典。
+
+```swift
+let assetWriter = try AVAssetWriter(url: outputURL, fileType: AVFileTypeQuickTimeMovie)
+
+let settingsAssistant = AVOutputSettingsAssistant(
+                                     preset: AVOutputSettingsPreset.hevc1920x1080)
+
+settingsAssistant.sourceVideoFormat = videoFormatDescription
+
+let newVideoSettings = settingsAssistant.videoSettings
+
+// Modify a few fields in newVideoSettings here
+
+let assetWriterInput = AVAssetWriterInput(mediaType: AVMediaTypeVideo,
+                                     outputSettings: newVideoSettings)
+
+assetWriter.add(assetWriterInput)
+guard assetWriter.startWriting() else {
+    throw assetWriter.error!
+}
+```
+
+关键点：
+
+- `hevc1920x1080` 提供 HEVC 维度 preset。
+- `sourceVideoFormat` 应在读取 `videoSettings` 前设置；transcript 里强调这样能把源素材特性和 preset 组合起来。
+- `videoSettings` 可以直接使用，也可以作为起点修改尺寸、bit rate 等字段。
+- 这条路径适合想接近 `AVAssetExportSession` 默认行为，又要保留少量自定义控制的导出器。
+
+### 5. 检查 HDR 相关 outputSettings（[15:36](https://developer.apple.com/videos/play/wwdc2020/10010/?time=936)）
+
+transcript 明确指出，HDR 导出时要小心三组 key。
+
+| Key | 需要检查的内容 |
+| --- | --- |
+| `AVVideoCodecKey` | HDR 导出支持 `HEVC` 和 `Apple ProRes`。HEVC 适合分发，ProRes 适合专业视频工作流。 |
+| `AVVideoColorPropertiesKey` | 包含 transfer function、color primaries、YCbCr matrix。HLG 与 PQ 是支持的 HDR transfer function，HDR 内容常用 `BT.2020`。 |
+| `AVVideoCompressionPropertiesKey` | HEVC HDR 导出时，`VideoProfileLevelKey` 必须设为 `HEVC_Main10_AutoLevel`。这个 key 不适用于 ProRes 导出。 |
+
+HDR10 还可以带两个 metadata：`MasteringDisplayColorVolume` 描述母版显示器，`ContentLightLevelInfo` 描述整段影片的光照水平。session 建议尽量提供这两项，因为缺失时 decoder 的 EOTF 只能采用默认假设。
+
+### 6. 记住平台边界（[20:44](https://developer.apple.com/videos/play/wwdc2020/10010/?time=1244)）
+
+iOS 侧，带 Apple A10 Fusion 或更新芯片的设备支持 HEVC 硬件编码。session 给出的例子包括 iPhone 7、2018 年发布的 iPad，以及 2019 年的 iPod touch。
+
+Mac 侧，所有 Mac 都有 HEVC 与 Apple ProRes software encoder。HEVC hardware encoding 通常出现在运行新 macOS 的 2017 年及更新 Mac 上，硬件编码会让导出速度快很多。
+
+## 核心启发
+
+- **做什么**：给视频编辑 App 增加“HDR 原样导出”选项。**为什么值得做**：`AVAssetExportSession` 的 HEVC 与 Apple ProRes preset 会保留 HDR10 或 HLG 源格式。**怎么开始**：复用现有导出流程，把 preset 切到 HEVC 或 Apple ProRes，导出后按源素材类型检查输出格式。
+
+- **做什么**：为相机类 App 增加 HDR 片段导出。**为什么值得做**：`AVAssetWriter` 可以从 camera-captured frames 直接写出文件，并控制 codec、frame rate、尺寸和动态范围。**怎么开始**：创建 `AVAssetWriter`，把捕获视频的 `videoFormatDescription` 传入 `sourceFormatHint`，先只显式设置 `AVVideoCodecKey`。
+
+- **做什么**：做一个混合 SDR/HDR 素材的导出预览提示。**为什么值得做**：`AVAssetExportSession` 在混合 composition 中会偏向 HDR 输出，SDR source 会被转换到 HDR。**怎么开始**：扫描用户时间线里的素材动态范围，在导出面板展示最终输出会采用 HDR、HLG 或带 metadata 的格式。
+
+- **做什么**：为专业用户提供“HDR10 参数检查”面板。**为什么值得做**：HDR10 输出依赖 PQ、`BT.2020`、Main10 profile，并可受 MDCV 与 CLLI metadata 影响。**怎么开始**：在 AVAssetWriter 设置页列出 codec、transfer function、color primaries、matrix、profile level 和 metadata 状态，让用户在导出前确认。
+
+- **做什么**：同时提供 HDR 和 SDR 分享版本。**为什么值得做**：session 建议用 H.264 preset 把 HDR 转成 SDR，以提高旧设备兼容性。**怎么开始**：同一份源素材跑两次导出，一路使用 HEVC 或 ProRes 保留 HDR，另一路使用 H.264 生成 SDR 分享文件。
+
+## 关联 Session
+
+- [Edit and play back HDR video with AVFoundation](/articles/wwdc2020-10009) — 先看 HDR 素材如何在 AVVideoComposition、Core Image 和自定义 compositor 中被编辑和预览。
+- [Author fragmented MPEG-4 content with AVAssetWriter](/articles/wwdc2020-10011) — 继续学习 AVAssetWriter 写 fragmented MPEG-4，为 HLS 输出准备片段化文件。
+- [Optimize the Core Image pipeline for your video app](/articles/wwdc2020-10008) — 适合处理导出前的视频滤镜管线、CIContext 和 Metal 性能问题。
+- [Decode ProRes with AVFoundation and VideoToolbox](/articles/wwdc2020-10090) — 补充 ProRes 解码和显示链路，和本文中的 ProRes 导出选择互补。

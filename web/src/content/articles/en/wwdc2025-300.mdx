@@ -1,0 +1,176 @@
+---
+title: "Enhance your app with machine-learning-based video effects"
+description: "discover how to add effects like frame rate conversion, super resolution, and noise filtering to improve video editing and live streaming experiences. we"
+date: 2026-06-10
+tags: ["Photos & Camera", "Audio & Video"]
+thumbnail: "/images/sessions/2025/300.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/300/"
+sessionId: "wwdc2025-300"
+year: "2025"
+relatedSessions:
+  - title: "Capture cinematic video in your app"
+    code: "319"
+    description: "discover how the cinematic video api enables your app to effortlessly capture ci"
+  - title: "Enhancing your camera experience with capture controls"
+    code: "253"
+    description: "learn how to customize capture controls in your camera experiences. we"
+---
+
+## Highlight
+
+> 从 macOS 15.4 开始、iOS 26 新增的 VTFrameProcessor API 是 Video Toolbox 框架的新能力，提供了一组基于机器学习的视频处理算法。这些算法针对 Apple Silicon 做了专门优化，覆盖两大场景：高质量视频编辑（帧率转换、超分辨率、运动模糊、时序降噪）和实时视频增强（低延迟帧插值、低延迟超分辨率）。
+
+---
+
+## 核心内容
+
+视频应用过去要做慢动作、超分辨率或者降噪，往往要么自己训模型，要么集成第三方库，工程量大、效果还不一定稳。Video Toolbox 是视频应用最常用的框架之一，但长期以来缺一组开箱即用、跑在 Apple Silicon 上的视频增强算法。
+
+这次苹果在 Video Toolbox 里新增了 VTFrameProcessor API。它在 macOS 15.4 上线，iOS 26 同步加入。开发者只需要导入 Video Toolbox，就能拿到帧率转换、超分辨率、运动模糊、时序降噪这几个面向高质量视频编辑的算法，以及低延迟帧插值、低延迟超分辨率这两个面向实时场景的算法。所有算法都针对 Apple Silicon 做了优化，应用层只管按帧喂数据。
+
+API 的形态固定为两步：先选效果，用一个 `VTFrameProcessorConfiguration` 启动 session；再逐帧处理，用一个 `VTFrameProcessorParameters` 描述输入输出。每种效果都对应一对 Configuration / Parameters 类型。框架是帧级别的接口，应用自己负责读帧、写帧、管理 pixel buffer。
+
+---
+
+## 详细内容
+
+VTFrameProcessor API 一共提供六种效果。帧率转换、超分辨率、运动模糊、时序降噪针对视频编辑场景；低延迟帧插值、低延迟超分辨率针对视频会议、直播这类实时场景；时序降噪两边都能用（[01:11](https://developer.apple.com/videos/play/wwdc2025/300/?time=71)）。
+
+帧率转换是最常见的入口。它通过在已有帧之间合成新帧来提升每秒帧数，可以用来匹配显示设备的目标帧率，也可以用来做慢动作（[06:50](https://developer.apple.com/videos/play/wwdc2025/300/?time=410)）。第一步是创建 session（[08:06](https://developer.apple.com/videos/play/wwdc2025/300/?time=486)）：
+
+```swift
+// Frame rate conversion configuration
+
+let processor = VTFrameProcessor()
+
+guard let configuration = VTFrameRateConversionConfiguration(frameWidth: width,
+                                                            frameHeight: height,
+                                                     usePrecomputedFlow: false,
+                                                  qualityPrioritization: .normal,
+                                                               revision: .revision1)
+else {
+     throw Fault.failedToCreateFRCConfiguration
+}
+
+try processor.startSession(configuration: configuration)
+```
+
+关键点：
+- `VTFrameProcessor()` 是无状态的处理器实例，效果由后续传入的 configuration 决定。
+- `frameWidth` / `frameHeight` 是输入帧分辨率，session 启动后不能再改。
+- `usePrecomputedFlow: false` 让框架在处理时即时计算光流；如果应用有预处理阶段，可以提前用 `VTOpticalFlowConfiguration` 算好光流再传入。
+- `qualityPrioritization` 控制画质和性能的权衡。
+- `revision: .revision1` 锁定算法版本，便于线上结果可复现。
+- `startSession` 之后才能拿到一个能处理帧的处理器。
+
+然后是缓冲区分配。所有输入输出帧的 pixel buffer 都由调用方负责分配，可以用 configuration 上的 `sourcePixelBufferAttributes` 和 `destinationPixelBufferAttributes` 创建 CVPixelBuffer pool（[08:56](https://developer.apple.com/videos/play/wwdc2025/300/?time=536)）：
+
+```swift
+// Frame rate conversion buffer allocation
+
+//use sourcePixelBufferAttributes and destinationPixelBufferAttributes property of VTFrameRateConversionConfiguration to create source and destination CVPixelBuffer pools
+
+sourceFrame = VTFrameProcessorFrame(buffer: curPixelBuffer, presentationTimeStamp: sourcePTS)
+nextFrame = VTFrameProcessorFrame(buffer: nextPixelBuffer, presentationTimeStamp: nextPTS)
+
+// Interpolate 3 frames between reference frames for 4x slow-mo
+var interpolationPhase: [Float] = [0.25, 0.5, 0.75]
+
+//create destinationFrames
+let destinationFrames = try framesBetween(firstPTS: sourcePTS,
+                                           lastPTS: nextPTS,
+                            interpolationIntervals: intervals)
+```
+
+关键点：
+- `VTFrameProcessorFrame` 把 CVPixelBuffer 与一个 PTS 绑定，是框架统一的帧载体。
+- `interpolationPhase` 数组里每个 0–1 的浮点数表示要在两帧之间的什么相对位置插一帧；`[0.25, 0.5, 0.75]` 等于在两帧之间插 3 帧，得到 4 倍慢动作。
+- 数组的长度直接决定输出帧数量。
+- `destinationFrames` 是与 `interpolationPhase` 等长的输出帧数组，由调用方预先分配好缓冲。
+
+帧率转换的最后一步是构造 parameters 并执行（[09:48](https://developer.apple.com/videos/play/wwdc2025/300/?time=588)）：
+
+```swift
+// Frame rate conversion parameters
+
+guard let parameters = VTFrameRateConversionParameters(sourceFrame: sourceFrame,
+                                                         nextFrame: nextFrame,
+                                                       opticalFlow: nil,
+                                                interpolationPhase: interpolationPhase,
+                                                    submissionMode: .sequential,
+                                                 destinationFrames: destinationFrames)
+else {
+     throw Fault.failedToCreateFRCParameters
+}
+
+try await processor.process(parameters: parameters)
+```
+
+关键点：
+- `sourceFrame` 和 `nextFrame` 是参与插值的两个参考帧。
+- `opticalFlow: nil` 让处理器自己算光流；如果在 session 里设了 `usePrecomputedFlow: true`，这里要传预先计算好的光流帧。
+- `submissionMode: .sequential` 表示帧按顺序送入，框架可以利用前后帧的连贯性；如果是非顺序提交则用 `.random`。
+- `process(parameters:)` 是异步函数，返回时 `destinationFrames` 里的 buffer 已经写满输出帧。
+
+运动模糊则需要前一帧和后一帧两个参考帧。它通过模拟慢快门得到拖影，可以让时间流逝视频更自然，也可以给快速运动加速度感（[11:23](https://developer.apple.com/videos/play/wwdc2025/300/?time=683)）。Parameters 的写法如下（[12:35](https://developer.apple.com/videos/play/wwdc2025/300/?time=755)）：
+
+```swift
+// Motion blur process parameters
+
+sourceFrame = VTFrameProcessorFrame(buffer: curPixelBuffer, presentationTimeStamp: sourcePTS)
+nextFrame = VTFrameProcessorFrame(buffer: nextPixelBuffer, presentationTimeStamp: nextPTS)
+previousFrame = VTFrameProcessorFrame(buffer: prevPixelBuffer, presentationTimeStamp: prevPTS)
+destinationFrame = VTFrameProcessorFrame(buffer: destPixelBuffer, presentationTimeStamp: sourcePTS)
+
+guard let parameters = VTMotionBlurParameters(sourceFrame: currentFrame,
+                                                nextFrame: nextFrame,
+                                            previousFrame: previousFrame,
+                                          nextOpticalFlow: nil,
+                                      previousOpticalFlow: nil,
+                                       motionBlurStrength: strength,
+                                           submissionMode: .sequential,
+                                         destinationFrame: destinationFrame) 
+else {
+    throw Fault.failedToCreateMotionBlurParameters
+}
+
+try await processor.process(parameters: parameters)
+```
+
+关键点：
+- 运动模糊一次处理一个目的帧，输出是 `destinationFrame`（单数），而不是数组。
+- 第一帧时 `previousFrame` 应设为 nil，最后一帧时 \`nextFrame\` 应设为 nil。
+- `nextOpticalFlow` 和 `previousOpticalFlow` 都置 nil 时，处理器自动算光流。
+- `motionBlurStrength` 取值范围 1–100，数值越大拖影越长。
+- `destinationFrame` 的 PTS 与 sourceFrame 一致，强调输出对应当前时刻。
+
+实时类的接口形态更轻。低延迟超分辨率只用 `LowLatencySuperResolutionScalerConfiguration` 和对应 parameters：configuration 只需要宽、高和缩放比例，parameters 只需要源帧和目的帧（[13:53](https://developer.apple.com/videos/play/wwdc2025/300/?time=833)）。它专门为视频会议优化，能在网络较差时压低编码瑕疵、锐化边缘。
+
+---
+
+## 核心启发
+
+- **做什么：用帧率转换给老视频做高质量慢动作**
+  - 为什么值得做：`interpolationPhase` 数组直接对应慢动作倍率，`[0.25, 0.5, 0.75]` 就是 4x，无需再调第三方插帧库。
+  - 怎么开始：用 `VTFrameRateConversionConfiguration` 启动 session，准备好 source / next 两帧的 PTS，把目标倍率折算成 0–1 的相对位置数组传进去。
+
+- **做什么：把低延迟超分辨率接进视频会议或直播 SDK**
+  - 为什么值得做：API 表面极小，只要宽高和缩放比例，就能在弱网下减少压缩伪影、锐化人脸边缘。
+  - 怎么开始：在收端解码后接上 `LowLatencySuperResolutionScalerConfiguration`，每解出一帧就调用一次 process，输出帧直接喂给渲染层。
+
+- **做什么：用运动模糊修复延时摄影的卡顿感**
+  - 为什么值得做：`motionBlurStrength` 1–100 一档调整就能让一串静态图变成连续运动，省掉手工合成快门拖影的工作量。
+  - 怎么开始：按顺序拿到 previous / current / next 三帧，让框架自动计算光流，先用较低 strength 验证效果再调大。
+
+- **做什么：在视频编辑工程里预先计算光流**
+  - 为什么值得做：光流计算开销大，预处理阶段算一次能在后续多个特效（运动模糊、帧率转换）之间复用，渲染阶段更稳。
+  - 怎么开始：用 `VTOpticalFlowConfiguration` 和 `VTOpticalFlowParameters` 单独跑一遍光流，保存结果；之后在效果 session 里把 `usePrecomputedFlow` 设为 true，并把光流帧传给 parameters。
+
+---
+
+## 关联 Session
+
+- [Capture cinematic video in your app](/articles/wwdc2025-319) — 把 Cinematic Video API 接入 App，用系统级算法捕获带景深焦点切换的视频。
+- [Enhancing your camera experience with capture controls](/articles/wwdc2025-253) — 自定义 iPhone 上相机捕获控件，给拍摄类 App 增加硬件按键体验。
+- [What's new in Metal 4](/articles/wwdc2025-205) — Metal 4 的新管线和资源管理，搭配视频特效做 GPU 后处理。
+- [Discover machine learning & AI frameworks on Apple platforms](/articles/wwdc2025-360) — 概览 Apple 平台上各类机器学习框架，理解 VTFrameProcessor 在整体技术栈中的位置。

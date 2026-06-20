@@ -1,0 +1,326 @@
+---
+title: "Discover Metal for immersive apps"
+description: "Find out how you can use Metal to render fully immersive experiences for visionOS. We'll show you how to set up a rendering session on the platform and create a basic render loop, and share how you can make your experience interactive by incorporating spatial input."
+date: "2023-06-06"
+tags: ["Spatial Computing", "Graphics & Games", "Metal"]
+thumbnail: "/images/sessions/2023/10089.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10089/"
+sessionId: "wwdc2023-10089"
+year: "2023"
+relatedSessions:
+  - title: "Bring your Unity VR app to a fully immersive space"
+    code: "10093"
+    description: "将现有 Unity VR 应用迁移到 visionOS 完全沉浸式空间"
+  - title: "Build great games for spatial computing"
+    code: "10080"
+    description: "空间计算游戏开发技术概览"
+  - title: "Meet ARKit for spatial computing"
+    code: "10082"
+    description: "ARKit 空间计算新 API 详解"
+---
+
+## Highlight
+
+> Apple 通过 CompositorServices API 让开发者用 Metal 直接渲染到 visionOS 的合成器，配合 ARKit 实现完全沉浸式体验。核心架构是 SwiftUI 创建 ImmersiveSpace + CompositorLayer 配置渲染会话，引擎主体可用 C/C++ 编写。
+
+## 核心内容
+
+### 完全沉浸式体验的渲染选择
+
+（[00:10](https://developer.apple.com/videos/play/wwdc2023/10089/?time=10)）visionOS 上的完全沉浸式体验有两种渲染路径。RealityKit 适合大多数场景，底层使用 CoreAnimation 和 MaterialX。如果希望直接控制渲染管线，Metal + ARKit 是另一条路。RecRoom 就是使用 CompositorServices + Metal + ARKit 的实例。
+
+### SwiftUI 场景架构
+
+（[01:47](https://developer.apple.com/videos/play/wwdc2023/10089/?time=107)）visionOS 有三种主要场景类型：
+
+- **Window**：类似 macOS 的 2D 体验
+- **Volume**：在 Shared Space 中与其他应用共存，内容在边界内渲染
+- **ImmersiveSpace**：允许在任何位置渲染内容，用于完全沉浸式体验
+
+Metal 渲染选择 ImmersiveSpace 类型。它作为容器，内容通过 `ImmersiveSpaceContent` 协议提供。使用 Metal 时，这个内容类型叫做 `CompositorLayer`。
+
+### CompositorServices API
+
+（[03:42](https://developer.apple.com/videos/play/wwdc2023/10089/?time=222)）CompositorServices 是 visionOS 新引入的 API，提供 Metal 渲染接口，让应用直接渲染到合成器服务器。特点是低 IPC 开销、低延迟，同时支持 C 和 Swift API。
+
+创建 `CompositorLayer` 需要两个参数：
+- `CompositorLayerConfiguration` 协议：定义渲染会话的行为和能力
+- `LayerRenderer`：渲染会话的接口，用于调度和渲染帧
+
+### 应用入口代码
+
+（[04:45](https://developer.apple.com/videos/play/wwdc2023/10089/?time=285)）
+
+```swift
+@main
+struct MyApp: App {
+    var body: some Scene {
+        ImmersiveSpace {
+            CompositorLayer { layerRenderer in
+                let engine = my_engine_create(layerRenderer)
+                let renderThread = Thread {
+                    my_engine_render_loop(engine)
+                }
+                renderThread.name = "Render Thread"
+                renderThread.start()
+            }
+        }
+    }
+}
+```
+
+关键点：
+- `@main` 标记应用入口
+- `ImmersiveSpace` 作为场景容器
+- `CompositorLayer` 接收 `layerRenderer` 实例
+- 在闭包中创建引擎实例和渲染线程
+- 渲染循环在独立线程运行，避免阻塞主线程
+
+### 默认场景配置
+
+（[05:20](https://developer.apple.com/videos/play/wwdc2023/10089/?time=320)）SwiftUI 默认会创建 Window 场景，即使第一个场景是 ImmersiveSpace。要修改这个行为，在 Info.plist 中添加 `UIApplicationPreferredDefaultSceneSessionRole` 键，值为 `CPSceneSessionRoleImmersiveSpaceApplication`。
+
+### CompositorLayer 配置
+
+（[10:32](https://developer.apple.com/videos/play/wwdc2023/10089/?time=632)）
+
+```swift
+struct MyConfiguration: CompositorLayerConfiguration {
+    func makeConfiguration(capabilities: LayerRenderer.Capabilities,
+                           configuration: inout LayerRenderer.Configuration) {
+
+        let supportsFoveation = capabilities.supportsFoveation
+        let supportedLayouts = capabilities.supportedLayouts(options: supportsFoveation ?
+                                                             [.foveationEnabled] : [])
+
+        configuration.layout = supportedLayouts.contains(.layered) ? .layered : .dedicated
+
+        configuration.isFoveationEnabled = supportsFoveation
+
+        // HDR support
+        configuration.colorFormat = .rgba16Float
+   }
+}
+```
+
+关键点：
+- `supportsFoveation` 检查设备是否支持注视点渲染（模拟器不支持）
+- `supportedLayouts` 查询可用的布局选项
+- `layout` 选择纹理映射方式：layered（单纹理双切片）、dedicated（双纹理各单切片）、shared（单纹理单切片双视口）
+- `isFoveationEnabled` 启用注视点渲染
+- `colorFormat` 设置为 `.rgba16Float` 支持 HDR 渲染
+
+### 注视点渲染
+
+（[06:51](https://developer.apple.com/videos/play/wwdc2023/10089/?time=411)）注视点渲染（Foveated Rendering）的核心目标：在不增加纹理尺寸的前提下，提高每度像素密度。visionOS 通过创建采样率映射来实现——注视区域使用更高采样率，外围区域降低。这减少了渲染功耗，同时保持视觉保真度。
+
+Compositor 为每帧提供 `MTLRasterizationRateMap`。在 Xcode Metal Debugger 中可以检查目标纹理和光栅化率映射，观察不同区域的压缩程度。
+
+### LayerRenderer Layout 详解
+
+（[08:28](https://developer.apple.com/videos/play/wwdc2023/10089/?time=508)）Layout 定义每只眼睛的内容如何映射到 Metal 纹理：
+
+| Layout | 纹理数 | 切片数 | 视口数 | 特点 |
+|--------|--------|--------|--------|------|
+| layered | 1 | 2 | 2 | 单通道渲染双眼，支持注视点渲染 |
+| dedicated | 2 | 1 | 1 | 每眼独立纹理，易于移植 |
+| shared | 1 | 1 | 2 | 单纹理双视口，适合无注视点场景 |
+
+Layered 是最佳选择，支持单通道渲染且保留注视点渲染能力。
+
+### 色彩管理
+
+（[09:57](https://developer.apple.com/videos/play/wwdc2023/10089/?time=597)）Compositor 期望内容以扩展线性 Display P3 色彩空间渲染。visionOS 支持 2.0 的 EDR 动态范围（两倍于 SDR）。默认像素格式不支持 HDR，需要显式设置为 `rgba16Float`。
+
+## 详细内容
+
+### 渲染循环
+
+（[12:20](https://developer.apple.com/videos/play/wwdc2023/10089/?time=740)）
+
+```c
+void my_engine_render_loop(my_engine *engine) {
+    my_engine_setup_render_pipeline(engine);
+
+    bool is_rendering = true;
+    while (is_rendering) @autoreleasepool {
+        switch (cp_layer_renderer_get_state(engine->layer_renderer)) {
+            case cp_layer_renderer_state_paused:
+                cp_layer_renderer_wait_until_running(engine->layer_renderer);
+                break;
+            case cp_layer_renderer_state_running:
+                my_engine_render_new_frame(engine);
+                break;
+            case cp_layer_renderer_state_invalidated:
+                is_rendering = false;
+                break;
+        }
+    }
+
+    my_engine_invalidate(engine);
+}
+```
+
+关键点：
+- `my_engine_setup_render_pipeline` 初始化渲染管线所需资源
+- `@autoreleasepool` 管理自动释放对象
+- `cp_layer_renderer_get_state` 查询层渲染器状态
+- `paused` 状态时线程休眠，等待恢复运行
+- `running` 状态时渲染一帧
+- `invalidated` 状态时结束循环并清理资源
+
+### 单帧渲染流程
+
+（[15:56](https://developer.apple.com/videos/play/wwdc2023/10089/?time=956)）
+
+```c
+void my_engine_render_new_frame(my_engine *engine) {
+    
+    cp_frame_t frame = cp_layer_renderer_query_next_frame(engine->layer_renderer);
+    if (frame == nullptr) { return; }
+    
+    cp_frame_timing_t timing = cp_frame_predict_timing(frame);
+    if (timing == nullptr) { return; }
+
+    cp_frame_start_update(frame);
+
+    my_input_state input_state = my_engine_gather_inputs(engine, timing);
+    my_engine_update_frame(engine, timing, input_state);
+
+    cp_frame_end_update(frame);
+
+    // Wait until the optimal time for querying the input
+    cp_time_wait_until(cp_frame_timing_get_optimal_input_time(timing));
+
+    cp_frame_start_submission(frame);
+
+    cp_drawable_t drawable = cp_frame_query_drawable(frame);
+    if (drawable == nullptr) { return; }
+
+    cp_frame_timing_t final_timing = cp_drawable_get_frame_timing(drawable);
+    ar_pose_t pose = my_engine_get_ar_pose(engine, final_timing);
+    cp_drawable_set_ar_pose(drawable, pose);
+
+    my_engine_draw_and_submit_frame(engine, frame, drawable);
+
+    cp_frame_end_submission(frame);
+}
+```
+
+关键点：
+- `cp_layer_renderer_query_next_frame` 获取下一帧对象
+- `cp_frame_predict_timing` 预测帧的时间信息
+- `cp_frame_start_update` / `cp_frame_end_update` 包裹更新阶段（非延迟敏感工作：动画、角色更新、输入收集）
+- `cp_time_wait_until` 等待最佳输入查询时间
+- `cp_frame_start_submission` / `cp_frame_end_submission` 包裹提交阶段（延迟敏感工作：头部姿态依赖的渲染）
+- `cp_frame_query_drawable` 获取可绘制对象（包含目标纹理）
+- `cp_drawable_set_ar_pose` 设置 AR 姿态，Compositor 用它做重投影
+- `my_engine_draw_and_submit_frame` 编码 GPU 工作并提交
+
+### 帧时序图解
+
+Compositor 的时序对象定义三个关键时间点：
+
+1. **optimal input time**：查询延迟敏感输入的最佳时间，也是开始渲染帧的最佳时间
+2. **rendering deadline**：CPU 和 GPU 渲染工作必须完成的时间
+3. **presentation time**：帧显示在屏幕上的时间
+
+更新阶段应在 optimal input time 之前完成。等待 optimal input time 后开始提交阶段。CPU 和 GPU 工作必须在 rendering deadline 前完成，否则 Compositor 会使用前一帧。
+
+### 添加输入支持
+
+（[18:57](https://developer.apple.com/videos/play/wwdc2023/10089/?time=1137)）
+
+```swift
+@main
+struct MyApp: App {
+    var body: some Scene {
+        ImmersiveSpace {
+            CompositorLayer(configuration: MyConfiguration()) { layerRenderer in
+                let engine = my_engine_create(layerRenderer)
+                let renderThread = Thread {
+                    my_engine_render_loop(engine)
+                }
+                renderThread.name = "Render Thread"
+                renderThread.start()
+                layerRenderer.onSpatialEvent = { eventCollection in
+                    var events = eventCollection.map { my_spatial_event($0) }
+                    my_engine_push_spatial_events(engine, &events, events.count)
+                }
+            }
+        }
+        .upperLimbVisibility(.hidden)
+    }
+}
+```
+
+关键点：
+- `configuration` 参数传入自定义配置
+- `onSpatialEvent` 注册空间事件回调
+- 将 Swift 空间事件映射为 C 类型事件
+- `.upperLimbVisibility(.hidden)` 隐藏真实手部，显示虚拟手部
+
+### 事件推送与输入收集
+
+```c
+void my_engine_push_spatial_events(my_engine *engine,
+                                   my_spatial_event *spatial_event_collection,
+                                   size_t event_count) {
+    os_unfair_lock_lock(&engine->input_event_lock);
+    // Copy events into an internal queue
+    os_unfair_lock_unlock(&engine->input_event_lock);
+}
+
+my_input_state my_engine_gather_inputs(my_engine *engine,
+                                       cp_frame_timing_t timing) {
+    my_input_state input_state = my_input_state_create();
+
+    os_unfair_lock_lock(&engine->input_event_lock);
+    input_state.current_pinch_collection = my_engine_pop_spatial_events(engine);
+    os_unfair_lock_unlock(&engine->input_event_lock);
+
+    ar_hand_tracking_provider_get_latest_anchors(engine->hand_tracking_provider,
+                                                 input_state.left_hand,
+                                                 input_state.right_hand);
+
+    return input_state;
+}
+```
+
+关键点：
+- 空间事件在主线程投递，需要用锁机制同步
+- `os_unfair_lock` 用于线程安全的读写
+- `ar_hand_tracking_provider_get_latest_anchors` 获取左右手骨骼数据
+- 输入收集发生在更新阶段，在 optimal input time 之前
+
+## 核心启发
+
+**1. 用 Metal 构建自定义 VR 渲染引擎**
+
+- **做什么**：为 visionOS 写一个从零开始的轻量级 VR 渲染引擎
+- **为什么值得做**：CompositorServices 提供了底层访问，C/C++ 引擎代码可跨平台复用。注视点渲染和单通道实例化渲染让性能优化空间很大
+- **怎么开始**：用 SwiftUI 创建 ImmersiveSpace 和 CompositorLayer，用 C 写渲染循环，配置 layered layout + foveation，集成 ARKit 获取头部姿态
+
+**2. 开发手势交互的沉浸式艺术工具**
+
+- **做什么**：让用户用手势在虚拟空间中创作 3D 雕塑或绘画
+- **为什么值得做**：ARKit 手部追踪 + Metal 直接渲染的组合，可以实现极低延迟的交互反馈。空间事件提供 pinch 的完整 3D 位置信息
+- **怎么开始**：在 `gather_inputs` 中读取手部骨骼数据，用 pinch 事件作为"画笔"触发器，在 update 阶段更新虚拟画笔位置，在 submission 阶段渲染笔触
+
+**3. 移植现有 OpenGL/Metal 游戏到 visionOS**
+
+- **做什么**：把用自研引擎开发的 3D 游戏带到 visionOS
+- **为什么值得做**：引擎主体可以用 C/C++，只需要用 SwiftUI 做一层薄包装。Single-Pass Instanced Rendering 减少 CPU 开销，Foveated Rendering 提升视觉质量
+- **怎么开始**：用 SwiftUI 创建 CompositorLayer，将现有渲染管线的最后一步改为写入 Compositor 提供的 drawable，添加深度缓冲写入，用 ARKit 替代原有的相机控制
+
+**4. 构建沉浸式数据可视化应用**
+
+- **做什么**：把复杂数据集（如分子结构、气象模型）渲染为可交互的 3D 可视化
+- **为什么值得做**：HDR 支持（rgba16Float）让高动态范围数据展示更精确，用户可以用自然手势旋转、缩放数据模型
+- **怎么开始**：配置 HDR 色彩格式，在 update 阶段处理手势输入控制相机/模型变换，利用 Metal 的计算着色器做数据预处理
+
+## 关联 Session
+
+- [Bring your Unity VR app to a fully immersive space](/articles/wwdc2023-10093) — 将现有 Unity VR 应用迁移到 visionOS 完全沉浸式空间
+- [Build great games for spatial computing](/articles/wwdc2023-10080) — 空间计算游戏开发技术概览
+- [Meet ARKit for spatial computing](/articles/wwdc2023-10082) — ARKit 空间计算新 API 详解

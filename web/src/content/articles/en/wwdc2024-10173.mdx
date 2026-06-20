@@ -1,0 +1,255 @@
+---
+title: "Analyze heap memory"
+description: "dive into the basis for your app"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10173.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10173/"
+sessionId: "wwdc2024-10173"
+year: "2024"
+relatedSessions:
+  - title: "Consume noncopyable types in Swift"
+    code: "10170"
+    description: "get started with noncopyable types in swift. discover what copying means in swif"
+  - title: "Explore Swift performance"
+    code: "10217"
+    description: "discover how swift balances abstraction and performance. learn what elements of "
+  - title: "Explore the Swift on Server ecosystem"
+    code: "10216"
+    description: "swift is a great language for writing your server applications, and powers criti"
+  - title: "Go further with Swift Testing"
+    code: "10195"
+    description: "learn how to write a sweet set of (test) suites using swift testing"
+---
+
+## Highlight
+
+> 堆内存通常是应用内存占用的大头，Apple 提供了从 Xcode Memory Report 到 Instruments Allocations 的完整工具链来诊断瞬态增长、持续增长和内存泄漏三类问题。
+
+---
+
+## 核心内容
+
+堆内存（heap memory）是应用运行时动态分配的内存区域，通过 `malloc`、`calloc`、Swift/ObjC 的对象实例化来使用。堆内存通常是应用内存占用的大头，因为 dirty 页面会被计入应用的内存限制（[04:22](https://developer.apple.com/videos/play/wwdc2024/10173/?time=262)）。这场 Session 系统讲解了五类堆内存问题：瞬态增长（内存尖刺）、持续增长（只增不减）、内存泄漏（对象无法释放）、运行时性能问题（频繁分配/释放导致卡顿），以及如何用 Apple 的工具链逐一排查。
+
+工具链覆盖四个层面：Xcode Memory Report（看整体趋势）、Instruments Allocations（看分配历史和调用栈）、Memory Graph Debugger（看对象引用关系）、命令行工具（`heap`、`malloc_history`、`vmmap`、`Leaks`）（[04:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=250)）。
+
+Session 用 Destination Video 示例项目做演示。第一个问题是反复打开图片选择器导致内存尖刺到接近 1GB，最终 OOM 崩溃（[05:46](https://developer.apple.com/videos/play/wwdc2024/10173/?time=346)）。通过 Allocations Instrument 追踪发现，每次打开都创建了大量未释放的 autorelease pool 内容页，原因是循环中调用 Objective-C 框架 API 时产生的 autoreleased 对象都累积到同一个 pool 中（[10:54](https://developer.apple.com/videos/play/wwdc2024/10173/?time=654)）。解决方案是用嵌套的 `autoreleasepool` 包裹循环体，确保每次迭代结束时立即释放（[12:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=730)）。
+
+第二个问题是内存持续增长。修复瞬态增长后，发现内存呈阶梯状上升——每次打开图片选择器都会增长且不回落（[13:09](https://developer.apple.com/videos/play/wwdc2024/10173/?time=789)）。用 Mark Generation 功能分离出各时段的持续分配，发现大量 Data 存储分配来自 ThumbnailLoader（[15:23](https://developer.apple.com/videos/play/wwdc2024/10173/?time=923)）。通过 Memory Graph Debugger 追踪引用链，发现这些对象被全局缓存 `globalImageCache` 持有，而缓存键用的是当前时间而非文件创建时间——导致每次调用都生成新的缓存条目（[18:58](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1138)）。
+
+第三个问题是内存泄漏。Memory Graph Debugger 发现 ThumbnailRenderer、ThumbnailLoader 和一个闭包上下文形成了引用循环（[21:43](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1303)）。闭包默认强捕获了 renderer，导致三者互相强引用无法释放。解法是用 `[weak renderer]` 捕获列表（[23:40](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1420)）。
+
+---
+
+## 详细内容
+
+### 堆内存基础
+
+堆内存是应用虚拟内存的一部分，用于存放动态分配和长期存活的对象。每块堆分配来自 16KB 的内存页，页面有三种状态（[02:05](https://developer.apple.com/videos/play/wwdc2024/10173/?time=125)）：
+
+- **Clean**：未写入或只读映射，可随时丢弃
+- **Dirty**：已写入，计入内存占用，压力下会被压缩或换出
+- **Swapped**：已压缩或写入磁盘
+
+只有 Dirty 和 Swapped 计入应用的 memory footprint。堆内存通常占大头（[02:51](https://developer.apple.com/videos/play/wwdc2024/10173/?time=171)）。
+
+MallocStackLogging 是重要的调试功能，记录每个分配的调用栈和时间戳（[03:47](https://developer.apple.com/videos/play/wwdc2024/10173/?time=227)），可在 Xcode Scheme 的 Diagnostics 标签页勾选启用。
+
+### 瞬态增长：Autorelease Pool
+
+瞬态增长的特征是内存呈尖刺状——快速上升然后回落。这会触发内存压力，导致系统压缩/换出内存甚至终止应用（[07:56](https://developer.apple.com/videos/play/wwdc2024/10173/?time=476)）。
+
+在 Allocations Instrument 中，可以通过两种方式定位（[08:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=490)）：
+
+1. **Created & Still Living**：选中从波谷到波峰的时间段，查看哪些分配在增长后仍存活
+2. **Created & Destroyed**：选中较大时间段，查看哪些分配在该时段内被创建并销毁
+
+修复瞬态增长的关键代码（[12:16](https://developer.apple.com/videos/play/wwdc2024/10173/?time=736)）：
+
+```swift
+func loadThumbnails(with renderer: ThumbnailRenderer) {
+    for photoURL in urls {
+        autoreleasepool {
+            // 循环体内部创建的对象会在每次迭代结束时释放
+            renderer.faultThumbnail(from: photoURL)
+        }
+    }
+}
+```
+
+**关键点：**
+- `autoreleasepool` 创建一个局部作用域，其中产生的 autoreleased 对象会在作用域结束时被释放
+- 原代码中循环产生的 autoreleased 对象都累积到线程的顶层 pool 中，直到循环结束才释放
+- 嵌套 pool 确保每次迭代后立即释放，避免内存尖刺
+
+### 持续增长：缓存键错误
+
+持续增长的特征是内存呈阶梯状上升——每次操作后增长但不回落。用 Mark Generation 功能可以分离不同时间段产生的持续分配（[14:08](https://developer.apple.com/videos/play/wwdc2024/10173/?time=848)）。
+
+修复缓存键错误的关键代码（[19:28](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1168)）：
+
+```swift
+func faultThumbnail(from photoURL: URL) {
+  // 错误：使用当前时间作为缓存键
+  // let timestamp = UInt64(Date.now.timeIntervalSince1970)
+
+  // 正确：使用文件创建时间作为缓存键
+  let timestamp = cacheKeyTimestamp(for: photoURL)
+  let cacheKey = CacheKey(url: photoURL, timestamp: timestamp)
+
+  let thumbnail = cacheProvider.thumbnail(for: cacheKey) {
+    return makeThumbnail(from: photoURL)
+  }
+  images.append(thumbnail.image)
+}
+```
+
+**关键点：**
+- 原代码使用 `Date.now` 生成缓存键，导致每次调用都生成不同的键
+- 同一个文件每次访问都会创建新的 `PhotoThumbnail` 对象并加入全局缓存
+- 修复后使用文件的创建时间戳，确保相同文件使用同一缓存键
+
+### 内存泄漏：引用循环
+
+内存泄漏是可达但永远不会再使用的对象。闭包默认强捕获引用，容易形成引用循环（[22:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1330)）。
+
+修复引用循环的关键代码（[23:40](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1420)）：
+
+```swift
+// 错误：闭包强捕获 renderer
+loader.completionHandler = {
+  self.thumbnails = renderer.images // 隐式强捕获
+}
+
+// 正确：使用 weak 捕获
+loader.completionHandler = { [weak renderer] in
+  guard let renderer else { return }
+  self.thumbnails = renderer.images
+}
+```
+
+**关键点：**
+- 闭包默认强捕获所有引用的变量
+- `[weak renderer]` 创建弱引用，避免形成引用循环
+- `guard let renderer` 确保在闭包执行时对象仍然存在
+
+Memory Graph Debugger 会用黄色三角形标记泄漏的对象（[20:03](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1203)），可以按类型筛选定位泄漏源。
+
+### 引用类型：weak vs unowned
+
+`weak` 和 `unowned` 都可以避免强引用循环，但行为不同（[26:51](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1611)）：
+
+- **weak**：总是可选类型，对象释放后自动变为 `nil`，需要额外分配 weak reference storage
+- **unowned**：直接持有对象地址，不占用额外内存，但访问已释放对象会崩溃
+
+性能差异示例（[30:11](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1811)）：
+
+```swift
+// weak 需要为每个对象分配额外的 weak reference storage
+weak var holder: Swallow?
+
+// unowned 直接持有地址，无额外开销
+unowned let holder: Swallow
+```
+
+**关键点：**
+- weak 引用需要分配额外的存储空间来跟踪弱引用
+- unowned 引用无额外开销，但必须保证被引用对象生命周期更长
+- 使用 weak 时需检查 `swift_weakLoadStrong()` 等 runtime 函数的调用频率
+
+### 引用循环的隐式陷阱
+
+将方法赋值给闭包属性时会隐式捕获 `self`（[29:07](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1747)）：
+
+```swift
+class ByteProducer {
+  let data: Data
+  private var generator: ((Data) -> UInt8)? = nil
+
+  init(data: Data) {
+    self.data = data
+    // 错误：defaultAction 隐式使用 self，形成引用循环
+    generator = defaultAction
+  }
+
+  func defaultAction(_ data: Data) -> UInt8 {
+    // ...
+  }
+}
+
+// 正确：显式闭包 + weak 捕获
+generator = { [weak self] data in
+  return self?.defaultAction(data)
+}
+
+// 或者使用 unowned（当 generator 生命周期不超出 ByteProducer 时）
+generator = { [unowned self] data in
+  return self.defaultAction(data)
+}
+```
+
+**关键点：**
+- 方法作为闭包使用时会隐式捕获 `self`
+- 需要用显式闭包和捕获列表来控制引用类型
+- unowned 适用于闭包生命周期明确不超出被捕获对象的情况
+
+### 工具使用建议
+
+- **MallocStackLogging**：开发时启用，记录分配调用栈（[03:47](https://developer.apple.com/videos/play/wwdc2024/10173/?time=227)）
+- **Memory Graph Debugger**：暂停时捕获内存快照，查看引用关系（[04:32](https://developer.apple.com/videos/play/wwdc2024/10173/?time=272)）
+- **Instruments Allocations**：分析内存趋势和分配历史（[05:15](https://developer.apple.com/videos/play/wwdc2024/10173/?time=315)）
+- **命令行工具**：`heap`、`malloc_history`、`vmmap`、`Leaks` 用于离线分析（[04:50](https://developer.apple.com/videos/play/wwdc2024/10173/?time=290)）
+
+---
+
+## 核心启发
+
+**1. 在循环中调用框架 API 时使用嵌套 autoreleasepool**
+
+当循环中调用会产生 autoreleased 对象的 API（尤其是 Objective-C 框架）时，用嵌套的 `autoreleasepool` 包裹循环体。这能确保每次迭代结束时立即释放临时对象，避免内存尖刺。
+
+**为什么值得做：** 原始实现会导致所有 autoreleased 对象累积到线程的顶层 pool 中，直到 pool 被 drain 才释放——在循环中这可能需要很长时间。
+
+**怎么开始：** 在循环中添加 `autoreleasepool { ... }`，用 Xcode Memory Report 或 Instruments Allocations 验证内存尖刺是否消失。
+
+**2. 为缓存数据使用稳定的键**
+
+缓存时必须确保键能唯一标识数据，且同一数据的多次访问能命中缓存。使用文件 URL 作为键时，应结合文件的修改时间或创建时间，而非当前时间。
+
+**为什么值得做：** 错误的缓存键会导致缓存永远 miss，每次访问都创建新对象并加入缓存，造成内存持续增长。
+
+**怎么开始：** 审查所有缓存代码，确认缓存键的稳定性。对于文件资源，使用文件属性（如 `creationDate` 或 `contentModificationDate`）而非运行时时间。
+
+**3. 闭包捕获引用时默认使用 weak，仅在保证生命周期时用 unowned**
+
+闭包默认强捕获引用，容易形成引用循环。使用 `[weak self]` 打破循环是安全做法。当闭包生命周期明确不超出被捕获对象时（如内部闭包、同步回调），可以用 `[unowned self]` 节省 weak reference storage 的开销。
+
+**为什么值得做：** weak 引用需要为每个对象分配额外的存储空间，在大量对象时开销显著。unowned 无额外开销但访问已释放对象会崩溃。
+
+**怎么开始：** 在所有闭包中使用捕获列表。默认使用 `weak`，分析后确认生命周期关系时再考虑 `unowned`。
+
+**4. 用 Mark Generation 追踪持续增长的来源**
+
+当内存呈阶梯状增长时，用 Instruments Allocations 的 Mark Generation 功能在不同时间点标记，可以分离出各时段产生的持续分配。
+
+**为什么值得做：** 持续增长可能来自多个来源，Mark Generation 能将增长按时间分段，帮助定位具体哪段代码导致了增长。
+
+**怎么开始：** 在 Instruments 中重现增长模式，在增长前后点击 Mark Generation 按钮，然后按增长大小排序查看各代际的分配类型。
+
+**5. 验证修复后检查连锁泄漏**
+
+修复一个内存泄漏后，可能发现其他泄漏也消失了——因为被泄漏对象引用的其他对象也会随之泄漏（[24:08](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1448)）。
+
+**为什么值得做：** 泄漏对象可能持有其他对象的强引用，修复根因泄漏后，被持有的对象也能正常释放。
+
+**怎么开始：** 修复泄漏后重新运行 Memory Graph Debugger，确认泄漏数量减少或消失，并检查是否有新的根因泄漏。
+
+---
+
+## 关联 Session
+
+- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — Swift 中非复制类型的入门，了解什么是复制以及如何避免不必要的开销
+- [Explore Swift performance](/articles/wwdc2024-10217) — 深入 Swift 如何在抽象和性能之间取得平衡，了解影响性能的 Swift 语言特性
+- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Swift 在服务端应用中的应用，涵盖关键框架和工具
+- [Go further with Swift Testing](/articles/wwdc2024-10195) — 深入 Swift Testing 框架，学习如何编写测试套件和利用高级特性

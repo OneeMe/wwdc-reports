@@ -1,0 +1,227 @@
+---
+title: "Explore Core Image kernel improvements"
+description: "Discover how you can add Core Image kernels written in the Metal shading language into your app. We'll explore how you can use Xcode rules and naming conventions for Core Image kernels written in the Metal shading language."
+date: "2021-06-07"
+tags: ["Core Image", "Metal", "Image Processing", "Shader"]
+thumbnail: "/images/sessions/2021/10159.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10159/"
+sessionId: "wwdc2021-10159"
+year: "2021"
+relatedSessions:
+  - title: "Create image processing apps powered by Apple silicon"
+    code: "10153"
+    description: "Apple Silicon 图像处理优化"
+  - title: "Explore HDR rendering with EDR"
+    code: "10161"
+    description: "EDR HDR 渲染管线"
+  - title: "What's new in AVFoundation"
+    code: "10146"
+    description: "AVFoundation 异步属性加载新 API"
+---
+
+## Highlight
+
+> Core Image 现在支持两种 Metal kernel 编写方式：extern CIKernel（需自定义 build rule，兼容所有设备）和 stitchable CIKernel（用 Metal Dynamic Libraries，仅 A11+/Apple Silicon/AMD Navi/Vega）。
+
+## 核心内容
+
+你想写一个自定义图像滤镜。Core Image 的 CIFilter 已经提供了 200 多个内置滤镜，但总有满足不了的需求。过去写自定义 kernel 要用 CIKL（Core Image Kernel Language），语法和工具链都和 Metal 不同。
+
+现在 Core Image 直接支持 Metal Shading Language，你可以在 Xcode 中写 Metal kernel，享受语法高亮和编译期错误检查。
+
+## 详细内容
+
+### 为什么用 Metal 写 CIKernel
+
+（[00:46](https://developer.apple.com/videos/play/wwdc2021/10159/?time=46)）
+
+用 Metal 写 CIKernel 有三个好处：
+
+1. **自动 tiling 和 concatenation**。Core Image 自动把大图分成小块处理，多个滤镜合并为一次执行。
+2. **编译期优化**。kernel 在应用构建时编译，不是运行时。性能更好，启动更快。
+3. **访问高级特性**。gather-reads、group-writes、half-float math 等 Metal 特性都可以用。
+4. **开发体验**。Xcode 提供语法高亮和编译期错误检查。
+
+### 方式一：Extern CIKernel
+
+（[02:32](https://developer.apple.com/videos/play/wwdc2021/10159/?time=152)）
+
+Extern 方法需要自定义 build rule，兼容所有支持 Core Image 的设备。
+
+**步骤 1：添加 build rule**
+
+在 Target 设置中添加两个 build rule：
+
+1. `.ci.metal` 文件 → 用 `metal -fcikernel` 编译为 `.ci.air`
+2. `.ci.air` 文件 → 用 `metallib -cikernel` 链接为 `.ci.metallib`
+
+**步骤 2：编写 kernel**
+
+```metal
+// MyFilter.ci.metal
+#include <CoreImage/CoreImage.h>
+
+// extern "C" 标记让 Core Image 识别这个函数
+extern "C" {
+    namespace coreimage {
+        float4 myKernel(sampler src, float amount) {
+            float4 color = src.sample(src.coord());
+            // 自定义处理逻辑
+            return color * amount;
+        }
+    }
+}
+```
+
+（[03:54](https://developer.apple.com/videos/play/wwdc2021/10159/?time=234)）
+
+**步骤 3：加载和使用**
+
+```swift
+class MyFilter: CIFilter {
+    var inputImage: CIImage?
+    var amount: Float = 1.0
+
+    static var kernel: CIKernel = {
+        let url = Bundle.main.url(
+            forResource: "MyFilter",
+            withExtension: "ci.metallib"
+        )!
+        let data = try! Data(contentsOf: url)
+        return try! CIKernel(
+            functionName: "myKernel",
+            fromMetalLibraryData: data
+        )
+    }()
+
+    override var outputImage: CIImage? {
+        guard let input = inputImage else { return nil }
+        return MyFilter.kernel.apply(
+            extent: input.extent,
+            roiCallback: { _, rect in rect },
+            arguments: [input, amount]
+        )
+    }
+}
+```
+
+（[04:32](https://developer.apple.com/videos/play/wwdc2021/10159/?time=272)）
+
+**关键点：**
+- 文件后缀是 `.ci.metal`
+- 函数标记为 `extern "C"`
+- 编译产物后缀是 `.ci.metallib`
+- kernel 用 `static` 属性懒加载
+- `roiCallback` 返回输入图像中需要的区域
+
+### 方式二：Stitchable CIKernel
+
+（[05:42](https://developer.apple.com/videos/play/wwdc2021/10159/?time=342)）
+
+Stitchable 方法更简单，只需要一个 build setting，但只支持较新的设备。
+
+**步骤 1：设置 build setting**
+
+在 Target 的 "Other Metal Linker Flags" 中添加 `-framework CoreImage`。
+
+**步骤 2：编写 kernel**
+
+```metal
+// MyFilter.metal（普通 .metal 文件）
+#include <CoreImage/CoreImage.h>
+
+// [[stitchable]] 属性标记
+[[stitchable]] float4 myStitchableKernel(
+    sampler src,
+    float amount
+) {
+    float4 color = src.sample(src.coord());
+    return color * amount;
+}
+```
+
+（[06:18](https://developer.apple.com/videos/play/wwdc2021/10159/?time=378)）
+
+**步骤 3：加载和使用**
+
+```swift
+class MyFilter: CIFilter {
+    var inputImage: CIImage?
+    var amount: Float = 1.0
+
+    static var kernel: CIKernel = {
+        let url = Bundle.main.url(
+            forResource: "default",
+            withExtension: "metallib"
+        )!
+        let data = try! Data(contentsOf: url)
+        return try! CIKernel(
+            functionName: "myStitchableKernel",
+            fromMetalLibraryData: data
+        )
+    }()
+
+    override var outputImage: CIImage? {
+        guard let input = inputImage else { return nil }
+        return MyFilter.kernel.apply(
+            extent: input.extent,
+            roiCallback: { _, rect in rect },
+            arguments: [input, amount]
+        )
+    }
+}
+```
+
+（[06:40](https://developer.apple.com/videos/play/wwdc2021/10159/?time=400)）
+
+**关键点：**
+- 普通 `.metal` 文件，不需要特殊后缀
+- 函数标记为 `[[stitchable]]`
+- 编译到 `default.metallib`
+- 不需要自定义 build rule
+- 可以链接其他 Metal library
+
+### 设备兼容性
+
+（[08:08](https://developer.apple.com/videos/play/wwdc2021/10159/?time=488)）
+
+Stitchable kernel 依赖 Metal Dynamic Libraries，需要检查设备支持：
+
+```swift
+if device.supportsDynamicLibraries {
+    // 可以使用 stitchable kernel
+} else {
+    // 回退到 extern kernel 或其他方案
+}
+```
+
+支持设备：
+- iPhone/iPad：A11 及更新芯片
+- Mac：所有 Apple Silicon
+- Intel Mac：AMD Navi 和 Vega GPU
+
+（[08:21](https://developer.apple.com/videos/play/wwdc2021/10159/?time=501)）
+
+**关键点：**
+- `supportsDynamicLibraries` 检查设备兼容性
+- 不支持时需要有回退方案
+- Extern kernel 兼容性更好
+- Stitchable kernel 开发体验更好
+
+## 核心启发
+
+1. **新项目优先用 stitchable kernel**。开发体验更好，不需要自定义 build rule。入口 API：`[[stitchable]]` + `-framework CoreImage` linker flag。
+
+2. **需要兼容旧设备时用 extern kernel**。A11 之前的设备不支持 stitchable。入口 API：`extern "C"` + `.ci.metal` build rule。
+
+3. **用 `supportsDynamicLibraries` 做运行时检测**。根据设备能力选择不同的 kernel 加载方式。入口 API：`MTLDevice.supportsDynamicLibraries`。
+
+4. **把 kernel 编译为静态属性懒加载**。避免每次创建 filter 都重新加载 metallib。入口 API：`static var kernel`。
+
+5. **roiCallback 返回最小所需区域**。不要图省事返回整张图像，减少不必要的采样。入口 API：`roiCallback: { _, rect in rect }`。
+
+## 关联 Session
+
+- [Create image processing apps powered by Apple silicon](/articles/wwdc2021-10153) — Apple Silicon 图像处理优化
+- [Explore HDR rendering with EDR](/articles/wwdc2021-10161) — EDR HDR 渲染管线
+- [What's new in AVFoundation](/articles/wwdc2021-10146) — AVFoundation 异步属性加载新 API

@@ -1,0 +1,417 @@
+---
+title: "What's new in StoreKit testing"
+description: "discover the latest tools to help you test your in-app purchases and subscriptions. we'll show you how to bring your products from app store connect into storekit testing in xcode, learn about improvements to the transaction manager, and explore your in-app purchase flow in xcode previews. we'll also take you through best practices when setting up an apple id for the sandbox environment, and show you how to create tests for refund requests, price increase consent, billing retry, and much more."
+date: "2026-06-10"
+tags: ["StoreKit", "In-App Purchase", "Testing"]
+thumbnail: "/images/sessions/2022/10039.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10039/"
+sessionId: "wwdc2022-10039"
+year: "2022"
+relatedSessions:
+  - title: "What's new with in-app purchase"
+    code: "10007"
+    description: "介绍 StoreKit 2、App Transaction、StoreKit Messages 和 App Store Server API 的年度更新。"
+  - title: "Explore in-app purchase integration and migration"
+    code: "10040"
+    description: "讲解 App Store Server API 与 App Store Server Notifications V2 的迁移路径。"
+  - title: "Implement proactive in-app purchase restore"
+    code: "110404"
+    description: "讲解如何在 App 启动时主动恢复用户已有的内购权益。"
+  - title: "What's new with SKAdNetwork"
+    code: "10038"
+    description: "介绍 SKAdNetwork 更新，并被本场作为 StoreKitTest 测试 SKAdNetwork 的延伸资料。"
+---
+
+## Highlight
+
+> Xcode 14 让 StoreKit 测试覆盖 App Store Connect 同步配置、SwiftUI 预览、退款、优惠码、价格上涨、计费重试和 Sandbox 计费失败模拟。
+
+---
+
+## 核心内容
+
+Food Truck 已经接入了 StoreKit：年度销售历史是一次性内购，Social Feed+ 是订阅。开发者真正麻烦的地方不在购买按钮本身，而在测试生命周期。产品元数据要在 App Store Connect、Xcode、本地单元测试和 Sandbox 之间保持一致；订阅还会遇到退款、优惠码、价格上涨、计费失败这些边界状态。
+
+Xcode 14 先解决配置问题。StoreKit Configuration File 可以从 App Store Connect 同步产品和订阅元数据。同步文件是只读的，需要修改时回到 App Store Connect，再在 Xcode 里按同步按钮。需要临时实验时，可以把同步文件转换成本地可编辑文件，但转换是单向操作。
+
+接下来是调试体验。StoreKit 配置文件中的产品可以直接进入 SwiftUI Preview，商店界面不用跑到设备上才看得到真实标题和描述。Transaction Manager 新增 Transaction Inspector 和过滤能力，可以查看订阅过期时间、后续续订、订阅组、优惠等状态，也能按产品 ID 或购买日期缩小交易列表。
+
+这场 session 的后半段是订阅边界状态。退款会让 `Transaction.updates` 发出带撤销信息的新交易；优惠码会同时影响当前交易和下一次续订；价格上涨可以用 Transaction Manager 或 `SKTestSession` 触发；计费重试和宽限期可以在 Xcode、单元测试和 Sandbox 中模拟。目标很明确：在发布前把订阅失败路径跑完。
+
+---
+
+## 详细内容
+
+### 同步 App Store Connect 产品，并在 SwiftUI Preview 中使用
+
+（[01:30](https://developer.apple.com/videos/play/wwdc2022/10039/?time=90)）Xcode 14 可以把 App Store Connect 中已经配置的内购产品同步到 StoreKit Configuration File。这样，同一份产品和订阅元数据可以用于 Xcode 本地测试、单元测试、Sandbox 和最终上线配置。
+
+（[06:58](https://developer.apple.com/videos/play/wwdc2022/10039/?time=418)）同步后的 StoreKit 配置还会进入 SwiftUI Preview。session 用 Social Feed+ 的产品描述举例：在 App Store Connect 修改标题或描述，同步到 Xcode 后，预览界面立刻使用真实产品数据。
+
+```
+VStack(alignment: .leading) {
+    Text(subscription.displayName)
+        .font(.headline.weight(.semibold))
+    Text(subscription.description)
+}
+```
+
+关键点：
+
+- `VStack(alignment: .leading)` 把订阅名称和描述按左对齐竖排展示。
+- `Text(subscription.displayName)` 使用 StoreKit 产品的本地化显示名，数据来自配置文件。
+- `.font(.headline.weight(.semibold))` 让产品名称在商店界面中更突出。
+- `Text(subscription.description)` 读取产品的本地化描述。演示中，这个描述来自 App Store Connect 同步后的 StoreKit 配置。
+
+这段代码很短，重点在数据来源。StoreKit 配置接入预览后，商店 UI 的排版、文案长度和本地化效果可以在 Canvas 里直接检查。
+
+### 用退款请求和交易撤销信息测试售后路径
+
+（[11:18](https://developer.apple.com/videos/play/wwdc2022/10039/?time=678)）退款入口用 `refundRequestSheet` 挂在 SwiftUI 视图上。测试 Xcode 环境时，用户选择的退款原因会一一对应 StoreKit API 的 `RevocationReason`。在 Xcode 或 Sandbox 中，退款会立即生效。
+
+```swift
+struct RefundView: View {
+    @State private var selectedTransactionID: UInt64?
+    @State private var refundSheetIsPresented = false
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        Button {
+            refundSheetIsPresented = true
+        } label: {
+            Text("Request a refund")
+                .bold()
+                .padding(.vertical, 5)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .padding([.horizontal, .bottom])
+        .disabled(selectedTransactionID == nil)
+        .refundRequestSheet(
+            for: selectedTransactionID ?? 0,
+            isPresented: $refundSheetIsPresented
+        ) { result in
+            if case .success(.success) = result {
+                dismiss()
+            }
+        }
+    }
+}
+```
+
+关键点：
+
+- `selectedTransactionID` 保存要退款的交易 ID；没有选中交易时按钮不可用。
+- `refundSheetIsPresented` 控制系统退款表单是否展示。
+- `Button` 被点击后把 `refundSheetIsPresented` 设为 `true`，触发退款表单。
+- `.disabled(selectedTransactionID == nil)` 防止传入无效交易。
+- `.refundRequestSheet(for:isPresented:)` 把交易 ID 和展示状态传给 StoreKit。
+- 回调中匹配 `.success(.success)` 后调用 `dismiss()`，表示退款请求已成功提交。
+
+（[12:33](https://developer.apple.com/videos/play/wwdc2022/10039/?time=753)）退款完成后，`Transaction.updates` 会发出更新。App 应读取 `revocationDate` 和 `revocationReason`，再撤销对应权益。
+
+```
+for await update in Transaction.updates {
+    let transaction = try update.payloadValue
+  
+    if let revocationDate = transaction.revocationDate,
+       let revocationReason = transaction.revocationReason {
+        print("\(transaction.productID) revoked on \(revocationDate)")
+       
+        switch revocationReason {
+        case .developerIssue: <#Handle developer issue#>
+        case .other: <#Handle other issue#>
+        default: <#Handle unknown reason#>
+        }
+        
+        <#Revoke access to the product#>
+    }
+    <#...#>
+}
+```
+
+关键点：
+
+- `for await update in Transaction.updates` 持续监听交易更新。
+- `try update.payloadValue` 取得验证后的交易载荷。
+- `revocationDate` 存在时，说明这笔交易已被撤销。
+- `revocationReason` 区分开发者问题、其他原因和未知原因。
+- 处理完原因后，App 要撤销产品访问权，避免退款后仍保留权益。
+
+### 测试优惠码当前状态和后续续订状态
+
+（[14:21](https://developer.apple.com/videos/play/wwdc2022/10039/?time=861)）优惠码测试先在本地 StoreKit 配置文件中添加 offer code，再在 App 里用 `offerCodeRedeemSheet` 展示兑换表单。Xcode 环境会列出配置文件中的所有优惠，不需要输入 App Store Connect 生成的真实码。
+
+```swift
+struct SubscriptionPurchaseView: View {
+    @State private var redeemSheetIsPresented = false
+        
+    var body: some View {
+        Button("Redeem an offer") {
+            redeemSheetIsPresented = true
+        }
+        .buttonStyle(.borderless)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical)
+        .offerCodeRedeemSheet(isPresented: $redeemSheetIsPresented)
+    }
+
+}
+```
+
+关键点：
+
+- `redeemSheetIsPresented` 保存兑换表单的展示状态。
+- `Button("Redeem an offer")` 是用户主动打开优惠码兑换入口。
+- 点击按钮后把绑定值设为 `true`。
+- `.offerCodeRedeemSheet(isPresented:)` 让 StoreKit 展示系统兑换表单。
+
+（[16:23](https://developer.apple.com/videos/play/wwdc2022/10039/?time=983)）优惠码兑换完成后，`Transaction.updates` 和 `Product.SubscriptionInfo.Status.updates` 都会产生新值。当前交易看 `transaction.offerType`，下一次续订看 `renewalInfo.offerType` 和 `offerID`。
+
+```
+for await status in Product.SubscriptionInfo.Status.updates {
+    let transaction = try status.transaction.payloadValue
+    let renewalInfo = try status.renewalInfo.payloadValue
+    
+    if let currentOfferType = transaction.offerType {
+        switch currentType {
+        case .introductory: <#Handle introductory offer#>
+        case .promotional:  <#Handle promotional offer#>
+        case .code:         <#Handle offer for codes#>
+        default:            <#Handle unknown offer type#>
+        }
+        self.hasCurrentOffer = true
+    }
+
+    if let nextOfferType = renewalInfo.offerType {
+        switch currentType {
+        case .introductory: <#Handle introductory offer#>
+        case .promotional: <#Handle promotional offer#>
+        case .code:
+            print("Customer has \(renewalInfo.offerID) queued")
+            <#Handle offer for codes#>
+        default: <#Handle unknown offer type#>
+        }
+        self.hasQueuedOffer = true
+    }
+}
+```
+
+关键点：
+
+- `Product.SubscriptionInfo.Status.updates` 用来监听订阅状态变化。
+- `status.transaction.payloadValue` 表示当前订阅交易。
+- `status.renewalInfo.payloadValue` 表示续订信息。
+- `transaction.offerType` 反映当前交易使用的优惠类型。
+- `renewalInfo.offerType` 反映下一次续订将使用的优惠类型。
+- `renewalInfo.offerID` 可在 code 类型优惠中取到配置的优惠引用名。
+- `hasCurrentOffer` 和 `hasQueuedOffer` 分别记录当前优惠和排队中的后续优惠。
+
+### 控制价格上涨提示，并写单元测试
+
+（[18:45](https://developer.apple.com/videos/play/wwdc2022/10039/?time=1125)）价格上涨提示会自动出现，但 App 可以通过 StoreKit Messages API 控制展示时机。Food Truck 的例子会在敏感视图出现时暂存 message，等用户退出编辑流程后再展示。
+
+```swift
+private var pendingMessages: [Message] = []
+
+private func updatesLoop() {
+    for await message in Message.messages {
+      if <#Check if sensitive view is presented#>,
+         let display: DisplayMessageAction = <#Get display message action#> {
+           try? display(message)
+      }
+      else {
+        pendingMessages.append(message)
+      }
+    }
+}
+```
+
+关键点：
+
+- `pendingMessages` 保存暂时不适合展示的 StoreKit 消息。
+- `Message.messages` 是异步消息序列，价格上涨提示会从这里到达。
+- 条件分支用于检查当前是否适合弹出系统消息。
+- `DisplayMessageAction` 负责真正展示消息。
+- 不适合展示时，把 `message` 放入队列，稍后再处理。
+
+（[20:53](https://developer.apple.com/videos/play/wwdc2022/10039/?time=1253)）用户同意或拒绝价格上涨后，订阅状态会通过 `Product.SubscriptionInfo.Status.updates` 更新。App 可以看 `priceIncreaseStatus` 和 `expirationReason`。
+
+```
+for await status in Product.SubscriptionInfo.Status.updates {
+    let renewalInfo = try status.renewalInfo.payloadValue
+
+    if renewalInfo.priceIncreaseStatus == .agreed {
+        print("Customer consented to price increase")
+        <#Handle consented to price increase#>
+    }
+    if renewalInfo.expirationReason == .didNotConsentToPriceIncrease {
+        print("Customer did not consent to price increase")
+        <#Handle expired due to not consenting to price increase#>
+    }
+
+    <#...#>
+
+}
+```
+
+关键点：
+
+- `renewalInfo.priceIncreaseStatus == .agreed` 表示用户已同意涨价。
+- `renewalInfo.expirationReason == .didNotConsentToPriceIncrease` 表示订阅因未同意涨价而过期。
+- 这两个判断覆盖了涨价流程的关键结果：继续订阅或失去订阅。
+
+（[21:19](https://developer.apple.com/videos/play/wwdc2022/10039/?time=1279)）单元测试可以用 `SKTestSession` 直接触发价格上涨流程，并禁用系统弹窗。
+
+```
+let session: SKTestSession = try SKTestSession(configurationFileNamed: "<#Configuration name#>")
+session.disableDialogs = true
+
+<#Purchase a subscription#>
+
+var transaction: SKTestTransaction! = session.allTransactions().first
+session.requestPriceIncreaseConsentForTransaction(identifier: transaction.identifier)
+
+transaction = session.allTransactions().first
+XCTAssertTrue(transaction.isPendingPriceIncreaseConsent)
+
+<#Assert app updates for pending price increase#>
+
+session.consentToPriceIncreaseForTransaction(identifier: transaction.identifier)
+
+// OR
+
+session.declinePriceIncreaseForTransaction(identifier: transaction.identifier)
+session.expireSubscription(productIdentifier: "<#Product ID#>")
+
+<#Assert app updates for finished price increase#>
+```
+
+关键点：
+
+- `SKTestSession(configurationFileNamed:)` 用 StoreKit 配置文件创建测试会话。
+- `session.disableDialogs = true` 让测试不被系统 UI 阻塞。
+- `session.requestPriceIncreaseConsentForTransaction` 把交易推入待同意涨价状态。
+- `XCTAssertTrue(transaction.isPendingPriceIncreaseConsent)` 验证状态已进入待处理。
+- `consentToPriceIncreaseForTransaction` 模拟用户同意。
+- `declinePriceIncreaseForTransaction` 加 `expireSubscription` 模拟用户拒绝后订阅过期。
+
+### 覆盖计费重试、宽限期和 Sandbox 计费失败
+
+（[24:57](https://developer.apple.com/videos/play/wwdc2022/10039/?time=1497)）订阅续订失败后，App 可能先进入宽限期，再进入计费重试。StoreKit 会在状态变化时发出更新。Food Truck 在宽限期内继续放行 Social Feed+，计费重试时引导用户更新付款方式。
+
+```
+for await status in Product.SubscriptionInfo.Status.updates {
+    let renewalInfo = try status.renewalInfo.payloadValue
+
+    if let gracePeriodExpirationDate = renewalInfo.gracePeriodExpirationDate,
+       gracePeriodExpirationDate < .now {
+        print("In grace period until \(gracePeriodExpirationDate)")
+        <#Allow access to subscription#>
+    }
+    else if renewalInfo.isInBillingRetry {
+        <#Handle billing retry#>
+    }
+
+    <#...#>
+
+}
+```
+
+关键点：
+
+- `renewalInfo.gracePeriodExpirationDate` 表示宽限期结束时间。
+- 有宽限期时，session 明确要求继续给订阅内容访问权。
+- `renewalInfo.isInBillingRetry` 用来识别计费重试状态。
+- 计费重试时，App 应提示用户修复付款问题。
+
+（[25:27](https://developer.apple.com/videos/play/wwdc2022/10039/?time=1527)）界面层可以直接看 `status.state`，并打开 App Store 账单页面。
+
+```swift
+struct SubscriptionStatusView: View {
+    let currentSubscription: Product
+    let status: Product.SubscriptionInfo.Status
+    @Environment(\.openURL) var openURL
+    var body: some View {
+        Section("Your Subscription") {
+            <#...#>
+            if status.state == .inBillingRetryPeriod || status.state == .inGracePeriod {
+                VStack {
+                    Text("""
+                    There was a problem renewing your subscription. Open the App Store to
+                    update your payment information.
+                    """)
+                    Button("Open the App Store") {
+                        openURL(URL(string: "https://apps.apple.com/account/billing")!)
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+关键点：
+
+- `status.state` 把订阅状态归纳为可直接用于 UI 的枚举值。
+- `.inBillingRetryPeriod` 和 `.inGracePeriod` 都需要显示付款问题提示。
+- `openURL` 打开 App Store 账单深链。
+- `https://apps.apple.com/account/billing` 是 session 示例中的付款信息入口。
+
+（[25:50](https://developer.apple.com/videos/play/wwdc2022/10039/?time=1550)）单元测试里，`SKTestSession` 可以开启宽限期和计费重试，再用 `resolveIssueForTransaction` 模拟 App Store 恢复订阅。
+
+```
+let session: SKTestSession = try SKTestSession(configurationFileNamed: "<#Configuration name#>")
+session.billingGracePeriodIsEnabled = true
+session.shouldEnterBillingRetryOnRenewal = true
+
+<#Purchase a subscription#>
+
+wait(for: [<#XCTExpectation#>], timeout: 60)
+
+let transaction: SKTestTransaction! = session.allTransactions().first
+XCTAssertTrue(transaction.hasPurchaseIssue)
+
+<#Assert app still allows access to subscription due to grace period#>
+
+wait(for: [<#XCTExpectation#>], timeout: 60)
+
+<#Assert app detects billing retry and no longer allows access to subscription#>
+
+session.resolveIssueForTransaction(identifier: transaction.identifier)
+
+<#Assert app allows access to subscription#>
+```
+
+关键点：
+
+- `billingGracePeriodIsEnabled` 打开测试会话中的宽限期。
+- `shouldEnterBillingRetryOnRenewal` 让续订进入计费失败路径。
+- `transaction.hasPurchaseIssue` 验证交易处在购买问题状态。
+- 第一次断言检查宽限期内仍然允许访问订阅。
+- 第二次断言检查宽限期结束后 App 识别计费重试。
+- `resolveIssueForTransaction` 模拟付款问题被修复。
+
+（[27:55](https://developer.apple.com/videos/play/wwdc2022/10039/?time=1675)）Sandbox 也新增了计费失败模拟。Sandbox tester 创建表单减少了字段，邮箱支持加号，密码有复杂度提示。之后，App Store Connect API 会支持查询 Sandbox Apple ID、清空购买历史、设置 interrupted purchase state。Sandbox Account Settings 中的 billing failure simulation 可以让前台购买失败，并让自动续订订阅进入与生产一致的计费失败状态。服务端可以用 `verifyReceipt`、App Store Server API 和 App Store Server Notifications V2 验证这些状态。
+
+---
+
+## 核心启发
+
+- **做一套订阅边界状态测试面板**：把退款、优惠码、价格上涨、计费重试和宽限期列成测试清单。为什么值得做：这些状态都能在 Xcode 或 Sandbox 中模拟，适合发布前人工验收。怎么开始：用 StoreKit Configuration File 配好订阅，配合 Transaction Manager 的 Inspector 和过滤器逐项验证。
+
+- **为退款后的权益撤销写回归测试**：退款成功后确认 App 立刻移除对应功能。为什么值得做：退款会通过 `Transaction.updates` 发出带 `revocationDate` 的交易，代码路径清晰。怎么开始：监听 `Transaction.updates`，在检测到 `revocationReason` 后撤销产品访问权。
+
+- **在商店页中展示当前优惠和排队优惠**：让订阅用户知道当前享受的优惠，以及下一次续订将应用什么优惠。为什么值得做：session 展示了当前交易和 `renewalInfo` 都能提供 `offerType`。怎么开始：订阅 `Product.SubscriptionInfo.Status.updates`，分别读取 `transaction.offerType`、`renewalInfo.offerType` 和 `renewalInfo.offerID`。
+
+- **延后展示价格上涨消息**：在编辑器、支付确认页或其他敏感流程中暂存 StoreKit message。为什么值得做：价格上涨提示可能多次出现，Xcode 可以反复触发来验证时机。怎么开始：监听 `Message.messages`，拿到 `DisplayMessageAction` 后根据当前界面决定展示或放入 `pendingMessages`。
+
+- **给计费失败用户提供修复入口**：在宽限期内保留访问，在计费重试时提示用户更新付款信息。为什么值得做：session 明确说明 Grace Period 能减少非自愿流失。怎么开始：检查 `Product.SubscriptionInfo.Status.state` 是否为 `.inGracePeriod` 或 `.inBillingRetryPeriod`，并用 `openURL` 打开 App Store 账单页面。
+
+---
+
+## 关联 Session
+
+- [What's new with in-app purchase](/articles/wwdc2022-10007) — 先看 StoreKit 2、App Transaction、Messages API 与服务端 API 的年度更新，再回到本场做测试覆盖。
+- [Explore in-app purchase integration and migration](/articles/wwdc2022-10040) — 本场介绍 Sandbox 中 V2 Notifications 和 App Store Server API 验证状态，迁移细节由这场展开。
+- [Implement proactive in-app purchase restore](/articles/wwdc2022-110404) — 订阅状态测试完成后，可以继续学习如何在 App 启动时主动恢复和判断用户权益。
+- [What's new with SKAdNetwork](/articles/wwdc2022-10038) — 本场提到 StoreKitTest 可用于 SKAdNetwork 单元测试，这场补充广告归因测试背景。

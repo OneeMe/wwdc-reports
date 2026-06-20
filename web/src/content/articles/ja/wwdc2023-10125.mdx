@@ -1,0 +1,305 @@
+---
+title: "Bring your game to Mac, Part 3: Render with Metal"
+description: "Discover how you can support Metal in your rendering code as we close out our three-part series on bringing your game to Mac. Once you've evaluated your existing Windows binary with the Game Porting Toolkit and brought your HLSL shaders over to Metal, learn how you can optimally implement the features that high-end, modern games require. We'll show you how to manage GPU resource bindings, residency, and synchronization. Find out how to optimize GPU commands submission, render rich visuals with MetalFX upscaling, and more."
+date: "2023-06-06"
+tags: ["Metal", "Rendering", "MetalFX"]
+thumbnail: "/images/sessions/2023/10125.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10125/"
+sessionId: "wwdc2023-10125"
+year: "2023"
+relatedSessions:
+  - title: "Bring your game to Mac, Part 1: Make a game plan"
+    code: "10123"
+    description: "用 Game Porting Toolkit 评估 Windows 游戏在 Mac 上的可行性"
+  - title: "Bring your game to Mac, Part 2: Compile your shaders"
+    code: "10124"
+    description: "使用 Metal Shader Converter 将 HLSL 着色器转换为 Metal"
+  - title: "Optimize GPU renderers with Metal"
+    code: "10127"
+    description: "使用 Metal 最新特性优化 GPU 渲染器"
+---
+
+## Highlight
+
+> 这是将游戏移植到 Mac 三部曲的收官篇，讲解如何把渲染器移植到 Metal，涵盖资源绑定与驻留、命令提交优化、间接渲染和 MetalFX 超分辨率四个核心主题。
+
+## 核心内容
+
+### 从 Root Signature 到 Argument Buffer
+
+Direct3D 使用 Root Signature 描述资源绑定。一个典型的 Root Signature 有四个条目：纹理描述符表、缓冲区参数、32 位常量、采样器描述符表。
+
+Metal 的 Argument Buffer 更灵活，支持混合类型元素。但如果引擎期望同质数组，也很容易编码。
+
+**编码纹理描述符表**：
+
+```objc
+// 在渲染循环之外创建纹理表
+id<MTLBuffer> textureTable = [device newBufferWithLength:sizeof(MTLResourceID) * texturesCount
+                                                 options:MTLResourceStorageModeShared];
+
+MTLResourceID* textureTableCPUPtr = (MTLResourceID*)textureTable.contents;
+for (uint32_t i = 0; i < texturesCount; ++i) {
+    // 创建纹理
+    id<MTLTexture> texture = [device newTextureWithDescriptor:textureDesc[i]];
+    // 把纹理的 GPU 资源 ID 存入表
+    textureTableCPUPtr[i] = texture.gpuResourceID;
+}
+```
+
+**关键点**：
+- `MTLResourceID` 是 Metal 3 引入的资源标识符
+- 纹理表在初始化阶段创建，不在渲染循环中
+- `gpuResourceID` 直接获取纹理的 GPU 端标识
+
+（[03:55](https://developer.apple.com/videos/play/wwdc2023/10125/?time=235)）
+
+**编码采样器描述符表**：
+
+```objc
+id<MTLBuffer> samplerTable = [device newBufferWithLength:sizeof(MTLResourceID) * samplersCount
+                                                 options:MTLResourceStorageModeShared];
+
+MTLResourceID* samplerTableCPUPtr = (MTLResourceID*)samplerTable.contents;
+for (uint32_t i = 0; i < samplersCount; ++i) {
+    MTLSamplerDescriptor* desc = [MTLSamplerDescriptor new];
+    desc.supportArgumentBuffers = YES;  // 必须设置
+    // ... 配置其他采样器属性
+
+    id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:desc];
+    samplerTableCPUPtr[i] = sampler.gpuResourceID;
+}
+```
+
+**关键点**：
+- `supportArgumentBuffers = YES` 是采样器能放入 Argument Buffer 的前提
+- 和纹理表一样，采样器表也在初始化阶段创建
+
+（[04:33](https://developer.apple.com/videos/play/wwdc2023/10125/?time=273)）
+
+**编码顶层 Argument Buffer**：
+
+```objc
+struct TopLevelAB {
+    MTLResourceID* textureTable;
+    float*         myBuffer;
+    uint32_t       myConstant;
+    MTLResourceID* samplerTable;
+};
+
+id<MTLBuffer> topAB = [device newBufferWithLength:sizeof(TopLevelAB)
+                                          options:MTLResourceStorageModeShared];
+
+TopLevelAB* topABCPUPtr = (TopLevelAB*)topAB.contents;
+topABCPUPtr->textureTable = (MTLResourceID*)textureTable.gpuAddress;
+topABCPUPtr->myBuffer     = (float*)myBuffer.gpuAddress;
+topABCPUPtr->myConstant   = 128;
+topABCPUPtr->samplerTable = (MTLResourceID*)samplerTable.gpuAddress;
+```
+
+**关键点**：
+- 顶层结构对应 Root Signature 的四个条目
+- `gpuAddress` 获取子表的 GPU 地址
+- 渲染循环中只需绑定这个顶层 buffer：`[encoder setVertexBuffer:topAB offset:0 atIndex:0]`
+
+（[05:05](https://developer.apple.com/videos/play/wwdc2023/10125/?time=305)）
+
+### 资源驻留管理
+
+Bindless 资源需要显式管理驻留。核心建议：
+
+**只读资源**：归入大 Heap，每个编码器调用一次 `useHeap`。
+
+```objc
+// 创建 Heap
+MTLHeapDescriptor* heapDesc = [MTLHeapDescriptor new];
+heapDesc.size = requiredSize;
+heapDesc.type = MTLHeapTypeAutomatic;
+id<MTLHeap> heap = [device newHeapWithDescriptor:heapDesc];
+
+// 从 Heap 分配纹理和缓冲区
+id<MTLTexture> texture = [heap newTextureWithDescriptor:desc];
+id<MTLBuffer> buffer = [heap newBufferWithLength:length options:options];
+
+// 渲染时一次性标记整个 Heap 驻留
+[encoder useHeap:heap];
+```
+
+**关键点**：
+- Heap 的 hazard tracking mode 设为 Untracked
+- 所有只读资源从一个 Heap 分配
+- 每个编码器只需一次 `useHeap` 调用
+
+（[06:49](https://developer.apple.com/videos/play/wwdc2023/10125/?time=409)）
+
+**可写资源**：单独分配，用 `useResource` 指定使用标志，让 Metal 处理同步。
+
+```objc
+// 单独分配可写资源
+id<MTLTexture> textureRW = [device newTextureWithDescriptor:desc];
+id<MTLBuffer> bufferRW = [device newBufferWithLength:length options:options];
+
+// 标记资源驻留，指定读写标志
+[encoder useResource:textureRW usage:MTLResourceUsageWrite stages:stage];
+[encoder useResource:bufferRW usage:MTLResourceUsageRead stages:stage];
+```
+
+**关键点**：
+- 可写资源不要放入 Heap
+- 用 `useResource` 明确指定读写意图
+- Metal 自动处理跨编码器的 hazard tracking 和同步
+
+（[07:34](https://developer.apple.com/videos/play/wwdc2023/10125/?time=454)）
+
+### 命令提交优化
+
+Apple GPU 是 TBDR（Tile-Based Deferred Renderer）架构，有统一内存和片上 Tile Memory。Metal 使用 Pass 概念，需要把命令按类型分组。
+
+优化前的问题序列：清除 → 绘制 → 复制 → 计算 → 绘制。这个序列在 Tile Memory 和系统内存之间有 5 次往返。
+
+优化步骤：
+
+1. **把复制操作移到渲染开始前**
+2. **按类型分组命令**：把绘制命令放在一起，计算命令放在一起
+3. **合并共享相同渲染目标的 Pass**
+4. **用 LoadActionClear 代替空编码器清除**
+5. **优化 Store Action**：只在需要时存储渲染目标内容
+
+优化后只剩 1 次最终 flush，内存带宽大幅降低。
+
+（[10:53](https://developer.apple.com/videos/play/wwdc2023/10125/?time=653)）
+
+### Metal Debugger 自动发现优化机会
+
+Xcode 的 Metal Debugger 在 Summary viewer 的 Insights 部分列出优化建议，分四类：Memory、Bandwidth、Performance、API Usage。
+
+示例：GBuffer Pass 存储了比需要更多的 attachment。Albedo 纹理在后续帧中不再使用，Store 操作是冗余的。修复方式是把 store action 设为 DontCare。
+
+另一个示例：GBuffer 和 Forward 两个 Pass 可以合并，因为它们读写相同的 attachment。合并后节省带宽。
+
+Dependencies viewer 可以查看 Pass 之间的数据流，确认 load/store action 和合并机会。
+
+（[15:06](https://developer.apple.com/videos/play/wwdc2023/10125/?time=906)）
+
+## 详细内容
+
+### 间接渲染
+
+ExecuteIndirect 把多个绘制命令的参数存入缓冲区，GPU 从缓冲区读取参数执行绘制。这让 GPU 可以决定渲染什么，是实现 GPU 驱动渲染循环的关键。
+
+Metal 有两种翻译方式：
+
+**方式一：Draw Indirect**
+
+```objc
+// 把 ExecuteIndirect 翻译成一系列 drawIndexedPrimitives 调用
+uint32_t drawArgumentsBufferOffset = 0;
+for (uint32_t i = 0; i < maxDrawCount; ++i) {
+    [renderEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                              indexType:MTLIndexTypeUInt16
+                            indexBuffer:indexBuffer
+                      indexBufferOffset:indexBufferOffset
+                         indirectBuffer:drawArgumentsBuffer
+                   indirectBufferOffset:drawArgumentsBufferOffset];
+
+    drawArgumentsBufferOffset += sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
+}
+```
+
+**关键点**：
+- 每个绘制命令单独编码
+- 通过偏移量读取不同的间接参数
+- 实现简单，适用于大多数场景
+
+（[19:31](https://developer.apple.com/videos/play/wwdc2023/10125/?time=1171)）
+
+**方式二：Indirect Command Buffer（ICB）**
+
+当场景有数千个绘制命令且 CPU 编码时间是瓶颈时，用 ICB。ICB 在 GPU 上编码命令，包括设置管线状态和缓冲区绑定。
+
+```metal
+// 计算内核：把间接绘制参数翻译成 ICB 命令
+kernel void translateToICB(device const Command* indirectCommands [[buffer(0)]],
+                           device const ICBContainerAB* icb [[buffer(1)]],
+                           ...)
+{
+    device const Command* indirectCommand = &indirectCommands[commandIndex];
+    device const MTLDrawIndexedPrimitivesIndirectArguments* args =
+        &command->mdiBuffer[mdiIndex];
+
+    render_command drawCall(icb->buffer, indirectCommand->mdiCmdStart + mdiIndex);
+
+    if (args->indexCount > 0 && args->instanceCount > 0) {
+        encodeCommand(indirectCommand, args, drawCall);
+    } else {
+        cmd.reset();
+    }
+}
+
+void encodeCommand(device const Command* indirectCommand,
+                   device const MTLDrawIndexedPrimitivesIndirectArguments* args,
+                   thread render_command& drawCall)
+{
+    drawCall.set_render_pipeline_state(indirectCommand->pso);
+
+    for (ushort i = 0; i < indirectCommand->vertexBuffersCount; ++i) {
+        drawCall.set_vertex_buffer(indirectCommand->vertexBuffer[i].buffer,
+                                   indirectCommand->vertexBuffer[i].slot);
+    }
+
+    drawCall.draw_indexed_primitives(primitive_type::triangle,
+                                     args->indexCount,
+                                     indirectCommand->indexBuffer + args->indexStart,
+                                     args->instanceCount,
+                                     args->baseVertex,
+                                     args->baseInstance);
+}
+```
+
+**关键点**：
+- ICB 命令在 GPU 上编码，减少 CPU 开销
+- 不需要为每个状态变化拆分间接执行命令
+- 可以复用现有的间接参数生成着色器
+
+（[21:48](https://developer.apple.com/videos/play/wwdc2023/10125/?time=1308)）
+
+### MetalFX 超分辨率
+
+MetalFX 让游戏以较低分辨率渲染，然后超采样到目标分辨率，节省每帧 GPU 时间。
+
+MetalFX 支持两种算法：
+- **Spatial**：性能最优
+- **Temporal**：质量接近原生分辨率渲染
+
+今年新增：iOS 支持、最高 3 倍超采样、Metal-cpp 支持。
+
+集成 MetalFX 需要：
+1. 引擎支持超分辨率
+2. 渲染器手动控制纹理采样的细节层级
+3. Temporal 超采样需要抖动序列和运动向量（如果已有 TAA 则已具备）
+
+（[22:54](https://developer.apple.com/videos/play/wwdc2023/10125/?time=1374)）
+
+## 核心启发
+
+- **做什么**：用 Argument Buffer 移植现有的 Root Signature 绑定模型
+  - **为什么值得做**：Metal 3 的 Argument Buffer 性能更高，且可以完整映射 Direct3D 的 descriptor table 概念
+  - **怎么开始**：在初始化阶段编码纹理表和采样器表，渲染循环只绑定顶层 Argument Buffer
+
+- **做什么**：用 Metal Debugger 的 Insights 功能自动发现带宽优化机会
+  - **为什么值得做**：可以直观看到哪些 Pass 可以合并、哪些 Store 操作是冗余的
+  - **怎么开始**：在 Xcode 中捕获 Metal workload，查看 Summary viewer 的 Insights 部分
+
+- **做什么**：在 CPU 编码瓶颈场景下使用 Indirect Command Buffer
+  - **为什么值得做**：把命令编码从 CPU 移到 GPU，大幅减少 CPU 开销
+  - **怎么开始**：添加一个计算内核把间接绘制参数翻译成 ICB 命令，然后用 `executeCommandsInBuffer` 执行
+
+- **做什么**：集成 MetalFX Upscaling 提升帧率
+  - **为什么值得做**：以较低分辨率渲染再超采样，在 Apple Silicon 上获得显著性能提升
+  - **怎么开始**：确认引擎支持超分辨率和手动 LOD 控制，选择 Spatial 或 Temporal 算法
+
+## 关联 Session
+
+- [Bring your game to Mac, Part 1: Make a game plan](/articles/wwdc2023-10123) — 用 Game Porting Toolkit 评估 Windows 游戏在 Mac 上的可行性
+- [Bring your game to Mac, Part 2: Compile your shaders](/articles/wwdc2023-10124) — 使用 Metal Shader Converter 将 HLSL 着色器转换为 Metal
+- [Optimize GPU renderers with Metal](/articles/wwdc2023-10127) — 使用 Metal 最新特性优化 GPU 渲染器

@@ -1,0 +1,181 @@
+---
+title: "Mix Swift and C++"
+description: "Learn how you can use Swift in your C++ and Objective-C++ projects to make your code safer, faster, and easier to develop. We'll show you how to use C++ and Swift APIs to incrementally incorporate Swift into your app."
+date: "2023-06-06"
+tags: ["Swift", "C++", "Developer Tools"]
+thumbnail: "/images/sessions/2023/10172.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10172/"
+sessionId: "wwdc2023-10172"
+year: "2023"
+relatedSessions:
+  - title: "What's new in Swift"
+    code: "112"
+    description: "Swift 5.9 新特性总览"
+  - title: "Write Swift macros"
+    code: "114"
+    description: "Swift 宏系统"
+  - title: "What's new in Xcode 15"
+    code: "116"
+    description: "Xcode 15 新功能"
+  - title: "Meet SwiftData"
+    code: "105"
+    description: "Swift 数据持久化框架"
+---
+
+## Highlight
+
+> Xcode 15 起，Swift 与 C++ 实现双向互调用，无需 Objective-C 桥接层，也没有运行时开销。
+
+## 核心内容
+
+你维护着一个大型 C++ 代码库，图像处理引擎、物理模拟器、音频解码器——核心业务逻辑全用 C++ 写。UI 层原本是 Objective-C++，每次想引入 SwiftUI 的新组件，都要先写一堆胶水代码。
+
+WWDC23 之后，这种情况改变了。
+
+Swift 5.9 引入 C++ 互操作性（C++ Interoperability）。你可以在 C++ 代码库里直接写 Swift 文件，Swift 代码里直接调用 C++ API，反过来 C++ 也能调用 Swift API。编译器自动处理类型映射、内存管理、命名空间转换，不需要手写桥接头。
+
+（[02:21](https://developer.apple.com/videos/play/wwdc2023/10172/?time=141)）演讲者演示了一个照片编辑 App：图像处理框架用 C++，UI 用 Objective-C++。她想加入 SwiftUI 的 PhotoPicker，过去需要写 Objective-C 桥接层，现在直接在项目里新建 Swift 文件即可。
+
+### 双向调用的实际流程
+
+（[02:47](https://developer.apple.com/videos/play/wwdc2023/10172/?time=167)）第一步：在 Build Settings 里把 "Swift Compiler - Language" 的 "C and Objective-C Interoperability Mode" 从 "C and Objective-C" 改成 "C++ and Objective-C++"。
+
+（[03:16](https://developer.apple.com/videos/play/wwdc2023/10172/?time=196)）第二步：Swift 文件里 `import CxxImageKit`，C++ 框架的 API 就以 Swift 风格呈现。`CxxImageEngine::shared` 变成 `CxxImageEngine.shared`，`loadImage()` 直接调用。
+
+（[04:39](https://developer.apple.com/videos/play/wwdc2023/10172/?time=279)）第三步：C++ 代码里 `#import "SampleApp-Swift.h"`，Swift 的 `public struct ImagePicker` 就能在 C++ 里构造和使用，甚至能嵌入 SwiftUI 视图。
+
+所有集成由编译器自动完成，调用是直接的、原生的，没有额外的运行时开销。
+
+## 详细内容
+
+### 自动导入的 C++ 类型
+
+（[06:15](https://developer.apple.com/videos/play/wwdc2023/10172/?time=375)）Swift 编译器能自动导入大多数 C++ 集合类型，包括标准库的 `std::vector`、`std::map` 等。C++ 类型默认映射为 Swift 的 struct（值类型），运算符映射为对应的 Swift 运算符，容器自动遵循 Swift 的 `Collection` 协议。
+
+```swift
+// C++ 的 std::vector<Image*> 在 Swift 中可直接遍历
+for image in CxxImageEngine.shared.pointee.getImages() {
+    let uiImage = CxxImageEngine.shared.pointee.uiImageFrom(image)
+    UIImageWriteToSavedPhotosAlbum(uiImage, nil, nil, nil)
+}
+```
+
+关键点：
+- `getImages()` 返回 C++ `std::vector`，Swift 自动将其识别为可遍历集合
+- `for...in` 循环直接可用，因为 vector 有 `begin()` 和 `end()` 方法
+- 遍历时编译器保证安全性，避免 C++ 迭代器常见的生命周期问题
+
+### 用注解优化 API 导入
+
+（[07:44](https://developer.apple.com/videos/play/wwdc2023/10172/?time=464)）编译器自动导入的 API 有时不够"Swift 化"。通过 `swift/bridging` 头文件中的注解，可以精细控制导入行为。
+
+**SWIFT_SHARED_REFERENCE：将 C++ 类型映射为 Swift 类**
+
+（[08:22](https://developer.apple.com/videos/play/wwdc2023/10172/?time=502)）`CxxImageEngine` 在 C++ 中总是以指针使用，具有引用语义。默认导入为 Swift struct 时，每次访问都要写 `.pointee`，而且类型显示为 `UnsafePointer`。
+
+在 C++ 头文件中添加注解：
+
+```cpp
+#import <swift/bridging>
+
+struct SWIFT_SHARED_REFERENCE(IKRetain, IKRelease) CxxImageEngine {
+    static CxxImageEngine *shared;
+    void loadImage(UIImage *image);
+    std::vector<Image *> getImages() const;
+    UIImage *uiImageFrom(Image *image) const;
+};
+```
+
+关键点：
+- `SWIFT_SHARED_REFERENCE(retainFunc, releaseFunc)` 告诉 Swift 这是引用类型
+- Swift 自动管理生命周期，调用指定的 `IKRetain` 和 `IKRelease` 函数
+- 导入后 Swift 中直接使用 `CxxImageEngine.shared`，不再需要 `.pointee`
+
+**SWIFT_COMPUTED_PROPERTY：将 getter/setter 映射为计算属性**
+
+（[08:22](https://developer.apple.com/videos/play/wwdc2023/10172/?time=502)）C++ 中常见的 `getImages()` / `setImages()` 命名在 Swift 中不够自然。
+
+```cpp
+/// \returns all images that have been loaded into the engine.
+SWIFT_COMPUTED_PROPERTY
+inline std::vector<Image *_Nonnull> getImages() const;
+```
+
+关键点：
+- `SWIFT_COMPUTED_PROPERTY` 标注 getter 方法
+- Swift 中自动映射为 `images` 属性
+- 调用方式从 `engine.getImages()` 变为 `engine.images`
+
+更新后的 Swift 代码：
+
+```swift
+for image in CxxImageEngine.shared.images {
+    let uiImage = CxxImageEngine.shared.uiImageFrom(image)
+    UIImageWriteToSavedPhotosAlbum(uiImage, nil, nil, nil)
+}
+```
+
+### 其他常用注解
+
+（[08:42](https://developer.apple.com/videos/play/wwdc2023/10172/?time=522)）
+
+```cpp
+// 标注返回值是独立值，Swift 不会隐式保留引用
+SWIFT_RETURNS_INDEPENDENT_VALUE
+std::string_view networkName() const;
+```
+
+关键点：
+- `SWIFT_RETURNS_INDEPENDENT_VALUE` 用于返回临时值或视图类型的函数
+- 告诉 Swift 调用方需要独立持有返回值，避免悬垂引用
+
+### 从 C++ 调用 Swift
+
+（[04:45](https://developer.apple.com/videos/play/wwdc2023/10172/?time=285)）Swift 代码标记为 `public` 后，编译器生成头文件供 C++ 使用。
+
+```objc
+#import "SampleApp-Swift.h"
+
+- (IBAction)openPhotoLibrary:(UIButton *)sender {
+    // 构造 SwiftUI 视图并在 C++ 中调用
+    SampleApp::ImagePicker::init().present(self);
+}
+```
+
+关键点：
+- `#import "ProjectName-Swift.h"` 导入生成的头文件
+- Swift 的 `public struct` 在 C++ 中以命名空间形式暴露
+- 支持 SwiftUI 视图、方法调用、属性访问
+
+## 核心启发
+
+**1. 渐进式迁移 C++ 代码库到 Swift**
+
+- **做什么**：在现有 C++ 项目中逐步引入 Swift 模块，替换 UI 层或业务层
+- **为什么值得做**：无需重写核心 C++ 引擎，就能用上 SwiftUI、Swift Concurrency 等现代特性
+- **怎么开始**：新建 Swift 文件，Build Settings 开启 C++ Interoperability，直接 `import` C++ 框架
+
+**2. 封装 C++ 游戏引擎给 Swift 使用**
+
+- **做什么**：将 C++ 游戏/渲染引擎的核心接口用注解优化后暴露给 Swift
+- **为什么值得做**：游戏逻辑用 C++ 保证性能，UI 和关卡编辑器用 SwiftUI 快速开发
+- **怎么开始**：用 `SWIFT_SHARED_REFERENCE` 管理引擎单例生命周期，用 `SWIFT_COMPUTED_PROPERTY` 优化属性访问
+
+**3. 跨平台 C++ 库 + Swift 前端**
+
+- **做什么**：同一个 C++ 核心库，iOS 端用 SwiftUI，Android 端用 Kotlin
+- **为什么值得做**：C++ Interoperability 支持 Linux 和 Windows，核心代码完全复用
+- **怎么开始**：将 C++ 库编译为 framework，Swift 项目直接依赖，无需额外绑定层
+
+**4. 机器学习模型推理层优化**
+
+- **做什么**：Core ML 之外的自定义 C++ 推理代码（如 ONNX Runtime）通过 Swift 调用
+- **为什么值得做**：避免 Objective-C++ 桥接的复杂度，直接在 Swift 中管理输入输出张量
+- **怎么开始**：将 C++ 推理引擎封装为 framework，Swift 中处理图像/文本预处理，调用 C++ API 推理
+
+## 关联 Session
+
+- [What's new in Swift](/articles/wwdc2023-112) — Swift 5.9 新特性总览，包含 C++ 互操作性的完整上下文
+- [Write Swift macros](/articles/wwdc2023-114) — Swift 宏系统，与 Swift 5.9 语言改进配套
+- [What's new in Xcode 15](/articles/wwdc2023-116) — Xcode 15 中开启 C++ Interoperability 的完整设置流程
+- [Meet SwiftData](/articles/wwdc2023-105) — 如果迁移后的 Swift 层需要数据持久化，SwiftData 是原生方案

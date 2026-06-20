@@ -1,0 +1,203 @@
+---
+title: "Go small with Embedded Swift"
+description: "embedded swift brings the safety and expressivity of swift to constrained environments. explore how embedded swift runs on a variety of microcontrollers through a demonstration using an off-the-shelf "
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10197.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10197/"
+sessionId: "wwdc2024-10197"
+year: "2024"
+relatedSessions:
+  - title: "Consume noncopyable types in Swift"
+    code: "10170"
+    description: "get started with noncopyable types in swift. discover what copying means in swif"
+  - title: "Explore Swift performance"
+    code: "10217"
+    description: "discover how swift balances abstraction and performance. learn what elements of "
+  - title: "Explore the Swift on Server ecosystem"
+    code: "10216"
+    description: "swift is a great language for writing your server applications, and powers criti"
+  - title: "Analyze heap memory"
+    code: "10173"
+    description: "dive into the basis for your app"
+---
+
+## Highlight
+
+> Swift 已经覆盖了移动端、桌面端和服务器，今年 Apple 把它带到了嵌入式设备。我们身边的智能灯泡、温控器、传感器大多用 C/C++ 编写微控制器程序。Embedded Swift 让你用 Swift 来写这些程序，同时享受 Swift 的类型安全、可选值、闭包等语言特性。
+
+---
+
+## 核心内容
+
+写微控制器程序，一直意味着写 C 或 C++。智能灯泡、温控器、传感器——这些设备里跑的固件几乎全是 C 代码。C 能直接操作硬件寄存器，但类型安全弱、回调靠函数指针加无类型 context 参数，代码一复杂就容易出错。
+
+Apple 今年推出 Embedded Swift，一种专门面向资源受限嵌入式设备的编译模式。它保留了 Swift 的值类型、引用类型、闭包、可选值、错误处理、泛型等核心特性，同时去掉了需要运行时元数据的部分（反射、`any` 类型、元类型），使编译产物足够小，能在几十 KB 内存的微控制器上运行。Apple 自家的 Secure Enclave Processor 已经在用 Embedded Swift，内存安全在安全关键场景中的价值不言而喻。
+
+Embedded Swift 目前是实验性功能，未源码稳定，需要从 swift.org 下载预览工具链。支持 ARM 和 RISC-V 架构（32 位和 64 位），通过 bridging header 调用厂商 C SDK，通过 C++ 互操作使用 Matter 协议。
+
+## 详细内容
+
+### 入口函数与 C SDK 调用
+
+Embedded Swift 程序的入口通过 `@_cdecl` 桥接到 C 的入口点。以下是最简示例（[03:50](https://developer.apple.com/videos/play/wwdc2024/10197/?time=230)）：
+
+```swift
+@_cdecl("app_main")
+func app_main() {
+  print("🏎️   Hello, Embedded Swift!")
+}
+```
+
+- `@_cdecl("app_main")` 将 Swift 函数导出为 C 符号 `app_main`，ESP32 SDK 启动时会调用它
+- 这就是整个程序——没有 `@main`、没有 SwiftUI、没有运行时依赖
+
+直接调用厂商 SDK 的 C API 控制硬件（[06:48](https://developer.apple.com/videos/play/wwdc2024/10197/?time=408)）：
+
+```swift
+@_cdecl("app_main")
+func app_main() {
+  print("🏎️   Hello, Embedded Swift!")
+  var config = led_driver_get_config()
+  let handle = led_driver_init(&config)
+  led_driver_set_hue(handle, 240) // blue
+  led_driver_set_saturation(handle, 100) // 100%
+  led_driver_set_brightness(handle, 80) // 80%
+  led_driver_set_power(handle, true)
+}
+```
+
+- `led_driver_get_config()` / `led_driver_init(&config)` —— 通过 bridging header 直接调用 C SDK 的函数
+- 这些 C 函数操纵硬件 LED 驱动，Swift 侧无需做任何额外绑定
+
+### 封装 C API 为 Swift 接口
+
+直接调 C API 能用，但写出来的代码不够直观。更好的做法是封装一层 Swift 接口（[08:32](https://developer.apple.com/videos/play/wwdc2024/10197/?time=512)）：
+
+```swift
+let led = LED()
+
+@_cdecl("app_main")
+func app_main() {
+  print("🏎️   Hello, Embedded Swift!")
+
+  led.color = .red
+  led.brightness = 80
+
+  while true {
+    sleep(1)
+    led.enabled = !led.enabled
+    if led.enabled {
+      led.color = .hueSaturation(Int.random(in: 0 ..< 360), 100)
+    }
+  }
+}
+```
+
+- `LED()` 是自定义的 Swift 封装类，内部调用 C SDK 的 `led_driver_*` 函数
+- `.red`、`.hueSaturation(_:_)` 是 Swift 枚举关联值——一种类型安全地表示颜色方式
+- `Int.random(in:)` 在嵌入式设备上一样可用
+- 这段代码在微控制器上运行的效果：LED 每秒闪烁，每次亮起时随机换色
+
+### 通过 Matter 协议实现 HomeKit 配件
+
+Matter 是智能家居开放标准，C++ 实现。Swift 通过 C++ 互操作直接调用 Matter API，实现设备发现、配网等基础设施。以下代码构建了一个可通过 Home App 控制的彩色灯泡（[12:44](https://developer.apple.com/videos/play/wwdc2024/10197/?time=764)）：
+
+```swift
+let led = LED()
+
+@_cdecl("app_main")
+func app_main() {
+  print("🏎️   Hello, Embedded Swift!")
+
+  // (1) create a Matter root node
+  let rootNode = Matter.Node()
+  rootNode.identifyHandler = {
+    print("identify")
+  }
+
+  // (2) create a "light" endpoint, configure it
+  let lightEndpoint = Matter.ExtendedColorLight(node: rootNode)
+  lightEndpoint.configuration = .default
+  lightEndpoint.eventHandler = { event in
+    print("lightEndpoint.eventHandler:")
+    print(event.attribute)
+    print(event.value)
+
+    switch event.attribute {
+    case .onOff:
+      led.enabled = (event.value == 1)
+
+    case .levelControl:
+      led.brightness = Int(Float(event.value) / 255.0 * 100.0)
+
+    case .colorControl(.currentHue):
+      let newHue = Int(Float(event.value) / 255.0 * 360.0)
+      led.color = .hueSaturation(newHue, led.color.saturation)
+
+    case .colorControl(.currentSaturation):
+      let newSaturation = Int(Float(event.value) / 255.0 * 100.0)
+      led.color = .hueSaturation(led.color.hue, newSaturation)
+
+    case .colorControl(.colorTemperatureMireds):
+      let kelvins = 1_000_000 / event.value
+      led.color = .temperature(kelvins)
+
+    default:
+      break
+    }
+  }
+
+  // (3) add the endpoint to the node
+  rootNode.addEndpoint(lightEndpoint)
+
+  // (4) provide the node to a Matter application, start the application
+  let app = Matter.Application()
+  app.eventHandler = { event in
+    print(event.type)
+  }
+  app.rootNode = rootNode
+  app.start()
+}
+```
+
+- `Matter.Node()` 表示整个 Matter 配件，`identifyHandler` 用闭包代替 C 的函数指针+context
+- `Matter.ExtendedColorLight` 是一个灯泡端点，`eventHandler` 闭包处理来自 Home App 的所有指令
+- `event.attribute` 是 Swift 枚举，`switch` 配合模式匹配可以同时匹配枚举 case 和关联值（如 `.colorControl(.currentHue)`），无需嵌套 switch
+- 设备通过 WiFi 加入家庭网络后，Home App 自动发现，无需额外配网逻辑
+
+### Embedded Swift 的限制
+
+Embedded Swift 去掉了需要运行时元数据的特性（[18:03](https://developer.apple.com/videos/play/wwdc2024/10197/?time=1083)）：
+
+- **运行时反射**（`Mirror`）—— 需要类型元数据记录，代码体积开销不可接受
+- **`any` 类型** —— 存在性容器需要元数据做类型擦除
+- **元类型**（`MyType.self` 作为值传递）—— 同样依赖元数据
+
+替代方案是用泛型（[19:24](https://developer.apple.com/videos/play/wwdc2024/10197/?time=1164)）：
+
+```swift
+// any Countable 在 Embedded Swift 中会编译报错
+// 替换为 some Countable，编译器做特化，不需要运行时元数据
+func count(countable: some Countable) {
+  print(countable.count)
+}
+```
+
+- 把 `any Countable` 换成 `some Countable`，函数变成泛型，编译器特化后无需元数据
+- 所有在 Embedded Swift 中能编译通过的代码，在完整 Swift 中也能编译运行——它是严格子集，不是变体
+
+## 核心启发
+
+- **做什么**：用 Embedded Swift 给现有 IoT 设备写固件替代层。为什么值得做：C 固件中回调靠函数指针+无类型 context，类型安全弱，bug 多。Swift 的闭包、枚举、可选值能直接消除这类问题。怎么开始：从 swift-embedded-examples 仓库克隆 ESP32 模板项目，用预览工具链编译一个 blink 示例跑通，再把 C SDK 的 API 封装为 Swift 接口逐步替换。
+
+- **做什么**：基于 Matter 协议做智能家居配件原型。为什么值得做：Matter 提供设备发现、配网、HomeKit 兼容等基础设施，不用自己实现。Swift 封装层让业务逻辑清晰可读。怎么开始：克隆 swift-matter-examples 仓库，按 README 搭建 ESP32 环境，参考 demo 中的 `eventHandler` 模式处理 Home App 指令。
+
+- **做什么**：用 Swift MMIO 库安全操作硬件寄存器。为什么值得做：直接读写寄存器容易出错（偏移量写错、位域漏掩码），Swift MMIO 提供类型安全的寄存器描述和位域访问。怎么开始：在项目中添加 swift-mmio 依赖，用 `@RegisterBank` 和 `@Register` 描述寄存器布局，替代手写偏移量和位运算。
+
+## 关联 Session
+
+- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — noncopyable 类型与 Embedded Swift 共享零拷贝理念，适合资源受限场景
+- [Explore Swift performance](/articles/wwdc2024-10217) — 理解 Swift 如何平衡抽象与性能，对嵌入式场景的取舍有直接参考价值
+- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Swift 跨平台生态的另一个方向，服务端与嵌入式共享同一语言
+- [Analyze heap memory](/articles/wwdc2024-10173) — 嵌入式设备内存受限，堆分析技巧同样适用于 Embedded Swift 程序优化

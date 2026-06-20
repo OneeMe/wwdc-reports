@@ -1,0 +1,267 @@
+---
+title: "Discover PhotoKit change history"
+description: "photokit can help you build rich, photo-centric features. learn how you can easily track changes to image assets with the latest apis in photokit. we'll introduce you to the phphotolibrary change history api and demonstrate how you can persist change tokens across launches to help your app recognize additions, deletions, and updates to someone's photo library."
+date: 2026-06-10
+tags: ["PhotoKit", "Photos & Camera", "WWDC 2022"]
+thumbnail: "/images/sessions/2022/10132.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10132/"
+sessionId: "wwdc2022-10132"
+year: "2022"
+relatedSessions:
+  - title: "What's new in the Photos picker"
+    code: "10023"
+    description: "Learn how PHPicker gives apps simple and secure access to the system photo library."
+  - title: "Add Live Text interaction to your app"
+    code: "10026"
+    description: "Bring Live Text interactions to still photos and paused video frames in your app."
+  - title: "Discover advancements in iOS camera capture: Depth, focus, and multitasking"
+    code: "110429"
+    description: "Use new camera capture capabilities for depth, focus, and multitasking workflows."
+  - title: "Bring Continuity Camera to your macOS app"
+    code: "10018"
+    description: "Use iPhone as an external camera source from a macOS app."
+---
+
+## Highlight
+
+> 之前要追踪照片库变化非常麻烦。新增资产需要按日期查询，修改需要比对 modification date（但不精确），删除更是要全量 diff。三种操作需要三种不同的检测方式，性能开销大，结果不可靠。
+
+---
+
+## 核心内容
+
+一个照片类 App，常见需求是让自己的界面跟系统照片库保持同步。
+
+Session 里的例子是一个登山社交 App。用户完成一次 hiking workout 后，App 按这次运动的开始和结束时间，从照片库里挑出相关照片，生成拼贴图。如果朋友后来发来新的登山照片，或者用户编辑了某张照片，拼贴图也应该更新。（[00:54](https://developer.apple.com/videos/play/wwdc2022/10132/?time=54)）
+
+旧做法要分三步。
+
+新增照片，可以按 `creationDate` 查询。修改照片，要重新 fetch 已追踪的资产，再检查 `modificationDate`。删除照片最麻烦，要把所有已追踪资产重新取出，再跟本地记录做 diff。Apple 特别指出，`modificationDate` 还可能被照片库内部处理活动改动，导致误报。（[01:25](https://developer.apple.com/videos/play/wwdc2022/10132/?time=85)）
+
+PhotoKit 引入 persistent change history。它把照片库变化记录成一条时间线，包括插入、更新和删除。App 保存一个 persistent change token（持久变化令牌），下次启动时用这个 token 查询之后发生的变化。（[02:42](https://developer.apple.com/videos/play/wwdc2022/10132/?time=162)）
+
+这个 token 表示照片库在某个时间点的状态，可以跨 App 启动保存。它是设备本地的 token，访问成本低。如果 App 处在 limited library mode，只会返回用户已授权的 PhotoKit 对象变化。（[03:17](https://developer.apple.com/videos/play/wwdc2022/10132/?time=197)）
+
+Persistent history 补的是离线变化。原来的 `PHChange` 仍然适合 App 运行中、内存里 fetch result 的实时变化；persistent history 用来追踪 App 不活跃期间的照片库变化。两者可以按需求组合使用。（[05:10](https://developer.apple.com/videos/play/wwdc2022/10132/?time=310)）
+
+---
+
+## 详细内容
+
+### 旧做法：三类变化要三套检查
+
+（[01:25](https://developer.apple.com/videos/play/wwdc2022/10132/?time=85)）新增资产看起来简单：记录上次启动时间，查询 `creationDate` 晚于它的照片。
+
+```swift
+// Discover added assets
+let options = PHFetchOptions()
+options.predicate = NSPredicate(format: "creationDate > %@", lastLaunchDate as CVarArg)
+let insertedAssets = PHAsset.fetchAssets(with: options)
+```
+
+关键点：
+
+- `PHFetchOptions()` 创建一次 PhotoKit 查询配置。
+- `predicate` 把结果限制在上次启动之后创建的资产。
+- `PHAsset.fetchAssets(with:)` 返回可能新增的照片资产。
+
+（[01:46](https://developer.apple.com/videos/play/wwdc2022/10132/?time=106)）修改和删除需要重新检查 App 已经记录的资产。
+
+```swift
+let fetchResult = PHAsset.fetchAssets(with: localIdentifiers, options: nil)
+// Discover all modified and deleted assets
+fetchResult.enumerateObjects { asset, idx, stop in
+    if asset.modificationDate?.compare(lastLaunchDate) == .orderedDescending {
+        // Asset could have been modified
+    }
+    if !localIdentifiers.contains(asset.localIdentifier) {
+        // Asset could have been deleted
+    }
+}
+```
+
+关键点：
+
+- `localIdentifiers` 是 App 已经追踪的照片本地标识符。
+- `fetchAssets(with:options:)` 重新从照片库取出这些资产。
+- `modificationDate` 晚于上次启动时，只能说明资产可能被修改，因为系统内部处理也可能更新这个日期。
+- `localIdentifier` 不在本地记录里时，App 才能推断某个资产可能已经被删除。
+
+这段代码体现了旧方案的成本：新增、修改、删除各走一套逻辑，结果仍然不够确定。
+
+### 新做法：用 token 拉取持久变化
+
+（[04:33](https://developer.apple.com/videos/play/wwdc2022/10132/?time=273)）新的入口是 `PHPhotoLibrary.fetchPersistentChanges(since:)`。App 传入上次保存的 token，PhotoKit 返回 token 之后的 persistent changes。
+
+```swift
+let persistentChanges = try! PHPhotoLibrary.shared().fetchPersistentChanges(since: self.lastStoredToken)
+
+for persistentChange in persistentChanges {
+   if let changeDetails = persistentChange.changeDetails(for: PHObjectType.asset) {
+        let updatedIdentifiers = changeDetails.updatedLocalIdentifiers
+        let deletedIdentifiers = changeDetails.deletedLocalIdentifiers
+        let insertedIdentifiers = changeDetails.insertedLocalIdentifiers
+    }
+}
+
+// After processing change details
+self.lastStoredToken = lastPersistentChange.changeToken
+```
+
+关键点：
+
+- `lastStoredToken` 是上次处理完照片库变化后保存的 persistent change token。
+- `fetchPersistentChanges(since:)` 返回这个 token 之后发生的变化。
+- `changeDetails(for: PHObjectType.asset)` 只取照片资产相关的变化详情。
+- `updatedLocalIdentifiers`、`deletedLocalIdentifiers`、`insertedLocalIdentifiers` 分别给出更新、删除、新增的资产标识符。
+- 处理完成后，把最后一个 persistent change 的 `changeToken` 保存起来，供下次启动使用。
+
+（[04:21](https://developer.apple.com/videos/play/wwdc2022/10132/?time=261)）`changeDetails(for:)` 支持三类 Photos 对象：asset、asset collection、collection list。这个 session 的示例只处理 `PHObjectType.asset`，因为登山拼贴关心的是照片资产本身。
+
+### 只处理跟 App 有关的变化
+
+（[05:55](https://developer.apple.com/videos/play/wwdc2022/10132/?time=355)）拿到变化列表后，App 仍然要过滤。登山 App 不需要照片库里的所有变化，只关心三件事：新增照片是否落在某次 hike 的时间段内，已用照片是否被编辑，已用照片是否被删除。
+
+```swift
+// Get last stored change token
+let changeToken = self.lastStoredToken
+
+// Fetch persistent changes
+let persistentChanges = try!
+         library.fetchPersistentChanges(since: changeToken)
+
+for persistentChange in persistentChanges {
+    // Grab change details and process updates
+}
+```
+
+关键点：
+
+- `changeToken` 代表 App 上次同步到的照片库状态。
+- `library.fetchPersistentChanges(since:)` 一次取回后续变化。
+- 循环里再按 App 的业务规则处理变化详情，避免把照片库所有内部变化都变成 UI 工作。
+
+### 新增照片：用 inserted identifiers 生成新拼贴
+
+（[06:51](https://developer.apple.com/videos/play/wwdc2022/10132/?time=411)）对于新增资产，PhotoKit 已经给出 `insertedIdentifiers`。App 可以取出这些资产，再用 hike 的时间范围判断它们是否属于某次运动。
+
+```swift
+let insertedAssets = PHAsset.fetchAssets(with: insertedIdentifiers, options: nil)
+insertedAssets.enumerateObjects { asset, idx, stop in
+   for hike in hikes {
+        let dateInterval = NSDateInterval(start: hike.startDate, end: hike.endDate)
+        if dateInterval.contains(asset.creationDate) {
+            // This hike contains a new added asset
+        }
+    }
+}
+```
+
+关键点：
+
+- `insertedIdentifiers` 来自 persistent change details。
+- `PHAsset.fetchAssets(with:options:)` 把标识符转成可读取的 `PHAsset`。
+- 每个 `hike` 都有开始和结束时间。
+- `NSDateInterval` 用这两个时间构造一个区间。
+- `dateInterval.contains(asset.creationDate)` 判断新增照片是否属于这次 hike。
+
+### 修改照片：用 hasAdjustments 判断是否需要重绘
+
+（[07:08](https://developer.apple.com/videos/play/wwdc2022/10132/?time=428)）对于更新资产，session 引入了新的 `hasAdjustments` API。它可以判断资产是否有编辑调整，登山 App 用它决定是否重绘 UI 里的照片。
+
+```swift
+let updatedAssets = PHAsset.fetchAssets(with: updatedIdentifiers, options: nil)
+updatedAssets.enumerateObjects { asset, idx, stop in
+    if asset.hasAdjustments {
+        // This asset has edits
+    }
+}
+```
+
+关键点：
+
+- `updatedIdentifiers` 来自 persistent change details。
+- `fetchAssets` 取回这些被更新的资产。
+- `asset.hasAdjustments` 表示这张资产有编辑调整。
+- 条件成立时，App 可以重新渲染使用这张照片的界面。
+
+### 删除照片：用 deleted identifiers 找到要重建的拼贴
+
+（[07:20](https://developer.apple.com/videos/play/wwdc2022/10132/?time=440)）删除资产时，PhotoKit 给出的本地标识符已经足够。App 不需要再从照片库 fetch 一个不存在的资产，只要检查哪些拼贴引用了这些标识符。
+
+```swift
+for deletedIdentifier in deletedIdentifiers {
+    for collage in collages {
+        if collage.assetLocalIdentifiers.contains(deletedIdentifier) {
+            // This collage needs to be redrawn
+        }
+    }
+}
+```
+
+关键点：
+
+- `deletedIdentifiers` 是已删除资产的本地标识符集合。
+- `collages` 是 App 本地保存的拼贴数据。
+- `assetLocalIdentifiers` 记录某个拼贴使用了哪些照片。
+- 找到匹配的 `deletedIdentifier` 后，这个拼贴需要重新生成。
+
+### 错误处理：token 过期或详情不可用时重新 fetch
+
+（[08:20](https://developer.apple.com/videos/play/wwdc2022/10132/?time=500)）Persistent history 可能返回两类错误。第一类是 `persistentChangeTokenExpired`，表示 token 比可用历史还旧。第二类是 `persistentChangeDetailsUnavailable`，表示这次 persistent change 不能完整重建发生过的变化。
+
+```swift
+do {
+    let persistentChanges = try library.fetchPersistentChanges(since: changeToken)
+} catch PHPhotosError.persistentChangeTokenExpired,
+        PHPhotosError.persistentChangeDetailsUnavailable {
+    let fetchResult = PHAsset.fetchAssets(with: trackedIdentifiers, options: options)
+    // Use fetch result
+}
+```
+
+关键点：
+
+- `do` 块里正常按 token 拉取 persistent changes。
+- `persistentChangeTokenExpired` 需要 App 放弃旧 token。
+- `persistentChangeDetailsUnavailable` 需要 App 重新确认当前照片库状态。
+- 回退方案是用 `trackedIdentifiers` 重新 fetch 已追踪对象，让 App 恢复到正确状态。
+
+Apple 还建议把 change history 查询放到后台线程，避免照片库大量同步和处理活动阻塞 UI。对于 inserted 和 updated assets，一次大 fetch 通常比多次小 fetch 更合适。（[07:36](https://developer.apple.com/videos/play/wwdc2022/10132/?time=456)）
+
+### 其他 PhotoKit 更新
+
+（[08:54](https://developer.apple.com/videos/play/wwdc2022/10132/?time=534)）Session 末尾还提到几项 PhotoKit 更新：可以通过 media subtype 和 smart album 访问 cinematic videos；新增两个错误码，分别覆盖 macOS 上照片图库位于 File Provider sync root directory 时的图库损坏场景，以及 asset resource 因网络问题无法找到的场景。
+
+---
+
+## 核心启发
+
+- **做什么**：给旅行、运动或亲子相册 App 做自动补图。  
+  **为什么值得做**：persistent change history 可以直接告诉 App 哪些照片在上次启动后新增。  
+  **怎么开始**：保存 `lastStoredToken`，用 `insertedLocalIdentifiers` fetch 新资产，再按 `creationDate` 匹配活动时间段。
+
+- **做什么**：让照片拼贴、封面图或时间线在用户编辑照片后自动更新。  
+  **为什么值得做**：`updatedLocalIdentifiers` 和 `hasAdjustments` 可以定位被编辑的资产。  
+  **怎么开始**：维护每个 UI 模块引用的 asset local identifiers，检测更新后只重绘受影响模块。
+
+- **做什么**：为相册整理工具做删除感知的本地索引。  
+  **为什么值得做**：`deletedLocalIdentifiers` 直接给出已删除资产，不需要反复全量 diff。  
+  **怎么开始**：本地数据库保存 asset local identifier，收到删除标识符后清理索引或标记待重建。
+
+- **做什么**：给长时间不打开的照片 App 做后台同步入口。  
+  **为什么值得做**：persistent history 记录 App 不活跃期间的长时间变化。  
+  **怎么开始**：在后台队列调用 `fetchPersistentChanges(since:)`，只处理业务需要的 asset、asset collection 或 collection list 变化。
+
+- **做什么**：为 limited library mode 下的照片功能做增量刷新。  
+  **为什么值得做**：PhotoKit 只返回用户已选择对象的变化，适合权限范围较小的 App。  
+  **怎么开始**：把同步逻辑建立在 token 和 local identifiers 上，不假设 App 能访问整个照片库。
+
+---
+
+## 关联 Session
+
+- [What's new in the Photos picker](/articles/wwdc2022-10023) — 了解 PHPicker 如何提供更简单、更安全的照片库访问入口。
+- [Add Live Text interaction to your app](/articles/wwdc2022-10026) — 学习在照片和暂停视频帧里加入 Live Text 交互。
+- [Discover advancements in iOS camera capture: Depth, focus, and multitasking](/articles/wwdc2022-110429) — 了解 iOS 相机采集里的深度、对焦和多任务更新。
+- [Bring Continuity Camera to your macOS app](/articles/wwdc2022-10018) — 学习在 macOS App 中使用 iPhone 作为外部相机。

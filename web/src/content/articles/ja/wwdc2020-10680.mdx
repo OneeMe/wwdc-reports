@@ -1,0 +1,420 @@
+---
+title: "Refine Objective-C frameworks for Swift"
+description: "fine-tune your objective-c headers to work beautifully in swift. we'll show you how to take an unwieldy objective-c framework and transform it into an api that feels right at home. learn about the suite of annotations you can use to provide richer type information, more idiomatic names, and better errors to swift. and discover objective-c conventions you might not have known about that are key to a well-behaved swift api."
+date: 2020-06-10
+tags: ["WWDC 2020", "Swift", "Objective-C", "Developer Tools"]
+thumbnail: "/images/sessions/2020/10680.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10680/"
+sessionId: "wwdc2020-10680"
+year: "2020"
+relatedSessions:
+  - title: "What's new in Swift"
+    code: "10170"
+    description: "Swift 5.3 在运行时、诊断、语言特性、系统库和 package 生态上的年度更新。"
+  - title: "Embrace Swift type inference"
+    code: "10165"
+    description: "解释 Swift 编译器如何利用上下文推断类型，并说明 Xcode 12 如何改进类型错误定位。"
+  - title: "Safely manage pointers in Swift"
+    code: "10167"
+    description: "深入 Swift unsafe pointer 类型、raw pointer 和内存绑定，补充混合语言边界的安全背景。"
+  - title: "Unsafe Swift"
+    code: "10648"
+    description: "从 force unwrap、集合越界和指针 API 讲清 Swift 中 unsafe 操作的边界。"
+  - title: "Distribute binary frameworks as Swift packages"
+    code: "10147"
+    description: "讲解如何用 Swift Package 分发二进制框架，适合正在维护 framework API 的团队。"
+---
+
+## Highlight
+
+> 这场 session 演示如何通过 Objective-C 头文件注解、命名宏和少量 Swift wrapper，把默认导入 Swift 后充满隐式解包可选值、Any 集合、错误抛出歧义和笨重命名的框架，改成类型更具体、调用点更符合 Swift 习惯的 API。
+
+## 核心内容
+
+很多团队没有一次性把 Objective-C framework 重写成 Swift。旧代码继续存在，新业务却越来越多地用 Swift 调用这些 API。Swift 编译器会自动导入 Objective-C header，也会把 `NSString`、`NSDate`、initializer、错误处理方法改写成更接近 Swift 的接口。问题在于，自动转换只知道 header 写出来的事实，不知道框架维护者没有写出来的意图（[00:25](https://developer.apple.com/videos/play/wwdc2020/10680/?time=25)、[02:50](https://developer.apple.com/videos/play/wwdc2020/10680/?time=170)）。
+
+演讲里的 SpaceKit 就是一个典型例子。它是 Objective-C 写的模型框架，Swift 端看到的 generated interface 里有大量 implicitly unwrapped optional，集合类型落成 `Any`，某个保存方法会在“没有需要保存的变化”时被 Swift 当成 throw，initializer 继承关系也会让子类作者困惑。根因在 header 信息不足；Swift 只能按已经声明的事实导入 Objective-C（[01:33](https://developer.apple.com/videos/play/wwdc2020/10680/?time=93)、[03:16](https://developer.apple.com/videos/play/wwdc2020/10680/?time=196)）。
+
+Apple 给出的处理顺序很务实：先在 Xcode 12 里打开 Swift generated interface，看 Swift 客户端实际会看到什么；再回到 Objective-C header，用 nullability、lightweight generics、`NS_STRING_ENUM`、`NS_DESIGNATED_INITIALIZER`、`NS_SWIFT_NAME`、`NS_REFINED_FOR_SWIFT` 和 `NS_ERROR_ENUM` 修正导入结果；最后从调用点检查 API，而不是只看接口列表是否漂亮（[02:01](https://developer.apple.com/videos/play/wwdc2020/10680/?time=121)、[40:43](https://developer.apple.com/videos/play/wwdc2020/10680/?time=2443)）。
+
+## 详细内容
+
+### 用 nullability 消掉隐式解包可选值
+
+（[04:43](https://developer.apple.com/videos/play/wwdc2020/10680/?time=283)）Objective-C 的 pointer 类型天然可能为 `nil`，Swift 导入时如果拿不到更精确的信息，就会把它们标成 implicitly unwrapped optional。Session 的第一步是把真实语义写进 header：允许为空的地方标 `nullable`，其他地方放进 `NS_ASSUME_NONNULL_BEGIN` / `NS_ASSUME_NONNULL_END` 区间。
+
+```
+//
+// SKMission.h
+//
+// View the generated interface to see how Swift imports this header.
+//
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface SKMission : NSObject
+
+@property (readonly, nullable) NSString *name;
+
+- (instancetype)initWithName:(nullable NSString *)name;
+
+@end
+
+NS_ASSUME_NONNULL_END
+```
+
+关键点：
+
+- `NS_ASSUME_NONNULL_BEGIN` 和 `NS_ASSUME_NONNULL_END` 把中间的 pointer 默认视为 nonnull，减少重复标注。
+- `name` 属性保留 `nullable`，说明 mission 可能没有名字，Swift 端会得到 optional。
+- `initWithName:` 的参数也保留 `nullable`，调用者必须处理传入 `nil` 的语义。
+- transcript 明确提醒：Swift 会相信 header。如果 Objective-C 实际返回了被标成 nonnull 的 `nil`，Swift 不会在返回点替你检查，后续可能出现空字符串、无效对象或空指针崩溃（[08:09](https://developer.apple.com/videos/play/wwdc2020/10680/?time=489)）。
+
+（[10:31](https://developer.apple.com/videos/play/wwdc2020/10680/?time=631)）如果维护者无法确认某个值是否真的永远非空，可以用 null unspecified，让 Swift 保持 implicitly unwrapped optional。这个选择比错误地写 nonnull 更诚实，因为崩溃会出现在使用点，而不是把问题拖到更难定位的地方。
+
+### 给集合和字符串常量补上类型边界
+
+（[11:07](https://developer.apple.com/videos/play/wwdc2020/10680/?time=667)）Objective-C lightweight generics 会直接影响 Swift 看到的集合类型。`NSArray<SKAstronaut *> *` 会导入成元素类型明确的数组，而不是 `[Any]`。
+
+```
+//
+// SKAstronaut.h
+//
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface SKAstronaut : NSObject
+// Stub declaration
+@end
+
+NS_ASSUME_NONNULL_END
+
+//
+// SKMission.h
+//
+// View the generated interface to see how Swift imports this header.
+//
+
+#import <Foundation/Foundation.h>
+#import <SpaceKit/SKAstronaut.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface SKMission : NSObject
+
+@property (readonly) NSArray<SKAstronaut *> *crew;
+
+@end
+
+NS_ASSUME_NONNULL_END
+```
+
+关键点：
+
+- `NSArray<SKAstronaut *> *` 把 crew 的元素类型写进 Objective-C header。
+- Swift 导入后不需要从 `Any` 手动转换成 `SKAstronaut`。
+- 这类标注同样适用于 `NSSet` 和 `NSDictionary`，适合先处理模型集合、缓存集合和查询结果集合。
+
+（[13:23](https://developer.apple.com/videos/play/wwdc2020/10680/?time=803)）字符串常量也需要类型边界。`SKRocketStageCount` 原本只接收某几个火箭常量，但 Swift 看到的只是 `String`。`NS_STRING_ENUM` 会把 typedef reshape 成接近 Swift raw string enum 的 struct，让函数只接收 `SKRocket`。
+
+```
+//
+// SKRocket.h
+//
+// View the generated interface to see how Swift imports this header.
+//
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+typedef NSString *SKRocket NS_STRING_ENUM;
+
+extern SKRocket const SKRocketAtlas;
+extern SKRocket const SKRocketTitanII;
+extern SKRocket const SKRocketSaturnIB;
+extern SKRocket const SKRocketSaturnV;
+
+NSInteger SKRocketStageCount(SKRocket);
+
+NS_ASSUME_NONNULL_END
+```
+
+关键点：
+
+- `typedef NSString *SKRocket` 先把一组字符串常量归到同一个概念下。
+- `NS_STRING_ENUM` 改变 Swift 导入形态，让常量成为 `SKRocket` 的静态成员式用法。
+- `SKRocketStageCount(SKRocket)` 不再接受任意字符串，误传其他字符串的机会被压低。
+- snippet 同时把计数返回值写成 `NSInteger`。transcript 解释了原因：Swift 习惯用 `Int` 表示计数，`UInt` 更适合位运算场景（[11:33](https://developer.apple.com/videos/play/wwdc2020/10680/?time=693)）。
+
+### 把 initializer 规则写给 Swift
+
+（[15:24](https://developer.apple.com/videos/play/wwdc2020/10680/?time=924)）Objective-C 的 designated initializer 是约定，不是语言强制规则。Swift 导入类时会依赖这个约定。SpaceKit 的 `SKAstronaut` 如果不标注，Swift 子类作者会被要求覆盖两个名字不同但语义相近的 initializer，还会在 code completion 里看到继承自 `NSObject` 的无参 `init`。
+
+```
+//
+// SKAstronaut.h
+//
+// View the generated interface to see how Swift imports this header.
+//
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface SKAstronaut : NSObject
+
+- (instancetype)initWithNameComponents:(NSPersonNameComponents *)name NS_DESIGNATED_INITIALIZER;
+- (instancetype)initWithName:(NSString *)name;
+- (instancetype)init NS_UNAVAILABLE;
+
+@property (strong, readwrite) NSPersonNameComponents *nameComponents;
+@property (readonly) NSString *name;
+
+@end
+
+NS_ASSUME_NONNULL_END
+
+//
+// SKAstronaut.m
+//
+
+#import "SKAstronaut.h"
+
+@interface SKAstronaut ()
+@property (class, readonly, strong) NSPersonNameComponentsFormatter *nameFormatter;
+@end
+
+@implementation SKAstronaut
+
+- (id)initWithNameComponents:(NSPersonNameComponents *)name {
+    self = [super init];
+    if (self) {
+        _name = name;
+    }
+    return self;
+}
+
+- (id)initWithName:(NSString *)name {
+    return [self initWithNameComponents:[SKAstronaut _componentsFromName:name]];
+}
+
+- (id)init {
+  [self doesNotRecognizeSelector:_cmd];
+  return nil;
+}
+
+- (NSString *)name {
+    return [SKAstronaut.nameFormatter stringFromPersonNameComponents:self.nameComponents];
+}
+
++ (NSPersonNameComponents*)_componentsFromName:(NSString*)name {
+    return [self.nameFormatter personNameComponentsFromString:name];
+}
+
++ (NSPersonNameComponentsFormatter *)nameFormatter {
+    static NSPersonNameComponentsFormatter *singleton;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        singleton = [NSPersonNameComponentsFormatter new];
+    });
+    return singleton;
+}
+
+@end
+```
+
+关键点：
+
+- `initWithNameComponents:` 调用 `super init`，所以它被标成 `NS_DESIGNATED_INITIALIZER`。
+- `initWithName:` 调用 `self initWithNameComponents:`，因此它是 convenience 路径。
+- 无参 `init` 在实现里调用 `doesNotRecognizeSelector:`，header 里用 `NS_UNAVAILABLE` 明确告诉 Swift 和 Objective-C 客户端不能走这条路。
+- 标注后，Swift 能把继承和重写要求表达得更接近 Swift 类本身的 initializer 模型。
+
+### 修正 Objective-C 错误处理约定
+
+（[20:00](https://developer.apple.com/videos/play/wwdc2020/10680/?time=1200)）Swift 会把遵循 Objective-C error convention 的方法导入成 throwing method。约定的关键点是：返回 false 就表示失败，即使 `NSError **` 没有写入错误对象。SpaceKit 的旧 `saveToURL:error:` 会在“没有改动需要保存”时返回 false，这会让 Swift 抛出一个非公开 Foundation error type。
+
+```
+//
+// SKMission.h
+//
+// View the generated interface to see how Swift imports this header.
+//
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface SKMission : NSObject
+
+/// \returns \c YES if saved; \c NO with non-nil \c *error if failed to save;
+///          \c NO with nil \c *error` if nothing needed to be saved.
+- (BOOL)saveToURL:(NSURL *)url error:(NSError **)error NS_SWIFT_NOTHROW DEPRECATED_ATTRIBUTE;
+
+/// @param[out] wasDirty If provided, set to \c YES if the file needed to be
+///   saved or \c NO if there weren’t any changes to save.
+- (BOOL)saveToURL:(NSURL *)url wasDirty:(nullable BOOL *)wasDirty error:(NSError **)error;
+
+@end
+
+NS_ASSUME_NONNULL_END
+```
+
+关键点：
+
+- 旧方法加 `NS_SWIFT_NOTHROW`，告诉 Swift 不要按错误约定自动导入成 `throws`。
+- `DEPRECATED_ATTRIBUTE` 给迁移留出路径，Objective-C 客户端仍能看到旧接口。
+- 新方法把“是否真的写入文件”放进 `wasDirty` out parameter，让 `BOOL` 返回值重新只表示成功或失败。
+- 这个改动来自 transcript 对 error convention 的解释，不是单纯改命名。
+
+### 用 Swift wrapper 表达 Objective-C 做不到的接口
+
+（[22:40](https://developer.apple.com/videos/play/wwdc2020/10680/?time=1360)）Objective-C 的错误约定占用了返回值，没法同时自然表达“可能抛错”和“返回是否保存”。Session 的解决方式是在 framework 内增加 Swift 文件，用 extension 包一层 Swift API，再用 `NS_REFINED_FOR_SWIFT` 把底层 Objective-C 方法从常规补全里藏起来。
+
+```swift
+//
+// SKMission.h
+//
+// View the generated interface to see how Swift imports this header.
+//
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface SKMission : NSObject
+
+/// \returns \c YES if saved; \c NO with non-nil \c *error if failed to save;
+///          \c NO with nil \c *error` if nothing needed to be saved.
+- (BOOL)saveToURL:(NSURL *)url error:(NSError **)error NS_SWIFT_NOTHROW DEPRECATED_ATTRIBUTE;
+
+/// @param[out] wasDirty If provided, set to \c YES if the file needed to be
+///   saved or \c NO if there weren’t any changes to save.
+- (BOOL)saveToURL:(NSURL *)url wasDirty:(nullable BOOL *)wasDirty error:(NSError **)error NS_REFINED_FOR_SWIFT;
+
+@end
+
+NS_ASSUME_NONNULL_END
+
+//
+// SwiftExtensions.swift
+//
+
+import Foundation
+
+extension SKMission {
+    public func save(to url: URL) throws -> Bool {
+        var wasDirty: ObjCBool = false
+        try self.__save(to: url, wasDirty: &wasDirty)
+        return wasDirty.boolValue
+    }
+}
+```
+
+关键点：
+
+- `NS_REFINED_FOR_SWIFT` 让 Swift 名称前面多出两个下划线，Xcode 通常会把这种底层入口从补全和 generated interface 里隐藏。
+- Swift wrapper 暴露 `save(to:) throws -> Bool`，把错误和返回值分开表达。
+- `ObjCBool` 是必要细节。transcript 说明 Swift `Bool` 和 Objective-C `BOOL` 在部分平台上内存表示不同，不能把 Swift `Bool` 的指针直接传给 Objective-C。
+- `__save(to:wasDirty:)` 仍然可被 wrapper 调用，Objective-C API 没有被完全封死。
+
+### 用命名宏和 error enum 做最后抛光
+
+（[31:35](https://developer.apple.com/videos/play/wwdc2020/10680/?time=1895)）Swift 会自动重写 Objective-C selector，但命名判断带有审美成分。`NS_SWIFT_NAME` 允许维护者直接写出 Swift 端应该看到的 base name 和 argument label。
+
+```
+//
+// SKMission.h
+//
+// View the generated interface to see how Swift imports this header.
+//
+
+#import <Foundation/Foundation.h>
+#import <SKAstronaut/SKAstronaut.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+@interface SKMission : NSObject
+
+- (NSSet<SKMission *> *)previousMissionsFlownByAstronaut:(SKAstronaut *)astronaut NS_SWIFT_NAME(previousMissions(flownBy:));
+
+@end
+```
+
+关键点：
+
+- Objective-C selector `previousMissionsFlownByAstronaut:` 默认拆分结果不一定符合 Swift 读法。
+- `NS_SWIFT_NAME(previousMissions(flownBy:))` 明确把 `flownBy` 放到参数标签里。
+- transcript 还说明 `NS_SWIFT_NAME` 可用于类型、常量、变量和全局函数，并能把全局函数 reshape 成静态方法、实例方法或属性（[33:12](https://developer.apple.com/videos/play/wwdc2020/10680/?time=1992)）。
+
+（[37:02](https://developer.apple.com/videos/play/wwdc2020/10680/?time=2222)）NSError domain 加 `NS_ENUM` 在 Swift 里仍然难用。调用者要先转成 `NSError`，检查 domain，再把 code 转成 enum。把它改成 `NS_ERROR_ENUM` 后，Swift 会合成可以直接匹配的错误类型。
+
+```
+//
+//  SKError.h
+//  SpaceKit
+//
+
+#import <Foundation/Foundation.h>
+
+extern NSString *const SKErrorDomain;
+
+typedef NS_ERROR_ENUM(SKErrorDomain, SKErrorCode) {
+    SKErrorLaunchAborted = 1,
+    SKErrorLaunchOutOfRange,
+    SKErrorRapidUnscheduledDisassembly,
+    SKErrorNotGoingToSpaceToday
+};
+```
+
+关键点：
+
+- `NS_ERROR_ENUM(SKErrorDomain, SKErrorCode)` 把错误码和错误 domain 绑定起来。
+- Swift 会围绕它合成 `SKError`，并让它 conform to `Error`。
+- transcript 说明 Swift 还会合成用于 `catch` 和 `case` 匹配的运算逻辑，匹配时同时检查 domain 和 code。
+- 这让调用点可以表达成捕获某个 SpaceKit 错误，而不是手写 domain、code 和类型转换。
+
+## 核心启发
+
+### 给 Objective-C framework 做 Swift 导入体检
+
+- **做什么**：定期打开 public header 的 Swift generated interface，记录 optional、`Any` 集合、奇怪 initializer、throwing method 和命名问题。
+- **为什么值得做**：session 反复强调，Swift 客户端最终评价的是调用点。generated interface 是发现问题的入口。
+- **怎么开始**：在 Xcode 12 的 Related Items 菜单里打开 Swift 5 interface，把每个隐式解包可选值和 `Any` 集合回溯到对应 header。
+
+### 为老 API 增加 nullability 和泛型迁移计划
+
+- **做什么**：先给一个 header 增加首个 nullability 标注，再按 Xcode warning 把剩余位置补齐。
+- **为什么值得做**：Swift 会相信 Objective-C header。错误的 nonnull 可能在 Swift 端变成更晚出现的异常行为。
+- **怎么开始**：用 `NS_ASSUME_NONNULL_BEGIN` 包住大多数 nonnull 区域，只在真实允许为空的位置写 `nullable`；集合属性优先补 `NSArray<Element *>`、`NSSet<Element *>`、`NSDictionary<Key, Value>`。
+
+### 把字符串常量 API 收拢成 typed interface
+
+- **做什么**：查找本来只允许固定常量的 `NSString *` 参数，把它们改为带 `NS_STRING_ENUM` 的 typedef。
+- **为什么值得做**：SpaceKit 的 `SKRocketStageCount` 示例说明，纯字符串参数会让 Swift 调用者传入任意字符串。
+- **怎么开始**：先定义 `typedef NSString *YourKind NS_STRING_ENUM;`，再把常量声明和函数参数都改成这个 typedef，最后检查 Swift generated interface 的调用形态。
+
+### 给 Swift 客户端写一层小而准的 wrapper
+
+- **做什么**：把 Objective-C 无法自然表达的接口藏到 `NS_REFINED_FOR_SWIFT` 后面，用 Swift extension 暴露真正想让用户调用的方法。
+- **为什么值得做**：`save(to:) throws -> Bool` 示例把错误和返回值拆开了，Objective-C 原方法保留给底层调用。
+- **怎么开始**：先确认 Objective-C 方法已在 umbrella header 可见，再在 framework 的 Swift 文件中写 extension；需要传 `BOOL *` 时使用 `ObjCBool`。
+
+### 把 NSError code 迁成 Swift 可匹配的错误
+
+- **做什么**：把成对的 error domain 和 `NS_ENUM` 错误码改成 `NS_ERROR_ENUM`。
+- **为什么值得做**：Swift 会合成 domain-aware 的匹配逻辑，调用者不用手写 `NSError` domain 和 code 检查。
+- **怎么开始**：从最常被 `catch` 的错误枚举开始迁移，修改后在 Swift 调用点写出预期的 `catch` 形态，并用测试固定行为。
+
+## 关联 Session
+
+- [What's new in Swift](/articles/wwdc2020-10170) — Swift 5.3 在 runtime、诊断、语言特性、系统库和 package 生态上的年度更新。
+- [Embrace Swift type inference](/articles/wwdc2020-10165) — 解释 Swift 编译器如何从上下文推断类型，并展示 Xcode 12 的错误定位改进。
+- [Safely manage pointers in Swift](/articles/wwdc2020-10167) — 深入 unsafe pointer、raw pointer 和内存绑定，补充混合语言边界的底层安全背景。
+- [Unsafe Swift](/articles/wwdc2020-10648) — 从 force unwrap、集合越界和指针 API 讲清 Swift 中 unsafe 操作的边界。
+- [Distribute binary frameworks as Swift packages](/articles/wwdc2020-10147) — 用 Swift Package 分发 binary framework，适合维护 framework API 的团队继续阅读。

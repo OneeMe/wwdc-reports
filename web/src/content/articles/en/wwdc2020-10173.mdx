@@ -1,0 +1,306 @@
+---
+title: "Get the most out of Sign in with Apple"
+description: "sign in with apple makes it easy for people to sign in to your apps and websites with the apple id they already have. fully integrate sign in with apple into your app using secure requests, and by handling state changes and server notifications. we'll also introduce new apis that allow you to let existing users switch to sign in with apple quickly and easily."
+date: 2020-06-10
+tags: ["Safari & Web", "System Services", "Privacy & Security"]
+thumbnail: "/images/sessions/2020/10173.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10173/"
+sessionId: "wwdc2020-10173"
+year: "2020"
+relatedSessions:
+  - title: "One-tap account security upgrades"
+    code: "10666"
+    description: "adopt the account authentication modification extension to upgrade weak credentials to sign in with apple and strong passwords."
+  - title: "Meet Face ID and Touch ID for the web"
+    code: "10670"
+    description: "use face id and touch id on websites in safari with the web authentication api."
+  - title: "Secure your app: threat modeling and anti-patterns"
+    code: "10189"
+    description: "identify app security risks through threat modeling and avoid common anti-patterns."
+---
+
+## Highlight
+
+> Apple 在 2020 年为 Sign in with Apple 明确了 nonce、state、credentialState 和服务器通知的处理方式，并新增 Account Authentication Modification Extension，让已有密码账号能升级为 Apple ID 登录且避免重复账号。
+
+---
+
+## 核心内容
+
+Sign in with Apple 看起来只是一个登录按钮。真正落到产品里，麻烦在按钮之后。用户第一次授权时会给出姓名、邮箱、`identityToken` 和 `authorizationCode`；如果网络失败，姓名和邮箱下次不会再出现。用户还可能在设置里撤销授权，或者选择隐藏邮箱，让应用收到一个 private email relay 地址。
+
+这场 session 把登录链路拆成几件需要立即做对的事：请求阶段生成唯一 `nonce` 和 `state`，回调阶段校验 `state`，服务端解析并验证 `identityToken`，再用 `authorizationCode` 与 Apple ID servers 建立后续会话（[02:02](https://developer.apple.com/videos/play/wwdc2020/10173/?time=122)、[05:37](https://developer.apple.com/videos/play/wwdc2020/10173/?time=337)）。这样，客户端拿到凭证时知道它来自自己的请求，服务端也能检查 token 没有被重放或篡改。
+
+登录完成也不代表状态永远有效。Apple 要求应用在启动或回到前台时调用 `getCredentialState`，并针对 `.authorized`、`.revoked`、`.notFound` 和新的 `.transferred` 做不同处理（[08:51](https://developer.apple.com/videos/play/wwdc2020/10173/?time=531)、[10:16](https://developer.apple.com/videos/play/wwdc2020/10173/?time=616)）。如果应用从一个开发团队转移到另一个开发团队，`.transferred` 允许开发者静默迁移用户标识符。
+
+2020 年的新能力集中在两个方向。第一，服务器可以接收 Apple 签名的开发者通知，直接知道 private email relay 是否被关闭、授权是否被撤销、Apple ID 是否被删除（[11:31](https://developer.apple.com/videos/play/wwdc2020/10173/?time=691)）。第二，Account Authentication Modification Extension 可以把传统用户名密码账号升级到 Sign in with Apple，并在成功后让系统移除旧的弱密码凭据（[16:50](https://developer.apple.com/videos/play/wwdc2020/10173/?time=1010)、[29:42](https://developer.apple.com/videos/play/wwdc2020/10173/?time=1782)）。
+
+---
+
+## 详细内容
+
+### 1. 授权请求要带上 nonce 和 state
+
+（[02:02](https://developer.apple.com/videos/play/wwdc2020/10173/?time=122)、[03:01](https://developer.apple.com/videos/play/wwdc2020/10173/?time=181)）
+
+`nonce` 和 `state` 都是发送在授权请求里的不透明字符串。`nonce` 会嵌入返回的 `identityToken`，服务端可以用它减少 replay attack（重放攻击）的风险。`state` 会直接回到 credential，客户端可以用它把回调和本次请求配对。
+
+```swift
+// Configure request, setup delegates and perform authorization request
+
+    @objc func handleAuthorizationButtonPress() {
+        let request = ASAuthorizationAppleIDProvider().createRequest()
+        request.requestedScopes = [.fullName, .email]
+
+        request.nonce = myNonceString()
+        request.state = myStateString()
+
+        let controller = ASAuthorizationController(authorizationRequests: [request])
+
+        controller.delegate = self
+        controller.presentationContextProvider = self
+
+        controller.performRequests()
+    }
+```
+
+关键点：
+
+- `createRequest()` 创建 Apple ID 授权请求，所有安全参数都挂在这个 request 上。
+- `requestedScopes` 只请求应用确实需要的 `fullName` 和 `email`。
+- `request.nonce` 每次请求都要生成唯一值，后续在服务端从 `identityToken` 中验证。
+- `request.state` 用来在客户端确认返回的 credential 对应本次请求。
+- `ASAuthorizationController` 负责展示系统授权界面，并通过 delegate 回传结果。
+
+### 2. 回调里先保存必要信息，再交给服务端验证
+
+（[05:37](https://developer.apple.com/videos/play/wwdc2020/10173/?time=337)、[06:04](https://developer.apple.com/videos/play/wwdc2020/10173/?time=364)、[07:45](https://developer.apple.com/videos/play/wwdc2020/10173/?time=465)）
+
+Apple 明确提醒：姓名和邮箱只会在用户第一次授权时出现在 credential 中。应用需要在本地缓存必要对象，避免网络不好时丢失首次授权信息。随后把 `identityToken` 和 `authorizationCode` 发给服务端，由服务端验证公钥、过期时间、`nonce`，并用授权码向 Apple ID servers 换取后续调用需要的 token。
+
+```swift
+// ASAuthorizationControllerDelegate
+
+func authorizationController(controller: ASAuthorizationController, didCompleteWithAuthorization authorization: ASAuthorization) {
+        if let credential = authorization.credential as? ASAuthorizationAppleIDCredential {
+            let userIdentifier = credential.user
+            let fullName = credential.fullName
+            let email = credential.email
+            let realUserStatus = credential.realUserStatus
+
+            let state = credential.state
+            let identityToken = credential.identityToken
+            let authorizationCode = credential.authorizationCode
+
+            // Securely store the userIdentifier locally
+            self.saveUserIdentifier(userIdentifier)
+
+            // Create a session with your server and verify the information
+            self.createSession(identityToken: identityToken, authorizationCode: authorizationCode)
+    }
+}
+```
+
+关键点：
+
+- `credential.user` 是应用后续识别用户的本地标识，需要安全保存。
+- `fullName` 和 `email` 只在首次授权提供，服务端通信失败时也要能恢复。
+- `realUserStatus` 首次授权时返回，取值包括 unsupported、unknown、likely real。
+- `state` 必须和请求时生成的值一致，匹配失败时应停止登录流程。
+- `identityToken` 是 JSON Web Token（JWT），服务端要用 Apple 公钥验证签名并检查过期时间。
+- `authorizationCode` 发送到服务端后，可与 Apple ID servers 交换 refresh token、access token 和新的 `identityToken`。
+
+### 3. 应用启动和回到前台时检查 credentialState
+
+（[08:51](https://developer.apple.com/videos/play/wwdc2020/10173/?time=531)、[09:15](https://developer.apple.com/videos/play/wwdc2020/10173/?time=555)、[10:16](https://developer.apple.com/videos/play/wwdc2020/10173/?time=616)）
+
+`getCredentialState` 用已保存的 user identifier 查询凭证状态。Apple 建议在应用启动或进入前台时调用它，这样用户从系统设置里撤销授权后，应用可以及时关闭自己的会话。
+
+```
+// Getting a credential state
+
+        let provider = ASAuthorizationAppleIDProvider()
+
+        provider.getCredentialState(forUserID: getStoredUserIdentifier()) {
+                                                        (credentialState, error) in
+            switch(credentialState) {
+            case .authorized:
+                // Sign in with Apple credential Valid
+            case .revoked:
+                // Sign in with Apple credential Revoked, Sign out
+            case .notFound:
+                // Credential was not found, fallback to login screen
+            case .transferred:
+                // Application was recently transferred, refresh User Identifier
+            @unknown default:
+                break
+            }
+        }
+```
+
+关键点：
+
+- `.authorized` 表示凭证仍有效，可以跳过登录界面进入应用。
+- `.revoked` 表示用户撤销了授权，应用应退出登录、关闭会话并展示登录页。
+- `.notFound` 表示找不到对应凭证，应用应回到登录页。
+- `.transferred` 是 2020 年新增状态，适用于 app 从一个开发团队转移到另一个开发团队后的用户标识迁移。
+- `@unknown default` 保留给未来状态，避免新系统返回未知枚举时崩溃。
+
+### 4. 团队转移后用已有 user identifier 触发迁移
+
+（[10:22](https://developer.apple.com/videos/play/wwdc2020/10173/?time=622)、[11:00](https://developer.apple.com/videos/play/wwdc2020/10173/?time=660)）
+
+Sign in with Apple 的 user identifier 按开发团队隔离。公司收购或应用转移后，旧团队下的 user identifier 需要迁移到新团队。处理 `.transferred` 时，开发者把当前保存的 user identifier 填入新请求的 `request.user`，系统会生成匹配新团队的标识。
+
+```
+// Migrating a user identifier
+
+        let request = ASAuthorizationAppleIDProvider().createRequest()
+        request.requestedScopes = [.fullName, .email]
+
+        request.user = getStoredUserIdentifier()
+
+        request.nonce = myNonceString()
+        request.state = myStateString()
+
+        let controller = ASAuthorizationController(authorizationRequests: [request])
+
+        controller.delegate = self
+        controller.presentationContextProvider = self
+
+        controller.performRequests()
+```
+
+关键点：
+
+- 迁移流程复用创建账号或登录用户的授权请求。
+- `request.user` 填入当前保存的 user identifier，告诉系统这是一次迁移请求。
+- `nonce` 和 `state` 仍然需要设置，迁移流程也要保持同样的请求校验。
+- 回调仍通过 `ASAuthorizationController` 的 delegate 返回，应用可以在用户无感知的情况下刷新本地标识。
+
+### 5. 用服务器通知处理授权和邮箱状态变化
+
+（[11:31](https://developer.apple.com/videos/play/wwdc2020/10173/?time=691)、[12:06](https://developer.apple.com/videos/play/wwdc2020/10173/?time=726)、[12:48](https://developer.apple.com/videos/play/wwdc2020/10173/?time=768)）
+
+客户端生命周期检查只能覆盖设备上的状态。2020 年，Apple 增加 server-to-server developer notifications（服务器到服务器开发者通知）。开发者在 Apple Developer 网站注册 endpoint 后，Apple 会把事件作为自己签名的 JWT 发送到服务器。
+
+```text
+register server endpoint on Apple Developer website
+events are JSON Web Tokens signed by Apple
+
+email-disabled
+email-enabled
+consent-revoked
+account-delete
+```
+
+关键点：
+
+- `email-disabled` 表示用户停止接收 private email relay 转发的邮件。
+- `email-enabled` 表示用户重新打开 private email relay 的邮件接收。
+- `consent-revoked` 表示用户停止在应用中使用 Apple ID，应按用户退出登录处理。
+- `account-delete` 表示用户请求 Apple 删除 Apple ID，相关 user identifier 不再有效。
+- 这些通知直接进入服务端，适合更新账号状态、邮件发送策略和风控记录。
+
+### 6. SwiftUI 里用 SignInWithAppleButton 承接同一套请求参数
+
+（[13:35](https://developer.apple.com/videos/play/wwdc2020/10173/?time=815)、[13:54](https://developer.apple.com/videos/play/wwdc2020/10173/?time=834)、[14:40](https://developer.apple.com/videos/play/wwdc2020/10173/?time=880)）
+
+SwiftUI 新增 `SignInWithAppleButton`。按钮本身可以选择 `SignIn`、`Continue` 或 `SignUp` 标签，`onRequest` 里设置 scope、`nonce` 和 `state`，`onCompletion` 里处理授权成功或失败。按钮样式支持 black、white 和 white outline。
+
+```
+// SwiftUI example:
+
+SignInWithAppleButton(.signIn) {
+    onRequest: { (request) in
+        request.requestedScopes = [.fullName, .email]
+        request.nonce = myNonceString()
+        request.state = myStateString()
+    }
+    onCompletion: { (result) in
+        switch result {
+        case .success(let authorization):
+            // Handle Authorization
+        case .failure(let error)
+            // Handle Failure
+        }
+    }
+}.signInWithAppleButtonStyle(.black)
+```
+
+关键点：
+
+- `SignInWithAppleButton(.signIn)` 创建系统样式的 Apple 登录按钮。
+- `onRequest` 是配置授权请求的位置，和 UIKit 流程一样要设置 `nonce` 与 `state`。
+- `onCompletion` 处理授权结果，成功时继续解析 `authorization`。
+- `.signInWithAppleButtonStyle(.black)` 选择按钮样式，session 还提到 white 和 white outline。
+
+### 7. 用 Account Modification Extension 升级已有密码账号
+
+（[16:50](https://developer.apple.com/videos/play/wwdc2020/10173/?time=1010)、[18:42](https://developer.apple.com/videos/play/wwdc2020/10173/?time=1122)、[25:15](https://developer.apple.com/videos/play/wwdc2020/10173/?time=1515)、[29:42](https://developer.apple.com/videos/play/wwdc2020/10173/?time=1782)）
+
+Upgrade to Sign in with Apple 面向已有用户名密码账号。系统通过 Account Authentication Modification Extension 调用应用扩展，先尝试无界面验证已有 `ASPasswordCredential`。验证成功后，扩展请求 Apple ID credential，服务端完成账号转换，扩展再调用完成方法，系统会移除旧密码凭据。
+
+```swift
+enum VerificationResult : Int { case success; case failure; case twoFactorAuthRequired;
+
+override func convertAccountToSignInWithAppleWithoutUserInteraction(
+    for serviceIdentifier: ASCredentialServiceIdentifier,
+    existingCredential: ASPasswordCredential
+) {
+    verifyCredential(existingCredential) { (result: VerificationResult) in
+        switch result {
+        case .failure:
+            self.extensionContext.cancelRequest(withError:
+                ASExtensionError(.failed))
+        case .success:
+          self.extensionContext.getSignInWithAppleAuthorizationWithState(state: myStateString(),
+                                                                         nonce: myNonceString(),
+                                                                         {…}
+        case .twoFactorAuthRequired:
+            self.extensionContext.cancelRequest(withError:
+                ASExtensionError(.userInteractionRequired))
+    }
+}
+```
+
+关键点：
+
+- `convertAccountToSignInWithAppleWithoutUserInteraction` 是无界面升级的第一步，目标是减少用户额外操作。
+- `existingCredential` 是系统传入的已有密码凭据，扩展需要先验证它是否仍有效。
+- `.failure` 走 `ASExtensionError(.failed)`，结束升级流程。
+- `.success` 调用 `getSignInWithAppleAuthorizationWithState`，把 `state` 和 `nonce` 传入 Apple ID 授权流程。
+- `.twoFactorAuthRequired` 走 `ASExtensionError(.userInteractionRequired)`，让系统展示 step-up security（补充验证）界面。
+- 服务端完成账号转换后，扩展调用完成方法，系统移除旧的弱密码凭据，避免用户下次登录时看到两个账号入口。
+
+---
+
+## 核心启发
+
+- **把登录回调做成可恢复流程**
+  - **做什么**：首次授权时立即缓存 `userIdentifier`、姓名、邮箱、`state`、`identityToken` 和 `authorizationCode` 的处理状态。
+  - **为什么值得做**：session 明确说姓名和邮箱只在第一次授权返回，网络失败会让账号创建流程丢数据。
+  - **怎么开始**：在 `authorizationController(controller:didCompleteWithAuthorization:)` 中先保存本地恢复点，再调用服务端创建 session。
+
+- **为隐藏邮箱加独立状态**
+  - **做什么**：在用户资料或邮件系统里标记 private email relay 地址，并记录 `email-disabled` 与 `email-enabled` 通知。
+  - **为什么值得做**：Apple 说明 relay 地址按团队隔离、由 Apple 验证，并允许用户关闭或重新打开邮件转发。
+  - **怎么开始**：注册服务器通知 endpoint，把 `email-disabled` 触发为暂停营销邮件，把 `email-enabled` 触发为恢复可发送状态。
+
+- **把授权撤销接入统一退出登录**
+  - **做什么**：客户端监听 `.revoked`，服务端处理 `consent-revoked`，两条路径都进入同一套账号退出流程。
+  - **为什么值得做**：用户可以从系统设置断开应用；只依赖客户端下次启动会让服务端状态滞后。
+  - **怎么开始**：应用启动和回前台调用 `getCredentialState`，服务端收到 `consent-revoked` 后关闭 session 并清理 refresh token。
+
+- **给弱密码用户提供一键升级入口**
+  - **做什么**：在账号安全页增加“升级到 Sign in with Apple”，并支持系统从密码管理器发起升级。
+  - **为什么值得做**：Account Authentication Modification Extension 可以用已有凭据验证账号，成功后系统会移除旧的弱密码凭据。
+  - **怎么开始**：实现 `ASAccountAuthenticationModificationViewController` 子类，优先走无界面验证；只有需要二次验证时再返回 `userInteractionRequired`。
+
+---
+
+## 关联 Session
+
+- [One-tap account security upgrades](/articles/wwdc2020-10666) — 深入讲解 Account Authentication Modification Extension、强密码升级和 Sign in with Apple 升级流程。
+- [Meet Face ID and Touch ID for the web](/articles/wwdc2020-10670) — 介绍 Safari 中基于 Web Authentication API 的网站登录替代方案。
+- [Secure your app: threat modeling and anti-patterns](/articles/wwdc2020-10189) — 适合补齐登录、token 和状态管理背后的威胁建模思路。

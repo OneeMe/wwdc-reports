@@ -1,0 +1,205 @@
+---
+title: "Explore the Action & Vision app"
+description: "it's now easy to create an app for fitness or sports coaching that takes advantage of machine learning — and to prove it, we built our own. learn how we designed the action & vision app using object detection and action classification in create ml along with the new body pose estimation, trajectory detection, and contour detection features in the vision framework."
+date: 2020-06-10
+tags: ["WWDC 2020", "Vision", "Create ML", "Core ML"]
+thumbnail: "/images/sessions/2020/10099.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10099/"
+sessionId: "wwdc2020-10099"
+year: "2020"
+code: "10099"
+relatedSessions:
+  - title: "Build an Action Classifier with Create ML"
+    code: "10043"
+    description: "用 Create ML 训练基于人体姿态序列的动作分类模型，是本场投掷类型识别的模型来源。"
+  - title: "Detect Body and Hand Pose with Vision"
+    code: "10653"
+    description: "讲解 Vision 的身体和手部姿态检测，补足本场使用人体关键点分析动作的基础。"
+  - title: "Explore Computer Vision APIs"
+    code: "10673"
+    description: "介绍 Vision 与 Core Image 的轮廓、光流等视觉 API，是理解场地轮廓检测的前置内容。"
+  - title: "Get models on device using Core ML Converters"
+    code: "10153"
+    description: "说明如何把训练好的机器学习模型带到设备端运行，补充本场 Core ML 推理部分。"
+---
+
+## Highlight
+
+> Apple 用 Action & Vision 示例 App 演示如何在设备端组合 Create ML、Core ML 与 Vision 的物体检测、人体姿态、轨迹和轮廓检测，让 iPhone 或 iPad 记录豆袋投掷、识别投掷类型并实时反馈速度、角度和得分。
+
+## 核心内容
+
+很多运动分析 App 的第一步，是让用户自己看视频。拍下来、回放、靠眼睛判断动作哪里出了问题。Action & Vision 换了一个视角：手机先固定在场边，用相机观察玩家和场地，再在本机完成识别、分析和反馈。
+
+Session 选的例子是 bean bag toss（豆袋投掷）。App 要回答四个问题：场地在哪里，玩家怎么动，豆袋怎么飞，最后该给用户什么反馈。这个例子简单到容易理解，又足够完整：它同时需要场地定位、人体姿态、运动轨迹、动作分类、速度和角度计算。
+
+Apple 把流程拆成三个阶段。准备阶段先用 Create ML 训练出的物体检测模型找到板子，再用图像配准判断相机是否稳定。设置阶段用轮廓检测量出板子的边缘和洞口，并用身体姿态检测找到玩家。游戏阶段追踪豆袋的抛物线，取投掷发生前后的身体姿态窗口，交给 Core ML 模型判断是 overhand、underhand 还是 under-the-leg。
+
+这场 session 的价值不在某一个单独 API。它展示的是实时视觉 App 的工程组织方式：摄像头帧进入不同 ViewController 和队列，Vision 请求各自负责一类观察，最后由业务状态机把这些结果合并成用户能理解的反馈。
+
+## 详细内容
+
+这场 session 的 query 数据没有官方 code snippets。下面的代码块只列 transcript 中点名的类、函数、属性和计算关系，用来说明 sample project 的实现路径。
+
+### 场地识别：先找板子，再确认相机稳定
+
+（[05:56](https://developer.apple.com/videos/play/wwdc2020/10099/?time=356)）演讲者先列出整条算法链。板子由自定义物体检测模型识别，模型来自 Create ML，运行时通过 `VNCoreMLRequest` 做推理。找到板子后，App 用图像配准判断相机是否已经固定，再用轮廓检测量出板子的边缘。
+
+```swift
+// SetupViewController 的准备阶段流程，按 transcript 中的代码走查整理
+let boardDetectionRequest: VNCoreMLRequest
+let sceneStabilityRequest: VNTranslationalImageRegistrationRequest
+let boardContourRequest: VNDetectContoursRequest
+
+boardContourRequest.regionOfInterest = boardBoundingBox
+```
+
+关键点：
+
+- `VNCoreMLRequest` 负责运行 Create ML 训练出的板子检测模型，输出板子的 bounding box。
+- `VNTranslationalImageRegistrationRequest` 比较连续帧的平移变化；当 15 帧移动平均低于 10 像素时，App 认为场景稳定。
+- `VNDetectContoursRequest` 用上一步得到的 `boardBoundingBox` 设置 `regionOfInterest`，只在板子区域找轮廓。
+- 轮廓结果用于找板子边缘和洞口，后面计算真实速度时会用到板子的实际尺寸。
+
+### 玩家识别：用身体姿态把人从画面里取出来
+
+（[08:54](https://developer.apple.com/videos/play/wwdc2020/10099/?time=534)）板子和场地准备好后，App 需要找到玩家。这里使用的是 iOS 14 新增的 `VNDetectHumanBodyPoseRequest`。它返回肘、肩、腕、腿等人体关节点，App 可以据此计算关节角度，也可以把连续姿态作为动作分类模型的输入。
+
+```swift
+// GameViewController 接收相机帧后执行身体姿态请求
+let detectPlayerRequest: VNDetectHumanBodyPoseRequest
+
+func handleBodyPoseResults(_ observations: [VNRecognizedPointsObservation]) {
+    let playerBox = humanBoundingBox(observations)
+    bodyPoseObservations.append(contentsOf: observations)
+}
+```
+
+关键点：
+
+- `VNDetectHumanBodyPoseRequest` 是本场动作分析的核心输入，后面投掷角度和动作分类都依赖它。
+- `humanBoundingBox` 在 transcript 中用于过滤低置信度观察结果，并返回进入画面的玩家 bounding box。
+- App 会保存 `bodyPoseObservations`，因为动作分类需要一段时间窗口内的姿态序列。
+- 这一步没有把画面上传到云端；session 开头明确强调全部分析可以在设备端完成。
+
+### 轨迹检测：把豆袋飞行拆成可计算的抛物线
+
+（[18:01](https://developer.apple.com/videos/play/wwdc2020/10099/?time=1081)）游戏开始后，App 要找到豆袋飞行轨迹。`VNDetectTrajectoriesRequest` 是 stateful request（有状态请求），需要持续喂入带时间戳的 sample buffer。它不会在第一帧就给出结论，而是积累多帧证据，到第五帧左右才报告轨迹。
+
+```swift
+let detectTrajectoryRequest: VNDetectTrajectoriesRequest
+detectTrajectoryRequest.frameAnalysisSpacing = CMTime.zero
+detectTrajectoryRequest.trajectoryLength = trajectoryLength
+detectTrajectoryRequest.minimumObjectSize = minimumObjectSize
+detectTrajectoryRequest.maximumObjectSize = maximumObjectSize
+```
+
+关键点：
+
+- `frameAnalysisSpacing` 控制分析帧间隔；设为 0 会分析所有帧，也可以调大来降低旧设备负载。
+- `trajectoryLength` 用来过滤太短的零碎移动。
+- `minimumObjectSize` 和 `maximumObjectSize` 根据豆袋大小过滤噪声、手臂摆动和其他大物体。
+- `VNDetectTrajectoriesRequest` 要保留同一个实例，因为它会随着帧序列建立状态。
+- session 明确提醒：轨迹检测需要稳定场景，物体运动要能近似为抛物线，并且 sample buffer 必须带时间戳。
+
+（[19:29](https://developer.apple.com/videos/play/wwdc2020/10099/?time=1169)）轨迹结果由 `VNTrajectoryObservation` 返回。它包含检测点、投影点、抛物线系数和时间范围。App 用这些信息画出平滑轨迹，并通过 `UUID` 区分豆袋轨迹和阴影轨迹。
+
+```swift
+func processTrajectoryObservations(_ observations: [VNTrajectoryObservation]) {
+    for observation in observations {
+        let detectedPoints = observation.points
+        let projectedPoints = observation.projectedPoints
+        let coefficients = observation.equationCoefficients
+        let timeRange = observation.timeRange
+    }
+}
+```
+
+关键点：
+
+- `points` 是运动物体的中心点序列。
+- `projectedPoints` 是描述抛物线的投影点，适合画出平滑曲线。
+- `equationCoefficients` 对应 `y = ax^2 + bx + c` 的系数。
+- `timeRange` 告诉 App 投掷实际开始和结束的时间，用于回看对应的人体姿态窗口。
+
+### 动作分类：用投掷事件截取姿态窗口
+
+（[25:00](https://developer.apple.com/videos/play/wwdc2020/10099/?time=1500)）投掷类型不是连续预测出来的。App 先用轨迹检测确认一次投掷发生，再从身体姿态历史里取 45 帧，合并成一个 `MLMultiArray`，交给 Core ML 模型预测标签和置信度。
+
+```swift
+let bodyPoseWindow = bodyPoseObservations // 45 frames around the detected throw
+let modelInput: MLMultiArray = prepareInputWithObservations(bodyPoseWindow)
+let throwType = playerStats.getLastThrowType()
+
+let confidence = highestProbability
+```
+
+关键点：
+
+- transcript 明确说本场模型由 Create ML 训练，并通过 Core ML 在 App 中运行。
+- 45 帧窗口围绕轨迹检测到的投掷点，目的是覆盖完整投掷动作。
+- 模型输入来自 `VNDetectHumanBodyPoseRequest` 提取出的身体姿态，不直接使用原始视频帧。
+- 模型最初只有 underhand、overhand、under-the-leg 三类，后来加入 Other/Negative class，用来过滤捡豆袋、走路等非投掷动作。
+
+### 速度和角度：把像素量测转换成用户反馈
+
+（[27:51](https://developer.apple.com/videos/play/wwdc2020/10099/?time=1671)）App 已经知道板子的真实尺寸：二英尺乘四英尺。轮廓检测给出板子在图像中的像素尺寸，二者建立比例后，豆袋轨迹长度就能从像素转换为真实距离。再除以轨迹持续时间，就得到 release speed。
+
+```swift
+let distanceInPixels = trajectoryLengthInPixels
+let distanceInFeet = distanceInPixels * boardScaleInFeetPerPixel
+let releaseSpeed = distanceInFeet / trajectoryDuration
+
+let releaseAngle = angle(from: wristPoint, to: elbowPoint, relativeTo: horizon)
+```
+
+关键点：
+
+- 真实尺度来自规则板子的固定尺寸，不需要额外标定物。
+- `releaseSpeed` 在 transcript 中由 `updatePathLayer` 计算，使用轨迹长度和持续时间。
+- `releaseAngle` 在 `getReleaseAngle` 中计算，使用豆袋释放那一帧的 wrist 和 elbow points。
+- 这些指标最后进入 summary view，帮助玩家比较不同投掷轨迹、平均速度、释放角度和最终得分。
+
+### 实时处理：先释放相机 buffer，再渲染 UI
+
+（[33:00](https://developer.apple.com/videos/play/wwdc2020/10099/?time=1980)）实时 App 最容易出问题的地方是相机 buffer。摄像头可用 buffer 数量有限，分析代码占着 buffer 太久，摄像头就会丢帧。Session 的建议是拆队列、并行处理、尽快归还 buffer，再异步回到主队列渲染结果。
+
+```swift
+func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer) {
+    trajectoryQueue.async {
+        performTrajectoryAnalysis(sampleBuffer)
+    }
+
+    bodyPoseQueue.async {
+        performBodyPoseAnalysis(sampleBuffer)
+    }
+
+    DispatchQueue.main.async {
+        renderLatestOverlay()
+    }
+}
+```
+
+关键点：
+
+- trajectory 和 body pose 分开队列，避免所有分析阻塞在同一条执行路径上。
+- UI overlay 更新放回主队列，但不要等渲染完成才释放相机 buffer。
+- 如果跟不上帧率，使用 capture output 的 `didDrop` 回调查看丢帧原因。
+- 播放本地视频时，session 使用 `AVPlayerItemVideoOutput` 配合 `CADisplayLink`，按显示时间取 pixel buffer 做分析，避免播放卡顿。
+
+## 核心启发
+
+- **投篮或投掷复盘工具**：做什么：记录篮球、飞盘、网球发球一类抛物线动作。为什么值得做：本场的 `VNDetectTrajectoriesRequest` 已经给出点、抛物线和时间范围。怎么开始：先固定机位，用 `minimumObjectSize` 和 `maximumObjectSize` 锁定目标大小，再按 `timeRange` 截取动作前后的姿态。
+
+- **居家健身动作反馈**：做什么：识别深蹲、弓步、开合跳等动作的类型和次数。为什么值得做：Action & Vision 证明了身体姿态可以转成 `MLMultiArray` 并交给动作分类模型。怎么开始：先看 10043 训练动作分类器，再把姿态窗口缓存接到自己的 Core ML 模型。
+
+- **儿童运动游戏计分器**：做什么：把现实中的投掷、跳跃、挥拍动作变成自动计分小游戏。为什么值得做：本场用 GameManager 串起设置、游戏、总结三个状态，适合做低门槛互动游戏。怎么开始：先定义一个稳定场地，用轮廓检测建立真实尺度，再把轨迹或姿态结果映射成分数。
+
+- **教练端动作对比报告**：做什么：把多次投掷的速度、释放角度、轨迹形状汇总成训练报告。为什么值得做：summary view 已经展示了轨迹、平均速度、释放角度和得分。怎么开始：保存每次 `VNTrajectoryObservation` 的 projected points、release speed 和 release angle，用图表展示最佳与最差尝试。
+
+## 关联 Session
+
+- [Build an Action Classifier with Create ML](/articles/wwdc2020-10043) — 学习如何用 Create ML 训练本场使用的动作分类模型。
+- [Detect Body and Hand Pose with Vision](/articles/wwdc2020-10653) — 深入理解 `VNDetectHumanBodyPoseRequest` 和姿态关键点输出。
+- [Explore Computer Vision APIs](/articles/wwdc2020-10673) — 补充轮廓检测、光流和 Vision/Core Image 组合使用方式。
+- [Get models on device using Core ML Converters](/articles/wwdc2020-10153) — 了解训练好的模型如何转换并在设备端通过 Core ML 运行。

@@ -1,0 +1,268 @@
+---
+title: "Meet StoreKit 2"
+description: "StoreKit 2 delivers powerful, Swift-native APIs for in-app purchases and auto-renewable subscriptions. Learn how you can easily implement in-app purchases and subscriptions with async/await."
+date: "2021-06-08"
+tags: ["StoreKit", "In-App Purchase", "Subscriptions", "Swift", "async/await"]
+thumbnail: "/images/sessions/2021/10114.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10114/"
+sessionId: "wwdc2021-10114"
+year: "2021"
+relatedSessions:
+  - title: "Support customers and handle refunds"
+    code: "10115"
+    description: "StoreKit 2 客户支持和退款处理"
+  - title: "In-app purchases on the server"
+    code: "10174"
+    description: "服务端内购验证和 App Store Server API"
+  - title: "What's new in Wallet and Apple Pay"
+    code: "10092"
+    description: "Apple Pay 新特性和支付 sheet 改进"
+  - title: "Meet StoreKit for SwiftUI"
+    code: "10114"
+    description: "SwiftUI 中的 StoreKit 集成"
+---
+
+## Highlight
+
+> StoreKit 2 用 Swift async/await 重写了整个内购流程：`Product.products(for:)` 一行代码获取商品、`product.purchase()` 一行代码发起购买、每笔交易自带 JWS 签名且自动验证，订阅状态通过 `currentEntitlements` 直接查询。
+
+## 核心内容
+
+你在做一个内购系统。StoreKit 1 的代码你写过：创建 `SKProductsRequest`、实现代理方法、处理 `SKPaymentTransaction` 的状态机、在沙盒和正式环境之间来回切换测试、收据解析那一长串代码让你头疼。
+
+StoreKit 2 说：这些都可以更简单。
+
+新产品请求一行代码。新购买流程一行代码。交易验证自动完成。订阅状态直接查询。所有 API 都是 Swift-native 的 async/await，代码读起来像同步逻辑。
+
+而且 StoreKit 2 和 StoreKit 1 完全兼容。旧交易自动同步到新 API，你可以渐进式迁移。
+
+## 详细内容
+
+### 获取产品信息
+
+（[03:13](https://developer.apple.com/videos/play/wwdc2021/10114/?time=193)）
+
+StoreKit 2 的 `Product` 类型替代了 `SKProduct`，增加了产品类型、订阅信息等字段：
+
+```swift
+let products = try await Product.products(for: ["fuel.small", "car.sports", "nav.pro"])
+
+// 按类型分组
+let consumables = products.filter { $0.type == .consumable }
+let nonConsumables = products.filter { $0.type == .nonConsumable }
+let subscriptions = products.filter { $0.type == .autoRenewable }
+```
+
+**关键点：**
+- `Product.products(for:)` 是静态方法，传入产品 ID 集合
+- 返回的 `Product` 包含 `type` 属性，自动识别 consumable / non-consumable / subscription
+- 支持 `BackingValue` 包装类型，未来新增字段也能在旧 SDK 上访问
+
+### 发起购买
+
+（[03:31](https://developer.apple.com/videos/play/wwdc2021/10114/?time=211)）
+
+购买变成 `Product` 的实例方法，结果用 `PurchaseResult` 枚举：
+
+```swift
+let result = try await product.purchase()
+
+switch result {
+case .success(let verification):
+    // 购买成功，verification 包含签名交易
+    let transaction = try checkVerified(verification)
+    await deliverContent(for: transaction)
+    await transaction.finish()
+
+case .userCancelled:
+    // 用户取消
+    break
+
+case .pending:
+    // 等待验证（如家长批准、银行验证）
+    break
+
+case .unverified(_, let error):
+    // 验证失败
+    print("Purchase failed: \(error)")
+}
+```
+
+**关键点：**
+- `purchase()` 返回 `PurchaseResult`，覆盖成功、取消、等待、失败四种状态
+- 成功时返回的 `verification` 包含自动验证结果
+- 最后必须调用 `transaction.finish()`，否则交易会一直留在队列中
+
+### 自动交易验证
+
+（[11:19](https://developer.apple.com/videos/play/wwdc2021/10114/?time=679)）
+
+StoreKit 2 的每笔交易都带有 JWS（JSON Web Signature）签名。系统自动验证签名是否来自 App Store：
+
+```swift
+func checkVerified<T>(_ result: VerificationResult<T>) throws -> T {
+    switch result {
+    case .verified(let safe):
+        return safe
+    case .unverified(_, let error):
+        throw error
+    }
+}
+```
+
+**关键点：**
+- `VerificationResult` 有 `.verified` 和 `.unverified` 两个 case
+- 系统已验证签名来自 Apple、匹配你的 bundle ID、生成于当前设备
+- 你也可以选择自行验证 JWS，使用 CryptoKit 和证书链
+
+### App Account Token：关联你的用户系统
+
+（[04:20](https://developer.apple.com/videos/play/wwdc2021/10114/?time=260)）
+
+如果你的 App 有自己的账户系统，可以用 `appAccountToken` 把 StoreKit 交易和你的用户关联：
+
+```swift
+let accountToken = UUID(uuidString: user.id)!
+let result = try await product.purchase(options: [.appAccountToken(accountToken)])
+```
+
+**关键点：**
+- `appAccountToken` 是 UUID 格式，由你生成
+- 购买完成后，token 会出现在交易的 `appAccountToken` 字段中
+- 跨设备同步，即使换设备也能追踪到同一账户的购买记录
+
+### 监听交易更新
+
+（[15:22](https://developer.apple.com/videos/play/wwdc2021/10114/?time=922)）
+
+用 `Transaction.updates` 监听所有交易更新（包括其他设备上的购买、家长批准后的完成、退款等）：
+
+```swift
+Task {
+    for await result in Transaction.updates {
+        guard let transaction = try? checkVerified(result) else { continue }
+
+        if transaction.revocationDate == nil {
+            await deliverContent(for: transaction)
+        }
+        await transaction.finish()
+    }
+}
+```
+
+**关键点：**
+- `Transaction.updates` 是无限异步序列，App 启动后就要开始监听
+- 处理退款（`revocationDate` 非 nil）和升级（`isUpgraded` 为 true）的情况
+- 必须在 App 启动时就开始监听，否则可能错过更新
+
+### 查询交易历史和当前权益
+
+（[19:36](https://developer.apple.com/videos/play/wwdc2021/10114/?time=1176)）
+
+StoreKit 2 提供三种查询方式：
+
+```swift
+// 1. 获取所有历史交易
+for await result in Transaction.all {
+    let transaction = try checkVerified(result)
+    // 处理每条历史交易
+}
+
+// 2. 获取某个产品的最新交易
+if let result = await Transaction.latest(for: "nav.pro") {
+    let transaction = try checkVerified(result)
+    // 检查是否仍有效
+}
+
+// 3. 获取当前有效权益（最常用）
+for await result in Transaction.currentEntitlements {
+    let transaction = try checkVerified(result)
+    // 解锁对应内容
+}
+```
+
+**关键点：**
+- `currentEntitlements` 只返回当前有效的非消耗品和活跃订阅
+- 已退款的交易不会出现在 `currentEntitlements` 中
+- 消耗品不包含在内，因为它们不是持久权益
+- 用户换设备后首次打开 App 就能自动获取权益，无需手动恢复
+
+### 订阅状态查询
+
+（[22:47](https://developer.apple.com/videos/play/wwdc2021/10114/?time=1367)）
+
+订阅状态包含三部分：最新交易、续订状态、续订信息：
+
+```swift
+let statuses = await product.subscription?.status
+
+for status in statuses {
+    // 1. 最新交易
+    let latestTransaction = try checkVerified(status.transaction)
+
+    // 2. 续订状态：subscribed / expired / inGracePeriod / inBillingRetryPeriod / revoked
+    switch status.state {
+    case .subscribed:
+        // 正常订阅中
+    case .expired:
+        // 已过期
+    case .inGracePeriod:
+        // 宽限期内
+    default:
+        break
+    }
+
+    // 3. 续订信息（也带 JWS 签名）
+    let renewalInfo = try checkVerified(status.renewalInfo)
+    if renewalInfo.autoRenewStatus == .off {
+        // 用户关闭了自动续订，可以展示挽留优惠
+    }
+    if renewalInfo.autoRenewProductID != product.id {
+        // 用户降级了订阅等级
+    }
+}
+```
+
+**关键点：**
+- `status` 返回数组，因为用户可能同时有自有订阅和家庭共享订阅
+- 应该取数组中最高等级的服务
+- `renewalInfo` 包含 `autoRenewStatus`、`autoRenewProductID`、`expirationReason` 等关键字段
+- 续订信息也带 JWS 签名，系统自动验证
+
+### JWS 签名结构
+
+（[34:03](https://developer.apple.com/videos/play/wwdc2021/10114/?time=2043)）
+
+StoreKit 2 使用 JSON Web Signature 标准，包含三部分：
+
+1. **Header**：包含算法（ECDSA）和证书链（x5c）
+2. **Payload**：交易 ID、产品 ID、购买日期等核心数据
+3. **Signature**：用 header 和 payload 生成的签名
+
+自行验证时的额外检查：
+- 确认 payload 中的 bundle ID 匹配你的 App
+- 用 `AppStore.deviceVerificationID` 做设备验证：将 nonce 和 device ID 拼接后做 SHA384 哈希，与 payload 中的设备验证字段比对
+
+**关键点：**
+- 证书链包含在 JWS 数据中，验证无需联网
+- StoreKit 2 已自动完成验证，大部分场景不需要自行实现
+- 服务端验证参考 App Store Server API
+
+## 核心启发
+
+1. **新项目直接用 StoreKit 2 做内购**。async/await 让购买流程的代码从几十行代理方法压缩到几行顺序代码。自动验证省去了收据解析的麻烦。入口 API：`Product.products(for:)` + `product.purchase()`。
+
+2. **用 `currentEntitlements` 替代手动恢复购买**。用户换设备后首次打开 App 就能自动获取所有有效权益，不需要点击"恢复购买"按钮。消耗品除外。入口 API：`Transaction.currentEntitlements`。
+
+3. **在订阅过期前做挽留**。通过 `renewalInfo.autoRenewStatus` 检测用户是否关闭了自动续订，如果是，在过期前展示 win-back 优惠。入口 API：`Product.subscription?.status` + `.renewalInfo`。
+
+4. **用 `appAccountToken` 关联自有账户系统**。如果你的 App 有独立登录系统，生成 UUID 作为 `appAccountToken` 随购买发送，后续在交易记录中就能追踪到具体用户。入口 API：`.appAccountToken(UUID)` purchase option。
+
+5. **App 启动后立即启动交易监听**。`Transaction.updates` 是无限异步序列，必须在 App 启动时就开始监听，否则可能错过其他设备上的购买完成、家长批准、退款等事件。入口 API：`Task { for await result in Transaction.updates { ... } }`。
+
+## 关联 Session
+
+- [Support customers and handle refunds](/articles/wwdc2021-10115) — StoreKit 2 客户支持、退款处理和订阅管理
+- [In-app purchases on the server](/articles/wwdc2021-10174) — App Store Server API 和服务器端验证
+- [What's new in Wallet and Apple Pay](/articles/wwdc2021-10092) — Apple Pay 新特性和支付 sheet 改进
+- [Meet StoreKit for SwiftUI](/articles/wwdc2021-10114) — SwiftUI 中的 StoreKit 集成

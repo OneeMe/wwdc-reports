@@ -1,0 +1,238 @@
+---
+title: "Use model deployment and security with Core ML"
+description: "discover how to deploy core ml models outside of your app binary, giving you greater flexibility and control when bringing machine learning features to your app. and learn how core ml model deployment enables you to deliver revised models to your app without requiring an app update. we'll also walk you through how you can protect custom machine learning models through encryption, and preview your model performance in xcode."
+date: 2020-06-10
+tags: ["WWDC 2020", "Core ML", "Machine Learning", "Xcode"]
+thumbnail: "/images/sessions/2020/10152.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10152/"
+sessionId: "wwdc2020-10152"
+year: "2020"
+code: "10152"
+article:
+  type: "technical"
+  source: "session-transcript"
+  version: "1.0"
+relatedSessions:
+  - title: "Get models on device using Core ML Converters"
+    code: "10153"
+    description: "讲解如何把 TensorFlow、PyTorch 等训练框架中的模型转换为 Core ML，形成可部署到 App 的模型文件。"
+  - title: "Control training in Create ML with Swift"
+    code: "10156"
+    description: "介绍用 Swift 控制 Create ML 训练、checkpoint 和进度监听，适合和模型部署的迭代流程配合。"
+  - title: "Build Image and Video Style Transfer models in Create ML"
+    code: "10642"
+    description: "讲解如何训练本场示例中 FlowerStylizer 一类的风格迁移模型，并导出给 Core ML 使用。"
+  - title: "Build an Action Classifier with Create ML"
+    code: "10043"
+    description: "展示如何训练动作分类 Core ML 模型，是理解模型训练完成后如何进入部署阶段的相关案例。"
+---
+
+## Highlight
+
+> Core ML 在 2020 年引入了模型部署（Model Deployment）机制，允许开发者通过云端按需下发 ML 模型，而不再需要把模型编译进应用二进制中。Session 详细介绍了如何使用 Apple 提供的模型部署基础设施，将 `MLModel` 托管在云端，由设备周期性或在系统选择的时机后台取回更新，并在 App 下次启动时让新模型可用。
+
+## 核心内容
+
+Core ML 过去最直接的集成方式，是把 `.mlmodel` 拖进 Xcode，让 Xcode 编译成设备上运行的格式，再随 App 一起提交到 App Store。这个方式稳定，也保证用户安装后马上有模型可用。问题出现在模型迭代速度变快之后：团队重新训练了模型，只想让识别结果更准，却仍要等待下一次 App 更新。（[00:44](https://developer.apple.com/videos/play/wwdc2020/10152/?time=44)）
+
+Model Deployment 处理的正是这条发布链路。开发者把模型放进 Apple cloud 管理的 Model Deployment dashboard，设备会周期性取回可用更新。App 代码只需要通过新的 Core ML API 访问模型集合，系统负责后台下载、缓存和后续更新注册。（[01:29](https://developer.apple.com/videos/play/wwdc2020/10152/?time=89)）
+
+这场演示用一个花朵识别 App 说明流程。App 里有 `FlowerClassifier` 和 `FlowerStylizer` 两个模型。演示中 dahlia 和 hibiscus 识别成功，rose 因不在旧模型的三个训练类别中失败；重新训练后的 classifier 通过 dashboard 发布，下一次设备同步后，同一个 App、不改一行代码，就能识别 rose。（[04:00](https://developer.apple.com/videos/play/wwdc2020/10152/?time=240)）
+
+部署只是上半场。下半场讨论模型本身的安全。Xcode 2020 可以生成 `.mlmodelkey`，用它在构建时加密编译后的 Core ML 模型，或在创建 model archive 时加密上传内容。运行时仍按普通模型使用，Core ML 负责取回密钥并在内存中解密；文件系统里的 compiled model 保持加密状态。（[16:08](https://developer.apple.com/videos/play/wwdc2020/10152/?time=968)）
+
+最后，Xcode 对 Core ML 模型的查看和实验能力也增强了。模型面板会显示系统版本、class labels 和部分神经网络细节；interactive model preview 可以在写代码前直接试模型；Playgrounds 也获得 Core ML 模型的自动生成接口，便于快速验证输入输出。（[22:28](https://developer.apple.com/videos/play/wwdc2020/10152/?time=1348)）
+
+## 详细内容
+
+### 用 MLModelCollection 接入云端模型
+
+（[04:34](https://developer.apple.com/videos/play/wwdc2020/10152/?time=274)）接入 Model Deployment 的第一步，是让 App 通过 `MLModelCollection` 访问 dashboard 中已经部署的模型集合。演示中的集合名是 `"FlowerModels"`，集合里用模型名 `"FlowerClassifier"` 找到下载后的 compiled model URL。
+
+```swift
+private func classifyFlower(in image: CGImage) {
+    // Check for a loaded model
+    if let model = flowerClassifier {
+        classify(image, using: model)
+        return
+    }
+
+    MLModelCollection.beginAccessing(identifier: "FlowerModels") { [self] result in
+        var modelURL: URL?
+        switch result {
+        case .success(let collection):
+            modelURL = collection.entries["FlowerClassifier"]?.modelURL
+        case .failure(let error):
+            handleModelCollectionFailure(for: error)
+        }
+
+        let result = loadFlowerClassifier(from: modelURL)
+
+        switch result {
+        case .success(let model):
+            classify(image, using: model)
+        case .failure(let error):
+            handleModelLoadFailure(for: error)
+        }
+    }
+}
+
+func loadFlowerClassifier(from modelURL: URL?) -> Result<FlowerClassifier, Error> {
+    if let modelURL = modelURL {
+        return Result { try FlowerClassifier(contentsOf: modelURL) }
+    } else {
+        return Result { try FlowerClassifier(configuration: .init()) }
+    }
+}
+```
+
+关键点：
+
+- `flowerClassifier` 是本地缓存，已经加载过模型时直接复用，避免每次分类都重新加载。
+- `MLModelCollection.beginAccessing(identifier:)` 会在第一次访问集合时触发后台下载，并注册后续模型更新。
+- `collection.entries["FlowerClassifier"]?.modelURL` 指向系统放在 App container 中的 compiled model。
+- 失败时没有直接中断功能，而是交给 `loadFlowerClassifier(from:)` 用 bundle 内模型兜底。
+- `FlowerClassifier(contentsOf:)` 加载云端下发模型；`FlowerClassifier(configuration:)` 加载随 App 打包的模型。
+
+### 在 dashboard 中创建模型集合和部署
+
+（[08:15](https://developer.apple.com/videos/play/wwdc2020/10152/?time=495)）代码准备好之后，模型本身要在 Xcode 中创建 model archive。演示里 Xcode 生成 `FlowerClassifier.mlarchive`，随后通过按钮打开 Model Deployment dashboard。
+
+dashboard 的基本结构有两层。第一层是 model collection，比如 `"FlowerModels"`，它把 `FlowerClassifier` 和 `FlowerStylizer` 这类同属一个功能的模型放在一起。第二层是 deployment，比如演示中的 `"Global Deployment"`，它决定哪一组模型 archive 会被发给哪些设备。
+
+（[11:23](https://developer.apple.com/videos/play/wwdc2020/10152/?time=683)）更新模型时，开发者创建新的 deployment，上传重新训练后的 classifier 和仍然使用的 stylizer。设备不会立刻同步；系统会选择合适时机在后台下载，并在 App 下次启动时让新模型可用。
+
+关键点：
+
+- model archive 由 Xcode 从 `.mlmodel` 准备而来。
+- model collection 适合按 App 功能分组，例如花朵识别和风格化所需的模型。
+- collection 内模型会一起发布，适合需要保持版本一致的模型组合。
+- App 仍要保留 bundle 内模型或错误处理路径，因为首次下载可能遇到无网络等失败情况。
+
+### 用 targeted deployments 控制设备人群
+
+（[12:18](https://developer.apple.com/videos/play/wwdc2020/10152/?time=738)）当 App 成长后，同一个功能可能需要按设备人群使用不同模型。演示中的例子是 iPad 拍摄花朵时相机角度和光线环境与 iPhone 不同，所以团队训练了一个 iPad 专用 classifier。
+
+dashboard 支持在 deployment 中设置 targeting rule。演示选择的条件是 device class，并把 iPad 专用模型发给 iPad；默认模型继续给其他设备使用。App 侧不需要额外选择逻辑，设备会根据规则拉到对应模型。
+
+关键点：
+
+- targeted deployments 用于减少“把所有模型都塞进 App、运行时自己挑”的低效方案。
+- 默认模型覆盖所有未命中规则的设备，专用模型只发给匹配条件的设备。
+- 这个能力和 collection 配合使用，仍然保持一组模型的原子发布。
+
+### 加密部署模型和内置模型
+
+（[16:31](https://developer.apple.com/videos/play/wwdc2020/10152/?time=991)）Core ML 加密的是 compiled model，而非原始 `.mlmodel`。Xcode 先生成 `.mlmodelkey`，该 key 与开发团队账号关联；同一团队成员要使用同一个 key 构建或归档模型。对于通过 dashboard 发布的模型，创建 model archive 时 Xcode 会选择旁边的 `.mlmodelkey`，生成加密 archive 后再上传。
+
+（[20:03](https://developer.apple.com/videos/play/wwdc2020/10152/?time=1203)）对于打包在 App bundle 内的模型，可以在 Build Phases 的 Compile Sources 里给模型添加 Core ML compiler flag：
+
+```bash
+--encrypt "$SRCROOT/HelloFlowers/Models/FlowerStylizer.mlmodelkey"
+```
+
+关键点：
+
+- `--encrypt` 告诉 Core ML compiler 在构建时加密模型。
+- 参数值指向 Xcode 生成的 `.mlmodelkey` 文件。
+- 加密后的 compiled model 会随 App 打包，传输和设备静态存储期间都保持加密。
+
+### 用异步 load 方法加载加密模型
+
+（[20:50](https://developer.apple.com/videos/play/wwdc2020/10152/?time=1250)）加密模型第一次加载时需要网络，因为系统要安全取回解密 key。Core ML 因此引入异步 `load` 方法；演示里 `FlowerStylizer.load` 返回 `Result`，成功后再回到主线程应用风格化效果。
+
+```swift
+func stylizeImage() {
+    // If we already loaded the model, apply the effect
+    if let model = flowerStylizer {
+        applyStyledEffect(using: model)
+        return
+    }
+
+    // Otherwise load and apply
+    FlowerStylizer.load { [self] result in
+
+        switch result {
+
+        case .success(let model):
+            flowerStylizer = model
+            DispatchQueue.main.async {
+                applyStyledEffect(using: model)
+            }
+
+        case .failure(let error):
+            handleFailure(for: error)
+
+        }
+    }
+}
+
+func handleFailure(for error: Error) {
+    switch error {
+    case MLModelError.modelKeyFetch:
+        handleNetworkFailure()
+
+    default:
+        handleModelLoadError(error)
+    }
+}
+```
+
+关键点：
+
+- `flowerStylizer` 已存在时直接复用，避免重复加载和重复取 key。
+- `FlowerStylizer.load` 是异步入口，适合处理第一次加载时的网络依赖。
+- 成功分支把模型缓存下来，并在主线程更新 UI 效果。
+- `MLModelError.modelKeyFetch` 专门覆盖取 key 失败的情况，App 应提示用户联网或稍后再试。
+- key 取回后由系统安全保存，后续加载同一模型不再需要网络。
+
+### 在 Xcode 中预览和实验 Core ML 模型
+
+（[22:34](https://developer.apple.com/videos/play/wwdc2020/10152/?time=1354)）这场 session 的最后一组更新都发生在 Xcode。模型文件视图会显示支持的 OS 版本、class labels 和部分网络细节。interactive model preview 支持 image segmentation、pose detection、depth estimation，以及 Create ML 可训练的多类模型。Playgrounds 也能拖入 Core ML 模型，获得和 Xcode project 相同的自动生成 Swift 接口。
+
+关键点：
+
+- 部署前先在本地试模型，能降低把坏模型发布到用户设备的风险。
+- preview 适合在写集成代码前快速检查模型输入输出。
+- Playgrounds 适合把模型 demo 分享给同事，或在小样本上验证行为。
+
+## 核心启发
+
+### 1. 给识别类 App 做模型热更新
+
+**做什么**：把花草、商品、瑕疵检测这类分类模型从 App bundle 中抽到 Model Deployment。
+
+**为什么值得做**：session 演示的 rose 识别失败可以通过重新训练并发布 classifier 修复，App 代码和 App Store 版本都不用变化。
+
+**怎么开始**：保留一个随 App 打包的基础模型；在代码里用 `MLModelCollection.beginAccessing(identifier:)` 取云端模型；失败时回退到 bundle 内模型。
+
+### 2. 给同一功能发布成组模型
+
+**做什么**：把一个功能需要的多个模型放入同一个 model collection，例如 classifier、stylizer 或后处理模型。
+
+**为什么值得做**：演示中的 collection 会把 `FlowerClassifier` 和 `FlowerStylizer` 一起管理，避免功能依赖的模型版本错配。
+
+**怎么开始**：按功能命名 collection；在 dashboard 中给每个模型名上传对应 archive；App 通过 collection entry 的模型名拿到 `modelURL`。
+
+### 3. 按设备人群投放专用模型
+
+**做什么**：为 iPad、iPhone 或其他可定位设备人群训练专用模型，只向匹配设备发布。
+
+**为什么值得做**：session 中 iPad 相机角度和光线不同，专用 classifier 能解决同一模型覆盖所有设备时的精度问题。
+
+**怎么开始**：先训练默认模型，再训练目标设备模型；在 dashboard 的 deployment 中添加 targeting rule；让 App 继续通过同一个 collection 访问模型。
+
+### 4. 保护商业敏感模型
+
+**做什么**：对包含私有数据训练结果或商业策略的 Core ML 模型启用 Xcode model encryption。
+
+**为什么值得做**：加密后的 compiled model 在传输和设备静态存储时保持加密，运行时只在内存中被 Core ML 解密。
+
+**怎么开始**：在 Xcode 中创建 `.mlmodelkey`；部署模型时生成加密 model archive；内置模型则在 Compile Sources 里加上 `--encrypt` compiler flag，并迁移到异步 `load`。
+
+## 关联 Session
+
+- [Get models on device using Core ML Converters](/articles/wwdc2020-10153) — 讲如何把 TensorFlow、PyTorch 等模型转换为 Core ML，是本场模型部署前的准备环节。
+- [Control training in Create ML with Swift](/articles/wwdc2020-10156) — 讲用 Swift 控制训练和 checkpoint，适合需要频繁重新训练并发布模型的团队。
+- [Build Image and Video Style Transfer models in Create ML](/articles/wwdc2020-10642) — 讲如何训练本场示例中 `FlowerStylizer` 这类风格迁移模型。
+- [Build an Action Classifier with Create ML](/articles/wwdc2020-10043) — 展示动作分类模型的训练流程，可作为“训练模型后再部署到 App”的相关案例。

@@ -1,0 +1,315 @@
+---
+title: "Profile and optimize your game's memory"
+description: "learn how apple platforms calculate and allocate memory for your game. we'll show you how to use instruments and the game memory template to profile your game, take a memory graph to monitor current memory use, and analyze it using xcode memory debugger and command line tools. we'll also explore metal resources in metal debugger and provide tips and tricks to further help you optimize memory usage."
+date: 2026-06-10
+tags: ["WWDC 2022"]
+thumbnail: "/images/sessions/2022/10106.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10106/"
+sessionId: "wwdc2022-10106"
+year: "2022"
+relatedSessions:
+  - title: "Discover Metal 3"
+    code: "10066"
+    description: "harness the full potential of apple silicon in your app with metal 3. we'll introduce you to the latest features, improvements, and tooling."
+  - title: "Go bindless with Metal 3"
+    code: "10101"
+    description: "learn how you can unleash powerful rendering techniques like ray tracing when you go bindless with metal 3."
+  - title: "Boost performance with MetalFX Upscaling"
+    code: "10103"
+    description: "discover metalfx, a new api that provides platform optimized graphics effects for metal applications."
+  - title: "Load resources faster with Metal 3"
+    code: "10104"
+    description: "discover how you can use fast resource streaming in metal 3 to quickly load assets."
+  - title: "Maximize your Metal ray tracing performance"
+    code: "10105"
+    description: "learn how to simplify your ray tracing code and increase performance with the power of metal 3."
+---
+
+## Highlight
+
+> Apple GPU 软件团队的 Jack Xu 和 Seth Lu 系统讲解了游戏内存的分析和优化方法。内容从内存的基本概念开始，逐步深入到 Instruments 的内存分析工具、Xcode 的内存图分析、以及 Metal Debugger 的资源优化。
+
+---
+
+## 核心内容
+
+游戏的内存问题常常先出现在一个数字上：Xcode Memory Report 里的当前内存使用量变高，设备开始紧张，最后游戏可能被系统限制。开发者第一反应通常是看分配量，但这场 session 先纠正了这个入口：分配发生在虚拟地址空间，真正被系统计入限制的是 memory footprint（内存占用）。
+
+这个区别会改变排查顺序。游戏可以分配很大的虚拟区域，但只有被访问的页面才会进入物理内存。现代 Apple 设备的内存页粒度是 16 KiB。系统向游戏计费的是 dirty、compressed、swapped 这些页面，clean 页面虽然可能常驻内存，但可以从磁盘重新加载，不计入 footprint。
+
+Metal 游戏还多了一层复杂度。Apple silicon 使用统一内存，CPU 和 GPU 共享同一池快速内存，所以被访问的 Metal buffer、texture、pipeline state object 也会进入 dirty memory。纹理、缓冲区、drawable、堆分配和匿名 VM 需要放在同一个分析流程里看。
+
+Apple 给出的工作流分三步。第一步，用 Xcode Memory Gauge 和系统 API 确认 footprint 与可用内存。第二步，用 Instruments 的 Game Memory 模板记录内存增长。第三步，在某个时间点捕获 memory graph，用 Xcode Memory Debugger、`footprint`、`vmmap`、`heap`、`malloc_history`、`leaks` 找到大对象、分配来源和引用关系。最后，再进入 Metal Debugger 的 Memory Viewer 审计资源大小、最近使用时间、像素格式、storage mode 和 heap aliasing。
+
+---
+
+## 详细内容
+
+### 1. 先看 footprint，不要只看 allocations
+
+（[06:53](https://developer.apple.com/videos/play/wwdc2022/10106/?time=413)）Jack 在前半段明确区分了 allocations 和 actual memory use。allocations 是游戏在虚拟地址空间里请求的区域。memory footprint 是系统实际向游戏计费的物理内存规模，也是部分 Apple 平台执行内存限制时使用的指标。
+
+游戏可以在运行时查询当前环境还剩多少内存。iOS、iPadOS、tvOS 和 watchOS 上可以使用 `os_proc_available_memory()`。
+
+```objc
+#import <os/proc.h>
+
+API_UNAVAILABLE(macos) API_AVAILABLE(ios(13.0), tvos(13.0), watchos(6.0))
+size_t os_proc_available_memory(void);
+```
+
+关键点：
+
+- `#import <os/proc.h>` 引入进程相关的系统接口。
+- `API_UNAVAILABLE(macos)` 表示这个查询接口不适用于 macOS。
+- `API_AVAILABLE(...)` 标出可用平台和最低系统版本。
+- `os_proc_available_memory()` 返回当前进程可用的系统内存规模，可用于动态调整资源加载策略。
+
+（[07:07](https://developer.apple.com/videos/play/wwdc2022/10106/?time=427)）如果要看当前 footprint 和生命周期峰值，可以用 `proc_pid_rusage()` 读取 `rusage_info_current`。
+
+```objc
+#if __has_include(<libproc.h>)
+#include <libproc.h> // On macOS.
+#else
+#include <sys/resource.h> // On iOS, iPadOS and tvOS.
+int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer)  
+    __OSX_AVAILABLE_STARTING(__MAC_10_9, __IPHONE_7_0);
+#endif
+
+rusage_info_current rusage_payload;
+     
+int ret = proc_pid_rusage(getpid(),
+                          RUSAGE_INFO_CURRENT, // I.e., new RUSAGE_INFO_V6 this year.
+                          (rusage_info_t *)&rusage_payload);
+NSCAssert(ret == 0, @"Could not get rusage: %i.", errno); // Look up in `man errno`.
+        
+uint64_t footprint       = rusage_payload.ri_phys_footprint;
+uint64_t footprint_peak  = rusage_payload.ri_lifetime_max_phys_footprint;
+```
+
+关键点：
+
+- `__has_include(<libproc.h>)` 根据平台选择头文件，macOS 使用 `libproc.h`。
+- `proc_pid_rusage(getpid(), RUSAGE_INFO_CURRENT, ...)` 查询当前进程的资源使用情况。
+- `rusage_info_current` 在这里承载返回数据，session 说明它对应当年的 `RUSAGE_INFO_V6`。
+- `ri_phys_footprint` 是当前 physical footprint。
+- `ri_lifetime_max_phys_footprint` 是进程生命周期内的 footprint 峰值。
+
+这两个接口适合放进游戏的资源管理层。比如进入高质量地图前先看可用内存；检测到 footprint 接近预算时，减少预加载纹理、降低缓存上限，或者延后加载不在视野内的资源。
+
+### 2. 用 Game Memory 模板记录增长过程
+
+（[09:10](https://developer.apple.com/videos/play/wwdc2022/10106/?time=550)）Seth 介绍了 Xcode 14 新增的 Instruments Game Memory 模板。这个模板包含 Allocations、Metal Resource Events、VM Tracker、Virtual Memory Trace、Metal Application 和 GPU 等 instruments。它把 CPU 分配、Metal 资源事件、VM footprint 放在同一个时间轴上。
+
+游戏常在启动阶段集中分配资源。session 建议从一次新的游戏启动开始 profiling，而不是附加到已经运行的进程。这样才能看见启动期的增长曲线。
+
+（[10:04](https://developer.apple.com/videos/play/wwdc2022/10106/?time=604)）除了从 Xcode 点 Profile，也可以用 `xctrace` 自动录制。
+
+```bash
+xctrace record --template "Game Memory" \
+               --attach ModernRenderer \
+               --output ModernRenderer.trace \
+               --time-limit 30s
+```
+
+关键点：
+
+- `xctrace record` 启动一次 Instruments 录制。
+- `--template "Game Memory"` 指定本场 session 讲解的新模板。
+- `--attach ModernRenderer` 附加到名为 ModernRenderer 的进程。
+- `--output ModernRenderer.trace` 把结果保存成 trace 文件。
+- `--time-limit 30s` 控制录制时长，适合在自动化流程中复现启动期或某段固定玩法。
+
+（[10:14](https://developer.apple.com/videos/play/wwdc2022/10106/?time=614)）如果要指定设备，可以加 `--device-name`。
+
+```bash
+xctrace record --device-name "Seth's iPhone" \
+               --template "Game Memory" \
+               --attach ModernRenderer \
+               --output ModernRenderer.trace \
+               --time-limit 30s
+```
+
+关键点：
+
+- `--device-name` 选择 iPhone、iPad 或 Apple TV 作为目标设备。
+- 其余参数保持一致，方便把同一套 profiling 命令用于不同设备。
+- 生成的 trace 可以反复打开，比较不同资源包、不同关卡或不同画质设置的内存增长。
+
+（[10:23](https://developer.apple.com/videos/play/wwdc2022/10106/?time=623)）录制后先看 Allocations。它显示堆分配、匿名 VM、分配大小、对象引用计数和分配栈。Metal 游戏里，IOAccelerator 通常对应 Metal resources，IOSurface 对应 drawables。Allocations 默认显示分配大小，也可以切换到 Allocation Density，看哪些时间点出现分配峰值。
+
+（[12:50](https://developer.apple.com/videos/play/wwdc2022/10106/?time=770)）然后看 Metal Resource Events。这里可以看到 Metal resource 的分配和释放历史。session 特别提到，资源可以通过 Metal API 设置 label，这样在工具里就能按名称识别具体 texture 或 buffer。
+
+（[13:38](https://developer.apple.com/videos/play/wwdc2022/10106/?time=818)）最后看 VM Tracker。Dirty Size 是未压缩的 dirty memory，Swapped Size 是 compressed 或 swapped memory。它回答的问题是：这些分配到底有多少进入了 footprint。
+
+### 3. 捕获 memory graph，拆开当前状态
+
+（[15:09](https://developer.apple.com/videos/play/wwdc2022/10106/?time=909)）Instruments 适合看时间线。memory graph 适合看某个时刻的完整状态。它保存对象创建历史、引用关系、压缩和换出信息。你可以在问题发生时抓一次，也可以在问题发生前后各抓一次做比较。
+
+分析 memory graph 前，session 建议开启 Malloc Stack Logging。它会记录分配信息，让后续工具能追到对象来源。
+
+（[16:52](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1012)）不从 Xcode 启动时，可以用环境变量启用。
+
+```bash
+# See `man malloc`.
+MallocStackLogging=lite # Live allocations only.
+MallocStackLogging=1    # All allocation and free history.
+```
+
+关键点：
+
+- `MallocStackLogging=lite` 只记录仍然存活的分配，开销较低。
+- `MallocStackLogging=1` 记录所有分配和释放历史，适合查 fragmentation（碎片化）等问题。
+- session 中 Jack 说，多数只看 live object 引用的场景，推荐 Live Allocation Only。
+- 开启后，`heap`、`malloc_history` 等工具能提供更清楚的对象来源。
+
+（[18:07](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1087)）Mac 游戏可以用 `leaks` 在命令行捕获 memory graph。
+
+```bash
+leaks $PID     --outputGraph foo.memgraph
+# or
+leaks GameName --outputGraph foo.memgraph
+```
+
+关键点：
+
+- `leaks $PID` 按进程 ID 捕获。
+- `leaks GameName` 按进程名捕获。
+- `--outputGraph foo.memgraph` 把快照保存为 memory graph 文件。
+- session 提到，这种方式可以在 SSH 中远程执行，适合全屏游戏需要保持焦点的场景。
+
+（[18:41](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1121)）拿到 memory graph 后，先用 `footprint` 看高层分类。它会把 IOAccelerator、MALLOC_*、VM_ALLOCATE 等类别列出来。游戏使用 Unity 或自定义 allocator 时，大块匿名内存可能显示为 untagged VM_ALLOCATE。
+
+（[20:12](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1212)）Apple 平台允许应用使用最多 16 个 app-specific tags。自定义 allocator 可以给匿名映射打标签，后续在工具里更容易识别。
+
+```objc
+size_t length;
+
+int tag = VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1); // Check out `man mmap`.
+    
+void * reservation = mmap(NULL,
+                          length,
+                          PROT_READ | PROT_WRITE,
+                          MAP_ANONYMOUS | MAP_PRIVATE,
+                          tag, // Instead of using default `-1`.
+                          0);
+
+if (reservation == MAP_FAILED) {
+    @throw [[NSError alloc] initWithDomain:NSPOSIXErrorDomain
+                                      code:errno
+                                  userInfo:nil];    
+}
+
+return reservation;
+```
+
+关键点：
+
+- `VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1)` 从 16 个应用自定义标签中创建一个 VM tag。
+- `mmap(...)` 创建匿名私有映射。
+- 第五个参数使用 `tag`，替代默认的 `-1`。
+- `MAP_FAILED` 分支把 POSIX 错误转成 `NSError`，方便上层处理。
+- 这样生成的内存区域会在后续分析工具里以更清晰的类别出现。
+
+（[20:30](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1230)）如果代码使用 `mach_vm_allocate`，也可以在 flags 里带上同类标签。
+
+```objc
+size_t page_count;
+
+mach_vm_size_t allocation_size = page_count * PAGE_SIZE;
+mach_vm_address_t vm_address;
+kern_return_t kr;
+
+kr = mach_vm_allocate(mach_task_self(),
+                      &vm_address,
+                      allocation_size,
+                      VM_FLAGS_ANYWHERE | VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1));
+    
+if (kr != KERN_SUCCESS) { // Refer to mach/kern_return.h.
+    @throw [[NSError alloc] initWithDomain:NSMachErrorDomain
+                                      code:kr
+                                  userInfo:nil];
+}
+    
+return vm_address;
+```
+
+关键点：
+
+- `allocation_size = page_count * PAGE_SIZE` 按页数计算分配大小。
+- `mach_task_self()` 指向当前 task。
+- `VM_FLAGS_ANYWHERE` 让系统选择合适地址。
+- `VM_MAKE_TAG(...)` 把 app-specific tag 合入 flags。
+- `KERN_SUCCESS` 之外的返回值会被转成 Mach 错误域。
+
+（[21:12](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1272)）接下来用 `vmmap` 看 dirty 和 swapped 的拆分。`footprint` 里 dirty size 包含 swapped 和 compressed，`vmmap` 会把它们拆到不同列。swapped 列常指向较少使用、可能可以优化的内存。
+
+（[23:32](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1412)）再用 `heap` 看 malloc 对象。Xcode 14 的 `heap` 可以利用 Malloc Stack Logging 记录的信息识别 caller 或 responsible library，帮助定位大型非对象内存来自哪个库或插件。session 的例子里，Manifold Garden 的 memory graph 显示 FMOD Studio 和 GameAssembly.dylib 占用了可观堆内存。
+
+（[26:45](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1605)）找到大对象地址后，用 `malloc_history` 查 allocation call stack。用 Xcode Memory Debugger 也可以在 inspector 里看到对象的 allocation history。
+
+（[27:48](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1668)）最后查引用关系。`leaks` 可以用 memory graph 检查引用树、泄漏和 retain cycles。Xcode 14 重新设计的 memory graph view 会显示选中对象的 ingoing 和 outgoing edges，并提供 neighbor selection popover，适合复杂游戏状态下理解对象为什么还活着。
+
+### 4. 用 Metal Debugger 审计 GPU 资源
+
+（[30:37](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1837)）Metal resources 在游戏里经常占用大块内存。Seth 的建议是从一次 GPU frame capture 进入 Metal Debugger，然后打开 Memory Viewer。
+
+Memory Viewer 的表格能按类别过滤资源，比如只看 textures。几个最有用的列是：
+
+- Insights：列出工具发现的内存优化建议。
+- Allocated Size：按资源大小排序，先审计最大的 texture、buffer、model 数据。
+- Time Since Last Bound：找出很久没有被绑定过，甚至从未使用的资源。
+- Pixel Format：检查 texture 是否可以换成更省内存的格式。
+
+（[33:03](https://developer.apple.com/videos/play/wwdc2022/10106/?time=1983)）如果某个资源长期没有使用，可以考虑释放。如果以后还可能用到，可以把它设为 volatile purgeable state。Metal 在系统内存压力高时可以驱逐这类资源；一旦资源变成 empty，系统就不再把它计入游戏 footprint。重新使用前，需要检查内容是否还在，并在需要时重新加载。
+
+这段逻辑可以用伪代码表达。下面不是官方片段，只描述控制流。
+
+```text
+for each metal_resource in captured_resources:
+    if metal_resource.was_never_bound:
+        audit_asset_loading_path(metal_resource)
+    else if metal_resource.has_not_been_bound_for_a_while:
+        mark_as_volatile_or_release(metal_resource)
+    when_resource_is_needed_again:
+        if resource_content_is_empty:
+            reload_resource_content()
+```
+
+关键点：
+
+- `was_never_bound` 对应 Memory Viewer 里从未使用的资源，优先检查是否值得加载。
+- `has_not_been_bound_for_a_while` 对应 Time Since Last Bound 很大的资源。
+- `mark_as_volatile_or_release` 表示两种策略：可重建资源设为 volatile，不再需要的资源直接释放。
+- `resource_content_is_empty` 对应 purgeable state 变成 empty 后的恢复路径。
+- `reload_resource_content()` 必须由游戏自己的资源系统完成，session 没有给出具体 API 片段。
+
+（[34:18](https://developer.apple.com/videos/play/wwdc2022/10106/?time=2058)）纹理还有几个明确的节省方向：许多纹理可以使用 16-bit half precision pixel format；只需要 alpha 时避免多个颜色通道；只读纹理可以考虑 block compression，比如 ASTC 和 BC；A15 Bionic 以后，纹理和 render target 还可以使用 lossy compression，在尽量保持质量的前提下降低内存。
+
+（[35:10](https://developer.apple.com/videos/play/wwdc2022/10106/?time=2110)）storage mode 也会影响内存。只在单个 pass 使用的临时 render target，可以用 memoryless。典型例子是 depth、stencil 或 multisampled textures。只由 GPU 使用的 texture，优先考虑 private，而不是 shared 或 managed。session 还提醒，Apple silicon Mac 上不需要 managed mode，和 iPhone、iPad 一样。
+
+（[36:05](https://developer.apple.com/videos/play/wwdc2022/10106/?time=2165)）如果多个资源不会同时使用，可以从 heap 分配 aliased resources，让它们共享同一块 backing allocation。Seth 同时提醒，要非常小心这些资源访问的同步。
+
+---
+
+## 核心启发
+
+- **做一个内存预算 HUD。** 在开发版游戏里显示当前 footprint、峰值 footprint 和可用内存。为什么值得做：session 明确说 footprint 是 Apple 平台理解实际内存使用和执行限制的核心指标。怎么开始：用 `proc_pid_rusage()` 读取 `ri_phys_footprint` 与 `ri_lifetime_max_phys_footprint`，在支持的平台上用 `os_proc_available_memory()` 读取可用内存。
+
+- **把关卡加载做成可录制流程。** 为每个典型关卡写一条 `xctrace record --template "Game Memory"` 命令。为什么值得做：Game Memory 模板把 Allocations、Metal Resource Events、VM Tracker 放在同一条时间线上，适合比较不同资源包的启动期内存增长。怎么开始：为启动、进入关卡、返回大厅各录制 30 秒 trace，并保存到 CI 或性能测试产物。
+
+- **给自定义 allocator 打 VM tag。** 自研引擎、Unity 插件或资源系统如果使用匿名 VM，把不同用途映射到 app-specific tags。为什么值得做：session 的 Manifold Garden 例子显示，未标记的 VM_ALLOCATE 会降低分析清晰度。怎么开始：`mmap` 路径把默认 `-1` 换成 `VM_MAKE_TAG(...)`，`mach_vm_allocate` 路径把 tag 合入 flags。
+
+- **建立 memory graph 排查手册。** 遇到内存峰值时先抓 `.memgraph`，再按 `footprint`、`vmmap`、`heap`、`malloc_history`、`leaks` 的顺序排查。为什么值得做：这些工具分别回答类别、dirty/swapped 拆分、对象分布、分配栈、引用关系五个问题。怎么开始：在团队 wiki 里记录每个命令的输入、输出和下一步判断条件。
+
+- **给 Metal 资源做定期审计。** 每个 milestone 用 Metal Debugger Memory Viewer 排序检查 Allocated Size 和 Time Since Last Bound。为什么值得做：Metal resources 在 Apple silicon 上会进入 footprint，纹理格式、storage mode、purgeable state 都能影响实际内存。怎么开始：先处理最大纹理，再处理长期未绑定资源，最后检查临时 render target 是否可以改成 memoryless。
+
+---
+
+## 关联 Session
+
+- [Discover Metal 3](/articles/wwdc2022-10066) — 介绍 Metal 3 的整体能力，是理解本场 Metal Debugger 和资源优化建议的入口。
+- [Go bindless with Metal 3](/articles/wwdc2022-10101) — 进一步讲解 heap 与资源管理，本场提到 heap aliasing 时建议继续观看。
+- [Boost performance with MetalFX Upscaling](/articles/wwdc2022-10103) — 讨论 MetalFX 如何降低渲染压力，适合和内存预算一起规划画质策略。
+- [Load resources faster with Metal 3](/articles/wwdc2022-10104) — 关注资源流式加载，和本场的启动期内存增长、资源加载审计互补。
+- [Maximize your Metal ray tracing performance](/articles/wwdc2022-10105) — 讲 Metal ray tracing 的性能和资源组织，适合大型场景的内存优化背景。

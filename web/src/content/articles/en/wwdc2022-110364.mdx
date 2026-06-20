@@ -1,0 +1,162 @@
+---
+title: "Demystify parallelization in Xcode builds"
+description: "learn how the xcode build system extracts maximum parallelism from your builds. we'll explore how you can structure your project to improve build efficiency, take you through the process for resolving relationships between targets' build phases in xcode, and share how you can take full advantage of available hardware resources when compiling in swift. we'll also introduce you to build timeline — a powerful tool to help you monitor your build efficiency and performance."
+date: "2022-06-06"
+tags: ["Developer Tools", "Xcode", "Build Performance"]
+thumbnail: "/images/sessions/2022/110364.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110364/"
+sessionId: "wwdc2022-110364"
+year: "2022"
+relatedSessions:
+  - title: "Link fast: Improve build and launch times"
+    code: "110362"
+    description: "Xcode 14 链接器优化，与构建并行化互补"
+  - title: "What's new in Xcode 14"
+    code: "110427"
+    description: "Xcode 14 新功能总览，包含 Build Timeline"
+  - title: "Deep dive into Xcode Cloud for teams"
+    code: "110375"
+    description: "团队构建与 CI/CD 优化"
+  - title: "Improve app size and runtime performance"
+    code: "110363"
+    description: "编译器层面的运行时优化"
+---
+
+## Highlight
+
+> Xcode 14 通过全新的 Swift Driver 集成、emit-module 分离和 Eager Linking，让跨 target 的构建任务可以更早并行执行，同时 Build Timeline 工具让开发者第一次能直观看到构建中的并行瓶颈。
+
+## 核心内容
+
+### 构建慢的根源：关键路径太长
+
+按 Cmd+B 后，Xcode 构建系统会分析整个项目的依赖图。编译产生 .o 文件，链接器消费 .o 文件生成可执行文件。这些任务之间有明确的输入输出依赖。
+
+当项目变大，依赖图变复杂。构建系统会优先执行没有依赖的任务，完成后解锁下游任务。但总有一些任务串在一起形成"关键路径"——即使 CPU 核心再多，这条路径上的任务也必须逐个执行。
+
+缩短关键路径的方法只有一个：打破路径上的依赖关系，让更多任务并行。
+
+### Xcode 14 的两层并行化
+
+Apple 从两个层面解决构建并行化：
+
+1. **Target 内部**：编译、资源复制、代码签名等 build phase 按输入输出依赖调度，无关的 phase 并行执行
+2. **Target 之间**：通过 emit-module 分离和 Eager Linking，下游 target 不再需要等上游完全编译链接完才能开始
+
+## 详细内容
+
+### Build Timeline：第一次看到构建的并行真相
+
+（[06:29](https://developer.apple.com/videos/play/wwdc2022/110364/?time=389)）
+
+Xcode 14 新增的 Build Timeline 是理解构建性能的核心工具。它与传统构建日志不同——按并行度而非层级组织。
+
+**如何阅读 Timeline：**
+- 横轴 = 时间，任务越长占用越宽
+- 纵轴 = 并行度，同一时间的行数表示同时执行的任务数
+- 颜色 = 不同 target
+- 空白 = 任务等待输入，这是优化目标
+
+打开方式：构建完成后，在构建日志的 Editor Options 中选择 Assistant，底部就会出现 Build Timeline。选中某个任务，构建日志会自动定位到对应条目；反过来也一样。
+
+按住 Option 选中某个区域，视图会自动缩放到该时间段。这在分析局部瓶颈时很有用。
+
+### Target 内部的并行化：Script Phase 的依赖声明
+
+（[10:35](https://developer.apple.com/videos/play/wwdc2022/110364/?time=635)）
+
+Build phase 描述了一个 target 的构建步骤。编译、资源复制、链接、脚本执行都是 build phase。
+
+编译和复制资源可以并行，因为它们互不依赖。但链接必须等编译完成，因为链接器需要 .o 文件。
+
+Run Script Phase 比较特殊。脚本没有自动的输入输出推断，必须手动声明。如果声明不完整，构建系统会串行执行脚本以避免数据竞争。
+
+Xcode 14 引入了 **User Script Sandboxing**，强制脚本只能访问声明的输入输出：
+
+```
+// 在 Build Settings 中设置
+ENABLE_USER_SCRIPT_SANDBOXING = YES
+```
+
+如果脚本尝试访问未声明的文件，构建会直接失败，并列出违规路径。这帮助你发现缺失的依赖声明。
+
+当脚本正确声明了输入输出后，可以开启 `FUSE_BUILD_SCRIPT_PHASES = YES` 让多个脚本并行执行。
+
+**关键点：**
+- Sandbox 不是安全特性，只覆盖项目源码目录和 Derived Data
+- 缺失的输入输出声明会导致增量构建不正确
+- 两个脚本如果存在文件依赖，必须正确声明，否则并行执行会产生数据竞争
+
+### Swift Driver 重写：构建系统与编译器深度集成
+
+（[19:50](https://developer.apple.com/videos/play/wwdc2022/110364/?time=1190)）
+
+Xcode 14 之前，Xcode Build System 和 Swift Driver 各自调度任务。Driver 负责把 Swift 编译拆成子任务，但 Build System 看不到这些子任务，无法全局优化。
+
+Xcode 14 的 Swift Driver 用 Swift 完全重写，与 Build System 深度集成。所有子任务都进入统一的任务池，由 Build System 统一调度。
+
+这带来了两个直接好处：
+1. 调度器能根据实际 CPU 核心数分配任务，避免过度订阅
+2. 高核心数机器上的空闲时间显著减少
+
+### Emit-Module 分离：下游 target 更早开始编译
+
+（[21:36](https://developer.apple.com/videos/play/wwdc2022/110364/?time=1296)）
+
+Swift target 编译时，其他 target 需要它的 module 文件才能开始编译。以前，module 要等所有编译任务完成后才能生成。
+
+Xcode 14 和 Swift 5.7 把 module 生成拆成独立的 **emit-module 任务**，直接从所有源文件生成 module，不依赖编译的 .o 文件：
+
+```
+// 编译流程变化
+// 以前：Compile all → Link → Emit module → 下游开始编译
+// 现在：Emit module (并行) → 下游收到 module 就开始编译
+//        Compile all (并行) → Link
+```
+
+下游 target 只要 emit-module 完成就能开始编译，不需要等上游的链接完成。这大幅缩短了关键路径上的等待时间。
+
+### Eager Linking：链接也能提前
+
+（[22:28](https://developer.apple.com/videos/play/wwdc2022/110364/?time=1348)）
+
+正常情况下，target B 链接 target A 时，必须等 target A 的链接完成。Eager Linking 打破了这个依赖。
+
+emit-module 任务会同时生成一个 **文本格式的动态库 stub**（TBD 文件），里面列出了目标 target 最终会导出的符号。target B 的链接任务可以依赖这个 stub，而不是等 target A 的完整链接产物。
+
+启用方式：
+
+```
+// Build Settings
+EAGER_LINKING = YES
+```
+
+**关键点：**
+- 只适用于纯 Swift target 之间的动态链接
+- 依赖 target 的 emit-module 产物，而不是 linked product
+- stub 包含符号列表，链接器用这些信息提前开始工作
+
+## 核心启发
+
+- **打开 Build Timeline 分析你的项目**
+  找到 Timeline 中的大面积空白区域，这些就是被阻塞的任务。看看哪些 target 的编译等了很久才开始，检查是否存在不必要的依赖链。
+
+- **为所有 Run Script Phase 声明完整的输入输出**
+  开启 `ENABLE_USER_SCRIPT_SANDBOXING = YES`，让构建系统帮你发现缺失的依赖。修复后开启 `FUSE_BUILD_SCRIPT_PHASES = YES` 让脚本并行执行。
+
+- **把大 Framework 拆成更小的 Swift Package**
+  emit-module 分离和 Eager Linking 的收益在模块化项目中更明显。小模块的 emit-module 完成更快，下游 target 能更早开始编译。
+
+- **在 CI 中监控构建时间趋势**
+  Build Timeline 可以配合 CI 使用。记录每次全量构建的时间，发现异常增长时及时分析 Timeline 找出新增的瓶颈。
+
+- **升级 Xcode 14 后重新评估构建性能**
+  Swift Driver 重写带来的调度优化对所有项目都有效，不需要改代码。用同一台机器对比 Xcode 13 和 14 的构建时间，量化收益。
+
+## 关联 Session
+
+- [Link fast: Improve build and launch times](/articles/wwdc2022-110362) — Xcode 14 链接器优化，链接时间最高提升 2 倍
+- [What's new in Xcode 14](/articles/wwdc2022-110427) — Xcode 14 全部新功能总览
+- [Deep dive into Xcode Cloud for teams](/articles/wwdc2022-110375) — 团队 CI/CD 中的构建优化
+- [Improve app size and runtime performance](/articles/wwdc2022-110363) — 编译器层面的运行时优化，与构建优化互补
+- [Create Swift Package plugins](/articles/wwdc2022-110401) — 用 Swift Package 插件定制构建流程

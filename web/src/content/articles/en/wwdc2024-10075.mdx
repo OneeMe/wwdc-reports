@@ -1,0 +1,202 @@
+---
+title: "Track model changes with SwiftData history"
+description: "reveal the history of your model"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10075.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10075/"
+sessionId: "wwdc2024-10075"
+year: "2024"
+relatedSessions:
+  - title: "What's new in SwiftData"
+    code: "10137"
+    description: "discover the latest updates to SwiftData"
+  - title: "Create a custom data store with SwiftData"
+    code: "10138"
+    description: "combine the power of SwiftData's modeling API with your own persistence backend"
+  - title: "Bring your app's core features to users with App Intents"
+    code: "10210"
+    description: "learn the principles of the app intents framework, like intents, entities, and queries"
+---
+
+## Highlight
+
+> SwiftData History 通过 Transaction 和 Token 机制，让 App 能增量查询数据仓库中每次 save 产生的插入、更新、删除变更。
+
+---
+
+## 核心内容
+
+SwiftData 的查询一直有一个盲区：`ModelContext.fetch()` 只能拿到数据仓库的当前快照。如果你的 Widget 在后台改了一条数据，主 App 重新打开时拿到的结果和之前一模一样——你无从得知中间发生了什么。开发者不得不手动做 diff，或者用 NotificationCenter 拼凑出类似的逻辑，既不优雅也不可靠。
+
+SwiftData History 补上了这块空白。它的核心机制是：每次 `ModelContext.save()` 时，SwiftData 自动生成一个 Transaction，里面按时间顺序记录了所有 Change（插入、更新、删除）。你通过 HistoryDescriptor 查询这些 Transaction，配合 Token 做书签，就能增量式地消费变更流。Session 以 SampleTrips 为例，演示了 Widget 中确认住宿后，主 App 如何通过 History API 发现变更并给对应 Trip 打上未读标记，完整走通了 fetch -> process -> update 三步流程。
+
+---
+
+## 详细内容
+
+### 1. 用 `.preserveValueOnDeletion` 保留已删除模型的标识信息
+
+模型被删除后，它的属性数据会一起消失。如果后续要在 History 中处理这条删除记录，你可能连它"是谁"都不知道。SwiftData 提供了 `.preserveValueOnDeletion` 属性修饰符，标记后这些属性会以 tombstone 的形式保留下来，供 History 查询时使用。
+
+（[04:57](https://developer.apple.com/videos/play/wwdc2024/10075/?time=297)）
+
+```swift
+@Model
+class Trip {
+    #Unique<Trip>([\.name, \.startDate, \.endDate])
+
+    @Attribute(.preserveValueOnDeletion)
+    var name: String
+    var destination: String
+
+    @Attribute(.preserveValueOnDeletion)
+    var startDate: Date
+
+    @Attribute(.preserveValueOnDeletion)
+    var endDate: Date
+
+    var bucketList: [BucketListItem] = [BucketListItem]()
+    var livingAccommodation: LivingAccommodation?
+}
+```
+
+关键点：
+- `@Attribute(.preserveValueOnDeletion)` 标记的属性在模型删除后仍保留在 tombstone 中
+- `#Unique` 宏声明唯一性约束，History 查询时可以用来定位记录
+- 需要保留的通常是标识性字段（name、date），非标识字段（destination）不必标记
+
+### 2. 用 HistoryDescriptor 查询 Transaction
+
+HistoryDescriptor 是查询 History 的入口，支持按 token 和 author 过滤。Token 充当书签，Author 用来区分变更来源（比如主 App vs Widget）。
+
+（[06:26](https://developer.apple.com/videos/play/wwdc2024/10075/?time=386)）
+
+```swift
+private func findTransactions(after token: DefaultHistoryToken?, author: String) -> [DefaultHistoryTransaction] {
+    var historyDescriptor = HistoryDescriptor<DefaultHistoryTransaction>()
+    if let token {
+        historyDescriptor.predicate = #Predicate { transaction in
+            (transaction.token > token) && (transaction.author == author)
+        }
+    }
+
+    var transactions: [DefaultHistoryTransaction] = []
+    let taskContext = ModelContext(modelContainer)
+    do {
+        transactions = try taskContext.fetchHistory(historyDescriptor)
+    } catch let error {
+        print(error)
+    }
+
+    return transactions
+}
+```
+
+关键点：
+- `DefaultHistoryToken` 和 `DefaultHistoryTransaction` 中的 "Default" 对应的是 DefaultStore；如果你用自定义 DataStore，类型名会不同
+- `transaction.token > token` 筛选出上次处理之后的所有 Transaction
+- `transaction.author == author` 按来源过滤，Widget 中通过 `ModelContext.author = TransactionAuthor.widget` 设置
+- 没有传入 token 时，返回所有可用的 History
+- `fetchHistory()` 是 ModelContext 上的新方法，专门用于查询 History
+
+### 3. 处理 Change：按类型匹配插入、更新、删除
+
+拿到 Transaction 后，遍历其中的 Change，用 `switch` 匹配具体类型。Change 是泛型参数化的，可以直接按模型类型匹配。
+
+（[07:34](https://developer.apple.com/videos/play/wwdc2024/10075/?time=454)）
+
+```swift
+private func findTrips(in transactions: [DefaultHistoryTransaction]) -> (Set<Trip>, DefaultHistoryToken?) {
+    let taskContext = ModelContext(modelContainer)
+    var resultTrips: Set<Trip> = []
+    for transaction in transactions {
+        for change in transaction.changes {
+            let modelID = change.changedPersistentIdentifier
+            let fetchDescriptor = FetchDescriptor<Trip>(predicate: #Predicate { trip in
+                trip.livingAccommodation?.persistentModelID == modelID
+            })
+            let fetchResults = try? taskContext.fetch(fetchDescriptor)
+            guard let matchedTrip = fetchResults?.first else {
+                continue
+            }
+            switch change {
+            case .insert(_ as DefaultHistoryInsert<LivingAccommodation>):
+                resultTrips.insert(matchedTrip)
+            case .update(_ as DefaultHistoryUpdate<LivingAccommodation>):
+                resultTrips.update(with: matchedTrip)
+            case .delete(_ as DefaultHistoryDelete<LivingAccommodation>):
+                resultTrips.remove(matchedTrip)
+            default: break
+            }
+        }
+    }
+    return (resultTrips, transactions.last?.token)
+}
+```
+
+关键点：
+- `change.changedPersistentIdentifier` 拿到变更模型的 PersistentIdentifier
+- 通过 FetchDescriptor 反查到关联的 Trip 实例
+- `DefaultHistoryInsert<LivingAccommodation>` 泛型匹配，只处理 LivingAccommodation 类型的插入
+- `default: break` 跳过其他模型类型的变更
+- 返回最后一个 Transaction 的 token，作为下次查询的起点
+
+### 4. 用 UserDefaults 持久化 Token
+
+Token 需要持久化，否则 App 重启后无法增量查询。Session 推荐用 UserDefaults 存储，而不是存在 SwiftData 本身（避免清理 History 时产生循环依赖）。
+
+（[10:19](https://developer.apple.com/videos/play/wwdc2024/10075/?time=619)）
+
+```swift
+private func findUnreadTrips() -> Set<Trip> {
+    let tokenData = UserDefaults.standard.data(forKey: UserDefaultsKey.historyToken)
+
+    var historyToken: DefaultHistoryToken? = nil
+    if let tokenData {
+        historyToken = try? JSONDecoder().decode(DefaultHistoryToken.self, from: tokenData)
+    }
+    let transactions = findTransactions(after: historyToken, author: TransactionAuthor.widget)
+    let (unreadTrips, newToken) = findTrips(in: transactions)
+
+    if let newToken {
+        let newTokenData = try? JSONEncoder().encode(newToken)
+        UserDefaults.standard.set(newTokenData, forKey: UserDefaultsKey.historyToken)
+    }
+    return unreadTrips
+}
+```
+
+关键点：
+- Token 支持 `Codable`，可以直接用 JSONEncoder/JSONDecoder 序列化
+- 首次调用时没有 token，会返回所有 History
+- 查询完成后立即保存新 token，确保下次只拿增量
+- Token 只对关联的 DataStore 有效；如果 History 数据被清理，token 会过期，`fetchHistory` 会抛出 `historyTokenExpired` 错误，此时需要丢弃旧 token 重新查询
+
+### 5. 自定义 DataStore 支持 History
+
+如果你的 App 使用了自定义 DataStore，需要自己实现 History 相关的类型：自定义的 Transaction、Change（Insert/Update/Delete）和 Token。此外，DataStore 需要遵循 `HistoryProviding` 协议。Session 提到几个关键考量：
+
+- Transaction 的边界要明确定义，DefaultStore 中一次 `save` 产生的所有变更归为一个 Transaction
+- Change 的边界通常是一个模型实例的粒度
+- 你的 App 可能不需要所有 Change 类型（比如只做时间序列日志的场景，可能只需要 Insert）
+- 需要考虑是否支持 `.preserveValueOnDeletion`，以及删除后数据如何存储
+- Token 需要自定义类型，遵循 `HistoryToken` 协议，状态要能唯一标识你在 Transaction 流中的位置；如果 App 使用多个关联 Store，Token 应包含所有 Store 的状态
+
+---
+
+## 核心启发
+
+1. **Widget 与主 App 的数据变更同步**：当 Widget 修改了 SwiftData 中的数据，主 App 可以通过 History API 按 `author` 过滤，只处理来自 Widget 的变更，实现精准的 UI 更新（如未读标记）。怎么开始：在 Widget 的 ModelContext 上设置 `.author`，主 App 用 `HistoryDescriptor` 的 predicate 按 author 过滤。
+
+2. **离线变更的增量同步**：App 离线期间的本地修改可以用 History 的时间顺序 Transaction 记录下来，联网后按 Token 增量同步到服务端，避免全量对比。怎么开始：每次同步成功后保存 Token，下次只拉 Token 之后的 Transaction；同步完成后可以清理已处理的 History 数据。
+
+3. **模型删除后的信息追溯**：用 `.preserveValueOnDeletion` 保留关键字段，使删除操作在 History 中仍然可追溯。怎么开始：在模型的标识性属性上加 `@Attribute(.preserveValueOnDeletion)`，处理 History 时通过 tombstone 值判断被删除记录的身份。
+
+---
+
+## 关联 Session
+
+- [What's new in SwiftData](/articles/wwdc2024-10137) — SwiftData 框架 2024 年的整体更新概览
+- [Create a custom data store with SwiftData](/articles/wwdc2024-10138) — 自定义 DataStore 的构建方法，与 History 自定义支持紧密关联
+- [Bring your app's core features to users with App Intents](/articles/wwdc2024-10210) — App Intents 框架的设计原则，Widget 交互的底层机制

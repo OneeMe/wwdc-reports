@@ -1,0 +1,198 @@
+---
+title: "Enhance ad experiences with HLS interstitials"
+description: "explore how hls interstitials can help you seamlessly insert advertisements into your hls content. we"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10114.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10114/"
+sessionId: "wwdc2024-10114"
+year: "2024"
+relatedSessions:
+  - title: "Explore dynamic pre-rolls and mid-rolls in HLS"
+    code: "10175"
+    description: "learn how hls interstitials provide a flexible approach to inserting ads and auxiliary content into your hls streams"
+  - title: "Discover media performance metrics in AVFoundation"
+    code: "10113"
+    description: "discover how you can monitor, analyze, and improve user experience with the new media performance metrics api in avfoundation"
+  - title: "Coordinate media experiences with Group Activities"
+    code: "10167"
+    description: "learn how you can build shared media experiences with group activities and shareplay"
+---
+
+## Highlight
+
+> HLS Interstitials 是 Apple 提出的在主内容时间线上插入独立广告片段的方案。相比直接把广告拼接进主内容流，Interstitials 支持延迟绑定广告决策、广告内容无需与正片一起处理，灵活性更高。
+
+---
+
+## 核心内容
+
+视频播放器里插广告，最朴素的做法是把广告片段直接拼进主内容流。这样做的问题很明显：广告决策必须在内容准备阶段就确定，无法在播放时动态替换；换一个广告就要重新拼接整个流。HLS Interstitials 的思路不同——广告是独立资源，挂载在主内容时间线的指定位置上，播放到那个时间点才加载和播放广告。广告可以延迟决策（late binding），正片流完全不需要改动。
+
+今年的重点是 Integrated Timeline API。之前开发者面对的难点是：时间线上既有正片又有广告片段，进度条怎么画？快进跳到一个广告还没加载的位置怎么办？新 API 通过 `AVPlayerItemIntegratedTimeline` 和 `AVPlayerItemSegment` 解决了这些问题。每个时间段（正片或广告）都是一个 Segment，带有起止时间、类型、occupancy 等属性。Snapshot 机制保证你在读取时间线状态时拿到的是一致的数据，不会因为时间线动态变化而出现读取不一致的情况。同时，SharePlay 也开始支持 Interstitials 协同播放——只要标记广告内容在所有参与者之间是相同的，就可以在广告期间保持同步。
+
+---
+
+## 详细内容
+
+### 三种时间线展示模式
+
+Interstitials 在时间线上有三种展示方式（[03:40](https://developer.apple.com/videos/play/wwdc2024/10114/?time=220)）：
+
+- **Point**：在进度条上标记一个点，播放头到达时暂停前进，广告播完后继续。适用于 VOD 内容中的广告标记。
+- **Fill**：在进度条上占据一段范围，广告时长计入总时长。适用于直播流中替换已烧录内容的场景。
+- **Supplements Primary Content**：与 Fill 类似，但在 UI 上与正片不可区分。适用于片头回顾、过场、评级提示等与正片紧密相关的辅助内容。
+
+在 `AVPlayerInterstitialEvent` 上通过 `timelineOccupancy` 和 `supplementsPrimaryContent` 两个属性控制（[03:54](https://developer.apple.com/videos/play/wwdc2024/10114/?time=234)）：
+
+```swift
+// Creating a single point interstitial event
+let pointEvent = AVPlayerInterstitialEvent(primaryItem: playerItem, time: ten)
+pointEvent.timelineOccupancy = .singlePoint
+```
+
+关键点：
+- `timelineOccupancy` 设为 `.singlePoint`，时间线上只显示一个点标记
+- Point 类型事件在播放时不会增加总时长，播放头在广告期间暂停
+
+```swift
+// Creating a fill interstitial event
+let fillEvent = AVPlayerInterstitialEvent(primaryItem: playerItem, time: ten)
+fillEvent.timelineOccupancy = .fill
+fillEvent.plannedDuration = CMTime(value: 15, timescale: 1)
+```
+
+关键点：
+- `timelineOccupancy` 设为 `.fill`，广告在时间线上占据一段范围
+- `plannedDuration` 为 Fill 类型提供时长回退值，因为广告实际时长可能较晚才获知
+- 设置 `plannedDuration` 是 Fill 类型事件的最佳实践（[04:19](https://developer.apple.com/videos/play/wwdc2024/10114/?time=259)）
+
+```swift
+// Creating a fill interstitial event supplementing primary
+let fillEvent2 = AVPlayerInterstitialEvent(primaryItem: playerItem, time: ten)
+fillEvent2.supplementsPrimaryContent = true
+fillEvent2.timelineOccupancy = .fill
+fillEvent2.plannedDuration = CMTime(value: 15, timescale: 1)
+```
+
+关键点：
+- `supplementsPrimaryContent = true` 表示该事件在 UI 上应与正片不可区分
+- 适用于评级提示、片头回顾、片尾字幕卡等场景（[04:30](https://developer.apple.com/videos/play/wwdc2024/10114/?time=270)）
+
+### Integrated Timeline API
+
+`AVPlayerItemIntegratedTimeline` 从 `AVPlayerItem` 上获取（[07:14](https://developer.apple.com/videos/play/wwdc2024/10114/?time=434)）。它提供 `currentSnapshot`，返回一个不可变的快照对象，包含绘制 UI 所需的全部一致状态。
+
+```swift
+// Create AVPlayerItem and obtain its integrated timeline
+let item = AVPlayerItem(url: ...)
+let integratedTimeline = item.integratedTimeline
+
+//  Any time we need a new representation of the timeline state, we can request for a snapshot
+let snapshot = integratedTimeline.currentSnapshot
+
+//  Using our snapshot, we can build a simple transport bar
+drawUISlider(start: .zero, duration: snapshot.duration, currentPosition: snapshot.currentTime)
+
+// Draw single-point interstitials on the transport bar
+let pointSegments = snapshot.segments.filter { segment in
+    segment.segmentType == .interstitial &&
+    segment.interstitialEvent?.timelineOccupancy == .singlePoint
+}
+for segment in pointSegments {
+    drawPoint(position: segment.timeMapping.target.start)
+}
+
+// Draw range interstitials on the transport bar
+let highlightFillSegments = snapshot.segments.filter { segment in
+    if (segment.segmentType == .interstitial) {
+        if let interstitialEvent = segment.interstitialEvent {
+            return interstitialEvent.timelineOccupancy == .fill &&
+                   !interstitialEvent.supplementsPrimaryContent
+        }
+    }
+    return false
+}
+
+for segment in highlightFillSegments {
+    let range = segment.timeMapping.target
+    highlightRegion(start: range.start, end: range.end)
+}
+```
+
+关键点：
+- `item.integratedTimeline` 从 AVPlayerItem 获取时间线对象
+- `integratedTimeline.currentSnapshot` 返回不可变快照，不会随播放状态变化而变异
+- `snapshot.duration` 包含 Fill 广告的总时长，`snapshot.currentTime` 在 Point 广告播放时暂停前进
+- 过滤 `supplementsPrimaryContent == true` 的片段，在 UI 上不做区分标记
+- 每个 Segment 都有 `segmentType`（`.primary` 或 `.interstitial`）和 `timeMapping` 属性
+
+### 监听时间线变化
+
+时间线是动态的——广告可能被动态解析，直播流会持续更新。通过 `snapshotsOutOfSyncNotification` 监听变化（[08:26](https://developer.apple.com/videos/play/wwdc2024/10114/?time=506)）：
+
+```swift
+// Listen to integrated timeline notifications to update our logic
+
+for await _ in NotificationCenter.default.notifications(named: AVPlayerItemIntegratedTimeline.snapshotsOutOfSyncNotification, object: integratedTimeline) {
+
+    let reason = _.userInfo![AVPlayerItemIntegratedTimeline.snapshotsOutOfSyncReasonKey]
+                as! AVPlayerIntegratedTimelineSnapshotsOutOfSyncReason
+
+    switch(reason) {
+    case .segmentsChanged:
+        redrawTransportBar(snapshot: integratedTimeline.currentSnapshot)
+    case .currentSegmentChanged:
+        updatePlayerControls(snapshot: integratedTimeline.currentSnapshot)
+    }
+}
+```
+
+关键点：
+- `segmentsChanged`：片段结构变化（广告被解析或移除），需要重绘进度条
+- `currentSegmentChanged`：播放头从正片进入广告或反之，需要更新播放控件
+- 收到通知后重新获取 `currentSnapshot` 即可拿到最新一致状态
+
+### HLS 服务端新属性
+
+在 HLS DateRange 标签中，新增两个属性控制时间线行为（[09:50](https://developer.apple.com/videos/play/wwdc2024/10114/?time=590)）：
+
+- `X-TIMELINE-OCCUPIES`：值为 `POINT` 或 `RANGE`，对应 `.singlePoint` 和 `.fill`
+- `X-TIMELINE-STYLE`：值为 `HIGHLIGHT`（在 UI 上标记）或 `PRIMARY`（与正片不可区分）
+
+### SharePlay 支持
+
+Interstitials 现在可以参与 SharePlay 协同播放（[10:57](https://developer.apple.com/videos/play/wwdc2024/10114/?time=657)）。前提条件：广告内容在所有参与者之间必须相同。通过 `contentMayVary = false` 标记：
+
+```swift
+// Set contentMayVary to false for SharePlay support
+let event = AVPlayerInterstitialEvent(primaryItem: playerItem, time: ten)
+event.contentMayVary = false
+event.timelineOccupancy = .fill
+event.plannedDuration = CMTime(value: 15, timescale: 1)
+event.supplementsPrimaryContent = true
+```
+
+关键点：
+- `contentMayVary = false` 表示该广告内容在所有参与者之间相同，允许协同播放
+- 在 HLS DateRange 中对应 `X-CONTENT-MAY-VARY=NO` 属性（[11:59](https://developer.apple.com/videos/play/wwdc2024/10114/?time=719)）
+- 如果广告因人而异（如个性化推荐），则不应开启协同
+- 协同期间，暂停、跳转等操作会在参与者之间自动同步
+
+---
+
+## 核心启发
+
+- **做什么**：用 Integrated Timeline 绘制包含广告的播放器进度条。为什么值得做：之前没有统一的时间线模型，进度条无法准确反映广告占位，快进/快退到广告位置也会出错。怎么开始：从 `AVPlayerItem.integratedTimeline` 获取时间线，用 `currentSnapshot` 读取 segment 列表绘制 UI。
+
+- **做什么**：用 `supplementsPrimaryContent` 替代视频流中的 discontinuity 片段。为什么值得做：片头回顾、过场动画等内容当前通常以 discontinuity 形式烧录在主内容中，替换成本高；用 Interstitials 可以独立管理这些辅助内容，且在 UI 上与正片无缝衔接。怎么开始：创建 `supplementsPrimaryContent = true` 的 Fill 事件，设置 `plannedDuration`，在 HLS 中用 `X-TIMELINE-STYLE=PRIMARY` 标记。
+
+- **做什么**：为 SharePlay 场景中的公共广告开启协同播放。为什么值得做：多人一起看直播时，如果广告期间各自播放不同内容会破坏同步体验；标记 `contentMayVary = false` 后，广告播放、暂停、跳转都会自动同步。怎么开始：确认广告内容在所有参与者之间一致，在事件上设置 `contentMayVary = false`，或在 HLS DateRange 中添加 `X-CONTENT-MAY-VARY=NO`。
+
+---
+
+## 关联 Session
+
+- [Explore dynamic pre-rolls and mid-rolls in HLS](/articles/wwdc2024-10175) — 深入了解 HLS Interstitials 的基础用法和动态广告插入
+- [Discover media performance metrics in AVFoundation](/articles/wwdc2024-10113) — 用新的媒体性能指标 API 监控和优化播放体验
+- [Coordinate media experiences with Group Activities](/articles/wwdc2024-10167) — 用 Group Activities 和 SharePlay 构建共享媒体体验
