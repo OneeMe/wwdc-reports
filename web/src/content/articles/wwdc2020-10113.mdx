@@ -1,51 +1,205 @@
 ---
 title: "Build local push connectivity for restricted networks"
-description: "leverage local push connectivity and deliver notifications from your application server to devices on networks without an internet connection. learn how to construct notifications for apps running in "
+description: "leverage local push connectivity and deliver notifications from your application server to devices on networks without an internet connection. learn how to construct notifications for apps running in restricted network environments, helping people communicate with the same reliability and experience they would expect when connected to the internet. we'll explore the technical details for this technology, when you might want to use it, and how to implement it in your app."
 date: 2026-06-10
-tags: ["WWDC 2020"]
+tags: ["WWDC 2020", "System Services", "NetworkExtension", "Notifications"]
 thumbnail: "/images/sessions/2020/10113.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10113/"
 sessionId: "wwdc2020-10113"
 year: "2020"
+code: "10113"
 relatedSessions:
-  - title: "Advancements in Game Controllers"
-    code: "10614"
-    description: "let"
+  - title: "The Push Notifications primer"
+    code: "10095"
+    description: "讲解 APNs、alert notification、background notification 和客户端回调，是理解 Local Push 取舍的基础。"
+  - title: "Support local network privacy in your app"
+    code: "10110"
+    description: "介绍 iOS 14 本地网络权限和 Bonjour 场景，补足指定 Wi-Fi 网络下通信的隐私背景。"
   - title: "Boost performance and security with modern networking"
     code: "10111"
-    description: "speed up your app and make it more nimble, private and secure with modern networ"
-  - title: "Create great enterprise apps: A chat with Box's Aaron Levie"
-    code: "10204"
-    description: "discover how organizations like box are adapting to changing conditions in the b"
+    description: "梳理 URLSession、Network.framework、TLS 1.3 和现代网络协议，适合继续检查服务端连接基础。"
   - title: "Enable encrypted DNS"
     code: "10047"
-    description: "when people access the web within your app, their privacy is paramount. safeguar"
+    description: "展示 NetworkExtension 与 Network.framework 如何保护 DNS 查询，是受限网络安全配置的延伸。"
 ---
 
 ## Highlight
 
-> 传统的推送通知依赖 APNs（Apple Push Notification service），这需要互联网连接。但在某些场景中——企业内网、工厂车间、智能家居系统——设备可能没有互联网访问，但需要接收来自本地服务器的推送。iOS 14 引入了 Local Push Connectivity 框架来解决这个问题。
-
----
+> iOS 14 的 Local Push Connectivity 让 App Extension 在指定 Wi-Fi 网络上直接连接本地 provider server，使没有 APNs 或互联网连接的环境仍能接收文本通知和 VoIP 来电。
 
 ## 核心内容
 
-传统的推送通知依赖 APNs（Apple Push Notification service），这需要互联网连接。但在某些场景中——企业内网、工厂车间、智能家居系统——设备可能没有互联网访问，但需要接收来自本地服务器的推送。iOS 14 引入了 Local Push Connectivity 框架来解决这个问题。
+推送通知平时依赖 Apple Push Notification service（APNs）。Provider server 把 payload 发给 APNs，APNs 再把它送到目标设备；App 通过 PushKit 或 UserNotifications 接收。这个模型省电，也适合大多数联网场景。
 
-Session 介绍了 `NWPushManager` 和 `NWConnection` 的配合使用。你的 App 可以声明一个 Network Extension，系统会在后台帮你维持与指定本地服务器的 TCP/TLS 连接。当服务器发送数据时，系统会唤醒你的 App 来处理。这个框架特别适合 MDM（移动设备管理）、IoT 设备控制、和工厂自动化等场景。
+问题出现在 APNs 到不了的网络里。逐字稿给的例子是 cruise ships、airlines、camping sites 和 hospitals：这些地方可能没有互联网，或互联网连接受限，但 App 里的消息、来电、现场协作仍然要及时到达。继续轮询本地服务器会浪费电量，也很难给用户稳定的来电体验。
 
+iOS 14 的 Local Push Connectivity 把这条链路改成局域网内的直接通信。App 声明哪些 Wi-Fi SSID 需要启用本地推送；设备加入这些 Wi-Fi 后，系统启动 App Extension；Extension 负责连接本地 provider server，并按开发者自己的协议接收通知。设备离开这些 Wi-Fi 后，系统停止 Extension。
 
-### 最佳实践
+这项能力不替代 APNs。Apple 在 session 里明确建议普通推送继续使用 PushKit 或 UserNotifications。Local Push Connectivity 面向一小类场景：通知对用户很关键，网络环境又无法访问 APNs。采用它还需要申请 NEAppPushProvider entitlement，且 containing app 和 App Extension 都要具备这个 entitlement。
 
-**已有项目**：如果你的 App 需要在无互联网的环境中接收推送（比如企业内网的即时通讯），评估 Local Push Connectivity 是否适合。它需要用户在设置中授权 Network Extension，并且只支持 TLS 加密连接。
+演示里的 SimplePush App 放在一艘 cruise ship 上。Jane 和 John 的设备没有互联网，只连接到 "Cruise Ship Wi-Fi"。Jane 发送文字消息时，John 的设备收到本地通知；Jane 发起语音通话时，John 的设备显示系统来电界面。这个演示对应了 Local Push 的两个出口：用户可见通知走 local notifications，VoIP 来电由 Extension 报告给系统，再交给 containing app 和 CallKit。
 
-**新项目**：在设计局域网通信架构时就考虑 Local Push。传统方案是轮询（Polling），效率低下且耗电。Local Push 使用长连接，只在有数据时才唤醒 App。确保你的本地服务器支持 TLS——Local Push 不支持明文连接。
+## 详细内容
 
----
+### 1. 在 containing app 中创建本地推送配置
 
-## 相关 Session
+（[10:07](https://developer.apple.com/videos/play/wwdc2020/10113/?time=607)）`NEAppPushManager` 由 containing app 使用。它保存 Local Push Connectivity 的配置，包括目标 Wi-Fi、Extension bundle identifier、传给 Extension 的自定义配置，以及启用状态。
 
-- [Advancements in Game Controllers](/articles/wwdc2020-10614) — let
-- [Boost performance and security with modern networking](/articles/wwdc2020-10111) — speed up your app and make it more nimble, private and secure with modern networ
-- [Create great enterprise apps: A chat with Box's Aaron Levie](/articles/wwdc2020-10204) — discover how organizations like box are adapting to changing conditions in the b
-- [Enable encrypted DNS](/articles/wwdc2020-10047) — when people access the web within your app, their privacy is paramount. safeguar
+```swift
+import NetworkExtension
+
+let manager = NEAppPushManager()
+manager.matchSSIDs = [ "Cruise Ship Wi-Fi", "Cruise Ship Staff Wi-Fi" ]
+manager.providerBundleIdentifier = "com.myexample.SimplePush.Provider"
+manager.providerConfiguration = [ "host": "cruiseship.example.com" ]
+manager.isEnabled = true
+
+manager.saveToPreferences { (error) in
+    if let error = error {
+        // Handle error
+        return
+    }
+    // Report success
+}
+```
+
+关键点：
+
+- `import NetworkExtension` 引入 Local Push Connectivity 所在的框架。
+- `NEAppPushManager()` 创建一份配置对象，containing app 负责保存和管理它。
+- `matchSSIDs` 指定启用本地推送的 Wi-Fi 网络，系统只会在设备加入这些网络时启动 Extension。
+- `providerBundleIdentifier` 指向实现 `NEAppPushProvider` 的 App Extension。
+- `providerConfiguration` 把 host 等配置数据传给 Extension，session 示例里使用 `cruiseship.example.com`。
+- `isEnabled = true` 表示这份配置保存后会启用。
+- `saveToPreferences` 把配置写入系统偏好；保存成功且配置启用后，系统才会启用 Local Push Connectivity。
+
+### 2. 在 App Extension 中管理连接生命周期
+
+（[11:11](https://developer.apple.com/videos/play/wwdc2020/10113/?time=671)）App Extension 实现 `NEAppPushProvider` 子类。系统在设备加入匹配 Wi-Fi 时调用 `start`，在设备离开这些 Wi-Fi 时调用 `stop`。Extension 要在这两个入口里建立和断开本地 provider server 连接。
+
+```swift
+// Manage App Extension life cycle and report VoIP call
+
+class SimplePushProvider: NEAppPushProvider {
+
+    override func start(completionHandler: @escaping (Error?) -> Void) {
+        // Connect to your provider server
+        completionHandler(nil)
+    }
+
+    override func stop(with reason: NEProviderStopReason,
+                                   completionHandler: @escaping () -> Void) {
+        // Disconnect your provider server
+        completionHandler()
+    }
+
+    func handleIncomingVoIPCall(callInfo: [AnyHashable : Any]) {
+        reportIncomingCall(userInfo: callInfo)
+    }
+}
+```
+
+关键点：
+
+- `SimplePushProvider` 继承 `NEAppPushProvider`，对应前面配置里的 provider Extension。
+- `start(completionHandler:)` 是 Extension 启动入口，适合建立到 provider server 的连接。
+- `completionHandler(nil)` 告诉系统启动流程完成。
+- `stop(with:completionHandler:)` 是 Extension 停止入口，适合断开 server 连接并清理状态。
+- `handleIncomingVoIPCall` 是示例 App 自己处理 VoIP payload 的位置。
+- `reportIncomingCall(userInfo:)` 把来电信息报告给系统，系统随后唤醒 containing app 并交付 user info。
+
+Local Push 的协议层由 App 和 provider server 自己定义。逐字稿只说明 Extension 要直接和本地 Wi-Fi 网络上的 server 通信，没有规定 payload 格式。写实现时，应该把协议解析、重连策略和错误上报放在 Extension 内部；面向用户的提醒再交给系统通知或 CallKit。
+
+### 3. 在 containing app 中接收 VoIP 来电信息
+
+（[11:57](https://developer.apple.com/videos/play/wwdc2020/10113/?time=717)）当 Extension 报告 VoIP 来电后，系统会唤醒 containing app。App 启动时要加载已保存的 `NEAppPushManager`，并为每个 manager 设置 `NEAppPushDelegate`，这样才能接收 `didReceiveIncomingCallWithUserInfo` 回调。
+
+```swift
+class AppDelegate: UIResponder, UIApplicationDelegate, NEAppPushDelegate {
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions:
+                     [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        NEAppPushManager.loadAllFromPreferences { (managers, error) in
+            // Handle non-nil error
+            for manager in managers {
+                manager.delegate = self
+            }
+        }
+        return true
+    }
+
+    func appPushManager(_ manager: NEAppPushManager,
+                didReceiveIncomingCallWithUserInfo userInfo: [AnyHashable: Any] = [:]) {
+        // Report incoming call to CallKit and let it display call UI
+    }
+}
+```
+
+关键点：
+
+- `AppDelegate` 同时遵守 `UIApplicationDelegate` 和 `NEAppPushDelegate`。
+- `loadAllFromPreferences` 读取系统里保存的 Local Push 配置。
+- `manager.delegate = self` 把来电回调接回 containing app。
+- `didReceiveIncomingCallWithUserInfo` 在主队列上交付 Extension 报告的 user info。
+- 回调里应使用 CallKit 报告来电并显示系统来电 UI。
+- 逐字稿还提醒：要接收 incoming call info，containing app 必须在 Xcode capabilities 中启用 Voice over IP background mode。
+
+### 4. 用户可见通知与 VoIP 通知走不同出口
+
+（[05:07](https://developer.apple.com/videos/play/wwdc2020/10113/?time=307)）Extension 收到用户可见的文本消息后，应该使用 UserNotifications framework 创建 local notification。它能显示 alert、播放声音、更新 badge，让用户像收到普通推送一样进入 App。
+
+```text
+User-facing notification path:
+provider server -> NEAppPushProvider extension -> UserNotifications local notification
+
+VoIP notification path:
+provider server -> NEAppPushProvider extension -> reportIncomingCall(userInfo:) -> containing app -> CallKit
+```
+
+关键点：
+
+- 文本消息这类 user-facing notification 用 local notifications 获取用户注意力。
+- VoIP 通知携带 incoming call 信息，Extension 通过 `reportIncomingCall(userInfo:)` 报告给系统。
+- 系统负责唤醒 containing app，并把 call info 交给 `NEAppPushDelegate`。
+- containing app 再通过 CallKit 显示来电 UI，保持和系统电话体验一致。
+
+## 核心启发
+
+### 1. 船舶、园区或医院内的离线消息系统
+
+**做什么**：为只接入本地 Wi-Fi 的场所提供即时消息和提醒。
+
+**为什么值得做**：这正是 session 的目标场景。APNs 不可达时，设备仍能通过 `NEAppPushProvider` 连接本地 provider server。
+
+**怎么开始**：先申请 NEAppPushProvider entitlement；在 containing app 里用 `NEAppPushManager.matchSSIDs` 限定场所 Wi-Fi；Extension 收到文本 payload 后用 UserNotifications 发 local notification。
+
+### 2. 局域网 VoIP 呼叫入口
+
+**做什么**：让同一受限网络里的用户互相发起语音通话，并使用系统来电 UI。
+
+**为什么值得做**：逐字稿演示了 SimplePush 在没有互联网的 cruise ship Wi-Fi 上显示 incoming call UI。
+
+**怎么开始**：Extension 收到 VoIP payload 后调用 `reportIncomingCall(userInfo:)`；containing app 实现 `NEAppPushDelegate`；收到回调后把来电交给 CallKit，并启用 Voice over IP background mode。
+
+### 3. 针对固定 SSID 的本地服务配置页
+
+**做什么**：在 App 设置页里保存服务端 host 和允许启用 Local Push 的 Wi-Fi 名称。
+
+**为什么值得做**：session 示例把 provider server host 和 SSID 放在 SimplePush 设置里，配置明确后系统才知道何时启动 Extension。
+
+**怎么开始**：把用户选择或管理员下发的 SSID 写入 `matchSSIDs`；把 server host 放入 `providerConfiguration`；保存时检查 `saveToPreferences` 的错误并给出可恢复提示。
+
+### 4. APNs 与 Local Push 的降级策略
+
+**做什么**：联网时继续走 APNs，进入指定受限 Wi-Fi 后启用本地推送。
+
+**为什么值得做**：Apple 建议大多数通知仍使用 PushKit 或 UserNotifications；Local Push 只服务 APNs 不可达且通知必要的场景。
+
+**怎么开始**：把普通远程推送逻辑保留在 APNs 链路；用 `NEAppPushManager` 只声明需要本地推送的 SSID；在 Extension 协议里携带足够的消息类型，让文本通知和 VoIP 来电分别走 local notification 与 CallKit。
+
+## 关联 Session
+
+- [The Push Notifications primer](/articles/wwdc2020-10095) — 讲解 APNs、alert notification、background notification 和客户端回调，是理解 Local Push 取舍的基础。
+- [Support local network privacy in your app](/articles/wwdc2020-10110) — 介绍 iOS 14 本地网络权限和 Bonjour 场景，补足指定 Wi-Fi 网络下通信的隐私背景。
+- [Boost performance and security with modern networking](/articles/wwdc2020-10111) — 梳理 URLSession、Network.framework、TLS 1.3 和现代网络协议，适合继续检查服务端连接基础。
+- [Enable encrypted DNS](/articles/wwdc2020-10047) — 展示 NetworkExtension 与 Network.framework 如何保护 DNS 查询，是受限网络安全配置的延伸。

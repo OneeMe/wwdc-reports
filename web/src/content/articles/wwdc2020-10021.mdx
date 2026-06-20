@@ -1,54 +1,140 @@
 ---
 title: "Build Metal-based Core Image kernels with Xcode"
-description: "learn how to integrate and load core image kernels written in the metal shading language into your application, and discover how you can apply these image filters to create unique effects. explore how"
-date: 2026-06-10
-tags: ["WWDC 2020"]
+description: "learn how to integrate and load core image kernels written in the metal shading language into your application, and discover how you can apply these image filters to create unique effects. explore how to use xcode rules and naming conventions for core image kernels written in metal shading language. we'll explain how to best use core image apis effectively and optimally with metal and the metal shading language."
+date: 2020-06-10
+tags: ["Core Image", "Metal", "Xcode", "WWDC 2020"]
 thumbnail: "/images/sessions/2020/10021.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10021/"
 sessionId: "wwdc2020-10021"
 year: "2020"
 relatedSessions:
-  - title: "Adapt ad insertion to Low-Latency HLS"
-    code: "10232"
-    description: "find out how to integrate advertising into your low-latency hls streams through "
-  - title: "Author fragmented MPEG-4 content with AVAssetWriter"
-    code: "10011"
-    description: "transform your audio and video content into fragmented mpeg-4 files for a faster"
-  - title: "Deliver a better HLS audio experience"
-    code: "10158"
-    description: "discover techniques for streaming high-quality audio to bandwidth-limited networ"
+  - title: "Optimize the Core Image pipeline for your video app"
+    code: "10008"
+    description: "讲解视频 App 中 Core Image 管线、CIContext 复用、Metal 队列和自定义 kernel 的性能边界。"
   - title: "Discover Core Image debugging techniques"
     code: "10089"
-    description: "find and fix rendering and optimization issues in your core image pipeline with "
+    description: "展示如何生成并阅读 Core Image graph，用于定位渲染、颜色和性能问题。"
+  - title: "Edit and play back HDR video with AVFoundation"
+    code: "10009"
+    description: "说明如何用 AVFoundation 编辑和播放 HDR 视频，并用 Core Image filter 创建视频合成。"
+  - title: "Export HDR media in your app with AVFoundation"
+    code: "10010"
+    description: "介绍 HDR 媒体导出流程、支持格式和 AVFoundation 的导出入口。"
+  - title: "Build GPU binaries with Metal"
+    code: "10615"
+    description: "讲解 Metal shader 编译模型、GPU binary、binary archive 和动态库工作流。"
 ---
 
 ## Highlight
 
-> Core Image 自定义滤镜过去使用一种叫 CIKL（Core Image Kernel Language）的类 GLSL 语言编写，需要运行时编译，调试困难。2020 年苹果推出了基于 Metal 的 CIKernel，可以直接在 Xcode 中编写和预编译。
-
----
+> Apple 为 Core Image kernel 提供 `.ci.metal` 构建流程：Xcode 用 `-fcikernel` 和 `-cikernel` 在构建期生成 `.ci.metallib`，App 运行时用 `CIColorKernel` 加载并应用到 `CIImage`，减少运行时编译并获得 Metal 语法检查。
 
 ## 核心内容
 
-Core Image 自定义滤镜过去使用一种叫 CIKL（Core Image Kernel Language）的类 GLSL 语言编写，需要运行时编译，调试困难。2020 年苹果推出了基于 Metal 的 CIKernel，可以直接在 Xcode 中编写和预编译。
+写 Core Image 自定义滤镜时，开发者关心两件事：滤镜能不能进入 Core Image 的 automatic tiling 和 concatenation 管线，开发时能不能尽早发现 shader 语法错误。这个 session 的答案是把 CIKernel 写成 Metal Shading Language（Metal 着色语言），并让 Xcode 在 App 构建阶段完成 Core Image 专用的编译和链接。
 
-Session 展示了三种 Metal-based Kernel：CIColorKernel（颜色变换，一对一）、CIWarpKernel（几何变形，改变采样坐标）、CIGeneralKernel（通用，可同时改变颜色和坐标）。每种 Kernel 都有对应的 Metal 函数签名和参数约定。
+这条路径把工作拆成五步。先给 target 增加 `.ci.metal` 和 `.ci.air` 两条 build rule；再把 kernel 放进以 `.ci.metal` 结尾的源文件；接着按 Core Image 的函数签名写 Metal 函数；最后在 Swift 里加载 `.ci.metallib`，通过 `CIColorKernel.apply` 生成新的 `CIImage`。
 
-最大的改进是开发工具：Xcode 现在可以在构建时编译 CIKernel Metal 代码，提供语法高亮、错误提示和性能分析。你可以用 Metal Performance Shader 的调试工具来检查 Kernel 的执行状态。
+演示用的是 HDR zebra stripe 滤镜。它读取输入像素和目标坐标，在高于 SDR 白点的 HDR 区域画出红色斑马纹。这个例子很小，但覆盖了完整链路：`.ci.metal` 源文件、Core Image 提供的 Metal 类型、运行时加载、以及 `CIFilter` 子类的 `outputImage`。
 
+## 详细内容
 
-### 最佳实践
+### 1. 先把 `.ci.metal` 纳入 Xcode 构建（[01:20](https://developer.apple.com/videos/play/wwdc2020/10021/?time=80)）
 
-- **优先使用专用的 Kernel 类型。** 能用 CIColorKernel 解决的不要用 CIGeneralKernel，专用类型有更多优化空间。
-- **利用 Xcode 的实时预览。** Metal-based Kernel 支持在 Xcode 的 Playground 中实时预览效果，方便迭代。
-- **注意 Kernel 的执行区域（Extent）。** Warp Kernel 可能会读取输入图像范围外的像素，需要正确声明 `ropingRegion` 让 Core Image 知道需要多少额外数据。
-- **将多个自定义 Kernel 串联使用。** Core Image 会自动合并同一管线中的多个 Kernel，减少中间缓冲区。
+Core Image Metal code 不能直接走普通 Metal compute 或 graphics shader 的编译方式。session 建议在 target 里增加两条 custom build rule。
 
----
+- 第一条匹配 `.ci.metal` 文件，调用 Metal compiler，并带上 `-fcikernel`，产物是 `.ci.air`。
+- 第二条匹配 `.ci.air` 文件，调用 Metal linker，并带上 `-cikernel`，产物放进 App resources，后缀是 `.ci.metallib`。
+- 新建源文件时，文件名要以 `.ci.metal` 结尾，这样第一条 build rule 才会命中。
 
-## 相关 Session
+关键点：
 
-- [Adapt ad insertion to Low-Latency HLS](/articles/wwdc2020-10232) — find out how to integrate advertising into your low-latency hls streams through 
-- [Author fragmented MPEG-4 content with AVAssetWriter](/articles/wwdc2020-10011) — transform your audio and video content into fragmented mpeg-4 files for a faster
-- [Deliver a better HLS audio experience](/articles/wwdc2020-10158) — discover techniques for streaming high-quality audio to bandwidth-limited networ
-- [Discover Core Image debugging techniques](/articles/wwdc2020-10089) — find and fix rendering and optimization issues in your core image pipeline with 
+- `-fcikernel` 和 `-cikernel` 来自 transcript 的构建步骤，不是普通 Metal shader 的默认参数。
+- 编译结果进入 App resources 后，Swift 代码才能用 `Bundle.main.url(forResource:withExtension:)` 找到它。
+- 这一步把 kernel 编译从运行时提前到构建期，同时保留 Xcode 的语法高亮和构建期语法检查。
+
+### 2. 在 `.ci.metal` 文件里写 Core Image kernel（[03:08](https://developer.apple.com/videos/play/wwdc2020/10021/?time=188)）
+
+示例 kernel 来自 HDR 视频场景。它接收一个输入像素、一个时间参数和目标坐标，在高亮区域输出红色像素。
+
+```metal
+// MyKernels.ci.metal
+#include <CoreImage/CoreImage.h> // includes CIKernelMetalLib.h
+using namespace metal;
+
+extern "C" float4 HDRZebra(coreimage::sample_t s, float time, coreimage::destination dest)
+{
+    float diagLine = dest.coord().x + dest.coord().y;
+    float zebra = fract(diagLine / 20.0 + time * 2.0);
+    if ((zebra > 0.5) && (s.r > 1 || s.g > 1 || s.b > 1))
+        return float4(2.0, 0.0, 0.0, 1.0);
+    return s;
+}
+```
+
+关键点：
+
+- `#include <CoreImage/CoreImage.h>` 引入普通 Metal 类，也引入 Core Image 提供的 kernel 类型。
+- `extern "C"` 是 Core Image kernel 函数的声明要求。
+- `coreimage::sample_t` 表示输入图像中的一个像素；transcript 明确说明它是线性、预乘 alpha 的 RGBA `float4`，可用于 SDR 或 HDR 图像。
+- `coreimage::destination` 提供目标像素坐标，示例用 `dest.coord().x + dest.coord().y` 计算斜向条纹。
+- 条件 `s.r > 1 || s.g > 1 || s.b > 1` 对应“高于正常 SDR white 1”的 HDR 像素判断。
+
+### 3. 用 `CIColorKernel` 加载 `.ci.metallib`（[04:58](https://developer.apple.com/videos/play/wwdc2020/10021/?time=298)）
+
+Metal kernel 编译进 resources 后，Swift 侧通常把它包进 `CIFilter` 子类。session 建议把 `CIKernel` 对象放在 static property 里，让 metallib 的读取和初始化只发生一次。
+
+```swift
+class HDRZebraFilter: CIFilter {
+    var inputImage: CIImage?
+    var inputTime: Float = 0.0
+
+    static var kernel: CIColorKernel = { () -> CIColorKernel in
+        let url = Bundle.main.url(forResource: "MyKernels",
+                                  withExtension: "ci.metallib")!
+        let data = try! Data(contentsOf: url)
+        return try! CIColorKernel(functionName: "HDRzebra",
+                                  fromMetalLibraryData: data)
+    }()
+
+    override var outputImage: CIImage? {
+        get {
+            guard let input = inputImage else { return nil }
+            return HDRZebraFilter.kernel.apply(extent: input.extent,
+                                               arguments: [input, inputTime])
+        }
+    }
+}
+```
+
+关键点：
+
+- `Bundle.main.url(forResource: "MyKernels", withExtension: "ci.metallib")` 对应前面 build rule 产出的资源文件。
+- `Data(contentsOf:)` 读取 metallib 二进制数据。
+- `CIColorKernel(functionName:fromMetalLibraryData:)` 从 Metal library 中取出指定 kernel。
+- static property 让加载和初始化只在第一次使用时发生，避免每帧重复读取资源。
+- `outputImage` 里先检查 `inputImage`，再用 `apply(extent:arguments:)` 创建新的 `CIImage` recipe。
+
+### 4. 记住这条路径适合的收益（[00:20](https://developer.apple.com/videos/play/wwdc2020/10021/?time=20)）
+
+session 开头列出的收益很具体。Metal-based Core Image kernel 仍然可以使用 CIKernel 的 automatic tiling 和 concatenation；编译工作提前到 App 构建阶段，可以降低运行时编译开销；Metal 版本还能访问 gather reads、group writes、half-float math 这些高性能能力。
+
+开发体验也更直接。`.ci.metal` 在 Xcode 中写，输入时有语法高亮，构建时有语法检查。对一个需要不断调整视觉效果的滤镜来说，错误越早暴露，迭代成本越低。
+
+## 核心启发
+
+- **做什么**：给 HDR 视频预览加一个过曝 zebra overlay。**为什么值得做**：session 的 `HDRZebra` kernel 已经展示了如何判断像素是否高于 SDR white 1，并用红色条纹标出区域。**怎么开始**：先把示例写进 `MyKernels.ci.metal`，再用 `HDRZebraFilter` 接收 `inputImage` 和动画时间参数。
+
+- **做什么**：把图片编辑 App 的自定义滤镜迁移到 `.ci.metal`。**为什么值得做**：构建期会执行 Core Image 专用的 Metal 编译和链接，语法错误能在 build 阶段暴露。**怎么开始**：给 target 加 `.ci.metal` 与 `.ci.air` build rule，把滤镜函数声明为 `extern "C"`，再用 `CIColorKernel` 从 `.ci.metallib` 加载。
+
+- **做什么**：给滤镜预览加一个实时速度控制。**为什么值得做**：示例中的 `inputTime` 会作为参数传给 kernel，`apply(extent:arguments:)` 支持把输入图像和时间值一起用于生成新的 `CIImage`。**怎么开始**：在 `CIFilter` 子类上保留 `inputTime`，用滑块或播放时钟更新这个值，再把 `[input, inputTime]` 传入 `arguments` 数组。
+
+- **做什么**：为视频工具建立“构建失败即停止”的 shader 校验流程。**为什么值得做**：session 明确把 Metal kernel 的 syntax checking 放到 build 时完成，适合在 CI 或本地构建中提前挡住错误。**怎么开始**：把所有 Core Image Metal 源文件统一命名为 `.ci.metal`，确保 target build rule 会生成 `.ci.metallib`，再让 App 启动时只加载构建产物。
+
+## 关联 Session
+
+- [Optimize the Core Image pipeline for your video app](/articles/wwdc2020-10008) — 讲 `CIContext` 复用、Metal command queue 和视频滤镜管线，适合放在本 session 前阅读。
+- [Discover Core Image debugging techniques](/articles/wwdc2020-10089) — 补充 Core Image graph 的生成和解读，用于排查自定义 kernel 接入后的渲染、颜色和性能问题。
+- [Edit and play back HDR video with AVFoundation](/articles/wwdc2020-10009) — 展开 HDR 视频编辑与播放流程，包含用 Core Image filter 创建 `AVMutableVideoComposition` 的上下文。
+- [Export HDR media in your app with AVFoundation](/articles/wwdc2020-10010) — 继续处理 HDR 内容导出，适合把预览阶段的 Core Image 滤镜延伸到输出工作流。
+- [Build GPU binaries with Metal](/articles/wwdc2020-10615) — 深入 Metal shader 编译、GPU binary、binary archive 和动态库，补足构建期编译的 Metal 背景。

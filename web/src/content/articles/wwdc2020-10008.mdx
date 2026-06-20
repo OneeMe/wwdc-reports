@@ -1,54 +1,218 @@
 ---
 title: "Optimize the Core Image pipeline for your video app"
-description: "explore how you can harness the processing power of core image and optimize video performance within your app. we"
-date: 2026-06-10
-tags: ["WWDC 2020"]
+description: "explore how you can harness the processing power of core image and optimize video performance within your app. we'll show you how to build your core image pipeline for applying effects to your video in your apps: discover how to reduce your app's memory footprint when using cicontext, and learn best practices for using avplayview or mtkview view classes for video playback with core image filters. additionally, find out why you should write your own custom kernels in the metal shading language, and learn performance tips for optimal usage of metal command queues in your core image pipeline."
+date: 2020-06-10
+tags: ["Core Image", "Metal", "Video", "WWDC 2020"]
 thumbnail: "/images/sessions/2020/10008.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10008/"
 sessionId: "wwdc2020-10008"
 year: "2020"
 relatedSessions:
-  - title: "Add custom views and modifiers to the Xcode Library"
-    code: "10649"
-    description: "the xcode library is an easy way for you to discover available swiftui views and"
-  - title: "Advancements in the Objective-C runtime"
-    code: "10163"
-    description: "dive into the microscopic world of low-level bits and bytes that underlie every "
-  - title: "Become a Simulator expert"
-    code: "10647"
-    description: "simulator runs your ios, ipados, tvos, or watchos apps directly on your mac — no"
-  - title: "Broaden your reach with Siri Event Suggestions"
-    code: "10197"
-    description: "whether you"
+  - title: "Build Metal-based Core Image kernels with Xcode"
+    code: "10021"
+    description: "讲解如何把 Metal Shading Language 编写的 Core Image kernel 集成并加载到 App 中。"
+  - title: "Discover Core Image debugging techniques"
+    code: "10089"
+    description: "展示如何生成和阅读 Core Image graph，用于定位渲染、颜色和性能问题。"
+  - title: "Edit and play back HDR video with AVFoundation"
+    code: "10009"
+    description: "说明如何用 AVFoundation 编辑和播放 HDR 视频，并结合 Core Image 滤镜处理画面。"
+  - title: "Export HDR media in your app with AVFoundation"
+    code: "10010"
+    description: "介绍 HDR 媒体导出流程、支持格式和 AVFoundation 的导出入口。"
 ---
 
 ## Highlight
 
-> Core Image 在 iOS 14 中迎来了重要的性能改进和 API 更新。Session 从一个视频滤镜 App 的典型管线出发，逐步展示了如何将 Core Image 的处理效率最大化。
-
----
+> Apple 建议视频 App 为每个视图复用一个 CIContext，关闭中间结果缓存，并在与 Metal 混用时把 CIContext 绑定到同一 MTLCommandQueue，以减少内存占用和 GPU 队列等待。
 
 ## 核心内容
 
-Core Image 在 iOS 14 中迎来了重要的性能改进和 API 更新。Session 从一个视频滤镜 App 的典型管线出发，逐步展示了如何将 Core Image 的处理效率最大化。
+视频滤镜和静态图片滤镜的压力不同。视频每一帧都在变化，App 如果频繁创建 `CIContext`，或者让 Core Image 和自己的 Metal 渲染各走一条命令队列，就会把时间花在初始化、缓存和等待同步上。画面越接近实时播放，这些开销越容易变成掉帧。
 
-核心内容包括：CIContext 的创建和复用策略（这直接影响 GPU 资源管理）、CIFilter 链的构建方式、如何利用 CIImage 的惰性求值特性减少不必要的中间渲染。Session 还深入讲解了 Core Image 与 Metal 的协作——通过 `CIContext(MTLDevice:)` 创建基于 Metal 的上下文，利用 GPU 并行计算加速滤镜处理。
+这场 session 把优化拆成三段。先把 `CIContext` 做成每个 view 一个长期对象，并关闭中间结果缓存；再把滤镜尽量放到 Metal 实现中，优先使用内建 Core Image filter，必要时编写 `.ci.metal` kernel；最后选择适合视频播放的 view，使用 `AVMutableVideoComposition` 交给 AVFoundation 播放，或用 `MTKView` 自己控制渲染和显示。
 
-一个关键的新特性是 `CIImage.replacingMetalTexture(_:)` 方法，它允许你在 Metal 纹理和 CIImage 之间建立零拷贝桥接，避免昂贵的纹理数据复制。对于实时视频处理场景（如每帧都需要应用多个滤镜），这种优化可以显著降低延迟。
+这些建议都围绕同一个目标：让 Core Image 的工作贴近视频帧的生命周期。每帧只保留必要状态，GPU 工作放在正确的队列里，最终输出直接进入视频播放或 Metal drawable。
 
+## 详细内容
 
-### 最佳实践
+### 1. 为视频视图创建 CIContext（[00:52](https://developer.apple.com/videos/play/wwdc2020/10008/?time=52)）
 
-- **永远复用 CIContext。** CIContext 内部持有 GPU 资源和编译好的 Kernel 缓存，每次创建新实例会导致资源浪费和 Kernel 重新编译。
-- **利用惰性求值合并滤镜。** 把多个 CIFilter 串联后再统一 render，让 Core Image 自动合并为单个 GPU Pass，而不是每个滤镜单独 render。
-- **指定正确的 Color Space。** 视频通常使用 BT.709 或 BT.2020，确保输入和输出的 Color Space 一致，避免不必要的色彩空间转换。
-- **在后台队列中处理渲染。** CIContext.render() 可以在后台线程执行，配合 Metal Command Buffer 的调度可以更好地利用 GPU。
+Apple 的第一条建议是每个 view 只创建一个 `CIContext`。`CIContext` 容易创建，但初始化会消耗时间和内存。视频帧每次都不同，中间结果缓存的收益很低，关闭它能降低内存占用。
 
----
+```swift
+let context = CIContext(options: [
+    .cacheIntermediates: false,
+    .name: "MyAppView"
+])
+```
 
-## 相关 Session
+关键点：
 
-- [Add custom views and modifiers to the Xcode Library](/articles/wwdc2020-10649) — the xcode library is an easy way for you to discover available swiftui views and
-- [Advancements in the Objective-C runtime](/articles/wwdc2020-10163) — dive into the microscopic world of low-level bits and bytes that underlie every 
-- [Become a Simulator expert](/articles/wwdc2020-10647) — simulator runs your ios, ipados, tvos, or watchos apps directly on your mac — no
-- [Broaden your reach with Siri Event Suggestions](/articles/wwdc2020-10197) — whether you
+- `.cacheIntermediates: false` 对应 transcript 中的视频场景：每帧内容不同，缓存中间图像会增加内存压力。
+- `.name` 给 context 一个可读名称，配合 Core Image 调试工具时更容易定位是哪一个 view 的管线。
+- 这个 context 应该跟 view 生命周期绑定，不要在每一帧重新创建。
+
+如果 App 已经有自己的 Metal 渲染步骤，CIContext 应该使用同一条 Metal command queue。session 中的时间线示例说明，分开的队列会让 App 发出 wait 命令，GPU 管线中会出现空泡。
+
+```swift
+let context = CIContext(mtlCommandQueue: queue, options: [
+    .cacheIntermediates: false
+])
+```
+
+关键点：
+
+- `mtlCommandQueue` 让 Core Image 和其他 Metal render 共用同一条队列。
+- 输入或输出是 Metal texture 时，这种写法能减少跨队列同步。
+- transcript 明确指出，共用队列可以移除等待，让工作更好地流水化。
+
+### 2. 优先使用内建 Core Image filter（[02:59](https://developer.apple.com/videos/play/wwdc2020/10008/?time=179)）
+
+session 建议优先使用内建 filter，因为这些 filter 已经由 Metal 实现。Xcode 文档也补充了参数说明、示例图片和示例代码。
+
+```swift
+import CoreImage.CIFilterBuiltins
+
+func motionBlur(inputImage: CIImage) -> CIImage? {
+    let motionBlurFilter = CIFilter.motionBlur()
+    motionBlurFilter.inputImage = inputImage
+    motionBlurFilter.angle = 0
+    motionBlurFilter.radius = 20
+    return motionBlurFilter.outputImage
+}
+```
+
+关键点：
+
+- `CoreImage.CIFilterBuiltins` 提供类型化的 filter 入口，示例中直接创建 `CIFilter.motionBlur()`。
+- `inputImage`、`angle`、`radius` 是这个滤镜的输入属性。
+- 返回 `outputImage` 时还只是 Core Image recipe，真正渲染会在后面的播放或 view 输出阶段发生。
+
+### 3. 把自定义 CIKernel 写进 `.ci.metal`（[03:56](https://developer.apple.com/videos/play/wwdc2020/10008/?time=236)）
+
+当内建 filter 不够用时，session 建议使用 Metal 编写自定义 CIKernel。这样可以把编译工作移动到 App 构建阶段，并获得 gather reads、group writes、half-float math、语法高亮和构建期语法检查。
+
+```metal
+// MyKernels.ci.metal
+#include <CoreImage/CoreImage.h> // includes CIKernelMetalLib.h
+using namespace metal;
+
+extern "C" float4 HDRZebra(coreimage::sample_t s, float time, coreimage::destination dest)
+{
+    float diagLine = dest.coord().x + dest.coord().y;
+    float zebra = fract(diagLine / 20.0 + time * 2.0);
+    if ((zebra > 0.5) && (s.r > 1 || s.g > 1 || s.b > 1))
+        return float4(2.0, 0.0, 0.0, 1.0);
+    return s;
+}
+```
+
+关键点：
+
+- `#include <CoreImage/CoreImage.h>` 引入普通 Metal 类和 Core Image 提供的附加类型。
+- `extern "C"` 是 kernel 函数声明要求。
+- `coreimage::sample_t` 表示输入图像中的像素，transcript 说明它是线性、预乘 alpha 的 RGBA `float4`，适合 SDR 和 HDR。
+- `coreimage::destination` 提供目标像素坐标，示例用 `dest.coord()` 生成斑马纹。
+- 条件 `s.r > 1 || s.g > 1 || s.b > 1` 对应 HDR 像素高于 SDR 白点的判断。
+
+### 4. 用 AVMutableVideoComposition 接入 AVPlayerView（[05:50](https://developer.apple.com/videos/play/wwdc2020/10008/?time=350)）
+
+如果 App 主要目标是播放带滤镜的视频，`AVPlayerView` 是最简单的路径。关键对象是 `AVMutableVideoComposition`，它用 asset 和每帧回调创建。回调里设置 Core Image filter，然后把输出交回 request。
+
+```swift
+let videoComposition = AVMutableVideoComposition(
+    asset: asset,
+    applyingCIFiltersWithHandler: { request in
+        let filter = HDRZebraFilter()
+        filter.inputImage = request.sourceImage
+
+        if let output = filter.outputImage {
+            request.finish(with: output, context: myCtx)
+        } else {
+            request.finish(with: err)
+        }
+    }
+)
+```
+
+关键点：
+
+- `applyingCIFiltersWithHandler` 的 handler 会按视频帧调用。
+- `request.sourceImage` 是当前帧输入图像。
+- `request.finish(with:context:)` 把 Core Image 输出交回 AVFoundation。
+- transcript 提到 Xcode 调试时可以点开 `CIImage` 的 eye 图标，查看组成该图像的 recipe；示例里还能看到 10-bit HDR surface 从 HLG 自动色彩管理到 Core Image working space。
+
+### 5. 用 MTKView 控制渲染和显示（[07:01](https://developer.apple.com/videos/play/wwdc2020/10008/?time=421)）
+
+需要更多控制权时，可以用 `MTKView`。初始化阶段创建 `CIContext`，允许 Core Image 使用 Metal Compute，并在 HDR view 上设置浮点像素格式和扩展动态范围。
+
+```swift
+class MyView: MTKView {
+    var context: CIContext
+    var commandQueue: MTLCommandQueue
+
+    override init(frame frameRect: CGRect, device: MTLDevice?) {
+        let dev = device ?? MTLCreateSystemDefaultDevice()!
+        context = CIContext(mtlDevice: dev, options: [.cacheIntermediates: false])
+        commandQueue = dev.makeCommandQueue()!
+
+        super.init(frame: frameRect, device: dev)
+
+        framebufferOnly = false
+        colorPixelFormat = MTLPixelFormat.rgba16Float
+        if let caml = layer as? CAMetalLayer {
+            caml.wantsExtendedDynamicRangeContent = true
+        }
+    }
+}
+```
+
+关键点：
+
+- `framebufferOnly = false` 让 Core Image 能使用 Metal Compute。
+- `rgba16Float` 对应 macOS HDR view 的设置建议。
+- `wantsExtendedDynamicRangeContent = true` 让 `CAMetalLayer` 支持扩展动态范围内容。
+
+绘制时，session 使用 `CIRenderDestination`，传入返回 drawable texture 的 block。这样 `CIContext` 可以先开始排队 Metal work，再等待上一帧完成。
+
+```swift
+func draw(in view: MTKView) {
+    let size = self.convertToBacking(self.bounds.size)
+    let destination = CIRenderDestination(
+        width: Int(size.width),
+        height: Int(size.height),
+        pixelFormat: colorPixelFormat,
+        commandBuffer: nil
+    ) {
+        return view.currentDrawable!.texture
+    }
+
+    context.startTask(toRender: image, from: rect, to: destination, at: point)
+
+    let commandBuffer = commandQueue.makeCommandBuffer()!
+    commandBuffer.present(view.currentDrawable!)
+    commandBuffer.commit()
+}
+```
+
+关键点：
+
+- `CIRenderDestination` 记录目标尺寸、像素格式和延迟获取 texture 的 block。
+- `startTask(toRender:from:to:at:)` 启动 Core Image 渲染任务。
+- 最后用 command buffer present 当前 drawable，完成本帧显示。
+
+## 核心启发
+
+- **实时 HDR 过曝提示**：做一个视频预览叠加层，把高于 SDR 白点的区域标红。这个 session 的 `HDRZebra` kernel 已经给出判断方式；可以先用 `.ci.metal` 文件实现 kernel，再把它接入 `AVMutableVideoComposition`。
+- **低内存视频滤镜预览器**：给剪辑 App 做一组实时滤镜预览。入口是每个 preview view 复用一个 `CIContext`，并设置 `.cacheIntermediates: false`，让滑动时间线时不会积累无用中间帧。
+- **Core Image 与 Metal 混合渲染播放器**：在已有 Metal overlay 的播放器里加入 Core Image 滤镜。关键是用同一个 `MTLCommandQueue` 创建 `CIContext`，让 Metal 输入、Core Image 处理和最终叠加保持在同一条队列上。
+- **可视化滤镜调试模式**：给内部调试版加一个按钮，打开当前帧的 `CIImage` recipe 检查。session 展示了 Xcode 的 eye 图标调试入口，可以把这个流程写进性能排查手册。
+- **HDR MetalKit 预览窗口**：为 macOS 视频工具做一个 `MTKView` 预览。先设置 `framebufferOnly = false`、`rgba16Float` 和 `wantsExtendedDynamicRangeContent`，再用 `CIRenderDestination` 把 Core Image 输出送到当前 drawable。
+
+## 关联 Session
+
+- [Build Metal-based Core Image kernels with Xcode](/articles/wwdc2020-10021) — 继续讲 `.ci.metal` 文件、kernel 加载和 Core Image 自定义滤镜的集成方式。
+- [Discover Core Image debugging techniques](/articles/wwdc2020-10089) — 讲 Core Image graph 的生成和解读，适合排查本 session 中的内存、颜色和性能问题。
+- [Edit and play back HDR video with AVFoundation](/articles/wwdc2020-10009) — 展开 HDR 视频编辑与播放，并包含用 Core Image filter 创建 `AVMutableVideoComposition` 的流程。
+- [Export HDR media in your app with AVFoundation](/articles/wwdc2020-10010) — 补足 HDR 内容导出部分，适合把实时滤镜处理延伸到导出工作流。

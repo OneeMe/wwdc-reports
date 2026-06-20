@@ -1,47 +1,286 @@
 ---
 title: "Symbolication: Beyond the basics"
-description: "discover how you can achieve maximum performance and insightful debugging with your app. symbolication is at the center of tools such as instruments and lldb to help bridge the layers between your app"
-date: 2026-06-10
-tags: ["WWDC 2021"]
+description: "discover how you can achieve maximum performance and insightful debugging with your app. symbolication is at the center of tools such as instruments and lldb to help bridge the layers between your application's runtime and your source code. learn how this process works and the steps you can take to gain the most insight into your app."
+date: "2021-06-06"
+tags: ["Developer Tools", "Debugging"]
 thumbnail: "/images/sessions/2021/10211.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10211/"
 sessionId: "wwdc2021-10211"
 year: "2021"
 relatedSessions:
-  - title: "Build interactive tutorials using DocC"
-    code: "10235"
-    description: "discover how you can author immersive tutorials from scratch with docc. we"
-  - title: "Customize your advanced Xcode Cloud workflows"
-    code: "10269"
-    description: "xcode cloud integrates with apple developer tools and services, all major source"
   - title: "Detect and diagnose memory issues"
     code: "10180"
-    description: "discover how you can understand and diagnose memory performance problems with xc"
-  - title: "Detect bugs early with the static analyzer"
-    code: "10202"
-    description: "discover how xcode can automatically track down infinite loops, unused code, and"
+    description: "用 Xcode 和命令行工具定位内存泄漏、堆增长和内存回归。"
+  - title: "Triage TestFlight crashes in Xcode Organizer"
+    code: "10203"
+    description: "在 Xcode Organizer 中查看和分组 TestFlight 崩溃报告。"
+  - title: "Discover breakpoint improvements"
+    code: "10209"
+    description: "使用 Xcode 13 的列断点和未解析断点改进调试流程。"
+  - title: "Explore advanced project configuration in Xcode"
+    code: "10210"
+    description: "理解 Xcode 构建设置、构建规则和复杂工程配置。"
 ---
 
 ## Highlight
 
-> ## 一句话判断
-
----
+> Apple 解释了符号化（Symbolication）如何把运行时地址还原成函数名、文件名和行号，并给出 atos、otool、vmmap、nm、symbols、dwarfdump、codesign 等工具来诊断崩溃日志和 Instruments 采样信息。
 
 ## 核心内容
 
+崩溃发生时，设备看到的是内存地址和机器指令。开发者看到的代码却是函数、文件和行号。两者之间缺少映射，崩溃日志就只能告诉你某个地址出错了。
 
-### 最佳实践
+Session 里的 MagicNumbers 程序就是这个场景。代码从 10 个随机数里选一个数字。程序崩溃后，原始 crash log 只能显示 MagicNumbers 在某处崩了。寄存器、地址、反汇编都很难直接指出问题。
 
-**日常运维：** 确保 CI 中的 Archive 构建自动上传 dSYM 到 App Store Connect。对于 Bitcode 项目，使用 App Store Connect 下载的 dSYM，不要用本地的。崩溃报告完整保留 Binary Images 段，不要裁剪。
+Xcode Organizer 下载 dSYM 后，崩溃日志被重新处理。日志开始显示函数调用、文件名和行号，还能指出数组访问越界。原因是 `MAGIC_CHOICE` 超出了 10 个元素的数组范围。
 
-**调试流程：** 收到崩溃报告后先检查 dSYM 的 UUID 是否匹配。如果系统库的堆栈没有符号化，去 Xcode Settings > Symbols 下载对应版本的系统符号。手动符号化时用 `atos` 处理单个地址，用 `symbolicatecrash` 处理整个文件。
+性能分析也有同样的问题。Instruments 在没有完整符号信息时，只能显示部分 backtrace。高 CPU 区间和低 CPU 区间看起来像同一段代码。补上 dSYM 后，Instruments 能指出高 CPU 来自遗留的 debug code path。
 
----
+Apple 在这场 session 中把符号化拆成两步。第一步，把运行时地址转回二进制文件里的地址。第二步，用调试信息把文件地址映射到源码。前一步依赖 Mach-O、load command 和 ASLR slide。后一步依赖 function starts、nlist symbol table 和 DWARF。
 
-## 相关 Session
+## 详细内容
 
-- [Build interactive tutorials using DocC](/articles/wwdc2021-10235) — discover how you can author immersive tutorials from scratch with docc. we
-- [Customize your advanced Xcode Cloud workflows](/articles/wwdc2021-10269) — xcode cloud integrates with apple developer tools and services, all major source
-- [Detect and diagnose memory issues](/articles/wwdc2021-10180) — discover how you can understand and diagnose memory performance problems with xc
-- [Detect bugs early with the static analyzer](/articles/wwdc2021-10202) — discover how xcode can automatically track down infinite loops, unused code, and
+### 用 atos 手动符号化一个地址
+
+（[02:51](https://developer.apple.com/videos/play/wwdc2021/10211/?time=171)）`atos` 可以把一个崩溃地址还原成源码位置。前提是你有对应构建的 dSYM、架构、加载地址和崩溃地址。
+
+```bash
+atos -o MagicNumbers.dSYM/Contents/Resources/DWARF/MagicNumbers -arch arm64 -l 0x10045c000 -i 0x10045fb70
+```
+
+关键点：
+- `atos` 是地址符号化工具，用来查询某个地址对应的符号信息。
+- `-o MagicNumbers.dSYM/Contents/Resources/DWARF/MagicNumbers` 指向 dSYM 包里的 DWARF 二进制。
+- `-arch arm64` 指定要查询的架构切片，Universal 2 App 必须明确架构。
+- `-l 0x10045c000` 提供 `__TEXT` 段的加载地址，工具用它计算 ASLR slide。
+- `-i 0x10045fb70` 要求 `atos` 同时考虑内联函数（inlined functions），这会让 backtrace 更接近源码调用关系。
+
+这条命令对应 session 开头的崩溃示例。Xcode Organizer 自动做的事情，也可以用 `atos` 手动完成。
+
+### 从 Mach-O 找回文件地址
+
+（[07:34](https://developer.apple.com/videos/play/wwdc2021/10211/?time=454)）符号化第一步是“回到文件”。运行时地址会受 ASLR（Address Space Layout Randomization，地址空间布局随机化）影响。文件里的地址由 linker 写入 Mach-O（Apple 可执行文件格式）header 的 load commands。
+
+```bash
+otool -l MagicNumbers | grep LC_SEGMENT -A8
+```
+
+关键点：
+- `otool -l` 打印 Mach-O 文件的 load commands。
+- `LC_SEGMENT_64` 描述一个 segment 的属性。
+- `vmaddr` 是 linker 分配给 segment 的文件地址。
+- `__TEXT` segment 存放函数和方法代码，是崩溃指令通常所在的位置。
+- `-A8` 让 `grep` 输出匹配行后面的 8 行，方便查看 segment 名称、地址和大小。
+
+（[11:32](https://developer.apple.com/videos/play/wwdc2021/10211/?time=692)）运行中的加载地址可以用 `vmmap` 查看。crash log 的 Binary Images 区域也会记录这些加载地址。
+
+```bash
+vmmap MagicNumbers | grep __TEXT
+```
+
+关键点：
+- `vmmap MagicNumbers` 枚举 MagicNumbers 进程的内存区域。
+- `grep __TEXT` 只保留 `__TEXT` segment。
+- `__TEXT` 的运行时加载地址记为 `L`。
+- `otool` 查到的 linker 地址记为 `A`。
+- ASLR slide 计算公式是 `S = L - A`。
+
+拿到 slide 后，用 `运行时地址 - S` 得到文件地址。文件地址稳定，不会因为每次启动时 kernel 选择了不同 ASLR slide 而变化。
+
+### 用反汇编确认崩溃指令
+
+（[10:31](https://developer.apple.com/videos/play/wwdc2021/10211/?time=631)）当你已经把崩溃地址换算成文件地址，可以查看该位置的机器指令。session 示例里，`otool` 找到了 `brk` 指令，它表示程序触发了异常。
+
+```bash
+otool -tV MagicNumbers -arch arm64
+```
+
+关键点：
+- `otool` 读取 Mach-O 文件。
+- `-t` 打印 `__TEXT` segment 里的文本段内容，也就是可执行指令。
+- `-V` 让输出使用符号化的反汇编格式。
+- `MagicNumbers` 是要检查的可执行文件。
+- `-arch arm64` 指定架构切片，避免 Universal 2 文件中查错架构。
+
+这一步适合验证“这个地址到底执行了什么”。它不能直接给你源码行号，但能确认 crash log 中的地址是否落在异常指令上。
+
+### 区分 function starts 和 nlist 符号表
+
+（[15:09](https://developer.apple.com/videos/play/wwdc2021/10211/?time=909)）function starts 是最基础的调试信息。它只记录函数起始地址，不记录函数名。它存放在 `__LINKEDIT` segment，并由 `LC_FUNCTION_STARTS` load command 指向。
+
+```bash
+symbols -onlyFuncStartsData -arch arm64 MagicNumbers
+```
+
+关键点：
+- `symbols` 用来检查二进制文件里的符号和调试信息。
+- `-onlyFuncStartsData` 只输出 function starts 数据。
+- 输出里会有一组地址和空占位。
+- 这些地址能告诉调试器“某个地址距离函数开头多少字节”。
+- 它无法告诉你函数名、文件名或行号。
+
+（[17:06](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1026)）nlist symbol table 比 function starts 多一层信息。它使用 `nlist_64` 结构记录名称、类型、section、描述和值。
+
+```c
+struct nlist_64 {
+    union {
+        uint32_t  n_strx;
+    } n_un;
+    uint8_t n_type;
+    uint8_t n_sect;
+    uint16_t n_desc;
+    uint64_t n_value;
+};
+```
+
+关键点：
+- `n_un.n_strx` 指向字符串表中的名称。
+- `n_type` 描述符号类型，session 重点提到 direct symbol 和 indirect symbol。
+- `n_sect` 表示符号所在 section。
+- `n_desc` 保存额外描述信息。
+- `n_value` 保存地址或相关值。
+
+（[17:59](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1079)）direct symbols 是 App 或 framework 自己定义并参与链接的函数或方法。Swift 符号通常经过 name mangling（名称修饰），需要 demangle 才好读。
+
+```bash
+nm -arch arm64 --defined-only --numeric-sort MagicNumbers | xcrun swift-demangle
+```
+
+关键点：
+- `nm` 查看 Mach-O 的符号表。
+- `-arch arm64` 选择 arm64 架构。
+- `--defined-only` 只显示当前二进制定义的 direct symbols。
+- `--numeric-sort` 按地址排序，便于和崩溃地址对照。
+- `xcrun swift-demangle` 把 Swift mangled name 还原成可读名称。
+
+（[23:06](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1386)）indirect symbols 表示来自外部 framework 或 library 的函数。例如 MagicNumbers 依赖 libswiftCore 中的 Swift 函数。
+
+```bash
+nm -m -arch arm64 --undefined-only --numeric-sort MagicNumbers
+```
+
+关键点：
+- `-m` 显示符号来自哪个 framework 或 library。
+- `--undefined-only` 只显示当前二进制使用、但由外部依赖提供的符号。
+- `--numeric-sort` 按地址排序。
+- 这些信息能说明 App 与系统库或 Swift runtime 的链接关系。
+- 它不会提供本地静态函数的源码行号。
+
+Release 构建常常会 strip symbol table。`Strip Linked Product`、`Strip Style`、`Strip Swift Symbols` 会影响保留哪些符号。出现“有函数名但没有文件名和行号”的 backtrace 时，通常还缺 DWARF。
+
+### 用 DWARF 获取文件名、行号和内联调用
+
+（[27:16](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1636)）DWARF（调试信息格式）提供最完整的源码映射。dSYM bundle 里包含一个带 `__DWARF` segment 的二进制。session 提到的关键数据流有 `debug_info`、`debug_abbrev` 和 `debug_line`。
+
+```bash
+dwarfdump -v -debug-info -arch arm64 MagicNumbers.dSYM
+```
+
+关键点：
+- `dwarfdump` 读取 DWARF 调试信息。
+- `-v` 输出详细内容。
+- `-debug-info` 查看 `debug_info` 数据流。
+- `-arch arm64` 指定架构。
+- `MagicNumbers.dSYM` 是要检查的 dSYM bundle。
+
+DWARF 用 compile unit（编译单元）表示一个源文件，用 subprogram（子程序）表示一个函数。compile unit 是树根，subprogram 是子节点。`debug_line` 保存文件地址到文件名和行号的映射。
+
+（[29:25](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1765)）如果 `atos` 没有使用 `-i`，内联函数的调用细节会丢失。session 中的输出仍然有函数名和行号，但缺少许多有价值的函数关系。
+
+```bash
+atos -o MagicNumbers.dSYM/Contents/Resources/DWARF/MagicNumbers -arch arm64 -l 0x10045c000 0x10045fb70
+```
+
+关键点：
+- 这条命令查询同一个 dSYM 和同一个地址。
+- 它保留 `-o`、`-arch`、`-l` 和目标地址。
+- 它没有 `-i` 参数。
+- 编译器优化会把函数调用替换成函数体，这叫 inlining（内联）。
+- DWARF 用 inlined subroutine（内联子程序）记录这类关系。
+
+内联信息解释了为什么 dSYM 对 Instruments 和 crash log 很重要。只有 DWARF 能表达函数被内联到哪里、调用点在源码哪一行、内联调用之间的父子关系。
+
+### 检查 dSYM、UUID、DWARF 和签名
+
+（[32:29](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1949)）静态库和 object file 也可能包含 DWARF。`dsymutil` 的 debug map 能显示函数来自哪些文件，工具随后可以扫描这些位置处理 DWARF。
+
+```bash
+dsymutil --dump-debug-map -arch arm64 MagicNumbers
+```
+
+关键点：
+- `dsymutil` 是生成和检查 dSYM 的工具。
+- `--dump-debug-map` 输出 debug map。
+- `-arch arm64` 指定架构。
+- `MagicNumbers` 是被检查的二进制。
+- 输出能帮助你确认调试信息来自哪些 object file 或静态库。
+
+（[33:59](https://developer.apple.com/videos/play/wwdc2021/10211/?time=2039)）dSYM 必须和 App 构建匹配。匹配依据是 UUID。crash report 的 Binary Images 区域有 App UUID，dSYM 也有自己的 UUID。
+
+```bash
+symbols -uuid MagicNumbers.dSYM
+```
+
+关键点：
+- `symbols` 可以读取 dSYM 的 UUID。
+- `-uuid` 只输出 UUID 信息。
+- UUID 是 load command 中的唯一标识。
+- App 和 dSYM 的 UUID 必须一致。
+- Bitcode App 的 dSYM 需要从 App Store Connect 下载对应版本。
+
+（[34:03](https://developer.apple.com/videos/play/wwdc2021/10211/?time=2043)）工具链偶尔可能生成无效 DWARF。Apple 建议用 `dwarfdump` 验证，并在发现错误时提交反馈。
+
+```bash
+dwarfdump --verify MagicNumbers.dSYM
+```
+
+关键点：
+- `dwarfdump` 检查 DWARF 内容。
+- `--verify` 执行一致性验证。
+- `MagicNumbers.dSYM` 是被验证的调试符号文件。
+- 如果出现错误，说明符号化质量可能受影响。
+- 单个二进制的 DWARF 数据有 4GB 上限，过大时需要拆分组件。
+
+（[35:09](https://developer.apple.com/videos/play/wwdc2021/10211/?time=2109)）如果 Instruments 找不到函数名，而你确认有 dSYM，还要检查签名和 entitlement。开发构建需要 `get-task-allow` entitlement，Instruments 才有权限符号化 App。
+
+```bash
+codesign --display -v --entitlements :- MagicApp.app
+```
+
+关键点：
+- `codesign` 查看 App 的代码签名信息。
+- `--display` 显示签名元数据。
+- `-v` 输出更详细的信息。
+- `--entitlements :-` 把 entitlement 内容打印到标准输出。
+- `MagicApp.app` 是要检查的 App bundle。
+
+如果缺少 `get-task-allow`，检查 Xcode 的 `Code Signing Inject Base Entitlements` build setting。使用 Profile action 时，Xcode 通常会自动设置。
+
+## 核心启发
+
+- **做什么**：给 CI 增加 dSYM UUID 校验。
+  **为什么值得做**：session 强调 App 和 dSYM 必须 UUID 匹配，错配会让崩溃日志无法完整符号化。
+  **怎么开始**：构建产物生成后运行 `symbols -uuid YourApp.app/YourApp` 和 `symbols -uuid YourApp.app.dSYM`，比较 UUID 后再上传归档。
+
+- **做什么**：做一个崩溃地址快速查询脚本。
+  **为什么值得做**：`atos` 可以把单个地址映射到函数名、文件名和行号，适合处理用户发来的 crash log 片段。
+  **怎么开始**：从 Binary Images 里提取 load address，从 backtrace 提取崩溃地址，然后拼出 `atos -o ... -arch ... -l ... -i ...`。
+
+- **做什么**：在性能排查手册里加入 Instruments dSYM 检查步骤。
+  **为什么值得做**：session 的 Instruments 示例说明，缺 dSYM 会让高耗时路径和普通路径看起来相同。
+  **怎么开始**：采样结果缺文件名或行号时，先定位对应 dSYM，再检查 UUID 和 `get-task-allow` entitlement。
+
+- **做什么**：为 Release 构建整理符号剥离策略。
+  **为什么值得做**：`Strip Linked Product` 和 `Strip Style` 会影响符号表可见性，保留错误会增加体积，剥离过度会降低诊断能力。
+  **怎么开始**：检查 target 的 strip build settings，结合 `nm`、`symbols -onlyNListData` 查看 direct symbols 是否符合预期。
+
+- **做什么**：建立大型项目的 dSYM 大小监控。
+  **为什么值得做**：session 提到单个二进制 DWARF 数据有 4GB 上限，过大的 dSYM 会影响工具处理。
+  **怎么开始**：归档后统计每个 dSYM 体积；接近上限的模块拆成 framework 或独立组件，让每个组件生成更小的 dSYM。
+
+## 关联 Session
+
+- [Detect and diagnose memory issues](/articles/wwdc2021-10180) — 学习用 Xcode、XCTest 和命令行工具定位内存问题。
+- [Triage TestFlight crashes in Xcode Organizer](/articles/wwdc2021-10203) — 了解 Xcode Organizer 如何接收、聚类和符号化 TestFlight 崩溃报告。
+- [Discover breakpoint improvements](/articles/wwdc2021-10209) — 掌握 Xcode 13 的列断点和未解析断点，补齐交互式调试流程。
+- [Explore advanced project configuration in Xcode](/articles/wwdc2021-10210) — 理解复杂 Xcode 工程中的构建设置和文件依赖配置。

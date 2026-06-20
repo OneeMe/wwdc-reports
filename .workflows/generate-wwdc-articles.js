@@ -1,80 +1,46 @@
 export const meta = {
   name: 'generate-wwdc-articles',
-  description: '批量生成 WWDC session 中文技术文章（智能跳过已通过检查的文件）',
+  description: '批量生成 WWDC session 中文技术文章',
   phases: [
-    { title: '检查', detail: '格式检查，识别需要生成的文件' },
     { title: '生成', detail: '并行生成待处理文章' },
-    { title: '验证', detail: '最终验证' },
+    { title: '校验', detail: '检查文章格式并重试' },
   ],
 }
 
 const ARTICLES_DIR = 'web/src/content/articles'
 
-// 主执行函数
 async function main() {
-  // 参数验证
   const year = args?.year || 2023
   const yy = String(year).slice(-2)
 
-  // Phase 1: 格式检查，识别需要处理的文件
-  phase('检查')
+  // 从 args 获取失败文件列表和 prompt 模板
+  const targetCodes = args?.codes || []
+  const promptBase = args?.prompt || ''
 
-  log(`检查 WWDC${year} 现有文章格式...`)
-
-  // 使用 agent 读取失败文件列表
-  const checkResult = await agent(
-    `读取文件 /tmp/wwdc${year}-failed.txt 的内容，每行是一个数字代码。
-
-只输出数字代码列表，每行一个，如：
-101
-102
-103
-
-如果文件不存在或为空，输出"空"。`
-  )
-
-  // 解析检查结果
-  let targetCodes = []
-  let isFullGeneration = false
-
-  if (checkResult !== '空' && checkResult.trim().length > 0) {
-    targetCodes = checkResult
-      .split('\n')
-      .map(line => line.match(/^\d+/)?.[0])
-      .filter(Boolean)
-      .map(code => parseInt(code, 10))
-      .filter(code => code > 0 && code < 8000)
-    log(`需要重新生成 ${targetCodes.length} 篇文章`)
-  } else {
-    log(`没有需要处理的文件`)
-    return { skipped: 0, year: year, status: 'no-work' }
+  if (targetCodes.length === 0) {
+    log('错误：没有提供需要生成的 session code 列表')
+    return { status: 'error', reason: 'no-codes' }
   }
 
-  // Phase 2: 读取 prompt 模板
-  phase('读取模板')
+  if (!promptBase) {
+    log('错误：没有提供 prompt 模板')
+    return { status: 'error', reason: 'no-prompt' }
+  }
 
-  const templateResult = await agent(
-    `读取文件 scripts/agent-prompt-template.md 的完整内容。
+  log(`需要生成 ${targetCodes.length} 篇 WWDC${year} 文章`)
 
-只输出文件原文，不要解释或修改。`
-  )
-
-  const promptBase = templateResult
-    .replaceAll('{YEAR}', year)
-    .replaceAll('{YY}', yy)
-
-  // Phase 3: 并行生成文章（限制并发为 2）
+  // 并行生成文章
   phase('生成')
 
   const results = []
-  const CONCURRENCY = 2
+  const CONCURRENCY = 5
 
   for (let i = 0; i < targetCodes.length; i += CONCURRENCY) {
     const batch = targetCodes.slice(i, i + CONCURRENCY)
     const batchResults = await pipeline(
       batch,
       code => agent(
-        `为 WWDC${year} session ${code} 生成/重新生成中文技术文章。
+        `为 WWDC${year} session ${code} 重新生成中文技术文章。
 
 **写作要求：**
 
@@ -83,64 +49,78 @@ ${promptBase.replaceAll(/\{CODE\}/g, code)}
 **数据获取（必须先执行）：**
 
 \`\`\`bash
-# session 元数据
 node skills/wwdc-quick-look/scripts/query.mjs show-session --year ${year} --code ${code}
-
-# 代码片段
 node skills/wwdc-quick-look/scripts/query.mjs code --year ${year} --code ${code}
-
-# Resources
 node skills/wwdc-quick-look/scripts/query.mjs resources --year ${year} --code ${code}
-
-# 逐字稿
 node skills/wwdc-quick-look/scripts/query.mjs transcript --year ${year} --code ${code} --limit 100
 \`\`\`
 
 **任务：**
-
 1. 运行上述命令获取数据
-2. 生成 .mdx 文件
+2. 按模板格式生成完整 .mdx 文件
 3. 写入 ${ARTICLES_DIR}/wwdc${yy}-${code}.mdx
-4. 确保通过格式检查（检查脚本已能识别 Keynote/Overview/Design 等无代码 session）
+4. ⚠️ **章节名称必须完全一致**：使用 \`## 核心内容\`、\`## 详细内容\`、\`## 核心启发\`、\`## 关联 Session\`（不要用编号或自定义名称）
+5. 禁止 AI 风格短语（"不是...而是..."、"不仅...而且..."、"总而言之"等）
 
 完成后只输出"已生成：wwdc${yy}-${code}.mdx"。`,
         { label: `${code}` }
       )
     )
-    const filteredResults = batchResults.filter(r => r)
-    results.push(...filteredResults)
+    results.push(...batchResults.filter(r => r))
   }
 
-  log(`已处理 ${results.length} 篇文章`)
+  log(`已生成 ${results.length}/${targetCodes.length} 篇文章`)
 
-  // Phase 4: 最终验证
-  if (args.verify !== false) {
-    phase('验证')
+  // 校验格式
+  phase('校验')
+  const checkResults = []
+  const MAX_RETRIES = 2
 
-    const recheckResult = await agent(
-      `运行格式检查验证 WWDC${year} 文章：
+  for (const code of targetCodes) {
+    const filePath = `${ARTICLES_DIR}/wwdc${yy}-${code}.mdx`
+    let retries = 0
+    let passed = false
 
+    while (retries <= MAX_RETRIES && !passed) {
+      // 运行格式检查
+      const checkResult = await agent(
+        `检查文章 ${filePath} 的格式，运行：
 \`\`\`bash
-node scripts/check-article-format.mjs ${ARTICLES_DIR} 2>&1 | tail -5
+node scripts/check-article-format.mjs ${filePath}
 \`\`\`
+如果检查通过（输出 ✅），返回 "PASS"。
+如果检查失败（输出 ❌），分析失败原因，然后重新生成这篇文章。
+重新生成时使用相同的写作要求，但确保修复失败的问题。
+完成后返回 "REGENERATED" 或 "FAIL"。`,
+        { label: `check:${code}` }
+      )
 
-只输出统计信息。`
-    )
-
-    if (recheckResult.includes('失败: 0') || recheckResult.includes('失败：0')) {
-      log('格式验证：全部通过')
-    } else {
-      log(`验证结果：${recheckResult.trim()}`)
+      if (checkResult?.includes('PASS')) {
+        passed = true
+        checkResults.push({ code, status: 'pass', retries })
+      } else if (retries < MAX_RETRIES) {
+        retries++
+        log(`${code} 格式检查失败，重试 ${retries}/${MAX_RETRIES}`)
+      } else {
+        checkResults.push({ code, status: 'fail', retries })
+        log(`${code} 格式检查失败，已达最大重试次数`)
+      }
     }
   }
 
+  const passCount = checkResults.filter(r => r.status === 'pass').length
+  const failCount = checkResults.filter(r => r.status === 'fail').length
+
+  log(`校验完成：通过 ${passCount}/${targetCodes.length}，失败 ${failCount}`)
+
   return {
     processed: results.length,
-    year: year,
-    mode: isFullGeneration ? 'full' : 'incremental',
+    total: targetCodes.length,
+    year,
+    passed: passCount,
+    failed: failCount,
     status: 'done'
   }
 }
 
-// 执行主函数
-main()
+await main()
