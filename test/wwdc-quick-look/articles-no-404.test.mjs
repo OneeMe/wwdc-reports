@@ -14,13 +14,12 @@ function listRawDataFiles() {
   for (const entry of fs.readdirSync(DATA_DIR, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const yearDir = path.join(DATA_DIR, entry.name);
-    for (const f of fs.readdirSync(yearDir)) {
-      if (f.startsWith('raw_data_') && f.endsWith('.json')) {
-        files.push({
-          yearShort: entry.name,
-          filePath: path.join(yearDir, f),
-        });
-      }
+    const filePath = path.join(yearDir, 'raw_data.json');
+    if (fs.existsSync(filePath)) {
+      files.push({
+        yearShort: entry.name,
+        filePath,
+      });
     }
   }
   return files;
@@ -37,6 +36,16 @@ function isAslSession(video) {
   return /\(ASL\)\s*$/i.test(video.title ?? '');
 }
 
+function isNonArticleSession(video) {
+  return /\b(Group Lab|Dub Dub Daily|Special Presentation|Meet the Presenter|Study Hall|Q&A)\b/i.test(
+    video.title ?? '',
+  );
+}
+
+function isSkippedSession(video) {
+  return isAslSession(video) || isNonArticleSession(video);
+}
+
 function getLocalArticleCodes(year) {
   if (!fs.existsSync(ARTICLES_DIR)) return new Set();
   const prefix = `wwdc${String(year)}-`;
@@ -51,7 +60,7 @@ function getLocalArticleCodes(year) {
 }
 
 const rawFiles = listRawDataFiles();
-assert.ok(rawFiles.length > 0, `No raw_data_*.json files found in ${DATA_DIR}/`);
+assert.ok(rawFiles.length > 0, `No raw_data.json files found in ${DATA_DIR}/`);
 
 // Only enforce full coverage for the current active year (WWDC26).
 // Older years may have incomplete local article sets.
@@ -68,10 +77,14 @@ describe('articles-no-404', () => {
       const videos = data.videos ?? {};
       const localCodes = getLocalArticleCodes(year);
       const cdnCodes = new Set();
+      const skippedCodes = new Set();
       const missing = [];
 
       for (const video of Object.values(videos)) {
-        if (isAslSession(video)) continue;
+        if (isSkippedSession(video)) {
+          skippedCodes.add(video.eventContentId);
+          continue;
+        }
         cdnCodes.add(video.eventContentId);
         if (!localCodes.has(video.eventContentId)) {
           missing.push({
@@ -84,7 +97,7 @@ describe('articles-no-404', () => {
 
       const orphans = [];
       for (const code of localCodes) {
-        if (!cdnCodes.has(code)) {
+        if (!cdnCodes.has(code) && !skippedCodes.has(code)) {
           orphans.push(code);
         }
       }

@@ -3,20 +3,20 @@
 # WWDC Quick Look Skill
 
 [中文说明](README-CN.md)
-[![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look)](https://www.skills.sh/swiftggteam/wwdc-quick-look)
+[![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look-skill)](https://www.skills.sh/swiftggteam/wwdc-quick-look-skill)
 [Landing Page](https://wwdc-quick-look.swiftgg.team)
 
 WWDC Quick Look is a local agent skill for fast access to Apple WWDC session metadata, transcripts, Code tab snippets, and Resources links.
 
-Install it through skills.sh with one command, then let your agent use `wwdc-quick-look` whenever a WWDC question needs concrete session evidence. The repository also contains the crawler and published dataset that power the skill. The default path is local-first and no-key: it reads public Apple Developer pages, writes structured JSON and transcript text, and serves the latest archive from jsDelivr.
+Install it through skills.sh with one command, then let your agent use `wwdc-quick-look` whenever a WWDC question needs concrete session evidence. The installable skill lives in the lightweight `SwiftGGTeam/wwdc-quick-look-skill` repository. This repository contains the crawler, website, and published dataset that power the skill. The default path is local-first and no-key: it reads public Apple Developer pages, writes structured JSON and transcript text, and serves the latest archive from jsDelivr.
 
 ## Install With skills.sh
 
 ```sh
-npx skills add SwiftGGTeam/wwdc-quick-look
+npx skills add SwiftGGTeam/wwdc-quick-look-skill
 ```
 
-The skills CLI discovers `skills/wwdc-quick-look/SKILL.md` in this repository and installs it into your local agent skill directory. This is the recommended distribution path for Codex, Claude Code, Cursor, and other agent runtimes supported by skills.sh.
+The skills CLI installs from the standalone `SwiftGGTeam/wwdc-quick-look-skill` repository, so users do not need to clone this larger data and website repository. This repository tracks the same skill as a Git submodule at `skills/wwdc-quick-look` for local development.
 
 ## What This Skill Does
 
@@ -35,7 +35,7 @@ The skill can:
 
 ```text
 skills/
-└── wwdc-quick-look/          # Canonical skill source
+└── wwdc-quick-look/          # Submodule: SwiftGGTeam/wwdc-quick-look-skill
     ├── SKILL.md
     ├── scripts/query.mjs
     └── references/data-schema.md
@@ -51,10 +51,11 @@ data/
 ├── wwdc22/
 ├── wwdc23/
 ├── wwdc24/
-└── wwdc25/
+├── wwdc25/
+└── wwdc26/
 ```
 
-`skills/` is the single source of truth. The playground links expose the same skill to agent runtimes that expect either `.agents/skills` or `.claude/skills`. The repository root intentionally does not keep a `.agents/skills` copy.
+`skills/wwdc-quick-look` is a submodule that points to the standalone skill repository. The playground links expose the same skill to agent runtimes that expect either `.agents/skills` or `.claude/skills`. The repository root intentionally does not keep a `.agents/skills` copy.
 
 ## Use The Query Script Directly
 
@@ -62,11 +63,11 @@ After installing the skill, agents call this script for you. For local testing o
 
 ```sh
 node skills/wwdc-quick-look/scripts/query.mjs list-years
-node skills/wwdc-quick-look/scripts/query.mjs search --year 2025 --keyword "visionOS"
-node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2025 --code 290
-node skills/wwdc-quick-look/scripts/query.mjs resources --year 2025 --code 290
-node skills/wwdc-quick-look/scripts/query.mjs code --year 2025 --code 290 --limit 3
-node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2025 --code 290 --limit 20
+node skills/wwdc-quick-look/scripts/query.mjs search --year 2026 --keyword "Foundation Models"
+node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2026 --code 339
+node skills/wwdc-quick-look/scripts/query.mjs resources --year 2026 --code 339
+node skills/wwdc-quick-look/scripts/query.mjs code --year 2026 --code 339 --limit 3
+node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2026 --code 339 --limit 20
 ```
 
 By default the query script reads the published CDN dataset:
@@ -84,16 +85,17 @@ WWDC_QUICK_LOOK_BASE_URL=http://127.0.0.1:8765 \
 
 ## Dataset Coverage
 
-The committed local dataset covers WWDC 2020 through WWDC 2025.
+The committed local dataset covers WWDC 2020 through WWDC 2026.
 
-| Year | Sessions | Transcript files | Sessions with Resources | Sessions with Code snippets |
-|------|----------|------------------|--------------------------|-----------------------------|
-| 2020 | 209 | 206 | 150 | 124 |
-| 2021 | 207 | 204 | 176 | 127 |
+| Year | Sessions | Available transcripts | Sessions with Resources | Sessions with Code snippets |
+|------|----------|-----------------------|--------------------------|-----------------------------|
+| 2020 | 209 | 209 | 150 | 124 |
+| 2021 | 202 | 202 | 176 | 127 |
 | 2022 | 316 | 184 | 142 | 118 |
 | 2023 | 316 | 181 | 122 | 100 |
 | 2024 | 123 | 123 | 117 | 78 |
-| 2025 | 122 | 120 | 113 | 80 |
+| 2025 | 122 | 122 | 113 | 81 |
+| 2026 | 137 | 118 | 92 | 87 |
 
 Some Apple Developer entries are Q&A, Meet the Presenter, Study Hall, keynote, ASL, or community activity pages. When Apple publishes no timestamped transcript on the page, the manifest records that entry as `missing` instead of inventing text.
 
@@ -103,13 +105,17 @@ The crawler remains available for maintaining the dataset:
 
 ```sh
 # Crawl one year into the published data directory.
-node ./bin/wwdc-quick-look.js crawl --year 2025 --locale en --out-dir data/wwdc25
+node ./bin/wwdc-quick-look.js crawl --year 2026 --locale en --out-dir data/wwdc26
 
 # Rebuild the public year catalog.
 node scripts/build-index.mjs
 ```
 
 The combined crawl fetches public Apple Developer collection cards, enriches each session from its detail page, extracts Resources and Code tab snippets, and writes transcript text files plus a manifest.
+
+Data refreshes are intentionally manual. Run the crawler locally for the year you want to update, rebuild `data/index.json`, review the diff, and commit the changed data files.
+
+Only stable latest data is committed under `data/`: per-year `raw_data.json`, transcript files, transcript manifests, and `data/index.json`. Timestamped `raw_data_*.json` snapshots are local crawl artifacts and are ignored by Git.
 
 ## Published URLs
 
@@ -118,13 +124,13 @@ The combined crawl fetches public Apple Developer collection cards, enriches eac
 https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/index.json
 
 # Per-year session metadata
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/raw_data.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/raw_data.json
 
 # Transcript manifest
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/_manifest.json
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/transcripts-en/_manifest.json
 
 # Single transcript
-https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc25/transcripts-en/290.txt
+https://cdn.jsdelivr.net/gh/SwiftGGTeam/wwdc-quick-look@main/data/wwdc26/transcripts-en/339.txt
 ```
 
 jsDelivr caches paths. Use a commit-pinned URL when byte-stable archival output matters.
@@ -136,6 +142,8 @@ npm test
 npm run check
 node ./bin/wwdc-quick-look.js help
 ```
+
+After cloning this repository for development, initialize the skill submodule with `git submodule update --init --recursive`.
 
 The package has no runtime npm dependencies and requires Node.js 20 or newer.
 
