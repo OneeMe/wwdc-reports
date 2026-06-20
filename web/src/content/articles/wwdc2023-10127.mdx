@@ -1,59 +1,344 @@
 ---
 title: "Optimize GPU renderers with Metal"
-description: "discover how to optimize your gpu renderer using the latest metal features and best practices. we"
-date: 2026-06-10
-tags: ["WWDC 2023"]
+description: "Discover how to optimize your GPU renderer using the latest Metal features and best practices. We'll show you how to use function specialization and parallel shader compilation to maintain responsive authoring workflows and the fastest rendering speeds, and help you tune your compute shaders for optimal performance."
+date: "2023-06-06"
+tags: ["Metal", "GPU", "Optimization"]
 thumbnail: "/images/sessions/2023/10127.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10127/"
 sessionId: "wwdc2023-10127"
 year: "2023"
 relatedSessions:
-  - title: "Analyze hangs with Instruments"
-    code: "10248"
-    description: "user interface elements often mimic real-world interactions, including real-time"
-  - title: "Beyond the basics of structured concurrency"
-    code: "10170"
-    description: "it"
   - title: "Bring your game to Mac, Part 1: Make a game plan"
     code: "10123"
-    description: "bring modern, high-end games to mac and ipad with the powerful features of metal"
+    description: "用 Game Porting Toolkit 评估 Windows 游戏在 Mac 上的可行性"
   - title: "Bring your game to Mac, Part 2: Compile your shaders"
     code: "10124"
-    description: "discover how the metal shader converter streamlines the process of bringing your"
+    description: "使用 Metal Shader Converter 将 HLSL 着色器转换为 Metal"
+  - title: "Bring your game to Mac, Part 3: Render with Metal"
+    code: "10125"
+    description: "在 Metal 中实现高性能渲染"
 ---
 
 ## Highlight
 
-> Metal 生态团队的 Gauri Jog 讲解了如何利用 Metal 特性优化 GPU 渲染器，重点面向内容创作应用（如 Blender）和游戏引擎的材质渲染场景。
-
----
+> Metal 通过 function constants 消除 uber shader 的动态分支、用异步编译保持材质编辑响应、用动态链接减少编译时间、用 occupancy hints 调优计算内核，让 Blender 3D 的材质渲染从 58ms 降到 12.5ms。
 
 ## 核心内容
 
-Metal 生态团队的 Gauri Jog 讲解了如何利用 Metal 特性优化 GPU 渲染器，重点面向内容创作应用（如 Blender）和游戏引擎的材质渲染场景。
+### Uber Shader 的两难
 
-材质系统有两个性能目标：编辑时的响应速度（拖动滑块不卡顿）和渲染性能（实时交互和最终帧渲染都要快）。这两个目标经常矛盾——uber shader 响应快但性能差，特化 shader 性能好但编译慢。
+数字内容创作应用和游戏引擎中，材质系统有两个矛盾的目标：
 
-Session 给出的解决方案是分层策略：先用 uber shader 保证即时响应，同时异步编译特化版本，编译完成后无缝切换。核心技术是 Metal 的 function constants（函数常量），它允许在运行时设置材质参数值，编译器会据此做死代码消除和常量折叠，生成最优的 shader 变体。
+1. **编辑响应**：拖动滑块时 viewport 即时更新，不能卡顿
+2. **渲染性能**：实时交互和最终帧渲染都要快
 
-实战数据令人印象深刻：Blender 3D 中 Wanderer 和 Tree Creature 两个测试场景，uber shader 分别只有几十 fps，特化后性能大幅提升。GPU Debugger 时间线上，材质渲染从 58ms 降到 12.5ms。
+Uber shader 是一个包含所有可能材质特性的巨型着色器。编辑时只需要更新材质参数缓冲区，无需重新编译，响应很快。但因为要处理所有分支，运行时性能很差。
 
-Session 还介绍了 macOS 13.3 新增的 `shouldMaximizeConcurrentCompilation` 属性，以及 Metal 动态链接和计算着色器调优的新选项。
+Function constants 解决了这个矛盾。它在编译时把材质参数变成常量，编译器据此做死代码消除和常量折叠，生成最优的特化版本。
 
+（[02:05](https://developer.apple.com/videos/play/wwdc2023/10127/?time=125)）
 
-### 最佳实践
+### 用 Function Constants 特化材质
 
-- **始终先用 uber shader 保底**：异步编译期间用 uber shader 保持 UI 响应，编译完成后再切换到特化版本。这样材质编辑永远不会因为编译而卡顿。
-- **用 GPU Debugger 验证优化效果**：对比 uber shader 和特化版本的 ALU 指令数、寄存器溢出和内存等待时间。Session 中的 58ms vs 12.5ms 就是用 GPU Debugger Timeline 测量的。
-- **合理使用 function constants**：每个材质特性开关用一个 function constant。不变化的静态参数（如颜色、权重）也用 function constants 替代 buffer 读取，让编译器做常量折叠。
-- **多材质编辑场景启用并发编译**：如果你的应用支持同时编辑多个材质，设置 `shouldMaximizeConcurrentCompilation = true` 能显著缩短等待时间。
-- **监听材质参数变化**：参数变化时使缓存的特化版本失效，触发新的异步编译，同时切换回 uber shader。
+**Uber shader 的问题代码**：
 
----
+```metal
+fragment FragOut frag_material_main(device Material &material [[buffer(0)]]) {
+    if (material.is_glossy) {
+        material_glossy(material);
+    }
+    if (material.has_shadows) {
+        light_shadows(material);
+    }
+    if (material.has_reflections) {
+        trace_reflections(material);
+    }
+    if (material.is_volumetric) {
+        output_volume_parameters(material);
+    }
+    return output_material();
+}
+```
 
-## 相关 Session
+这些 `if` 在运行时判断，每次都要读取材质缓冲区，产生大量分支。
 
-- [Analyze hangs with Instruments](/articles/wwdc2023-10248) — user interface elements often mimic real-world interactions, including real-time
-- [Beyond the basics of structured concurrency](/articles/wwdc2023-10170) — it
-- [Bring your game to Mac, Part 1: Make a game plan](/articles/wwdc2023-10123) — bring modern, high-end games to mac and ipad with the powerful features of metal
-- [Bring your game to Mac, Part 2: Compile your shaders](/articles/wwdc2023-10124) — discover how the metal shader converter streamlines the process of bringing your
+**改用 function constants**：
+
+```metal
+constant bool IsGlossy        [[function_constant(0)]];
+constant bool HasShadows      [[function_constant(1)]];
+constant bool HasReflections  [[function_constant(2)]];
+constant bool IsVolumetric    [[function_constant(3)]];
+
+fragment FragOut frag_material_main(device Material &material [[buffer(0)]]) {
+    if (IsGlossy) {
+        material_glossy(material);
+    }
+    if (HasShadows) {
+        light_shadows(material);
+    }
+    if (HasReflections) {
+        trace_reflections(material);
+    }
+    if (IsVolumetric) {
+        output_volume_parameters(material);
+    }
+    return output_material();
+}
+```
+
+**关键点**：
+- `[[function_constant(N)]]` 声明编译时常量
+- Metal 编译器把常量布尔值折叠，值为 false 的分支直接删除
+- 不需要读取材质缓冲区来判断特性开关
+- 控制流大幅简化，内存读取和分支都被移除
+
+（[03:45](https://developer.apple.com/videos/play/wwdc2023/10127/?time=225)）
+
+### 常量折叠优化
+
+不变化的静态参数也可以用 function constants：
+
+```metal
+constant float4 MaterialColor  [[function_constant(0)]];
+constant float4 MaterialWeight [[function_constant(1)]];
+constant float4 SheenColor     [[function_constant(2)]];
+constant float4 SheenFactor    [[function_constant(3)]];
+
+void material_glossy(const constant Material& material) {
+    float4 light = glossy_eval(MaterialColor, MaterialWeight);
+    float4 sheen = sheen_eval(SheenColor, SheenFactor);
+    glossy_output_write(light, sheen, material.blend_factor);
+}
+```
+
+编译器直接把这些值内联到指令中，不需要从缓冲区读取。
+
+（[04:58](https://developer.apple.com/videos/play/wwdc2023/10127/?time=298)）
+
+### 在主机端创建特化管线
+
+```objc
+// 定义材质参数结构
+struct MaterialParameter {
+    NSString* name;
+    MTLDataType type;
+    void* value_ptr;
+};
+
+// 创建参数实例
+Material material = {true, {1.0f, 0.0f, 0.0f, 1.0f}};
+MaterialParameter is_glossy{@"IsGlossy", MTLDataTypeBool, &material.is_glossy};
+MaterialParameter mat_color{@"MaterialColor", MTLDataTypeFloat4, &material.color};
+MaterialParameter shader_parameters[2] = {is_glossy, mat_color};
+
+// 填充 function constant values
+MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
+for (const MaterialParameter& parameter : shader_parameters) {
+    [values setConstantValue:parameter.value_ptr
+                        type:parameter.type
+                    withName:parameter.name];
+}
+
+// 创建管线描述符，使用带 function constants 的片段函数
+MTLRenderPipelineDescriptor *dsc = [MTLRenderPipelineDescriptor new];
+dsc.fragmentFunction = [shader_library newFunctionWithName:@"frag_material_main"
+                                            constantValues:values
+                                                     error:&error];
+
+// 创建管线状态对象
+id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:dsc
+                                                                        error:&error];
+```
+
+**关键点**：
+- `newFunctionWithName:constantValues:error:` 创建带特化的函数
+- `MTLFunctionConstantValues` 通过名称设置常量值
+- 创建的 PSO 是针对这组材质参数的最优版本
+
+（[05:21](https://developer.apple.com/videos/play/wwdc2023/10127/?time=321)）
+
+## 详细内容
+
+### GPU Debugger 验证优化效果
+
+Uber shader 的 GPU Debugger 数据显示：
+- ALU 指令数很高
+- 大量寄存器溢出（spill）
+- 内存等待时间很长
+
+特化后的数据：
+- ALU 指令和 spill 立即减少（死代码消除和常量折叠）
+- 内存等待时间显著降低
+
+Timeline view 中，uber shader 渲染材质 Pass 需要 58ms，特化版本只需 12.5ms。
+
+（[06:26](https://developer.apple.com/videos/play/wwdc2023/10127/?time=386)）
+
+### 异步编译保持响应
+
+特化需要运行时编译，如果阻塞等待会造成卡顿。Metal 的异步 PSO 创建 API 解决了这个问题：
+
+```objc
+// 异步创建 shader library
+[device newLibraryWithSource:source
+                     options:options
+           completionHandler:^(id<MTLLibrary> library, NSError* error) {
+    // 库编译完成
+}];
+
+// 异步创建渲染管线状态
+[device newRenderPipelineStateWithDescriptor:descriptor
+                           completionHandler:^(id<MTLRenderPipelineState> pso, NSError* error) {
+    // PSO 编译完成，切换到特化版本
+}];
+```
+
+**工作流程**：
+1. 默认使用 uber shader 渲染
+2. 同时触发特化版本的异步编译
+3. 编译完成后切换到特化版本
+4. 材质参数变化时，使缓存的特化版本失效，回退到 uber shader，触发新的异步编译
+
+（[07:52](https://developer.apple.com/videos/play/wwdc2023/10127/?time=472)）
+
+### 最大化并发编译
+
+macOS 13.3 新增 `shouldMaximizeConcurrentCompilation` 属性：
+
+```objc
+// 启用最大并发编译
+device.shouldMaximizeConcurrentCompilation = YES;
+```
+
+设置后，Metal 编译器会充分利用所有 CPU 核心。这对同时编辑多个材质的场景特别有用，特化版本能更快就绪。
+
+（[09:16](https://developer.apple.com/videos/play/wwdc2023/10127/?time=556)）
+
+### 动态链接加速编译
+
+复杂材质的特化版本编译时间可能很长。动态链接可以把通用函数预编译成库，减少运行时编译量。
+
+**符号可见性控制**：
+
+```metal
+// 对外可见的函数
+__attribute__((visibility("default")))
+void matrix_mul();
+
+// 内部使用的函数
+__attribute__((visibility("hidden")))
+void matrix_mul_internal();
+```
+
+**检查设备支持**：
+
+```objc
+// 渲染管线动态库
+BOOL supportsRenderDylib = device.supportsRenderDynamicLibraries;
+
+// 计算管线动态库
+BOOL supportsComputeDylib = device.supportsDynamicLibraries;
+```
+
+Apple6 及以上 GPU family 支持渲染管线动态库。Apple6 及以上和大多数 Mac2 GPU family 支持计算管线动态库。
+
+**创建动态库**：
+
+```objc
+// 从现有 Metal 库创建
+id<MTLDynamicLibrary> dylib = [device newDynamicLibrary:library error:&error];
+
+// 从文件 URL 创建
+id<MTLDynamicLibrary> dylib = [device newDynamicLibraryWithURL:url error:&error];
+```
+
+**在管线中链接**：
+
+```objc
+MTLRenderPipelineDescriptor* dsc = [MTLRenderPipelineDescriptor new];
+dsc.vertexPreloadedLibraries   = @[dylib_Math, dylib_Shadows];
+dsc.fragmentPreloadedLibraries = @[dylib_Math, dylib_Shadows];
+
+// 或在编译选项中指定
+MTLCompileOptions* options = [MTLCompileOptions new];
+options.libraries = @[dylib_Math, dylib_Shadows];
+[device newLibraryWithSource:programString
+                     options:options
+                       error:&error];
+```
+
+**关键点**：
+- 动态库可以离线预编译，运行时完全避免编译
+- 把大型工具函数拆分到单独的动态库中
+- 主着色器编译时只需链接，大幅缩短时间
+
+（[10:58](https://developer.apple.com/videos/play/wwdc2023/10127/?time=658)）
+
+### 计算内核 Occupancy 调优
+
+每个 GPU 工作负载都有性能甜点，需要通过实验找到。Metal 提供 API 来指定期望的 GPU 占用率：
+
+```objc
+// 计算管线描述符
+@interface MTLComputePipelineDescriptor : NSObject
+@property (readwrite, nonatomic) NSUInteger maxTotalThreadsPerThreadgroup;
+@end
+
+// 编译选项（macOS 13.3 / iOS 16.4 新增）
+@interface MTLCompileOptions : NSObject
+@property (readwrite, nonatomic) NSUInteger maxTotalThreadsPerThreadgroup;
+@end
+```
+
+**动态库的 occupancy 匹配**：
+
+```objc
+MTLCompileOptions* options = [MTLCompileOptions new];
+options.libraryType = MTLLibraryTypeDynamic;
+options.installName = @"executable_path/dylib_Math.metallib";
+
+if (@available(macOS 13.3, *)) {
+    options.maxTotalThreadsPerThreadgroup = 768;
+}
+
+id<MTLLibrary> lib = [device newLibraryWithSource:programString
+                                          options:options
+                                            error:&error];
+
+id<MTLDynamicLibrary> dynamicLib = [device newDynamicLibrary:lib error:&error];
+```
+
+**关键点**：
+- `maxTotalThreadsPerThreadgroup` 值越高，编译器越倾向于高占用率
+- 需要在管线描述符和动态库编译选项中设置相同的值
+- 每个工作负载和设备的最优值不同，需要实验
+- 最优值不一定是 GPU 支持的最大线程数
+
+Blender Cycles 着色和相交计算内核的性能曲线显示，存在一个明显的性能甜点。在那个点上，spill 略有增加，但整体占用率提升带来了显著更好的内核性能。
+
+（[13:45](https://developer.apple.com/videos/play/wwdc2023/10127/?time=825)）
+
+## 核心启发
+
+- **做什么**：用 function constants 特化复杂材质着色器
+  - **为什么值得做**：Blender 3D 实测从 58ms 降到 12.5ms，ALU 指令、spill 和内存等待都大幅减少
+  - **怎么开始**：把材质特性开关声明为 `[[function_constant(N)]]`，在创建 PSO 时通过 `MTLFunctionConstantValues` 传入值
+
+- **做什么**：实现异步材质编译 workflow
+  - **为什么值得做**：编辑材质时不会卡顿，uber shader 保底，特化版本在后台编译完成后无缝切换
+  - **怎么开始**：用带 completion handler 的异步 API 创建 library 和 PSO，编译完成后替换渲染使用的管线
+
+- **做什么**：用动态链接拆分通用函数库
+  - **为什么值得做**：把数学、光照等通用函数预编译成动态库，主着色器编译时只需链接，大幅缩短时间
+  - **怎么开始**：按功能分组创建动态库，设置 `visibility("default")`，在管线描述符的 `preloadedLibraries` 中引用
+
+- **做什么**：调优计算内核的 maxTotalThreadsPerThreadgroup
+  - **为什么值得做**：不需要改代码或算法，只改一个参数就能找到性能甜点
+  - **怎么开始**：为内核设置不同的 `maxTotalThreadsPerThreadgroup` 值，用 GPU Debugger 测量执行时间，找到最优值
+
+## 关联 Session
+
+- [Bring your game to Mac, Part 1: Make a game plan](/articles/wwdc2023-10123) — 用 Game Porting Toolkit 评估 Windows 游戏在 Mac 上的可行性
+- [Bring your game to Mac, Part 2: Compile your shaders](/articles/wwdc2023-10124) — 使用 Metal Shader Converter 将 HLSL 着色器转换为 Metal
+- [Bring your game to Mac, Part 3: Render with Metal](/articles/wwdc2023-10125) — 在 Metal 中实现高性能渲染

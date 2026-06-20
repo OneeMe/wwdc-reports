@@ -1,108 +1,173 @@
 ---
 title: "Scale compute workloads across Apple GPUs"
-description: "discover how you can create compute workloads that scale efficiently across apple gpus. learn how to saturate the gpu by improving your work distribution, minimize gpu timeline gaps with effective pipelining and concurrent dispatches, and use atomic operations effectively. we'll also take you through the latest counters and tools in xcode and instruments that can help you optimize spatial and temporal memory access patterns."
+description: "Discover how you can create compute workloads that scale efficiently across Apple GPUs. Learn how to saturate the GPU by improving your work distribution, minimize GPU timeline gaps with effective pipelining and concurrent dispatches, and use atomic operations effectively. We'll also take you through the latest counters and tools in Xcode and Instruments that can help you optimize spatial and temporal memory access patterns."
 date: "2022-06-07"
-tags: ["Graphics & Games", "Performance"]
+tags: ["Metal", "GPU", "Performance"]
 thumbnail: "/images/sessions/2022/10159.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10159/"
 sessionId: "wwdc2022-10159"
 year: "2022"
 relatedSessions:
-  - title: "Accelerate machine learning with Metal"
-    code: "10063"
-    description: "discover how you can use metal to accelerate your pytorch model training on macos"
   - title: "Discover Metal 3"
-    code: "10066"
-    description: "了解 Metal 3 的总览能力，包括机器学习训练加速和 GPU 工具链更新"
-  - title: "Optimize your Metal code"
-    code: "10103"
-    description: "learn how to use metal shader profiler and tools to identify and fix performance bottlenecks"
-  - title: "Bring your world into augmented reality"
-    code: "10128"
-    description: "follow along as we demonstrate how you can use object capture and realitykit to"
+    code: "10007"
+    description: "Metal 3 的新特性概览"
+  - title: "Program Metal in C++ with metal-cpp"
+    code: "10160"
+    description: "用 C++ 编写 Metal 代码"
+  - title: "Transform your geometry with Metal mesh shaders"
+    code: "10162"
+    description: "Metal Mesh Shaders 几何处理管线"
 ---
 
 ## Highlight
 
-> Apple GPU 软件工程团队的 Marco Giordano 演示了如何从 8 核 M1 到 64 核 M1 Ultra 实现接近线性的性能扩展。核心问题不是 GPU 太慢，而是工作分布不均、时间线空闲间隙、内存访问模式未优化。Blender Cycles 渲染器的优化案例展示了从 40% GPU 利用率提升到接近饱和的完整路径。
-
----
+> Apple M1 GPU 从 8 核 iPad 到 64 核 Mac Studio 共享同一架构，但计算工作负载要获得线性扩展性能，需要解决工作分布不均、GPU 时间线空闲、原子操作竞争三大瓶颈。
 
 ## 核心内容
 
-Apple silicon 的 GPU 扩展能力很强——从 M1 的 8 核到 M1 Ultra 的 64 核，理论上是 8 倍性能。但现实中很多 workload 在不同芯片上跑出来的性能曲线远低于线性，甚至出现平台期。
+你的 Metal 计算应用在 M1 上跑得不错，但放到 M1 Ultra 上性能只提升了 30%，远没有达到核心数翻倍应有的效果。问题出在哪？
 
-这场 session 的核心诊断框架是三问：
-1. **GPU 是否在满负荷工作？** 看 Instruments 的 GPU track，有没有空闲间隙。
-2. **工作是否均匀分布？** 每个 GPU 核拿到的任务量是否相当。
-3. **瓶颈在哪？** 计算受限还是带宽受限，内存访问模式是否合理。
+GPU 工作负载的可扩展性（scalability）指的是：随着 GPU 核心数增加，性能能否成比例提升。理想情况是线性扩展——核心数翻倍，性能也翻倍。现实中常见三种非理想情况：性能达到平台期、GPU 时间线存在大量空闲间隙、性能提升不均匀（在某些核心数区间遇到瓶颈）。
 
-优化分两步走：先消除 GPU 空闲（改善工作分布、减少 CPU/GPU 同步、注意原子操作开销），再突破性能瓶颈（调整 grid 形状、优化内存布局）。
+（[00:59](https://developer.apple.com/videos/play/wwdc2022/10159/?time=59)）Apple M1 GPU 家族从 8 核扩展到 64 核，同一套 GPU 架构支持所有 Metal 3 特性。Affinity Photo 和 DaVinci Resolve 等专业应用已经实现了优秀的跨设备扩展性能。
 
-Blender Cycles 的案例展示了从 40% 利用率到接近饱和的过程：一开始是 GPU 大部分时间在等 CPU，原因是工作拆分粒度太粗、同步点太多；调整并发 dispatch 尺寸、减少 waitUntilCompleted 调用、用 Shared Event 建立异步依赖后，GPU 时间线填满了；最后再优化内存访问模式，突破带宽瓶颈。
+瓶颈分两类：计算受限（computation-bound）和带宽受限（bandwidth-bound）。优化过程中你可能在两者之间来回切换。如果计算是瓶颈，可以尝试把部分负载转移到内存访问；反之亦然。MPS 和 MPSGraph 框架已经针对所有硬件做了优化，但自定义计算内核仍需手动调优。
 
----
+（[04:37](https://developer.apple.com/videos/play/wwdc2022/10159/?time=277)）工作分布（work distribution）是第一个需要检查的环节。工作负载以 3D 线程组网格（threadgroup grid）的形式分派。线程组被均匀分布到 GPU 核心，每个线程组可以访问容量有限但速度极快的线程组内存（threadgroup memory）。单个线程组进一步拆分为 SIMD-group（在 Apple GPU 上宽度固定为 32）。每个线程组最多 1024 个线程，最多 32KB 线程组内存。
+
+如果线程组数量太少，GPU 无法饱和。经验法则是：每个 shader 核心需要 1K 到 2K 并发线程才能达到良好占用率（occupancy）。M1（8 核）需要至少 8K-16K 线程，M1 Max（32 核）需要 32K-64K，M1 Ultra（64 核）需要 64K-128K。
+
+（[06:43](https://developer.apple.com/videos/play/wwdc2022/10159/?time=403)）另一个常见问题是线程组过大。过大的线程组会阻碍负载在 GPU 核心间的均匀分布。最佳实践是使用 SIMD 宽度（32）的最小倍数，且能很好映射到你的工作负载。
 
 ## 详细内容
 
-### 问题 1：GPU 时间线有空闲间隙
+### 消除 GPU 时间线间隙
 
-（[02:15]([https://developer.apple.com/videos/play/wwdc2022/10159/?time=135)）GPU 被设计成始终在工作的状态：它从 command queue 拿任务，执行完再拿下一个。如果队列空了，GPU 就进入空闲状态，这就是浪费。
+（[08:18](https://developer.apple.com/videos/play/wwdc2022/10159/?time=498)）GPU 空闲是最大的性能杀手。假设一个工作负载因为 CPU/GPU 串行化只利用了 50% 的 GPU。CPU 做一部分工作，等 GPU 完成，再做下一部分。即使 GPU 核心翻倍，整体性能提升也有限：核心翻倍后 GPU 部分快了一倍，但 CPU 部分不变，总时间从 2 单位降到 1.5 单位，只提升了 33%。
 
-空闲间隙的来源通常是 CPU 和 GPU 之间的同步点。最明显的是 `waitUntilCompleted` 调用——CPU 会停下等 GPU 跑完当前工作，然后再提交下一批。这种串行模式会让 GPU 在等待期间无事可做。
+根本原因通常是 `waitUntilCompleted` 导致的 CPU/GPU 同步。修复方法有几种：
 
-更好的方式是用 Shared Event 建立 GPU 内部的依赖：前一个 dispatch 结束时 signal 这个 event，后一个 dispatch 开始前 wait 这个 event。两个 dispatch 可以在同一个 command buffer 里，事件依赖由 GPU 自己处理，CPU 不需要插手。
+**使用 MTLSharedEvents 替代 waitUntilCompleted**
 
-另一个常见场景是并发 dispatch 的粒度太粗。比如你有 100 万个元素要处理，结果只 dispatch 了 10 次，每次处理 10 万个元素。GPU 上只有 10 个 workgroup 在跑，大量核心闲置。把 dispatch 次数增加到 1000 次，每次 1000 个元素，GPU 上的并发度就能上来。
+```objc
+// 不推荐：阻塞 CPU 等待 GPU
+[commandBuffer waitUntilCompleted];
 
-经验值：目标是每个 GPU 核心上有 1K-2K 个并发线程。8 核 GPU 上至少要 8K-16K 个线程，64 核上要 64K-128K。dispatch 的 threadgroup 数量和每个 threadgroup 的线程数相乘要落在这个范围内。
+// 推荐：使用共享事件减少同步开销
+id<MTLSharedEvent> sharedEvent = [device newSharedEvent];
+[commandBuffer encodeSignalEvent:sharedEvent value:1];
+// CPU 可以在需要时检查事件状态，不必阻塞
+```
 
-### 问题 2：工作分布不均匀
+关键点：
+- `waitUntilCompleted` 会阻塞当前线程，造成 GPU 时间线间隙
+- `MTLSharedEvents` 开销更低，允许更灵活的同步策略
+- 如果可能，完全移除 CPU/GPU 同步点
 
-（[08:30]([https://developer.apple.com/videos/play/wwdc2022/10159/?time=510)）工作不均匀意味着部分 GPU 核忙死，部分核闲死。这通常发生在 workload 本身有倾斜时——比如有些元素的计算量特别大，有些特别小。
+**流水线化工作负载**
 
-Blender Cycles 的案例很典型：光线追踪渲染时，某些像素需要追踪上百次光线才能收敛，某些像素几十次就够。如果按像素平均分配工作，某些 GPU 核会被重负载像素卡住，其他核早就跑完剩下的轻量像素也帮不上忙。
+（[10:57](https://developer.apple.com/videos/play/wwdc2022/10159/?time=657)）如果算法能提前知道下一批数据，可以在等待共享事件之前就编码好下一批工作。这样 GPU 不会干涸，始终有工作可处理。
 
-解决方案是动态任务调度。维护一个全局的任务池，GPU 核完成当前任务后自己去取下一个。这样重负载任务会被多核分摊，轻负载任务也不会让核闲置。
+**使用并发分派（concurrent dispatches）**
 
-Metal 提供了 atomic operations 来实现这种模式。可以用 atomic counter 来跟踪任务队列的当前位置，每个 workgroup 完成任务后 atomic add 取下一批。这种方式需要权衡：atomic 操作本身有开销，但比让核闲置强。
+（[12:54](https://developer.apple.com/videos/play/wwdc2022/10159/?time=774)）对于处理多张图片的场景，原本一张接一张串行处理。使用 `MTLDispatchTypeConcurrent` 后，驱动可以把不同图片的独立工作交错执行，隐藏内核同步开销，同时填满各内核的启动和收尾阶段。
 
-### 问题 3：计算或带宽瓶颈
+```objc
+// 创建支持并发分派的命令缓冲区
+id<MTLCommandBuffer> commandBuffer = [commandQueue commandBufferWithUnretainedReferences];
 
-（[15:45]([https://developer.apple.com/videos/play/wwdc2022/10159/?time=945)）GPU 时间线填满后，下一步是突破性能瓶颈。瓶颈分两种：计算受限（compute-bound）和带宽受限（bandwidth-bound）。
+// 使用 concurrent dispatch type
+// 需要手动插入 barrier 管理依赖关系
+```
 
-计算受限意味着 GPU 的计算单元已经满负荷，算力是天花板。这种情况下的优化方向是减少不必要的计算、用更低精度的浮点（比如 half 而不是 float）、利用 SIMD 指令。
+实验结果显示：两张图片交错处理提升 30%，三张并行提升 70%。
 
-带宽受限意味着 GPU 等内存数据供应。内存访问模式在这里很关键：连续访问比随机访问快得多，因为内存控制器可以预取和合并请求。struct of arrays（SoA）比 array of structs（AoS）更友好，因为同类型数据在内存里连续。
+### 优化原子操作
 
-Instruments 的 Metal Performance Counters 可以帮你诊断瓶颈类型。如果看到 ALU time 很高，就是计算受限；如果看到 Memory traffic 很高但 ALU time 低，就是带宽受限。
+（[14:07](https://developer.apple.com/videos/play/wwdc2022/10159/?time=847)）全局原子操作（global atomics）在整个 GPU 上保持一致性。当大量线程竞争同一个内存地址时，性能会急剧下降，而且核心数越多竞争越严重。
 
-### 工具链：Xcode 和 Instruments
+以归约（reduction）算法为例：把所有 buffer 中的值求和。
 
-（[20:10]([https://developer.apple.com/videos/play/wwdc2022/10159/?time=1210)）Xcode 的 Metal Debugger 可以让你单步调试 shader，查看每个 thread 的寄存器状态。Instruments 的 GPU Track 可以显示 GPU 的时间线和利用率，Metal Performance Counters 则提供更细粒度的硬件指标。
+**不推荐的做法**：每个线程直接对主内存做 atomic add。
 
-关键计数器包括：
-- **GPU utilization**：实际工作时间占比
-- **ALU time**：计算单元利用率
-- **Memory traffic**：内存带宽使用量
-- **Vertex/Fragment throughput**：几何和像素处理吞吐
+```metal
+// 性能差：所有线程竞争同一个全局地址
+kernel void badReduction(device float* buffer [[buffer(0)]],
+                         device atomic_float* result [[buffer(1)]],
+                         uint gid [[thread_position_in_grid]])
+{
+    atomic_fetch_add_explicit(result, buffer[gid], memory_order_relaxed);
+}
+```
 
-这些工具可以帮助你定位问题阶段。先用 GPU Track 看宏观利用率，再用 Performance Counters 找瓶颈类型，最后用 Metal Debugger 下钻到具体 shader 代码。
+**推荐的做法**：分两级归约，先在线程组内用 SIMD 指令和 threadgroup 原子操作，最后每个线程组只写一个全局原子。
 
----
+```metal
+kernel void goodReduction(device float* buffer [[buffer(0)]],
+                          device atomic_float* result [[buffer(1)]],
+                          uint lid [[thread_index_in_threadgroup]],
+                          uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup float sharedSum;
+    
+    // 第一步：SIMD-group 内归约，使用寄存器操作，不访问内存
+    float localSum = buffer[lid]; // 简化示例
+    localSum = simd_sum(localSum);
+    
+    // 第二步：每个 SIMD-group 的最后一个线程写入 threadgroup 内存
+    if (lid == 31) {
+        atomic_fetch_add_explicit(&sharedSum, localSum, memory_order_relaxed);
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // 第三步：每个线程组只写一个全局原子
+    if (lid == 0) {
+        atomic_fetch_add_explicit(result, sharedSum, memory_order_relaxed);
+    }
+}
+```
+
+关键点：
+- `simd_sum` 等 SIMD-group 指令在寄存器间交换数据，无需内存往返
+- threadgroup 原子操作由每个 GPU 核心独立的 threadgroup 内存处理，随核心数线性扩展
+- 最后一步全局原子操作的数量等于线程组数量，且各线程组完成时间不同，天然分散了竞争
+
+### 优化内存访问模式
+
+（[17:15](https://developer.apple.com/videos/play/wwdc2022/10159/?time=1035)）即使 GPU 时间线没有间隙，扩展性能仍可能不理想。这时需要检查 GPU limiters。Xcode 和 Metal System Trace 提供了详细的计数器。
+
+低效内存访问会导致高 Last Level Cache（LLC）或 MMU limiter，以及低利用率。两种优化方向：
+
+1. **重组数据布局**：让数据访问更局部化
+2. **调整访问模式**：让线程组的访问模式匹配数据布局
+
+（[18:12](https://developer.apple.com/videos/play/wwdc2022/10159/?time=1092)）假设内存中数据按行排列，但线程组以方形 2D 模式访问。第一个 SIMD-group 访问的数据被打包到 cache line 中，但大部分 cache line 空间被浪费了。解决方案之一是把数据重新组织成条带（stripes），让线程组能充分利用每个 cache line。
+
+另一个方案是调整线程组形状。比如用更扁长的矩形线程组替代方形，让访问模式与行优先的数据布局对齐。
+
+### Blender Cycles 案例
+
+（[20:08](https://developer.apple.com/videos/play/wwdc2022/10159/?time=1208)）Blender Cycles 使用排序来减少线程发散：按材质类型对光线命中点排序。这减少了线程发散，但增加了空间内存发散，导致高 MMU limiter。
+
+解决方案：在排序前对内存范围做分区（partitioning）。排序时确保同一分区的索引不会混合。这样 SIMD-group 访问的数据范围被限制在分区内，大幅降低 MMU 压力。实验结果：Top limiter 和 LLC limiter 降低约 20%，GPU 读带宽显著提升，整体性能提升 10% 到 30%（取决于场景）。
 
 ## 核心启发
 
-- **GPU 利用率是第一优先级。** 在优化任何具体算法前，先确保 GPU 一直在做事。空闲间隙就是浪费。
-- **同步点是敌人。** 能用 Shared Event 的地方不要用 CPU 端的 wait，能把依赖编码进 command buffer 的地方不要用 barrier。
-- **工作粒度要适配硬件。** 粗粒度会让核闲置，细粒度会增加调度开销。1K-2K 线程/核是经验起点。
-- **瓶颈诊断要有数据。** 靠猜测会走弯路。用 Instruments 的计数器确定瓶颈类型，再针对性优化。
+**优化你的图像处理管线**
 
----
+如果你有批量图像滤镜处理的 App，检查是否在用 `waitUntilCompleted` 串行化 CPU 和 GPU。改用 `MTLSharedEvents` 配合流水线化，可以让 GPU 利用率从 50% 提升到接近 100%，在 M1 Ultra 上获得接近线性的性能扩展。入口是 `MTLSharedEvent` 和 `encodeSignalEvent:value:`。
+
+**实现 GPU 上的并行粒子系统**
+
+粒子模拟通常需要每帧做位置更新、碰撞检测、渲染。用并发分派把不同粒子组的工作交错提交，隐藏内核同步开销。注意在依赖点手动插入 barrier。关键 API 是 `MTLDispatchTypeConcurrent`。
+
+**为机器学习推理优化内存布局**
+
+如果你的 App 用 Metal 做自定义神经网络层，检查内存访问模式。把权重数据从行优先重排成更适合线程组访问的格式，可以显著降低 LLC limiter。用 Xcode 14 的新增计数器（MMU Limiter、MMU Utilization、MMU TLB Miss Rate）来验证优化效果。
 
 ## 关联 Session
 
-- [Accelerate machine learning with Metal](/articles/wwdc2022-10063) — discover how you can use metal to accelerate your pytorch model training on macos
-- [Discover Metal 3](/articles/wwdc2022-10066) — 了解 Metal 3 的总览能力，包括机器学习训练加速和 GPU 工具链更新
-- [Optimize your Metal code](/articles/wwdc2022-10103) — learn how to use metal shader profiler and tools to identify and fix performance bottlenecks
-- [Bring your world into augmented reality](/articles/wwdc2022-10128) — follow along as we demonstrate how you can use object capture and realitykit to
+- [Discover Metal 3](/articles/wwdc2022-10007) — Metal 3 的新特性概览
+- [Program Metal in C++ with metal-cpp](/articles/wwdc2022-10160) — 用 C++ 编写 Metal 代码
+- [Transform your geometry with Metal mesh shaders](/articles/wwdc2022-10162) — Metal Mesh Shaders 几何处理管线

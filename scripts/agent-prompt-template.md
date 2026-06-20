@@ -4,7 +4,7 @@
 
 ## 当前任务
 
-为 WWDC26 session {CODE} 生成一篇中文技术文章。
+为 WWDC2021 session {CODE} 生成一篇中文技术文章。
 
 ## 数据来源
 
@@ -14,23 +14,23 @@
 cd /Users/onee/Code/onee-workspace/projects/personal/wwdc-quick-look
 
 # session 元数据
-node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2026 --code {CODE}
+node skills/wwdc-quick-look/scripts/query.mjs show-session --year 2021 --code {CODE}
 
 # 代码片段
-node skills/wwdc-quick-look/scripts/query.mjs code --year 2026 --code {CODE}
+node skills/wwdc-quick-look/scripts/query.mjs code --year 2021 --code {CODE}
 
 # Resources
-node skills/wwdc-quick-look/scripts/query.mjs resources --year 2026 --code {CODE}
+node skills/wwdc-quick-look/scripts/query.mjs resources --year 2021 --code {CODE}
 
 # 逐字稿（先获取前 100 行判断长度）
-node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2026 --code {CODE} --limit 100
+node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2021 --code {CODE} --limit 100
 ```
 
 如果逐字稿超过 100 行，再获取完整版（去掉 --limit）。
 
 ## 输出格式
 
-写入文件：`/Users/onee/Code/onee-workspace/projects/personal/wwdc-quick-look/web/src/content/articles/wwdc2026-{CODE}.mdx`
+写入文件：`/Users/onee/Code/onee-workspace/projects/personal/wwdc-quick-look/web/src/content/articles/wwdc2021-{CODE}.mdx`
 
 文件内容格式如下：
 
@@ -38,12 +38,12 @@ node skills/wwdc-quick-look/scripts/query.mjs transcript --year 2026 --code {COD
 ---
 title: "Session 英文标题"
 description: "session 原始描述（从元数据中获取）"
-date: "2026-06-10"
+date: "2021-06-06"
 tags: ["主题1", "主题2"]
-thumbnail: "/images/sessions/2026/{CODE}.jpg"
-videoUrl: "https://developer.apple.com/videos/play/wwdc2026/{CODE}/"
-sessionId: "wwdc2026-{CODE}"
-year: "2026"
+thumbnail: "/images/sessions/2021/{CODE}.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/{CODE}/"
+sessionId: "wwdc2021-{CODE}"
+year: "2021"
 relatedSessions:
   - title: "相关 session 标题"
     code: "xxx"
@@ -98,12 +98,12 @@ relatedSessions:
 
 ## 关联 Session
 
-从 WWDC26 的以下 session 中选择 3-5 个最相关的：
+从 WWDC21 的以下 session 中选择 3-5 个最相关的：
 
-101(Keynote), 121(Siri/iPhone), 201(App Attest), 203(PencilKit), 204(WebKit), 205(App Store), 206(Device Management), 207(HealthKit), 209(Wallet), 210(In-App Purchase), 212(CarPlay), 213(Translate with agents), 215(HTML Model), 216(Web Extensions), 219(Accessibility Reading), 220(Accessibility Controls), 221(tvOS Dynamic Type), 222(MetricKit), 223(Live Activities), 224(Virtualization), 226(Live Communication), 227(UI Prototypes with agents), 230(Assessment), 232(MLX local AI), 233(MLX distributed), 234(Immersive environments), 237(Image understanding), 240(App Schemas), 241(Foundation Models), 242(Agentic apps), 243(Instruments), 246(Core Spotlight LLM), 250(Design principles), 251(Brand identity), 252(Reality Composer Pro 3), 253(Music Understanding), 254(MusicKit), 256(Subtitles), 258(Xcode 27), 259(Xcode agents), 260(Device Hub), 261(Xcode Cloud), 262(Swift), 265(gRPC), 267(Swift Testing), 268(Instruments responsiveness), 269(SwiftUI), 271(Drag and Drop), 272(SwiftUI + AppKit/UIKit), 274(SwiftData), 275(SwiftData persistence), 277(WidgetKit), 278(UIKit modernization), 279(RealityKit), 280(Reality Composer Pro 3), 281(Reality Composer Pro 3 + Xcode), 282(Spatial Preview), 283(Object tracking), 284(3D Models), 285(USDKit), 286(Foveated streaming), 287(visionOS 27), 289(AppKit modernization), 290(Naming), 292(Search), 295(AppIntentsTesting), 297(Visual intelligence), 298(Evaluations), 299(Robust evaluations), 303(Camera app), 304(Photo capture), 305(Core Image RAW), 309(Retention Messaging), 310(Shortcuts), 312(Now Playing), 314(CSS Grid), 315(HTML select), 319(PCC Foundation Model), 320(Immersive web), 321(Lazy stacks), 322(SwiftUI graphics), 324(Core AI), 325(Core AI optimization), 326(Core AI integration), 328(MLX Swift), 330(Metal tensors), 334(fm CLI/Python), 335(Evaluations hill-climbing), 338(Immersive Video), 339(LLM provider), 341(Center Stage), 343(App Intents advanced), 344(Code-along Siri), 345(App Intents new), 347(Security agentic), 356(Cyberpunk Mac), 357(Game port agents), 358(Game touch), 359(Metal neural rendering), 369(Bluetooth), 370(TextKit), 372(PaperKit), 375(Image Playground), 378(StoreKit), 379(Trust Insights), 388(Metal performance), 389(Container machines), 391(Group subscriptions), 393(Reality Composer Pro 3)
+101(Keynote), 102(SwiftUI), 103(SwiftUI Essentials), 104(SwiftUI On All Devices), 105(Widgets), 106(Swift Charts), 107(App Intents), 108(Metal), 109(Accessibility), 110(Localization), 111(Design), 112(Swift), 113(Swift Concurrency), 114(Swift Package Manager), 115(Xcode), 116(Xcode Cloud), 117(TestFlight), 118(App Store), 119(App Store Connect), 120(Siri), 121(Shortcuts), 201(App Attest), 202(CryptoKit), 203(PencilKit), 204(WebKit), 205(App Store), 206(Device Management), 207(HealthKit), 208(MapKit), 209(Wallet), 210(In-App Purchase), 211(StoreKit), 212(CarPlay), 213(Translate), 214(Natural Language), 215(Core ML), 216(Web Extensions), 217(Safari), 218(Passkeys), 219(Accessibility), 220(Accessibility Controls), 221(tvOS), 222(MetricKit), 223(Widgets), 224(Virtualization), 226(Communication Notifications), 227(UI Prototypes), 230(Assessment), 232(Create ML), 233(Core ML Tools), 234(RealityKit), 235(ARKit), 236(Scene Understanding), 237(Image Understanding), 238(Object Capture), 239(Reality Composer), 240(App Intents), 241(SiriKit), 242(Shortcuts), 243(Instruments), 244(Debugging), 245(Performance), 246(Core Spotlight), 247(Search), 248(Suggestions), 249(Design Principles), 250(Design), 251(Brand), 252(Reality Composer), 253(MusicKit), 254(Audio), 255(AVFoundation), 256(Subtitles), 257(Xcode), 258(Swift), 259(SwiftUI), 260(Device Management), 261(Xcode Cloud), 262(Swift), 265(Networking), 267(Swift Testing), 268(Instruments), 269(SwiftUI), 271(Drag and Drop), 272(SwiftUI + UIKit), 273(SwiftUI + AppKit), 274(Core Data), 275(Core Data), 276(Core Data), 277(WidgetKit), 278(UIKit), 279(RealityKit), 280(Reality Composer), 281(Reality Composer + Xcode), 282(Spatial), 283(Object Tracking), 284(3D Models), 285(USD), 286(Foveated Rendering), 287(visionOS), 289(AppKit), 290(Naming), 292(Search), 295(App Intents), 297(Vision), 298(Machine Learning), 299(Core ML), 303(Camera), 304(Photo Capture), 305(Core Image), 309(Messages), 310(Shortcuts), 312(Now Playing), 314(Web), 315(HTML), 319(Core ML), 320(WebXR), 321(Lazy Stacks), 322(SwiftUI Graphics), 324(Core ML), 325(ML Optimization), 326(ML Integration), 328(Create ML), 330(Metal), 334(ML Tools), 335(ML Evaluation), 338(Spatial Video), 339(Core ML), 341(Camera), 343(App Intents), 344(Siri), 345(App Intents), 347(Security), 356(Mac Gaming), 357(Game Porting Toolkit), 358(Game Controllers), 359(Metal), 369(Bluetooth), 370(TextKit), 372(PencilKit), 375(Image Playground), 378(StoreKit), 379(Privacy), 388(Metal), 389(Virtualization), 391(Subscriptions), 393(Reality Composer)
 
 格式：
-- [标题](/articles/wwdc2026-{code}) — 一句话描述
+- [标题](/articles/wwdc2021-{code}) — 一句话描述
 ```
 
 ## 写作规则

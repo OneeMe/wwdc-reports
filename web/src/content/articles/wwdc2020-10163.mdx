@@ -1,55 +1,163 @@
 ---
 title: "Advancements in the Objective-C runtime"
-description: "dive into the microscopic world of low-level bits and bytes that underlie every objective-c and swift class. find out how recent changes to internal data structures, method lists, and tagged pointers "
-date: 2026-06-10
-tags: ["WWDC 2020"]
+description: "dive into the microscopic world of low-level bits and bytes that underlie every objective-c and swift class. find out how recent changes to internal data structures, method lists, and tagged pointers provide better performance and lower memory usage. we'll demonstrate how to recognize and fix crashes in code that depend on internal details, and show you how to keep your code unaffected by changes to the runtime."
+date: 2020-06-10
+tags: ["WWDC 2020", "Developer Tools", "Objective-C", "Swift"]
 thumbnail: "/images/sessions/2020/10163.jpg"
 videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10163/"
 sessionId: "wwdc2020-10163"
 year: "2020"
 relatedSessions:
-  - title: "Add custom views and modifiers to the Xcode Library"
-    code: "10649"
-    description: "the xcode library is an easy way for you to discover available swiftui views and"
-  - title: "Become a Simulator expert"
-    code: "10647"
-    description: "simulator runs your ios, ipados, tvos, or watchos apps directly on your mac — no"
-  - title: "Broaden your reach with Siri Event Suggestions"
-    code: "10197"
-    description: "whether you"
-  - title: "Build GPU binaries with Metal"
-    code: "10615"
-    description: "power up your shader pipeline with enhancements to the metal shader compilation "
+  - title: "Refine Objective-C frameworks for Swift"
+    code: "10680"
+    description: "把 Objective-C 头文件整理成更符合 Swift 调用习惯的 API，适合继续处理 ObjC 与 Swift 的边界。"
+  - title: "What's new in Swift"
+    code: "10170"
+    description: "介绍 Swift 2020 的运行时性能、开发体验和语言库更新。"
+  - title: "Safely manage pointers in Swift"
+    code: "10167"
+    description: "深入讲解 Swift unsafe pointer、raw pointer 和绑定内存的正确用法。"
+  - title: "Unsafe Swift"
+    code: "10648"
+    description: "解释 Swift 中 unsafe 操作、C 指针 API 和避免 undefined behavior 的实践。"
 ---
 
 ## Highlight
 
-> 深入了解 Advancements in the Objective-C runtime 的技术细节和最佳实践。
-
----
+> 2020 年的新 iOS 与 macOS Objective-C runtime 通过拆分类的读写数据、改用相对方法列表、调整 arm64 tagged pointer 格式来降低系统级内存占用，同时要求 App 只通过公开 runtime 与 Foundation API 读取对象信息。
 
 ## 核心内容
 
-这场 Session 深入探讨了 Objective-C 运行时（runtime）在 2020 年的技术演进。虽然 Objective-C 作为语言已经进入了维护模式，但它的运行时仍然是 iOS/macOS 应用执行的基础设施——Swift 代码与 Objective-C 框架的互操作全部依赖它。Session 聚焦于三个核心改进：tagged pointer 的扩展、方法查找的性能优化，以及新的 isa 优化策略。
+多数开发者不会每天打开 Objective-C runtime 的头文件。问题是，几乎每个 iOS 和 macOS App 都站在它上面：Objective-C class 用它，Swift class 也共享同一套 class 基础结构。Apple 在这场 session 开场就说得很直接：这不是一场教你迁移新 API 的演讲，理想状态下，你不改代码，App 会因为系统运行时变小而受益。（[00:11](https://developer.apple.com/videos/play/wwdc2020/10163/?time=11)）
 
-Tagged pointer 机制得到了扩展。从 iOS 14 开始，更多的值类型被优化为 tagged pointer 形式存储——直接在指针中编码小整数、日期、URL 等常见值，跳过堆内存分配。这减少了内存压力和缓存未命中，对应用的内存占用和启动速度都有实际帮助。
+真正的风险来自另一类代码：调试工具、性能工具、历史遗留库，或者某个第三方依赖，直接去读 runtime 的内部结构。过去这些字段位置看起来稳定，不代表它们是 API。2020 年的 runtime 正好移动了这些内部布局：类的读写数据被拆开，方法列表从 64 位指针改成相对偏移，arm64 tagged pointer 的 bit 布局也变了。直接读 bit 和结构体的代码会崩溃，或者在更糟的情况下错误处理用户数据。（[00:32](https://developer.apple.com/videos/play/wwdc2020/10163/?time=32), [21:24](https://developer.apple.com/videos/play/wwdc2020/10163/?time=1284)）
 
-方法查找（method lookup）也进行了优化。Session 介绍了新的 vtable 分发策略和改进后的方法缓存机制。对于频繁调用的热路径方法，运行时可以跳过完整的 `objc_msgSend` 查找流程，直接通过缓存命中。这些优化对 Swift 调用 Objective-C 代码的性能提升尤为明显。
+Apple 给出的路线很清楚。runtime 内部可以继续变，因为外部应该通过 `class_getName`、`method_getImplementation`、`isKindOfClass:`、`CFGetTypeID` 这类公开 API 读取信息。系统因此能把更多内存保持为 clean memory，让 iOS 设备少背 dirty memory 的成本，也让 App 获得更大的可用内存空间。（[07:01](https://developer.apple.com/videos/play/wwdc2020/10163/?time=421), [22:27](https://developer.apple.com/videos/play/wwdc2020/10163/?time=1347)）
+
+## 详细内容
+
+### 类数据：把少用的读写字段移出去
+
+（[01:16](https://developer.apple.com/videos/play/wwdc2020/10163/?time=76)）runtime 中的 class object 保存最常访问的信息，例如 metaclass、superclass 和 method cache。更多静态信息放在 `class_ro_t` 里，`ro` 表示 read only，包含类名、方法、协议和实例变量。类第一次被使用时，runtime 还会分配 `class_rw_t`，保存运行时才生成、可能变化的数据。
+
+关键差异在 clean memory 和 dirty memory。`class_ro_t` 读入后不再改变，可以在系统需要内存时丢弃并从磁盘重新载入。`class_rw_t` 会在进程运行时被修改，iOS 没有 swap，因此 dirty memory 的成本更高。Apple 在真实设备上测到，系统中 `class_rw_t` 约占 30 MB，但只有约 10% 的类真的会修改方法，Swift demangled name 字段也不是每个 Swift class 都需要。于是 runtime 把少用字段移到 extended record，约 90% 的类无需分配这部分数据，系统级节省约 14 MB。
+
+```sh
+heap Mail | egrep 'class_rw|COUNT'
+```
+
+关键点：
+
+- `heap Mail` 查看 Mail 进程的堆内存分配。
+- `egrep 'class_rw|COUNT'` 只保留 `class_rw_t` 相关行和统计头。
+- session 演示里，Mail 大约使用 9000 个 `class_rw_t`，只有稍多于 900 个需要 extended information。
+- 这条命令不是 App 代码路径，适合在 Mac 上验证 runtime 数据结构变化带来的内存影响。（[05:37](https://developer.apple.com/videos/play/wwdc2020/10163/?time=337)）
+
+不要用内部字段判断一个类。类名、父类和方法列表都有公开 runtime API。（[07:35](https://developer.apple.com/videos/play/wwdc2020/10163/?time=455)）
+
+```objc
+class_getName
+
+class_getSuperclass
+
+class_copyMethodList
+```
+
+关键点：
+
+- `class_getName` 读取类名，避免依赖 `class_ro_t` 的具体布局。
+- `class_getSuperclass` 读取父类，避免假设 class object 里字段顺序不变。
+- `class_copyMethodList` 获取方法列表，runtime 会处理新版和旧版内部格式。
+
+### 方法列表：64 位指针改成 32 位相对偏移
+
+（[08:04](https://developer.apple.com/videos/play/wwdc2020/10163/?time=484)）每个 Objective-C 方法条目包含三个字段：selector、type encoding 和 implementation。旧格式在 64 位系统上每个字段都是指针，一个方法条目占 24 bytes。方法实现和元数据位于同一个 binary image 内，不需要指向整个 64 位地址空间，所以 2020 年的工具链可以把这些字段变成 binary 内部的 32 位相对偏移。
+
+这样做有三个结果。第一，方法条目大小减半。Apple 在典型 iPhone 上测到系统级方法数据约 80 MB，新格式能节省约 40 MB。第二，相对偏移不需要 dynamic linker 在加载后修正绝对地址，可以保留在真正的 read-only memory 里。第三，swizzling 不再改写原方法列表，而是通过一个全局表把方法映射到被替换后的 implementation，避免一次 swizzle 就 dirty 掉整页方法列表。（[10:40](https://developer.apple.com/videos/play/wwdc2020/10163/?time=640), [11:30](https://developer.apple.com/videos/play/wwdc2020/10163/?time=690)）
+
+Xcode 会根据 minimum deployment target 生成对应格式。目标系统足够新时，工具链自动生成相对方法列表；仍需支持旧系统时，Xcode 会继续生成旧格式。风险出现在构建产物的 deployment target 比实际运行系统更新，旧 runtime 会把两个 32 位字段当成一个 64 位指针读取，最终在读取方法信息时崩溃。（[12:23](https://developer.apple.com/videos/play/wwdc2020/10163/?time=743), [13:31](https://developer.apple.com/videos/play/wwdc2020/10163/?time=811)）
+
+公开 API 可以读取同样的三个字段。（[14:38](https://developer.apple.com/videos/play/wwdc2020/10163/?time=878)）
+
+```objc
+method_getName
+
+method_getTypeEncoding
+
+method_getImplementation
+```
+
+关键点：
+
+- `method_getName` 返回方法 selector。
+- `method_getTypeEncoding` 返回参数和返回值编码，供 introspection 和 message forwarding 使用。
+- `method_getImplementation` 返回方法实现入口，不需要调用方知道方法列表是旧指针格式还是新相对偏移格式。
+
+### Tagged pointer：arm64 格式改变，类型检查走 API
+
+（[14:53](https://developer.apple.com/videos/play/wwdc2020/10163/?time=893)）Tagged pointer 利用真实对象指针中固定为 0 的空闲 bit，把小对象直接编码进指针值。`NSNumber`、`NSDate` 等类型可以避免为小值分配堆对象。session 也提醒，这些值会在进程启动时用随机值混淆，试图直接查看内存中的 payload 会看到被扰乱后的结果。
+
+Intel 上使用低 bit 标记 tagged pointer。arm64 旧格式使用最高 bit，原因是 `objc_msgSend` 可以用一次比较同时处理普通指针、tagged pointer 和 `nil` 的常见路径。2020 年的 arm64 格式继续保留最高 bit 标记，但把 tag number 移到底部三个 bit；extended tag 放进 ARM Top Byte Ignore 可忽略的高位区域。这样 extended tagged pointer 的 payload 可以容纳一个指向 binary 中常量数据的普通指针，减少原本需要 dirty memory 保存的数据。（[19:03](https://developer.apple.com/videos/play/wwdc2020/10163/?time=1143), [20:08](https://developer.apple.com/videos/play/wwdc2020/10163/?time=1208)）
+
+旧代码如果用 bit mask 自己判断 tagged pointer，在 iOS 14 之后可能得到错误答案。对象和 CF 类型都应该走标准 API。（[21:52](https://developer.apple.com/videos/play/wwdc2020/10163/?time=1312)）
+
+```objc
+if ([obj isKindOfClass:[NSString class]]) {
+    // a string
+}
+NSUInteger length = [obj length];
 
 
-### 最佳实践
+if (CFGetTypeID(obj) == CFStringGetTypeID()) {
+    // a string
+}
+CFIndex length = CFStringGetLength(obj);
+```
 
-- 不要在性能敏感的热路径上频繁跨越 Swift/ObjC 边界，尽量在单一语言体系内完成高频调用
-- 使用 `final` 和 `private` 修饰符让 Swift 编译器使用 direct dispatch，避免不必要的虚表查找
-- 理解 `@objc dynamic` 的性能代价——它强制使用 ObjC message dispatch，只在需要方法替换（swizzling）或 KVO 时使用
-- 定期用 Instruments 的 Time Profiler 检查 `objc_msgSend` 的开销占比，超过 5% 就值得优化
-- tagged pointer 是透明的优化，不需要代码层面的适配，但理解它有助于做内存性能分析
+关键点：
 
----
+- `isKindOfClass:` 让 Foundation 处理 tagged pointer 与真实对象指针的差异。
+- `[obj length]` 对 `NSString` 正常工作，调用方不需要读取 payload。
+- `CFGetTypeID` 和 `CFStringGetTypeID` 是 Core Foundation 层的类型判断入口。
+- `CFStringGetLength` 通过 CF API 读取长度，同样不依赖 tagged pointer bit 布局。
 
-## 相关 Session
+## 核心启发
 
-- [Add custom views and modifiers to the Xcode Library](/articles/wwdc2020-10649) — the xcode library is an easy way for you to discover available swiftui views and
-- [Become a Simulator expert](/articles/wwdc2020-10647) — simulator runs your ios, ipados, tvos, or watchos apps directly on your mac — no
-- [Broaden your reach with Siri Event Suggestions](/articles/wwdc2020-10197) — whether you
-- [Build GPU binaries with Metal](/articles/wwdc2020-10615) — power up your shader pipeline with enhancements to the metal shader compilation 
+### 做一次 runtime 依赖审计
+
+**做什么**：列出工程和第三方依赖里所有直接访问 Objective-C runtime 内部结构、手写 tagged pointer bit mask、假设方法列表布局的代码。
+
+**为什么值得做**：session 反复强调，2020 年这些内部布局已经移动。旧代码可能在用户升级系统后崩溃，或者把对象类型判断错。
+
+**怎么开始**：先搜索 `class_rw_t`、`method list`、`tagged pointer`、位运算类型判断，再把读取类和方法的代码替换为 `class_getName`、`class_copyMethodList`、`method_getImplementation`。
+
+### 给二进制产物加 deployment target 检查
+
+**做什么**：在 CI 里检查 App、framework 和外部二进制库的 minimum deployment target，确保它们没有高于产品实际支持的最低系统版本。
+
+**为什么值得做**：relative method list 依赖新 runtime 理解新格式。用新格式构建的库跑在旧系统上，会把两个 32 位字段拼成错误指针。
+
+**怎么开始**：把构建设置、第三方 framework 的最低系统版本和实际测试矩阵放进同一个检查脚本，并在最老支持系统上跑一次启动与动态调用 smoke test。
+
+### 建一个 dirty memory 对比流程
+
+**做什么**：在升级 Xcode、SDK 或 deployment target 后，用固定 App 和固定场景对比 runtime 相关 dirty memory。
+
+**为什么值得做**：session 用 `heap` 演示了 `class_rw_t` 拆分后的收益。团队也可以用同样方法确认自己的 App 是否从系统优化中受益。
+
+**怎么开始**：准备一组稳定操作路径，采集 `heap <AppName> | egrep 'class_rw|COUNT'` 输出，把结果写入性能记录，和上一版构建对比。
+
+### 封装一层安全对象类型判断
+
+**做什么**：把历史代码里的 Foundation/CF 类型判断集中到少数 helper，内部只调用 `isKindOfClass:`、`CFGetTypeID` 和对应类型 API。
+
+**为什么值得做**：tagged pointer 格式是 runtime 维护者才能安全解释的细节。集中封装后，代码审查时更容易阻止新的 bit 级判断进入主干。
+
+**怎么开始**：先覆盖 `NSString`、`NSNumber`、`NSDate` 和常见 CF 类型，给 tagged pointer 可能出现的输入补单元测试，再删除旧的 bit mask 分支。
+
+## 关联 Session
+
+- [Refine Objective-C frameworks for Swift](/articles/wwdc2020-10680) — 继续处理 Objective-C API 如何被 Swift 正确、自然地调用。
+- [What's new in Swift](/articles/wwdc2020-10170) — 补充 Swift 2020 的运行时性能和语言库更新。
+- [Safely manage pointers in Swift](/articles/wwdc2020-10167) — 讲 Swift unsafe pointer、raw pointer 和绑定内存的正确边界。
+- [Unsafe Swift](/articles/wwdc2020-10648) — 从语言安全模型解释何时需要 unsafe 操作，以及如何避免 undefined behavior。
