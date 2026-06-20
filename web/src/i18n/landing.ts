@@ -42,8 +42,8 @@ export const localeData: Record<string, LocaleData> = {
     documentTitle: "wwdc-quick-look · 落地页",
     brandLabel: "SwiftGGTeam 技能",
     navHome: "首页",
-    navArticles: "Articles",
-    navSkill: "Skill",
+    navArticles: "文章",
+    navSkill: "技能",
     kicker: "SwiftGGTeam 技能",
     title: "wwdc-quick-look",
     subtitle: "一条命令安装到你的智能体。之后直接用提示词检索 WWDC 课程、资源链接、代码片段和逐字稿。",
@@ -136,14 +136,14 @@ export const localeData: Record<string, LocaleData> = {
     documentTitle: "wwdc-quick-look · ランディングページ",
     brandLabel: "SwiftGGTeam スキル",
     navHome: "ホーム",
-    navArticles: "Articles",
-    navSkill: "Skill",
+    navArticles: "記事",
+    navSkill: "スキル",
     kicker: "SwiftGGTeam スキル",
     title: "wwdc-quick-look",
     subtitle: "1コマンドでAgentにインストール。プロンプトからWWDCセッション、リソース、コードタブ、文字起こしを直接検索できます。",
     installStep: "インストール",
     installLink: "skills.sh を開く",
-    githubStar: "Star on GitHub",
+    githubStar: "GitHub でスター",
     installCmd: "npx skills add SwiftGGTeam/wwdc-quick-look-skill",
     artCommandLabel: "インストールコマンド",
     artCardSearchTitle: "セッション検索",
@@ -157,15 +157,15 @@ export const localeData: Record<string, LocaleData> = {
     promptIntro: "導入後、skills対応のチャットで直接以下のように入力してください：",
     prompts: [
       {
-        label: "Search",
+        label: "検索",
         text: "wwdc-quick-lookを使って、2025年で「visionOS」「SwiftUI」を含むセッションを一覧化し、タイトルと開始情報を返してください。"
       },
       {
-        label: "Session",
+        label: "セッション",
         text: "WWDC25のセッションコード290の詳細をwwdc-quick-lookで表示し、Apple公式リソース・ドキュメント・デモURLを返してください。"
       },
       {
-        label: "Transcript",
+        label: "文字起こし",
         text: "WWDC24のセッションコード150の文字起こしをwwdc-quick-lookで取得し、「privacy」を含む行を先頭から20行だけ返してください。"
       }
     ],
