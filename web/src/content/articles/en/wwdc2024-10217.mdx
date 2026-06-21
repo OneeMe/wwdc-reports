@@ -24,29 +24,29 @@ relatedSessions:
 
 ## Highlight
 
-> Swift 的性能直觉不如 C 那么直接。C 到机器码的翻译几乎是字面的——局部变量在栈上，堆分配只有你显式调用 malloc 才会发生。Swift 引入了安全性和大量抽象工具（闭包、泛型等），这些抽象的实现成本不像 malloc 那样一目了然。
+> Swift performance intuition isn't as direct as C. Translation from C to machine code is almost literal—local variables on the stack, heap allocation only when you explicitly call malloc. Swift introduces safety and many abstraction tools (closures, generics, etc.), and their implementation costs aren't as visible as malloc.
 
 ---
 
-## 核心内容
+## Core Content
 
-写 C 的时候，你对性能有天然的直觉：局部变量在栈上，`malloc` 是唯一的堆分配点，编译器做的事几乎可以一一对应到机器码。Swift 打破了这个直觉——安全性要求引入了隐式检查，泛型、闭包、协议等抽象工具的实现成本散落在各个角落，不像 `malloc` 那样一眼可见。
+When writing C, you have natural performance intuition: local variables on the stack, `malloc` as the only heap allocation point, and compiler work maps almost one-to-one to machine code. Swift breaks this intuition—safety requirements introduce implicit checks, and implementation costs of abstractions like generics, closures, and protocols are scattered everywhere, not as visible as `malloc`.
 
-John McCall 把底层性能问题归纳为四个维度：函数调用开销、数据表示效率、内存分配耗时、值的拷贝和销毁成本。每个 Swift 特性都或多或少影响其中一两个维度。好消息是 Swift 优化器很强，能消除大量你看不到的抽象开销；坏消息是优化器有极限，你写代码的方式直接决定了它能做多少。
+John McCall summarizes low-level performance concerns into four dimensions: function call overhead, data representation efficiency, memory allocation cost, and value copy/destruction cost. Every Swift feature affects one or two of these to some degree. The good news is the Swift optimizer is strong and eliminates much abstraction overhead you don't see; the bad news is the optimizer has limits, and how you write code directly determines how much it can do.
 
-这引出了一个务实的建议：当性能对项目重要时，必须定期监控它。在自顶向下的调查中定位热点后，想办法测量它们，然后把测量自动化到开发流程中。无论你搞坏了优化器的假设，还是不小心引入了二次方算法，自动化回归测试都能帮你及时捕获。
+This leads to practical advice: when performance matters to your project, monitor it regularly. After locating hotspots in a top-down investigation, find ways to measure them, then automate those measurements into your development workflow. Whether you break optimizer assumptions or accidentally introduce quadratic algorithms, automated regression tests catch regressions in time.
 
 ---
 
-## 详细内容
+## Detailed Content
 
-### 函数调用的四种成本
+### Four costs of function calls
 
-函数调用有四项开销：设置参数、解析函数地址、分配局部状态空间、以及对优化的阻碍。前三项是你做了什么，第四项是你因此做不了什么（[04:39](https://developer.apple.com/videos/play/wwdc2024/10217/?time=279)）。
+Function calls have four overheads: setting up parameters, resolving the function address, allocating local state space, and hindering optimization. The first three are what you do; the fourth is what you therefore cannot do ([04:39](https://developer.apple.com/videos/play/wwdc2024/10217/?time=279)).
 
-其中参数传递有两层：底层是调用约定的寄存器搬运，现代处理器基本能隐藏；高层的所有权约定可能导致额外的 retain/release，这在 profile 里经常出现。
+Parameter passing has two layers: at the low level, register moves per calling convention—modern processors mostly hide this; at the high level, ownership conventions may cause extra retain/release, which often shows up in profiles.
 
-**静态派发 vs 动态派发** 是关键分野。静态派发让编译器可以看到函数定义，从而做内联和泛型特化；动态派发支持多态，但牺牲了优化机会。在 Swift 里，protocol requirement 用动态派发，protocol extension method 用静态派发（[06:40](https://developer.apple.com/videos/play/wwdc2024/10217/?time=400)）：
+**Static dispatch vs dynamic dispatch** is the key divide. Static dispatch lets the compiler see function definitions for inlining and generic specialization; dynamic dispatch supports polymorphism but sacrifices optimization opportunities. In Swift, protocol requirements use dynamic dispatch; protocol extension methods use static dispatch ([06:40](https://developer.apple.com/videos/play/wwdc2024/10217/?time=400)):
 
 ```swift
 protocol DataModel {
@@ -60,16 +60,16 @@ extension DataModel {
 }
 ```
 
-- `protocol DataModel` 主体里声明的 `update(from:)` 是 requirement，调用时走动态派发
-- `extension DataModel` 里声明的 `update(from:)` 是 extension method，调用时走静态派发
-- 两者语义不同：requirement 遵循动态多态，extension method 基于编译期已知类型
-- 性能关键路径上优先使用 extension method，但需要理解语义变化
+- `update(from:)` declared in the `protocol DataModel` body is a requirement—calls use dynamic dispatch
+- `update(from:)` declared in `extension DataModel` is an extension method—calls use static dispatch
+- Different semantics: requirements follow dynamic polymorphism; extension methods are based on compile-time known types
+- Prefer extension methods on performance-critical paths, but understand the semantic change
 
-### 内存分配：全局、栈、堆三种来源
+### Memory allocation: global, stack, and heap sources
 
-全局内存在程序加载时分配，几乎免费，但只能用于生命周期贯穿整个程序的固定大小数据。栈分配通过移动栈指针完成，同样极快，但要求内存在当前函数作用域内有明确的生命周期终点。堆分配最灵活，分配和释放的开销也最大（[08:29](https://developer.apple.com/videos/play/wwdc2024/10217/?time=509)）。
+Global memory is allocated at program load—nearly free, but only for fixed-size data whose lifetime spans the entire program. Stack allocation moves the stack pointer—equally fast, but requires memory to have a clear lifetime endpoint within the current function scope. Heap allocation is most flexible and has the highest allocation/deallocation cost ([08:29](https://developer.apple.com/videos/play/wwdc2024/10217/?time=509)).
 
-函数的 CallFrame 就在栈上分配。编译器无论如何都要做一次栈指针减法来保存返回地址，多减几个字节不花额外时间，所以局部变量放在 CallFrame 里几乎是免费的（[07:18](https://developer.apple.com/videos/play/wwdc2024/10217/?time=438)）：
+A function's CallFrame is allocated on the stack. The compiler must subtract the stack pointer once to save the return address anyway; subtracting a few more bytes costs no extra time, so local variables in the CallFrame are nearly free ([07:18](https://developer.apple.com/videos/play/wwdc2024/10217/?time=438)):
 
 ```
 _$s4main9updateAll6models4fromySayAA9DataModel_pG_AA0F6SourceCtF:
@@ -81,16 +81,16 @@ _$s4main9updateAll6models4fromySayAA9DataModel_pG_AA0F6SourceCtF:
     ret
 ```
 
-- `sub sp, sp, #208`：进入函数时，栈指针减 208 字节，分配 CallFrame
-- `stp x29, x30, [sp, #192]`：保存帧指针和返回地址
-- `add sp, sp, #208`：退出函数时，栈指针加回 208 字节，释放 CallFrame
-- 这 208 字节覆盖了所有局部状态，包括 `models`、`source`、`model`、迭代器等
+- `sub sp, sp, #208`: on function entry, stack pointer subtracts 208 bytes, allocating the CallFrame
+- `stp x29, x30, [sp, #192]`: save frame pointer and return address
+- `add sp, sp, #208`: on function exit, stack pointer adds back 208 bytes, releasing the CallFrame
+- These 208 bytes cover all local state, including `models`, `source`, `model`, iterators, etc.
 
-### 值的拷贝与所有权
+### Value copying and ownership
 
-Swift 的所有权系统是内存安全的核心。值的交互方式有三种：consume（转移所有权）、mutate（临时取得所有权再归还）、borrow（只读借用，阻止他人修改或销毁）（[15:00](https://developer.apple.com/videos/play/wwdc2024/10217/?time=900)）。
+Swift's ownership system is core to memory safety. Values interact in three ways: consume (transfer ownership), mutate (temporarily take ownership then return), borrow (read-only loan that prevents others from modifying or destroying) ([15:00](https://developer.apple.com/videos/play/wwdc2024/10217/?time=900)).
 
-拷贝一个值意味着拷贝它的内联表示。拷贝 struct 是递归拷贝所有存储属性，拷贝 class 是 retain 引用。大 struct 的拷贝成本来自两方面：引用类型属性需要逐一 retain，每个拷贝副本还需要独立的存储空间。`consume` 操作符可以显式请求无拷贝转移（[16:27](https://developer.apple.com/videos/play/wwdc2024/10217/?time=987)）：
+Copying a value means copying its inline representation. Copying a struct recursively copies all stored properties; copying a class retains the reference. Large struct copy cost comes from two sources: reference-type properties need individual retains, and each copy needs independent storage. The `consume` operator explicitly requests copy-free transfer ([16:27](https://developer.apple.com/videos/play/wwdc2024/10217/?time=987)):
 
 ```swift
 func makeArray() {
@@ -99,12 +99,12 @@ func makeArray() {
 }
 ```
 
-- `var array = [1.0, 2.0]`：初始化，字面量产生独立值，直接转移所有权，无拷贝
-- `var array2 = consume array`：显式消费 `array`，将其所有权转移到 `array2`，零拷贝
-- `consume` 之后访问 `array` 会触发编译错误，因为值已被转移
-- 编译器在能证明没有后续使用时通常会自动做这个优化，`consume` 是给你手动控制的手段
+- `var array = [1.0, 2.0]`: initialization; literal produces an independent value, ownership transferred directly, no copy
+- `var array2 = consume array`: explicitly consume `array`, transfer ownership to `array2`, zero copy
+- Accessing `array` after `consume` triggers a compile error because the value was transferred
+- The compiler usually auto-applies this optimization when it can prove no subsequent use; `consume` gives you manual control
 
-传递参数时，Swift 需要证明没有同时的 mutate 或 consume 才能借用而非拷贝。类属性的存储位置让这个证明变难，可能导致防御性拷贝（[18:10](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1090)）：
+When passing parameters, Swift must prove no concurrent mutate or consume to borrow instead of copy. Class property storage makes this proof harder and may cause defensive copies ([18:10](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1090)):
 
 ```swift
 func makeArray(object: MyClass) {
@@ -113,13 +113,13 @@ func makeArray(object: MyClass) {
 }
 ```
 
-- `object.array` 的存储在类实例中，Swift 难以证明 `print` 期间属性不被修改
-- 编译器可能插入防御性拷贝（retain buffer），确保 `print` 读到稳定值
-- 这是 Swift 正在积极改进的领域，包括优化器增强和显式 `borrow` 特性
+- `object.array` storage is in the class instance; Swift can't easily prove the property isn't modified during `print`
+- The compiler may insert defensive copies (retain buffer) to ensure `print` reads a stable value
+- Swift is actively improving this area, including optimizer enhancements and explicit `borrow` features
 
-### 闭包：非逃逸 vs 逃逸
+### Closures: non-escaping vs escaping
 
-函数值在 Swift 里始终是一对：函数指针 + 上下文指针。非逃逸闭包的上下文可以分配在栈上，因为闭包不会在调用结束后被使用（[28:47](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1727)）：
+Function values in Swift are always a pair: function pointer + context pointer. Non-escaping closure context can be allocated on the stack because the closure isn't used after the call returns ([28:47](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1727)):
 
 ```swift
 func sumTwice(f: () -> Int) -> Int {
@@ -131,16 +131,16 @@ func puzzle(n: Int) -> Int {
 }
 ```
 
-- `sumTwice` 接受非逃逸函数 `f`
-- 闭包 `{ n + 1 }` 捕获 `n`，编译器生成一个栈上的上下文结构体存放 `n`
-- 调用 `f()` 时，上下文指针作为隐式参数传入，无需堆分配
-- 如果 `n` 是 `var` 且被闭包修改，非逃逸闭包只捕获指向变量的指针，变量本身不需要堆化
+- `sumTwice` accepts a non-escaping function `f`
+- Closure `{ n + 1 }` captures `n`; the compiler generates a stack context struct holding `n`
+- When calling `f()`, the context pointer is passed as an implicit parameter—no heap allocation
+- If `n` is `var` and modified by the closure, non-escaping closures only capture a pointer to the variable—the variable itself doesn't need heap allocation
 
-逃逸闭包则不同：上下文必须堆分配并用引用计数管理，本质上是匿名类的实例。被逃逸闭包捕获的 `var` 也会被堆化，因为闭包可能延长变量的生命周期（[29:34](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1774)）。
+Escaping closures differ: context must be heap-allocated and reference-counted—essentially an anonymous class instance. `var` captured by escaping closures is also heap-allocated because the closure may extend the variable's lifetime ([29:34](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1774)).
 
-### 泛型 vs 协议类型（`some` vs `any`）
+### Generics vs protocol types (`some` vs `any`)
 
-泛型函数和协议类型函数看起来相似，运行时特征截然不同（[31:50](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1910)）：
+Generic functions and protocol-type functions look similar but have very different runtime characteristics ([31:50](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1910)):
 
 ```swift
 func updateAll<Model: DataModel>(models: [Model],
@@ -157,41 +157,41 @@ func updateAll(models: [any DataModel], from source: DataSource) {
 }
 ```
 
-- 第一个（泛型）：数组元素同质，内存紧凑排布；类型信息和 witness table 作为顶层参数传入一次；调用方知道具体类型时可以特化（[32:57](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1977)）
-- 第二个（`any`）：数组元素可异质，每个元素自带类型信息和 witness table；内联存储只有 3 个指针大小，超出则堆分配；特化极其困难
-- `any DataModel` 的内联表示包含值存储（3 指针）、类型元数据指针、witness table 指针
+- First (generic): array elements are homogeneous, compactly laid out in memory; type info and witness table passed once as top-level parameters; can specialize when caller knows the concrete type ([32:57](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1977))
+- Second (`any`): array elements can be heterogeneous; each element carries its own type info and witness table; inline storage is only 3 pointer sizes, heap-allocated if exceeded; specialization is extremely difficult
+- `any DataModel` inline representation includes value storage (3 pointers), type metadata pointer, witness table pointer
 
-优化器可以特化泛型函数——当调用方传入已知类型 `[MyDataModel]` 时，编译器能生成只处理该类型的专门版本，消除所有抽象开销。
+The optimizer can specialize generic functions—when the caller passes a known type `[MyDataModel]`, the compiler generates a specialized version handling only that type, eliminating all abstraction overhead.
 
-### async 函数的内存模型
+### Memory model of async functions
 
-async 函数的局部状态不能放在 C 栈上，因为挂起时线程可能被释放。Swift 的方案是给每个 async task 分配独立的 slab 栈（[25:02](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1502)）。async 函数被拆分成多个 partial function，每个 partial function 在 C 栈上运行到下一个挂起点，然后 tail-call 下一个 partial function。挂起时直接返回，线程立即被复用。
-
----
-
-## 核心启发
-
-- **做什么**：用 `some` 替代 `any` 声明泛型约束
-  - 为什么值得做：`some` 保留具体类型信息，编译器可以特化和内联；`any` 引入 existential container，每个元素自带 3 指针 + 元数据 + witness table，值超出 3 指针还会触发堆分配
-  - 怎么开始：检查函数参数中的 `[any Protocol]`，如果元素总是同质，改为 `<T: Protocol>` 或 `[some Protocol]`
-
-- **做什么**：区分 protocol requirement 和 extension method
-  - 为什么值得做：requirement 走动态派发，编译器无法内联；extension method 走静态派发，可以内联和特化。性能关键路径上差别显著
-  - 怎么开始：审视热路径上的协议方法调用，把性能关键的调用从 requirement 移到 extension，或将 protocol 改为泛型约束
-
-- **做什么**：避免在类属性上直接传参，或用 `borrow` 显式标注
-  - 为什么值得做：类属性的存储位置让编译器难以证明没有并发修改，可能插入防御性拷贝（额外的 retain/release）。Swift 正在改进，但目前仍需注意
-  - 怎么开始：在 Instruments 中检查热路径的 retain/release 数量，发现异常多的拷贝时考虑用局部变量过渡或显式 `borrow`
-
-- **做什么**：自动化性能回归测试
-  - 为什么值得做：优化器很强但不是万能的，代码风格变化可能悄悄破坏优化假设。手动检查不可靠，只有自动化才能在每次提交时捕获回归
-  - 怎么开始：用 Instruments 定位热点后，编写测量这些热点的 XCTest 性能测试，集成到 CI 流水线
+Async function local state can't live on the C stack because the thread may be released during suspension. Swift's approach allocates an independent slab stack for each async task ([25:02](https://developer.apple.com/videos/play/wwdc2024/10217/?time=1502)). Async functions are split into multiple partial functions; each partial function runs on the C stack until the next suspension point, then tail-calls the next partial function. On suspension it returns immediately and the thread is reused.
 
 ---
 
-## 关联 Session
+## Core Takeaways
 
-- [Analyze heap memory](/articles/wwdc2024-10173) — 用 Instruments 深入分析堆内存分配，定位泄漏和过度分配
-- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — 理解 noncopyable 类型如何用所有权系统消除不必要的拷贝
-- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Swift 在服务端场景下的性能考量和生态工具
-- [Go further with Swift Testing](/articles/wwdc2024-10195) — 用 Swift Testing 框架编写包括性能测试在内的自动化测试套件
+- **What to do**: Use `some` instead of `any` for generic constraints
+  - Why it's worth it: `some` preserves concrete type info so the compiler can specialize and inline; `any` introduces existential containers where each element carries 3 pointers + metadata + witness table, and values exceeding 3 pointers trigger heap allocation
+  - How to start: Check function parameters for `[any Protocol]`; if elements are always homogeneous, change to `<T: Protocol>` or `[some Protocol]`
+
+- **What to do**: Distinguish protocol requirements from extension methods
+  - Why it's worth it: requirements use dynamic dispatch—the compiler can't inline; extension methods use static dispatch and can be inlined and specialized. Significant difference on performance-critical paths
+  - How to start: Review protocol method calls on hot paths; move performance-critical calls from requirements to extensions, or change the protocol to a generic constraint
+
+- **What to do**: Avoid passing class properties directly as parameters, or explicitly annotate with `borrow`
+  - Why it's worth it: class property storage makes it hard for the compiler to prove no concurrent modification, possibly inserting defensive copies (extra retain/release). Swift is improving, but attention is still needed
+  - How to start: Check retain/release counts on hot paths in Instruments; when abnormally many copies appear, use local variables as intermediates or explicit `borrow`
+
+- **What to do**: Automate performance regression tests
+  - Why it's worth it: The optimizer is strong but not omnipotent; code style changes can quietly break optimizer assumptions. Manual checks are unreliable—only automation catches regressions on every commit
+  - How to start: After locating hotspots in Instruments, write XCTest performance tests measuring those hotspots and integrate into CI
+
+---
+
+## Related Sessions
+
+- [Analyze heap memory](/articles/wwdc2024-10173) — Deep heap memory allocation analysis with Instruments to locate leaks and over-allocation
+- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — How noncopyable types use the ownership system to eliminate unnecessary copies
+- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Performance considerations and ecosystem tools for Swift on the server
+- [Go further with Swift Testing](/articles/wwdc2024-10195) — Write automated test suites including performance tests with the Swift Testing framework
