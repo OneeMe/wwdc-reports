@@ -30,6 +30,12 @@ function countCjk(text) {
   return (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) ?? []).length;
 }
 
+function countKana(text) {
+  return (text.match(/[\u3040-\u309f\u30a0-\u30ff]/g) ?? []).length;
+}
+
+const JA_MIN_KANA = 20;
+
 function extractYear(filename) {
   const m = filename.match(/^wwdc(\d{4})-/);
   return m ? m[1] : "unknown";
@@ -47,6 +53,7 @@ function classifyStatus(zhContent, locContent, lang) {
   if (hash(zhBody) === hash(locBody)) return "placeholder";
 
   const bodyCjk = countCjk(locBody);
+  const bodyKana = countKana(locBody);
   const bodyLen = locBody.length;
   const cjkRatio = bodyLen > 0 ? bodyCjk / bodyLen : 0;
 
@@ -56,13 +63,18 @@ function classifyStatus(zhContent, locContent, lang) {
       : JA_SECTIONS.filter((s) => locBody.includes(s)).length;
 
   const hasTranslatedHeaders = translatedSections >= 2;
+  const hasJaSectionHeaders =
+    lang === "ja" && translatedSections >= 3 && bodyKana >= JA_MIN_KANA;
 
   // Partial: some English/Japanese headers but still heavy Chinese body
   if (cjkRatio > 0.08 && !hasTranslatedHeaders) return "partial";
   if (cjkRatio > 0.15 && translatedSections < 3) return "partial";
 
   // Done: low Chinese ratio OR proper localized section headers
-  if (cjkRatio <= 0.08 || (hasTranslatedHeaders && cjkRatio <= 0.2)) return "done";
+  // JA uses kana density (same heuristic as check-translation.mjs) because kanji overlap with Chinese.
+  if (cjkRatio <= 0.08 || (hasTranslatedHeaders && cjkRatio <= 0.2) || hasJaSectionHeaders) {
+    return "done";
+  }
 
   return "partial";
 }
