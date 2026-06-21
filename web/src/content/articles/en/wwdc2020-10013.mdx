@@ -27,21 +27,21 @@ relatedSessions:
 
 ## Highlight
 
-> Metal 函数指针是 2020 年引入的重要特性，它允许 GPU 代码在运行时通过函数表（Function Table）动态调用不同的函数，而不是在编译时硬编码调用关系。
+> Metal function pointers, introduced in 2020, let GPU code dynamically call different functions at runtime through a function table instead of hard-coding call relationships at compile time.
 
-## 核心内容
+## Core Content
 
-光线追踪里的着色阶段很容易膨胀。一个简单 path tracer 先生成射线，做几何求交，再根据命中的材质和光源计算颜色。只要场景里出现多种光源、多种材质，原本放在 `shade` 里的逻辑就会变成一串固定调用，新增一种材质就要重新组织 shader 代码和 pipeline。
+Shading in ray tracing grows quickly. A simple path tracer generates rays, intersects geometry, then computes color from the hit material and lights. Multiple light and material types turn the logic inside `shade` into a fixed chain of calls—each new material type forces shader and pipeline reorganization.
 
-Metal 2020 的函数指针 API 把这件事拆开了。开发者可以把光照函数、材质函数标记为 visible function，再通过 Metal API 把这些函数接入 pipeline。GPU 端拿到的是 visible function table（可见函数表），shader 可以按索引取出函数指针并调用它。
+Metal's 2020 function pointer API separates that concern. Mark lighting and material functions as visible functions, attach them to the pipeline through Metal API, and the GPU receives a visible function table from which shaders fetch function pointers by index and call them.
 
-这场 session 的主线不是只给 shader 增加一个语法特性。它把函数指针放进完整的工程流程里：哪些函数参与单次 pipeline 编译，哪些函数预编译成 binary function，哪些函数后续增量加入，怎样把函数表传给 GPU，递归和 SIMD divergence 会带来哪些性能约束。
+This session is not only new shader syntax. It places function pointers in a full engineering flow: which functions compile into one pipeline, which precompile as binary functions, which load incrementally later, how to pass tables to the GPU, and performance limits around recursion and SIMD divergence.
 
-## 详细内容
+## Detailed Content
 
-### [03:09](https://developer.apple.com/videos/play/wwdc2020/10013/?time=189) 从固定的着色调用开始
+### [03:09](https://developer.apple.com/videos/play/wwdc2020/10013/?time=189) Start from fixed shading calls
 
-session 先用一个简化的 path tracer 展示问题位置。kernel 在求交之后找到材质，再调用 `shade` 完成光照和材质计算。
+The session uses a simplified path tracer to show where the problem lives. After intersection the kernel finds a material and calls `shade` for lighting and material work.
 
 ```metal
 float3 shade(...);
@@ -59,13 +59,13 @@ float3 shade(...);
 }
 ```
 
-关键点：
+Key points:
 
-- `intersection.geometry_id` 用来找到当前命中的材质。
-- `shade` 是光照和材质逻辑的汇合点。
-- 当光源类型和材质类型增加，固定的 `shade` 调用会承担越来越多分支。
+- `intersection.geometry_id` locates the hit material.
+- `shade` is where lighting and material logic meet.
+- As light and material types grow, a fixed `shade` call accumulates branches.
 
-`shade` 内部再分成 lighting 和 material 两个阶段。
+Inside `shade`, lighting and material are separate stages.
 
 ```metal
 float3 shade(...)
@@ -76,15 +76,15 @@ float3 shade(...)
 }
 ```
 
-关键点：
+Key points:
 
-- `LightingFromLight` 代表根据光源类型计算 lighting 的阶段。
-- `CalculateLightingForMaterial` 代表根据材质类型应用 lighting 的阶段。
-- 这两个阶段正好适合拆成可替换的 visible function。
+- `LightingFromLight` computes lighting from the light type.
+- `CalculateLightingForMaterial` applies lighting according to material type.
+- Both stages are natural split points for visible functions.
 
-### [04:59](https://developer.apple.com/videos/play/wwdc2020/10013/?time=299) 用 `[[visible]]` 暴露 GPU 函数
+### [04:59](https://developer.apple.com/videos/play/wwdc2020/10013/?time=299) Expose GPU functions with `[[visible]]`
 
-Metal Shading Language 增加了 `[[visible]]` 函数限定。它和 `vertex`、`fragment`、`kernel` 一样标在函数定义前，表示这个函数可以被 Metal API 操作。
+Metal Shading Language adds the `[[visible]]` qualifier. Like `vertex`, `fragment`, and `kernel`, it marks functions the Metal API can reference.
 
 ```metal
 [[visible]]
@@ -98,15 +98,15 @@ Lighting Area(Light light, TriangleIntersectionData triangleIntersectionData)
 }
 ```
 
-关键点：
+Key points:
 
-- `[[visible]]` 让 `Area` 这样的光照函数成为可被 CPU 端引用的 Metal function object。
-- transcript 明确提到 visible function 可以在另一个 Metal 文件或另一个 Metal library 中。
-- pipeline 创建时可以把这些 function object 加进去，之后 GPU 端通过函数指针调用。
+- `[[visible]]` makes lighting functions like `Area` into Metal function objects the CPU can reference.
+- Visible functions can live in another Metal file or library per the transcript.
+- Add these function objects when creating the pipeline; the GPU calls them through function pointers.
 
-### [05:30](https://developer.apple.com/videos/play/wwdc2020/10013/?time=330) 单次编译：把 visible function 复制进 pipeline
+### [05:30](https://developer.apple.com/videos/play/wwdc2020/10013/?time=330) Single compilation: copy visible functions into the pipeline
 
-single compilation 的做法是把所有可能调用的 visible function 放入 `MTLLinkedFunctions.functions`，再创建 compute pipeline state。
+Single compilation puts all possibly called visible functions in `MTLLinkedFunctions.functions`, then creates compute pipeline state.
 
 ```swift
 // Single compilation configuration
@@ -120,15 +120,15 @@ let pipeline = try device.makeComputePipelineState(descriptor: computeDescriptor
                                                    reflection: nil)
 ```
 
-关键点：
+Key points:
 
-- `linkedFunctions.functions` 列出 pipeline 可能调用的 visible function。
-- pipeline 创建结果包含 kernel 代码和这些函数的 specialized copies。
-- transcript 把这种优化类比为 link-time optimization：运行时性能最好，pipeline 创建时间和对象体积会增加。
+- `linkedFunctions.functions` lists visible functions the pipeline may call.
+- The pipeline contains the kernel plus specialized copies of those functions.
+- The transcript compares this to link-time optimization: best runtime performance, larger pipeline and slower creation.
 
-### [07:43](https://developer.apple.com/videos/play/wwdc2020/10013/?time=463) 分离编译：把函数预编译成 binary function
+### [07:43](https://developer.apple.com/videos/play/wwdc2020/10013/?time=463) Separate compilation: precompile functions as binary functions
 
-separate compilation 让函数以独立 GPU binary 的形式存在，多个 pipeline 可以共享这些 binary function。入口是 `MTLFunctionDescriptor`。
+Separate compilation keeps functions as independent GPU binaries shareable across pipelines. Entry point is `MTLFunctionDescriptor`.
 
 ```swift
 // Create by function descriptor:
@@ -138,11 +138,11 @@ functionDescriptor.name = "Area"
 let areaBinaryFunction = try library.makeFunction(descriptor: functionDescriptor)
 ```
 
-关键点：
+Key points:
 
-- `MTLFunctionDescriptor` 可以给函数创建过程附加配置。
-- 设置 `name` 后，`library.makeFunction(descriptor:)` 返回对应的 Metal function object。
-- descriptor 的价值在下一步：请求 binary pre-compilation。
+- `MTLFunctionDescriptor` attaches configuration to function creation.
+- After setting `name`, `library.makeFunction(descriptor:)` returns the Metal function object.
+- The descriptor's value appears in the next step: binary pre-compilation.
 
 ```swift
 // Create and compile by function descriptor:
@@ -152,13 +152,13 @@ functionDescriptor.options = MTLFunctionOptions.compileToBinary
 let areaBinaryFunction = try library.makeFunction(descriptor: functionDescriptor)
 ```
 
-关键点：
+Key points:
 
-- `MTLFunctionOptions.compileToBinary` 要求 Metal 把函数预编译为 binary。
-- binary function 可以在 pipeline 创建时被引用，减少把函数复制进 pipeline 的成本。
-- session 明确说明这种模式会带来函数调用的运行时开销。
+- `MTLFunctionOptions.compileToBinary` asks Metal to precompile the function to a binary.
+- Binary functions can be referenced at pipeline creation, reducing copy-into-pipeline cost.
+- The session notes runtime call overhead for this mode.
 
-预编译函数通过 `linkedFunctions.binaryFunctions` 接入 pipeline。
+Precompiled functions attach through `linkedFunctions.binaryFunctions`.
 
 ```swift
 // Specify binary functions on compute pipeline descriptor
@@ -173,15 +173,15 @@ let pipeline = try device.makeComputePipelineState(descriptor: computeDescriptor
                                                    reflection: nil)
 ```
 
-关键点：
+Key points:
 
-- `functions` 里的函数会参与 specialization。
-- `binaryFunctions` 里的函数使用预编译 binary。
-- 两者可以混用，用 pipeline size、创建时间和 runtime performance 做取舍。
+- Functions in `functions` participate in specialization.
+- Functions in `binaryFunctions` use precompiled binaries.
+- Mix both to trade pipeline size, creation time, and runtime performance.
 
-### [11:04](https://developer.apple.com/videos/play/wwdc2020/10013/?time=664) 增量编译：给已有 pipeline 加函数
+### [11:04](https://developer.apple.com/videos/play/wwdc2020/10013/?time=664) Incremental compilation: add functions to an existing pipeline
 
-游戏和动态内容加载常会遇到新材质。session 用 Wood material 举例，展示如何让已有 pipeline 支持后续增加 binary function。
+Games and dynamic loading often need new materials. The session uses a Wood material to show adding a binary function to an existing pipeline.
 
 ```swift
 // Create initial pipeline with option
@@ -198,15 +198,15 @@ let newPipeline =
    try pipeline.makeComputePipelineStateWithAdditionalBinaryFunctions(functions: [wood])
 ```
 
-关键点：
+Key points:
 
-- 初始 pipeline 创建前要设置 `supportAddingBinaryFunctions = true`。
-- 新函数仍然通过 `MTLFunctionDescriptor` 和 `compileToBinary` 生成。
-- 新 pipeline 从已有 pipeline 派生，只附加新增的 binary function。
+- Set `supportAddingBinaryFunctions = true` before creating the initial pipeline.
+- New functions still use `MTLFunctionDescriptor` and `compileToBinary`.
+- The new pipeline derives from the existing one and only attaches the new binary function.
 
-### [12:22](https://developer.apple.com/videos/play/wwdc2020/10013/?time=742) visible function table：把函数指针传给 GPU
+### [12:22](https://developer.apple.com/videos/play/wwdc2020/10013/?time=742) Visible function table: pass function pointers to the GPU
 
-visible function table 是 GPU 端拿到函数指针的方式。shader 里先声明函数指针类型，再把 function table 作为 kernel 参数或 argument buffer 传入。
+The visible function table is how the GPU receives function pointers. Declare pointer types in the shader and pass the table as a kernel parameter or through an argument buffer.
 
 ```metal
 // Helper using declaration in Metal
@@ -223,13 +223,13 @@ Lighting lighting = lightingFunction(light, triangleIntersection);
 return materialFunctions[material.index](material, lighting, triangleIntersection);
 ```
 
-关键点：
+Key points:
 
-- `visible_function_table<LightingFunction>` 和 `visible_function_table<MaterialFunction>` 分别承载光照函数和材质函数。
-- shader 通过 `light.index`、`material.index` 选择函数。
-- 取出的函数指针可以先保存到变量，也可以直接从 table 调用。
+- `visible_function_table<LightingFunction>` and `visible_function_table<MaterialFunction>` hold lighting and material functions.
+- The shader picks functions with `light.index` and `material.index`.
+- Store the pointer in a variable or call directly from the table.
 
-CPU 端从 pipeline state 分配 table，再把 function handle 放进指定 index。
+On the CPU, allocate a table from pipeline state and insert function handles at indices.
 
 ```swift
 // Initialize descriptor
@@ -246,15 +246,15 @@ computeCommandEncoder.setVisibleFunctionTable(lightingFunctionTable, bufferIndex
 argumentEncoder.setVisibleFunctionTable(lightingFunctionTable, index:1)
 ```
 
-关键点：
+Key points:
 
-- `MTLVisibleFunctionTableDescriptor.functionCount` 决定 table 容量。
-- `pipeline.functionHandle(function:)` 取得可写入 table 的 handle。
-- table 可以绑定到 `computeCommandEncoder`，也可以放进 argument buffer；使用 argument encoder 时 transcript 提醒要调用 `useResource`。
+- `MTLVisibleFunctionTableDescriptor.functionCount` sets table capacity.
+- `pipeline.functionHandle(function:)` yields handles for the table.
+- Bind to `computeCommandEncoder` or an argument buffer; with argument encoders call `useResource` per the transcript.
 
-### [14:23](https://developer.apple.com/videos/play/wwdc2020/10013/?time=863) function groups：告诉编译器每个调用点可能调用谁
+### [14:23](https://developer.apple.com/videos/play/wwdc2020/10013/?time=863) Function groups: tell the compiler who each call site may call
 
-function groups 用来给编译器更多信息。shader 在调用点标记 group，CPU 端在 `MTLLinkedFunctions.groups` 中声明每个 group 的候选函数。
+Function groups give the compiler more information. Mark call sites with a group in the shader; declare each group's candidates in `MTLLinkedFunctions.groups` on the CPU.
 
 ```metal
 // Add function groups to our shading function
@@ -270,11 +270,11 @@ triangleIntersection);
 }
 ```
 
-关键点：
+Key points:
 
-- `[[function_groups("lighting")]]` 标记 lighting 调用点。
-- `[[function_groups("material")]]` 标记 material 调用点。
-- 编译器知道每个调用点的函数集合后，可以在生成 pipeline 时做更有针对性的优化。
+- `[[function_groups("lighting")]]` marks the lighting call site.
+- `[[function_groups("material")]]` marks the material call site.
+- With that information the compiler can optimize pipeline generation per call site.
 
 ```swift
 // Function Group configuration
@@ -285,64 +285,64 @@ linkedFunctions.groups = ["lighting" : [area, spot, sphere ],
 computeDescriptor.linkedFunctions = linkedFunctions
 ```
 
-关键点：
+Key points:
 
-- `groups` 字典把 group name 映射到该调用点可能调用的函数。
-- lighting group 只包含 `area`、`spot`、`sphere`。
-- material group 只包含 `hair`、`glass`、`skin`。
+- `groups` maps group names to functions that call site may invoke.
+- The lighting group contains only `area`, `spot`, and `sphere`.
+- The material group contains only `hair`, `glass`, and `skin`.
 
-### [15:25](https://developer.apple.com/videos/play/wwdc2020/10013/?time=925) 递归和 SIMD divergence 的性能边界
+### [15:25](https://developer.apple.com/videos/play/wwdc2020/10013/?time=925) Recursion and SIMD divergence limits
 
-函数指针也打开了递归实现的空间。session 以 recursive path tracer 为例：材质函数可以发出新的 ray，再求交、着色、继续递归。为了表达调用链深度，compute pipeline descriptor 提供 `maxCallStackDepth`。默认值是 1，适合常见 visible function 和 intersection function 场景；如果函数调用链更深，需要显式设置预期深度。
+Function pointers also enable recursion. The session's recursive path tracer example has material functions emit new rays, intersect, shade, and recurse. `maxCallStackDepth` on the compute pipeline descriptor expresses call depth; default is 1 for typical visible and intersection functions—set it explicitly if the chain goes deeper.
 
-最后一个边界是 divergence。SIMD group 最适合所有线程执行同一条指令。通过函数指针调用时，同一个 SIMD group 内的线程可能指向不同函数，最坏情况下要把这些函数依次执行。session 给出的处理思路是：把函数参数、线程 index、函数 index 写入 threadgroup memory，按函数 index 排序，再按排序结果调用函数，把结果写回 threadgroup memory，让每个线程读取自己的结果。对于复杂函数，这能降低 divergence 的额外成本。
+The final limit is divergence. SIMD groups work best when all threads run the same instruction. With function pointers, threads in one SIMD group may point at different functions and the hardware may execute them serially. The session's mitigation: write parameters, thread index, and function index to threadgroup memory, sort by function index, invoke in sorted order, write results back, and let each thread read its own result—reducing divergence cost for complex functions.
 
-## 核心启发
+## Core Takeaways
 
-### 1. 可热更新的材质函数库
+### 1. Hot-swappable material function library
 
-**做什么**：把材质 BRDF 拆成 visible function，运行时用 function table 按材质索引选择。
+**What to do**: Split material BRDFs into visible functions and select by material index at runtime through a function table.
 
-**为什么值得做**：session 明确展示了 lighting 和 material 两个可拆阶段，材质种类增加时不必把所有逻辑塞进一个 `shade`。
+**Why it's worth it**: The session shows separable lighting and material stages; growing material types need not inflate one `shade`.
 
-**怎么开始**：先把一个材质函数标记为 `[[visible]]`，用 `MTLLinkedFunctions.functions` 接入 pipeline，再用 `visible_function_table<MaterialFunction>` 从 GPU 端按 `material.index` 调用。
+**How to start**: Mark one material function `[[visible]]`, attach with `MTLLinkedFunctions.functions`, call from `visible_function_table<MaterialFunction>` using `material.index`.
 
-### 2. 面向流式资源的 shader 增量加载
+### 2. Shader incremental loading for streaming assets
 
-**做什么**：游戏加载新资产时，把新材质函数编译为 binary function，并从已有 pipeline 派生新 pipeline。
+**What to do**: When new game assets load, compile new material functions as binary functions and derive a new pipeline from the existing one.
 
-**为什么值得做**：transcript 提到动态环境里常会出现新函数，尤其是 games streaming 新资产和 shader 的场景。
+**Why it's worth it**: Dynamic environments—especially games streaming assets and shaders—often gain new functions at runtime.
 
-**怎么开始**：创建初始 pipeline 前设置 `computeDescriptor.supportAddingBinaryFunctions = true`，新材质出现后用 `MTLFunctionDescriptor`、`compileToBinary` 和 `makeComputePipelineStateWithAdditionalBinaryFunctions(functions:)` 补上。
+**How to start**: Set `computeDescriptor.supportAddingBinaryFunctions = true` before the initial pipeline; when a new material appears use `MTLFunctionDescriptor`, `compileToBinary`, and `makeComputePipelineStateWithAdditionalBinaryFunctions(functions:)`.
 
-### 3. 可配置的 lighting/material 预览器
+### 3. Configurable lighting/material previewer
 
-**做什么**：做一个开发工具视图，让美术或图形工程师切换不同 light 和 material 组合，实时观察同一场景的变化。
+**What to do**: Build a dev tool where artists or graphics engineers switch light and material combinations and see the same scene update live.
 
-**为什么值得做**：visible function table 可以把 lighting function 和 material function 分开传给 GPU，shader 通过索引组合调用。
+**Why it's worth it**: Separate visible function tables for lighting and materials let the shader combine calls by index.
 
-**怎么开始**：分别建立 `lightingFunctions` 和 `materialFunctions` 两张表，CPU 端用 `setFunction(_:index:)` 写入候选函数，UI 改变时只更新索引或表项。
+**How to start**: Create `lightingFunctions` and `materialFunctions` tables; CPU uses `setFunction(_:index:)`; UI changes update indices or table entries only.
 
-### 4. 递归 path tracer 的调用栈实验
+### 4. Recursive path tracer call stack experiment
 
-**做什么**：在一个小型 path tracer 中比较迭代 bounce 和递归 bounce 的实现成本。
+**What to do**: In a small path tracer compare iterative versus recursive bounce costs.
 
-**为什么值得做**：session 明确指出 visible function 调用链可能需要更深 stack，ray tracing 也可以改写成迭代方式降低 stack usage。
+**Why it's worth it**: Visible function call chains may need deeper stacks; ray tracing can be rewritten iteratively to reduce stack usage.
 
-**怎么开始**：先用默认 `maxCallStackDepth` 跑单层 visible function 调用，再逐步增加递归深度，记录 pipeline 配置和帧耗时变化。
+**How to start**: Run single-layer visible calls with default `maxCallStackDepth`, then increase recursion depth and log pipeline config and frame time.
 
-### 5. 函数指针 divergence 诊断视图
+### 5. Function pointer divergence diagnostic view
 
-**做什么**：记录每个 threadgroup 内的 function index 分布，识别同一 SIMD group 中函数调用高度分散的材质或光源组合。
+**What to do**: Record function index distribution per threadgroup to spot material or light combinations that scatter calls within a SIMD group.
 
-**为什么值得做**：session 明确指出函数指针可能造成 thread-level divergence，复杂函数下可以通过排序增加 coherence。
+**Why it's worth it**: Function pointers can cause thread-level divergence; sorting can improve coherence for complex functions.
 
-**怎么开始**：在实验 kernel 中把参数、thread index 和 function index 写入 threadgroup memory，按 function index 排序后调用函数，再比较排序前后的耗时。
+**How to start**: In an experimental kernel write parameters, thread index, and function index to threadgroup memory, sort by function index before calling, compare timings with and without sorting.
 
-## 关联 Session
+## Related Sessions
 
-- [Discover ray tracing with Metal](/articles/wwdc2020-10012) — 本场用 ray tracing 的 shading 阶段解释函数指针，先看这场能补齐加速结构、求交和 compute kernel 的上下文。
-- [Build GPU binaries with Metal](/articles/wwdc2020-10615) — 深入 shader 编译、GPU binary、binary archive 和动态库，和本场的 binary function 取舍相邻。
-- [Debug GPU-side errors in Metal](/articles/wwdc2020-10616) — function table、argument buffer 和 GPU 端资源绑定出错时，需要 Xcode 12 的 GPU-side error 报告能力。
-- [Optimize Metal apps and games with GPU counters](/articles/wwdc2020-10603) — 本场最后讨论 runtime overhead 和 divergence，这场提供用 GPU counters 定位瓶颈的工具路线。
-- [Harness Apple GPUs with Metal](/articles/wwdc2020-10602) — 了解 Apple GPU 和 Metal workload 的性能背景，有助于判断函数指针方案的成本边界。
+- [Discover ray tracing with Metal](/articles/wwdc2020-10012) — This session explains function pointers through ray tracing shading; start there for acceleration structures, intersection, and compute kernels.
+- [Build GPU binaries with Metal](/articles/wwdc2020-10615) — Shader compilation, GPU binaries, binary archives, and dynamic libraries adjacent to binary function tradeoffs here.
+- [Debug GPU-side errors in Metal](/articles/wwdc2020-10616) — Xcode 12 GPU-side error reporting when function tables, argument buffers, or GPU bindings fail.
+- [Optimize Metal apps and games with GPU counters](/articles/wwdc2020-10603) — GPU counters for runtime overhead and divergence bottlenecks discussed at the end of this session.
+- [Harness Apple GPUs with Metal](/articles/wwdc2020-10602) — Apple GPU and Metal workload background to judge function pointer cost boundaries.
