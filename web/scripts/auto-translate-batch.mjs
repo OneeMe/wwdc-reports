@@ -36,11 +36,12 @@ const JA_HEADERS = {
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const opts = { year: "2021", codes: [], langs: ["en", "ja"] };
+  const opts = { year: "2021", codes: [], langs: ["en", "ja"], force: false };
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--year") opts.year = args[++i];
-    else if (args[i] === "--codes") opts.codes = args[++i].split(",").map((c) => c.trim());
+    else if (args[i] === "--codes") opts.codes = args[++i].split(",").map((c) => c.trim()).filter(Boolean);
     else if (args[i] === "--lang") opts.langs = [args[++i]];
+    else if (args[i] === "--force") opts.force = true;
   }
   return opts;
 }
@@ -72,6 +73,8 @@ function collectSegments(body) {
     if (i % 2 === 1) continue;
     for (const line of parts[i].split("\n")) {
       if (!hasCjk(line)) continue;
+      // Skip section headers already localized by applyHeaders
+      if (/^#{1,6}\s/.test(line.trim()) || /^＃{1,6}\s/.test(line.trim())) continue;
       segments[`${idx++}`] = line;
     }
   }
@@ -106,6 +109,7 @@ function reassembleBody(parts, translations) {
       lines
         .map((line) => {
           if (!hasCjk(line)) return line;
+          if (/^#{1,6}\s/.test(line.trim()) || /^＃{1,6}\s/.test(line.trim())) return line;
           return translations[`${tIdx++}`] ?? line;
         })
         .join("\n"),
@@ -139,14 +143,15 @@ function translateArticle(slug, lang) {
 const opts = parseArgs();
 let codes = opts.codes;
 if (codes.length === 0) {
-  const out = execSync(`node ${path.join(scriptDir, "count-translation-status.mjs")} --list-remaining ${opts.year} en`, {
-    encoding: "utf8",
-  });
+  const lang = opts.langs.length === 1 ? opts.langs[0] : "en";
+  const out = execSync(
+    `node ${path.join(scriptDir, "count-translation-status.mjs")} --list-remaining ${opts.year} ${lang}`,
+    { encoding: "utf8" },
+  );
   codes = out
     .split("\n")
     .filter((l) => l.includes("wwdc"))
-    .map((l) => l.trim().split(" ")[0])
-    .slice(0, 30);
+    .map((l) => l.trim().split(" ")[0]);
 }
 
 console.log(`Translating ${codes.length} articles × ${opts.langs.length} langs`);
@@ -156,7 +161,7 @@ for (const code of codes) {
     const outPath = path.join(articlesDir, lang, `${slug}.mdx`);
     const zhPath = path.join(articlesDir, `${slug}.mdx`);
     if (!existsSync(zhPath)) continue;
-    if (existsSync(outPath)) {
+    if (!opts.force && existsSync(outPath)) {
       const loc = readFileSync(outPath, "utf8");
       const hasZhHeaders =
         loc.includes("## 核心内容") ||
