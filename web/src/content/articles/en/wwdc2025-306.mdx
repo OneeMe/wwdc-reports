@@ -24,23 +24,23 @@ relatedSessions:
 
 ## Highlight
 
-> Session 介绍了 Instruments 26 中全新的 SwiftUI Instrument，以及它如何帮助诊断两类性能问题：长 body 更新（view body 执行时间过长导致 hitch）和不必要的更新（过多 view body 更新挤占帧预算）。
+> This session introduces the new SwiftUI Instrument in Instruments 26, and how it helps diagnose two kinds of performance problems: long body updates (view body execution taking too long and causing a hitch) and unnecessary updates (too many view body updates eating the frame budget).
 
 ---
 
-## 核心内容
+## Core Content
 
-Steven 在演示 Landmarks 应用时遇到了一个常见问题：列表滚动起来不够顺滑，但他不知道卡顿到底来自哪里。在 SwiftUI 里调试性能曾经非常痛苦——给 body 打断点，调用栈里全是 AttributeGraph 的递归调用，根本看不出哪个 View 因为什么原因被重新执行了。开发者只能靠猜测改代码，再凭手感判断有没有变快。
+Steven ran into a common problem while demoing the Landmarks app: the list did not scroll smoothly, and he had no idea where the stutter came from. Debugging SwiftUI performance used to be painful. You set a breakpoint in body, the call stack shows nothing but recursive AttributeGraph calls, and you cannot tell which View got re-executed or why. Developers had to guess at fixes, then judge by feel whether things got faster.
 
-Instruments 26 给了一个直接的答案。新的 SwiftUI Instrument 把 SwiftUI 内部的更新过程暴露了出来：Update Groups 显示 SwiftUI 在什么时候做工作，Long View Body Updates 标出哪些 View 的 body 跑得太久（红色和橙色按可能造成 hitch 的程度排序），Cause & Effect Graph 把"用户操作 → 状态变更 → View body 重新执行"这条因果链画成可点击的图。Steven 录一次 trace 就直接定位到 `LandmarkListItemView` 的 `distance` 计算属性——每次 body 都在创建一个 `MeasurementFormatter` 和一个 `NumberFormatter`，单次只需要一毫秒，但乘以屏幕上几十个 cell，足以让一帧错过 deadline。
+Instruments 26 gives a straight answer. The new SwiftUI Instrument exposes SwiftUI's internal update process: Update Groups show when SwiftUI does work, Long View Body Updates flag which View bodies run too long (red and orange sorted by hitch risk), and the Cause & Effect Graph draws the causal chain "user action → state change → View body re-execution" as a clickable diagram. Steven recorded one trace and pinpointed the `distance` computed property in `LandmarkListItemView`. Every body run created a `MeasurementFormatter` and a `NumberFormatter`. Each creation took only one millisecond, but multiplied by dozens of cells on screen, that was enough to miss a frame deadline.
 
 ---
 
-## 详细内容
+## Detailed Content
 
-帧预算的常识是这样的（[09:55](https://developer.apple.com/videos/play/wwdc2025/306/?time=595)）：每一帧应用先处理事件，再跑 UI 更新（包括所有需要重跑的 view body），然后交给系统渲染。所有这些必须在 frame deadline 之前完成。一个 body 跑超时，下一帧就来不及交给渲染器，画面就停在前一帧——这就是 hitch。
+The frame budget works like this ([09:55](https://developer.apple.com/videos/play/wwdc2025/306/?time=595)): each frame, the app processes events, runs UI updates (including all view bodies that need re-execution), then hands off to the system for rendering. All of this must finish before the frame deadline. One body running over time means the next frame cannot reach the renderer in time, and the picture stays on the previous frame. That is a hitch.
 
-Steven profile 出来的问题代码长这样（[08:47](https://developer.apple.com/videos/play/wwdc2025/306/?time=527)）：
+The problematic code Steven profiled looks like this ([08:47](https://developer.apple.com/videos/play/wwdc2025/306/?time=527)):
 
 ```swift
 struct LandmarkListItemView: View {
@@ -75,13 +75,13 @@ struct LandmarkListItemView: View {
 }
 ```
 
-关键点：
+Key points:
 
-- `body` 通过 `distance` 计算属性间接读取了距离字符串，每次 body 重跑都会触发一次完整的格式化流程。
-- `NumberFormatter` 和 `MeasurementFormatter` 是 Foundation 里出了名的"创建昂贵"对象，把它们放在 body 调用路径上意味着每次 body 都付一次创建 + 配置 + 字符串生成的代价。
-- Time Profiler 直接指向了 `distance` 这一帧，最重的子帧是这两个 formatter——这是教科书式的"body 内做计算"反模式。
+- `body` reads the distance string indirectly through the `distance` computed property. Every body re-execution triggers a full formatting pass.
+- `NumberFormatter` and `MeasurementFormatter` are known in Foundation as expensive objects to create. Putting them on the body call path means every body pays the cost of creation + configuration + string generation.
+- The Time Profiler pointed straight at the `distance` frame. The heaviest child frames were these two formatters. This is the textbook anti-pattern of "doing computation inside body."
 
-修复方式是把格式化挪进 `LocationFinder`，并缓存结果（[12:13](https://developer.apple.com/videos/play/wwdc2025/306/?time=733)）：
+The fix moves formatting into `LocationFinder` and caches the result ([12:13](https://developer.apple.com/videos/play/wwdc2025/306/?time=733)):
 
 ```swift
 @Observable
@@ -114,13 +114,13 @@ class LocationFinder: NSObject {
 }
 ```
 
-关键点：
+Key points:
 
-- `formatter` 在 `init` 里创建一次，存为属性，避免 body 每次都重建。
-- `distanceCache: [Landmark.ID: String]` 把已经格式化好的字符串按 landmark id 存起来，body 现在只是查字典。
-- 只有 `currentLocation` 或 `landmarks` 变化时才调用 `updateDistances()`，把代价从"每次 body"摊到"每次位置变化"。
+- `formatter` is created once in `init` and stored as a property, so body no longer rebuilds it every time.
+- `distanceCache: [Landmark.ID: String]` stores the formatted string by landmark id. Body now just looks up a dictionary.
+- `updateDistances()` is called only when `currentLocation` or `landmarks` changes. The cost shifts from "every body run" to "every location change."
 
-第二个问题更隐蔽——不必要的更新（[16:51](https://developer.apple.com/videos/play/wwdc2025/306/?time=1011)）。Steven 加了一个收藏按钮，结果点击任意一个 landmark 的爱心时，整个列表里所有 `LandmarkListItemView` 的 body 都被重跑了一遍。Cause & Effect Graph 显示：`isFavorite(_:)` 方法访问了 `favoritesCollection.landmarks` 这个数组，于是每个 cell 的 body 都和"整个数组"建立了依赖。修复方法是给每个 landmark 创建独立的 view model，让依赖粒度落到单个对象上（[17:20](https://developer.apple.com/videos/play/wwdc2025/306/?time=1040)、[29:21](https://developer.apple.com/videos/play/wwdc2025/306/?time=1761)）：
+The second problem is more subtle: unnecessary updates ([16:51](https://developer.apple.com/videos/play/wwdc2025/306/?time=1011)). Steven added a favorite button. When he tapped the heart on any landmark, every `LandmarkListItemView` body in the entire list re-ran. The Cause & Effect Graph showed that the `isFavorite(_:)` method accessed the `favoritesCollection.landmarks` array, so every cell body established a dependency on the whole array. The fix creates an independent view model for each landmark, so the dependency granularity drops to a single object ([17:20](https://developer.apple.com/videos/play/wwdc2025/306/?time=1040)、[29:21](https://developer.apple.com/videos/play/wwdc2025/306/?time=1761)):
 
 ```swift
 @Observable @MainActor
@@ -145,26 +145,26 @@ class ModelData {
 }
 ```
 
-关键点：
+Key points:
 
-- `@Observable class ViewModel` 把"是否收藏"这个状态拆成每 landmark 一份独立可观察对象。
-- `@ObservationIgnored private var viewModels` 让 `viewModels` 字典本身不参与依赖追踪——SwiftUI 不会因为字典变化而重跑所有 cell。
-- `isFavorite(_:)` 内部访问 `viewModel(for: landmark).isFavorite`，于是 cell 的 body 只依赖自己那一份 ViewModel，点击别的 landmark 的爱心时它不会被打扰。
-
----
-
-## 核心启发
-
-- **把 formatter 和其他昂贵对象搬出 body**：为什么值得做——`NumberFormatter` 和 `MeasurementFormatter` 创建成本高，列表里几十个 cell × 每帧 = 主线程很容易超时；怎么开始——把这类对象作为属性持有，或者在 model 层缓存格式化结果，body 里只查缓存。
-- **用新 SwiftUI Instrument 跑一次基线 trace**：为什么值得做——靠肉眼或 print 调试很难看出哪个 view body 跑得久、哪些 view 在被无谓地重跑；怎么开始——在 Xcode 26 按 Command-I，选 SwiftUI 模板，先看 Long View Body Updates 里红色和橙色的条目，再看 Cause & Effect Graph 找到那些"我没改它，它怎么也更新了"的 View。
-- **拆细 @Observable 的依赖粒度**：为什么值得做——一个集合属性会让所有访问它的 View 都建立依赖，单元素变化就会触发整组 View 重跑；怎么开始——为每个元素创建独立的 `@Observable` 子对象，把不需要参与观察的容器字段标 `@ObservationIgnored`。
-- **频繁变化的值不要放进 Environment**：为什么值得做——`@Environment` 的值变化会让所有读取它的 View 都进入更新检查路径；怎么开始——把 timer、geometry proxy、滚动偏移这类高频值用局部 `@State` 或专用 `@Observable` 对象承载，按读取范围划定影响半径。
+- `@Observable class ViewModel` splits the "is favorite" state into a separate observable object per landmark.
+- `@ObservationIgnored private var viewModels` keeps the `viewModels` dictionary itself out of dependency tracking. SwiftUI will not re-run all cells just because the dictionary changed.
+- Inside `isFavorite(_:)`, the code accesses `viewModel(for: landmark).isFavorite`. So each cell body depends only on its own ViewModel. Tapping the heart on another landmark does not disturb this cell.
 
 ---
 
-## 关联 Session
+## Core Takeaways
 
-- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — 用 SwiftUI 的 AttributedString 构建富文本编辑体验
-- [Embracing Swift concurrency](/articles/wwdc2025-268) — Swift 并发核心概念，理解主线程工作如何影响 UI 帧预算
-- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — 在同一个代码库里混用 Swift 和 Java
-- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Swift 代码层面的内存与性能优化方法
+- **Move formatters and other expensive objects out of body**: Why bother — `NumberFormatter` and `MeasurementFormatter` are costly to create, and dozens of cells times every frame means the main thread easily misses its deadline. How to start — hold such objects as properties, or cache formatted results at the model layer, and let body only read the cache.
+- **Run a baseline trace with the new SwiftUI Instrument**: Why bother — eyeballing or print-debugging rarely shows which view body runs long or which views get re-run for no reason. How to start — in Xcode 26, press Command-I, choose the SwiftUI template, first look at the red and orange entries in Long View Body Updates, then open the Cause & Effect Graph to find Views that updated even though you did not change them.
+- **Split `@Observable` dependency granularity finer**: Why bother — a single collection property makes every View that reads it depend on the whole collection, so a change to one element triggers the whole group of Views to re-run. How to start — create an independent `@Observable` sub-object for each element, and mark container fields that should not participate in observation with `@ObservationIgnored`.
+- **Do not put rapidly changing values in Environment**: Why bother — a change to an `@Environment` value puts every View that reads it on the update check path. How to start — carry timers, geometry proxies, scroll offsets, and other high-frequency values in local `@State` or a dedicated `@Observable` object, and scope the blast radius to the readers that actually need them.
+
+---
+
+## Related Sessions
+
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — Building a rich text editing experience with SwiftUI AttributedString
+- [Embracing Swift concurrency](/articles/wwdc2025-268) — Core Swift concurrency concepts, understanding how main-thread work affects the UI frame budget
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — Mixing Swift and Java in the same codebase
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Memory and performance optimization techniques at the Swift code level

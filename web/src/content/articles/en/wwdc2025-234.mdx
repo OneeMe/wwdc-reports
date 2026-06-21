@@ -24,19 +24,19 @@ relatedSessions:
 
 ## Highlight
 
-> iOS 26 在 NetworkExtension 中加入 URL Filter API，可基于完整 URL 做内容过滤，并通过 Bloom filter、PIR、Privacy Pass 与 Apple 托管的 OHTTP Relay 在不暴露 URL 与设备身份的前提下完成查询。
+> iOS 26 adds a URL Filter API to NetworkExtension. It filters content by full URL, and uses Bloom filters, PIR, Privacy Pass, and an Apple-hosted OHTTP Relay to run the lookup without exposing the URL or the device identity.
 
-## 核心内容
+## Core content
 
-做家长控制 App 或学校上网管理 App 的开发者一直被一个问题困住：HTTPS 把流量加密了，传统的 NEFilterDataProvider 只能看到 host 和 port。想拦掉某个网站的某条具体路径，比如某个分享链接、某个游戏页面，做不到。要么整站封掉、误伤大量正常内容，要么放过去。如果想绕开这个限制走 URL 维度过滤，就得自建 VPN、自建中间人 CA，把所有 URL 拉到自己服务器上看一眼——这又意味着 App 完全掌握了用户的浏览历史，隐私风险极大。
+Developers who build parental control apps or school network management apps have long been stuck on one problem: HTTPS encrypts the traffic, and the old NEFilterDataProvider only sees host and port. Blocking a specific path on a site — a share link, a game page — is not possible. Either you block the whole site and take down a lot of legitimate content, or you let it through. To filter at the URL level, you had to build your own VPN, install your own man-in-the-middle CA, and pull every URL back to your server for inspection. That meant the app held the user's full browsing history, a serious privacy risk.
 
-iOS 26 给出的解法是 URL Filter。它把"基于完整 URL 的过滤决策"做成系统能力：App 不在过滤路径中，看不到任何流量数据，只负责提供两样东西——一个本地 Bloom filter、一个远端 PIR 服务器。系统先用 Bloom filter 在设备端做快速判定，没命中就直接放行；命中（可能是黑名单也可能是误判）才发起 PIR 查询。PIR 用同态加密，让服务器在密文上执行查表，自始至终拿不到 URL 明文。所有查询再经过 Apple 托管的 Oblivious HTTP Relay 转发，把设备 IP 剥掉。开发者拿到了 URL 维度的过滤能力，用户的 URL 与身份都不会泄露给任何一方，包括 Apple、开发者、PIR 服务器自己。这条路适合家长控制、校园 App、企业禁访名单等所有"要看完整 URL，但不能保留浏览历史"的场景。
+iOS 26 answers with URL Filter. It turns "filter decisions on the full URL" into a system service. The app sits outside the filtering path and never sees any traffic data. The app supplies only two things: a local Bloom filter, and a remote PIR server. The system runs the Bloom filter on the device first; a miss lets the request through. A hit (a real match or a false positive) triggers a PIR query. PIR uses homomorphic encryption, so the server runs the lookup on the ciphertext and never sees the URL in plaintext. Every query is then forwarded through an Apple-hosted Oblivious HTTP Relay, which strips the device IP. The developer gets URL-level filtering, and the user's URL and identity leak to no one — not Apple, not the developer, not the PIR server itself. This path fits parental control, campus apps, enterprise blocklists, and every other case where you need to see the full URL but must not keep the browsing history.
 
-## 详细内容
+## Details
 
-URL Filter 依赖四项技术叠加：Bloom filter 做设备端预过滤，PIR（Private Information Retrieval）让服务器在密文上查库，Privacy Pass 做匿名鉴权，OHTTP Relay 隐藏来源 IP。整个流程系统全权代办，App 与 App Extension 都不在数据通路里（[19:01](https://developer.apple.com/videos/play/wwdc2025/234/?time=1141)）。
+URL Filter stacks four techniques: Bloom filter for on-device prefiltering, PIR (Private Information Retrieval) so the server queries the database on ciphertext, Privacy Pass for anonymous authentication, and OHTTP Relay to hide the source IP. The system runs the whole flow. The app and the app extension are not on the data path ([19:01](https://developer.apple.com/videos/play/wwdc2025/234/?time=1141)).
 
-WebKit 和 URLSession 发起的请求会被系统自动检查，但自己写网络栈的浏览器或 App 不会走这条路。这种情况下要主动调用 participation API 询问系统裁决（[22:15](https://developer.apple.com/videos/play/wwdc2025/234/?time=1335)）：
+Requests from WebKit and URLSession go through the system check automatically, but a browser or app that ships its own network stack does not. In that case, call the participation API to ask the system for a verdict ([22:15](https://developer.apple.com/videos/play/wwdc2025/234/?time=1335)):
 
 ```swift
 // Use participation API to check URLs before sending requests
@@ -55,14 +55,14 @@ func checkURL(url: URL) async throws -> Bool {
 }
 ```
 
-关键点：
+Key points:
 
-- `import NetworkExtension`：所有 URL Filter 相关 API 都在这个框架下。
-- `NEURLFilter.verdict(for:)` 是 async 调用，发起后系统会做 Bloom filter 预查 + 必要时的 PIR 查询，由系统返回最终裁决。
-- 返回值是枚举，`.deny` 代表命中黑名单；`.allow` 或非 deny 时放行请求。
-- App 自己拿不到 URL 是否在数据集中——它只能拿到一个布尔级别的"过/不过"。
+- `import NetworkExtension`: every URL Filter API lives in this framework.
+- `NEURLFilter.verdict(for:)` is async. The system runs the Bloom filter prefilter and, if needed, the PIR query, then returns the final verdict.
+- The return value is an enum. `.deny` means a blocklist hit; `.allow` or any non-deny value lets the request through.
+- The app never learns whether the URL is in the dataset. It gets only a boolean-level pass-or-block.
 
-接下来是 App 如何配置自己的 URL Filter（[25:01](https://developer.apple.com/videos/play/wwdc2025/234/?time=1501)）：
+Next, here is how the app configures its own URL Filter ([25:01](https://developer.apple.com/videos/play/wwdc2025/234/?time=1501)):
 
 ```swift
 // Configure and manage URL Filter
@@ -87,17 +87,17 @@ manager.isEnabled = true
 try await manager.saveToPreferences()
 ```
 
-关键点：
+Key points:
 
-- `NEURLFilterManager.shared`：单例。所有 URL Filter 配置都通过它读写。
-- `loadFromPreferences()`：从磁盘加载已有配置；改动前先 load 再 set 是 NetworkExtension 框架的固定模式。
-- `setConfiguration` 三个 URL/Token 参数：分别指向你自己的 PIR 服务器、Privacy Pass Issuer，以及鉴权 token。Apple 不托管这些组件，开发者自己部署。
-- `controlProviderBundleIdentifier`：你的 App Extension 的 bundle id，系统据此唤醒 extension 来抓取 Bloom filter。
-- `prefilterFetchInterval = 86400`：单位秒，控制系统多久回调一次 extension 的 `fetchPrefilter`。这里设成一天一次。
-- `shouldFailClosed = false`：PIR 失败时放行（false）还是拒绝（true）。家长控制类场景可能要设 true。
-- `isEnabled = true` + `saveToPreferences()`：写盘后过滤才真正生效。
+- `NEURLFilterManager.shared`: a singleton. Read and write every URL Filter setting through it.
+- `loadFromPreferences()`: load the existing configuration from disk. Load before set is the standard pattern across NetworkExtension.
+- The three URL/Token parameters of `setConfiguration` point to your own PIR server, your Privacy Pass Issuer, and the auth token. Apple does not host these; the developer deploys them.
+- `controlProviderBundleIdentifier`: the bundle id of your app extension. The system uses it to wake the extension to fetch the Bloom filter.
+- `prefilterFetchInterval = 86400`: in seconds. It controls how often the system calls back into the extension's `fetchPrefilter`. Here it runs once a day.
+- `shouldFailClosed = false`: when PIR fails, allow the request (false) or deny it (true). Parental control cases often want true.
+- `isEnabled = true` plus `saveToPreferences()`: the filter only takes effect once the configuration is on disk.
 
-App Extension 这一侧实现 `NEURLFilterControlProvider` 协议，负责把 Bloom filter 数据交给系统（[26:41](https://developer.apple.com/videos/play/wwdc2025/234/?time=1601)）：
+On the app extension side, implement the `NEURLFilterControlProvider` protocol. It hands the Bloom filter data to the system ([26:41](https://developer.apple.com/videos/play/wwdc2025/234/?time=1601)):
 
 ```swift
 // Implement NEURLFilterControlProvider protocol
@@ -119,28 +119,28 @@ class URLFilterControlProvider: NEURLFilterControlProvider {
 }
 ```
 
-关键点：
+Key points:
 
-- 继承 `NEURLFilterControlProvider`，由 Xcode 的 URL Filter app extension 模板生成骨架。
-- `fetchPrefilter()` 由系统按 `prefilterFetchInterval` 调度调用。Extension 可从 app bundle 或自家服务器拉数据。
-- `NEURLFilterPrefilter.PrefilterData.temporaryFilepath(fileURL)`：通过临时文件路径而非内存 buffer 把数据交给系统，适合大数据集。
-- 构造 `NEURLFilterPrefilter` 时必须传 `bitCount`、`hashCount`、`murmurSeed`——这三个参数决定 Bloom filter 的尺寸、哈希函数数量、murmur 哈希的 seed，必须与你在服务端构建 Bloom filter 时使用的参数完全一致，否则匹配失效。
+- Subclass `NEURLFilterControlProvider`. The Xcode URL Filter app extension template generates the skeleton.
+- The system calls `fetchPrefilter()` on the schedule set by `prefilterFetchInterval`. The extension can pull data from the app bundle or from your own server.
+- `NEURLFilterPrefilter.PrefilterData.temporaryFilepath(fileURL)`: hand the data to the system through a temporary file path rather than an in-memory buffer. This fits large datasets.
+- When constructing `NEURLFilterPrefilter`, you must pass `bitCount`, `hashCount`, and `murmurSeed`. These three parameters set the Bloom filter size, the number of hash functions, and the seed for the murmur hash. They must match the values you used to build the Bloom filter on the server, or the matching breaks.
 
-部署上还有两个关键点：URL Filter 通过 OHTTP Relay 出网，需要事先向 Apple 申请 Relay 能力，开发版构建可豁免，但 App Store / TestFlight / Ad-hoc / 企业签名分发都必须走完审批流程（[19:38](https://developer.apple.com/videos/play/wwdc2025/234/?time=1178)）。PIR 服务器侧的 use case 名字必须以 App 的 bundle id 开头、跟上 `url.filtering` 字符串，记录格式为 URL 字符串作 key、整数 1 作 value（[23:22](https://developer.apple.com/videos/play/wwdc2025/234/?time=1402)）。
+Two more points on deployment. URL Filter exits through an OHTTP Relay, so you must apply for Relay capability with Apple in advance. Development builds get a waiver, but App Store, TestFlight, Ad-hoc, and enterprise distribution all have to clear the approval process ([19:38](https://developer.apple.com/videos/play/wwdc2025/234/?time=1178)). On the PIR server, the use case name must start with the app's bundle id followed by the string `url.filtering`. The record format uses the URL string as the key and the integer 1 as the value ([23:22](https://developer.apple.com/videos/play/wwdc2025/234/?time=1402)).
 
-## 核心启发
+## Takeaways
 
-- **做家长控制 / 校园上网管理 App，迁移到 URL Filter**：为什么值得做——传统 NEFilterDataProvider 看不到 HTTPS 的完整 URL，只能整站封禁，体验粗糙；URL Filter 能精确到资源级别，且面向消费级设备开放，不再仅限 supervised device。怎么开始——先用 Apple 提供的 [PIRService 示例代码](https://swiftpackageindex.com/apple/pir-service-example/main/documentation/pirservice) 跑通服务端，App 这边申请 `url-filter-provider` entitlement，按上面的三段代码骨架搭出 Manager 配置、Extension 抓 Bloom filter、participation API 兜底自定义网络栈。
+- **Move parental control or campus network management apps to URL Filter**. Why it pays off: the old NEFilterDataProvider cannot see the full HTTPS URL and can only block whole sites, a blunt experience. URL Filter targets the resource level and is open to consumer devices, no longer limited to supervised devices. How to start: get the server side running with Apple's [PIRService sample code](https://swiftpackageindex.com/apple/pir-service-example/main/documentation/pirservice). On the app side, request the `url-filter-provider` entitlement, and use the three code skeletons above to build the Manager configuration, the Extension that fetches the Bloom filter, and the participation API for custom network stacks.
 
-- **企业内网访问改用 Network Relay 替代传统 VPN**：为什么值得做——MASQUE 协议针对 TCP/UDP 应用流量优化，平台原生支持，不需要写 NEPacketTunnelProvider，企业邮件和协作类云应用最适合走这条路（[03:53](https://developer.apple.com/videos/play/wwdc2025/234/?time=233)）；全隧道 IP VPN 反而是少数高合规场景才需要。怎么开始——用 NERelayManager API 配置 relay 与认证，或通过 MDM 配置文件下发；用户侧无需安装额外 extension。
+- **Replace traditional VPN with Network Relay for enterprise intranet access**. Why it pays off: the MASQUE protocol is tuned for TCP/UDP application traffic, the platform supports it natively, and you do not write an NEPacketTunnelProvider. Enterprise mail and cloud collaboration apps are the best fit for this path ([03:53](https://developer.apple.com/videos/play/wwdc2025/234/?time=233)). A full-tunnel IP VPN is only needed for a handful of high-compliance cases. How to start: configure the relay and the authentication with the NERelayManager API, or push it down through an MDM profile. The user does not have to install an extra extension.
 
-- **检查现有 VPN App 是否还在用 Packet Filter 或直接改路由表**：为什么值得做——Apple 在 Session 中明确说这不被支持，会与系统及其他 App 的过滤、路由规则冲突，并破坏 AirDrop、Mac Virtual Display、Sidecar 等功能（[07:34](https://developer.apple.com/videos/play/wwdc2025/234/?time=454)）。怎么开始——读 TN3165 与 TN3120 两份 Technote，把自定义隧道逻辑迁到 NEPacketTunnelProvider，并按场景启用 `enforceRoutes`（split tunnel）或 `includeAllNetworks`（full tunnel），再配合 `excludeLocalNetworks` 让 AirDrop 这类本地服务绕开隧道。
+- **Audit your existing VPN app for Packet Filter use or direct route table edits**. Why it pays off: the session states clearly that this is unsupported. It conflicts with the system's own filter and routing rules and with those of other apps, and it breaks AirDrop, Mac Virtual Display, Sidecar, and similar features ([07:34](https://developer.apple.com/videos/play/wwdc2025/234/?time=454)). How to start: read TN3165 and TN3120, move the custom tunnel logic to NEPacketTunnelProvider, and set `enforceRoutes` (split tunnel) or `includeAllNetworks` (full tunnel) per case. Pair it with `excludeLocalNetworks` so local services like AirDrop bypass the tunnel.
 
-- **不要用 NEPacketTunnelProvider 做内容过滤**：为什么值得做——它工作在 IP 层，拿不到流级或应用级元数据，做不出基于 host/URL 的判断（[08:26](https://developer.apple.com/videos/play/wwdc2025/234/?time=506)）。怎么开始——按目标重新选 API：拦流量用 NEFilterDataProvider/NEFilterPacketProvider，拦 URL 用新的 NEURLFilter，DNS 安全则走 DNS Configuration & Proxy API。
+- **Do not build content filtering on NEPacketTunnelProvider**. Why it pays off: it runs at the IP layer and has no flow-level or application-level metadata, so it cannot make host or URL decisions ([08:26](https://developer.apple.com/videos/play/wwdc2025/234/?time=506)). How to start: pick the API by the goal. For traffic, use NEFilterDataProvider or NEFilterPacketProvider. For URLs, use the new NEURLFilter. For DNS security, use the DNS Configuration & Proxy API.
 
-## 关联 Session
+## Related sessions
 
-- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — 配合 URL Filter 给未成年人构建分级体验
-- [Finish tasks in the background](/articles/wwdc2025-227) — 理解 Extension 后台调度，用于 Bloom filter 定期拉取
-- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — Network Extension 同样依赖现代密码学保护链路
-- [Optimize home electricity usage with EnergyKit](/articles/wwdc2025-257) — 另一个由系统代为执行、App 不接触敏感数据的隐私模式范例
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — pair with URL Filter to build tiered experiences for minors
+- [Finish tasks in the background](/articles/wwdc2025-227) — understand extension background scheduling, used to fetch the Bloom filter on a schedule
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — Network Extension also relies on modern cryptography to protect the link
+- [Optimize home electricity usage with EnergyKit](/articles/wwdc2025-257) — another privacy pattern where the system runs the work and the app never touches the sensitive data

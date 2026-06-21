@@ -24,21 +24,21 @@ relatedSessions:
 
 ## Highlight
 
-> Nate Cook 用一个 QOI 图片解析器演示了五轮优化，配合 Swift 6.2 的 InlineArray 和 Span，让解析速度比初版快了 700 倍，且全程不使用 unsafe 代码。
+> Nate Cook 氏は、QOI 画像パーサーを題材に 5 段階の最適化を実演しました。Swift 6.2 の InlineArray と Span を活用し、unsafe コードを一切使わずに、初版から 700 倍高速なパースを実現しました。
 
 ---
 
 ## 核心内容
 
-Nate Cook 在 WWDC25 现场打开了自己写的 QOI 图片查看器。点开一个几 KB 的小图标，秒开。换成一张稍大的鸟类照片，等了好几秒才出来。这就是性能问题登场的方式：在测试数据上一切正常，遇到真实数据就卡。
+Nate Cook 氏は、WWDC25 のステージで自作の QOI 画像ビューアを開きました。数 KB の小さなアイコンは一瞬で表示されますが、少し大きな鳥の写真に切り替えると、数秒かかってしまいます。これがパフォーマンス問題の登場です。テストデータでは問題なく動作しても、実際のデータに出会うと動作が重くなるのです。
 
-他没有掏出宏大的架构，而是把 Instruments 跑起来，从一个工具找问题，再回到代码改一行。整场 session 围绕同一个 QOI 解析器做了五轮迭代——修算法、删分配、消独占性检查、把堆内存搬到栈上、用 Span 干掉引用计数。每一步都先在 Instruments 里看到症状（platform_memmove 占满火焰图、近百万次 transient 分配、`swift_beginAccess` 频繁出现、`swift_retain`/`swift_release` 各占 7%），再用 Swift 6.2 引入的 InlineArray、RawSpan、OutputSpan 把这些症状解掉。最终，原版的二次复杂度变成线性，再叠加内存管理优化，整体快了 700 倍。
+彼は大規模なアーキテクチャの変更を行うのではなく、Instruments を起動して、ツールで問題を特定し、コードを 1 行ずつ修正していきました。本セッションは、同じ QOI パーサーを対象に 5 回のイテレーションを行いました。アルゴリズムの修正、メモリ割り当ての削除、排他性チェックの排除、ヒープメモリからスタックへの移行、Span を使った参照カウントの削除です。各ステップで、Instruments で症状を確認してから（platform_memmove がフレームグラフを埋め尽くす、近百万回の一時的な割り当て、`swift_beginAccess` の頻出、`swift_retain`/`swift_release` がそれぞれ 7% を占める）、Swift 6.2 で導入された InlineArray、RawSpan、OutputSpan を使って症状を解消しました。最終的に、初版の二次オーダー複雑度は線形に変わり、さらにメモリ管理の最適化を重ねることで、全体として 700 倍高速になりました。
 
 ---
 
 ## 详细内容
 
-**第一轮：算法错误（[07:01](https://developer.apple.com/videos/play/wwdc2025/312/?time=421)）。** 火焰图上 `platform_memmove` 占了绝大多数采样。原因在 `readByte()` 用 `Data.dropFirst()` 然后再用 `Data.init` 包一次，每读一个字节就把剩余 data 整体复制一份。改成 `popFirst()`：
+**第 1 回：アルゴリズムの誤り（[07:01](https://developer.apple.com/videos/play/wwdc2025/312/?time=421)）。** フレームグラフでは `platform_memmove` がほとんどのサンプリングを占めていました。原因は `readByte()` が `Data.dropFirst()` を使った後、`Data.init` で再びラップしていたことです。1 バイト読むたびに、残りの data 全体をコピーしていました。これを `popFirst()` に変更します。
 
 ```swift
 import Foundation
@@ -52,12 +52,12 @@ extension Data {
 }
 ```
 
-**关键点：**
-- `popFirst()` 是 `Collection` 的方法，从前端弹出一个元素并把起始位置后移一字节，O(1)。
-- `Data` 本身设计成可以从两端缩，因此这里不会触发整体复制。
-- 这一行的修改让解析时间从二次复杂度降回线性。
+**ポイント：**
+- `popFirst()` は `Collection` のメソッドで、先頭から要素を 1 つ取り出し、開始位置を 1 バイト進めます。O(1) です。
+- `Data` は両端から縮小できるように設計されているため、ここでは全体のコピーが発生しません。
+- この 1 行の変更により、パース時間は二次オーダー複雑度から線形に戻りました。
 
-**第二轮：消除中间分配（[12:53](https://developer.apple.com/videos/play/wwdc2025/312/?time=773)）。** Allocations 工具显示一张图触发了近百万次短命分配。源头是这条链式调用：`readEncodedPixels(...).flatMap { decodePixels(...) }.prefix(...).flatMap { $0.data(channels:) }`。每个像素都要 new 一个 3 或 4 元素的小数组、再 flatten、再拷进 `Data`。改写思路是先按最终大小一次性分配 `Data`，再逐像素写入：
+**第 2 回：中間割り当ての排除（[12:53](https://developer.apple.com/videos/play/wwdc2025/312/?time=773)）。** Allocations ツールでは、1 枚の画像で近百万回の短命な割り当てが発生していました。原因はこのチェーン呼び出しです：`readEncodedPixels(...).flatMap { decodePixels(...) }.prefix(...).flatMap { $0.data(channels:) }`。各ピクセルごとに 3 または 4 要素の小さな配列を new し、flatten し、再び `Data` にコピーしていました。修正方針は、最終サイズを先に計算して `Data` を 1 回だけ割り当て、ピクセルごとに書き込んでいく方式です。
 
 ```swift
 extension QOIParser {
@@ -89,15 +89,15 @@ extension QOIParser {
 }
 ```
 
-**关键点：**
-- `totalBytes = pixelCount * channels.rawValue`：根据 header 直接算出最终大小，不靠运行时增长。
-- `Data(repeating: 0, count: totalBytes)`：一次性分配，后续不再 realloc。
-- `offset` 变量手动跟踪写入位置，每次 `write(to:at:channels:)` 把数据原地写进 buffer。
-- 改写后总分配数从近百万降到个位数，执行时间再砍一半多。
+**ポイント：**
+- `totalBytes = pixelCount * channels.rawValue`：header から直接最終サイズを計算し、実行時にサイズを増やすことはありません。
+- `Data(repeating: 0, count: totalBytes)`：1 回だけ割り当てを行い、以降は realloc しません。
+- `offset` 変数で書き込み位置を手動で追跡し、毎回 `write(to:at:channels:)` でバッファに直接書き込みます。
+- 修正後、総割り当て数は近百万回から個位数に減り、実行時間はさらに半分以下になりました。
 
-**第三轮：消除 exclusivity 检查（[16:53 起](https://developer.apple.com/videos/play/wwdc2025/312/?time=1013)）。** 由于改进太明显，Nate 把测试循环 50 次以增加采样。filter `swift_beginAccess` 后看到 `previousPixel` 和 `pixelCache` 两个属性触发了运行时独占性检查。原因是这两个属性放在一个 class `State` 里，class 的属性需要运行时 enforce exclusivity。把它们直接挪到 parser struct 上后，同时把方法标 `mutating`，`swift_beginAccess` 从火焰图里完全消失。
+**第 3 回：exclusivity チェックの排除（[16:53 から](https://developer.apple.com/videos/play/wwdc2025/312/?time=1013)）。** 改善があまりに顕著だったため、Nate 氏はテストループを 50 回に増やしてサンプリングを増やしました。`swift_beginAccess` でフィルタリングすると、`previousPixel` と `pixelCache` の 2 つのプロパティが実行時の排他性チェックを引き起こしていることが分かりました。原因は、これらのプロパティが class `State` の中に置かれていたことです。class のプロパティは実行時に排他性を強制する必要があります。これらをパーサーの struct 上に直接移動し、メソッドを `mutating` にマークすると、`swift_beginAccess` はフレームグラフから完全に消えました。
 
-**第四轮：InlineArray 替换固定大小数组（[19:47](https://developer.apple.com/videos/play/wwdc2025/312/?time=1187)）。** `pixelCache` 是一个 64 元素、永远不变长的数组。Swift 6.2 的 `InlineArray` 用 value generics 把大小写进类型：
+**第 4 回：InlineArray による固定サイズ配列の置き換え（[19:47](https://developer.apple.com/videos/play/wwdc2025/312/?time=1187)）。** `pixelCache` は 64 要素で、長さが変わらない配列です。Swift 6.2 の `InlineArray` は、value generics を使ってサイズを型に組み込みます。
 
 ```
 var array: InlineArray<3, Int> = [1, 2, 3]
@@ -113,13 +113,13 @@ let bigger: InlineArray<6, Int> = array
 // error: Cannot assign value of type 'InlineArray<3, Int>' to type 'InlineArray<6, Int>'
 ```
 
-**关键点：**
-- 类型签名 `InlineArray<3, Int>`：`3` 是 value generic 参数，编译期就知道大小。
-- 不支持 `append`/`remove`，赋值给不同 size 的 InlineArray 会编译报错。
-- 元素直接内联存储（栈上或 struct 内部），没有独立堆分配，没有引用计数，没有 copy-on-write，每次赋值真复制。
-- 适合「定长、原地修改、不共享」的场景，不适合需要互相共享/copy-on-write 的场景。
+**ポイント：**
+- 型シグネチャ `InlineArray<3, Int>`：`3` は value generic パラメータで、コンパイル時にサイズが判明します。
+- `append`/`remove` はサポートされず、異なるサイズの InlineArray への代入はコンパイルエラーになります。
+- 要素は直接インラインで格納されます（スタック上または struct 内部）。独立したヒープ割り当て、参照カウント、copy-on-write はありません。毎回の代入は実際のコピーです。
+- 「固定長、原地変更、共有しない」シーンに適しており、相互共有や copy-on-write が必要なシーンには適しません。
 
-**第五轮：RawSpan + OutputSpan 干掉引用计数（[26:27](https://developer.apple.com/videos/play/wwdc2025/312/?time=1587)）。** profile 里 `swift_retain` 7%、`swift_release` 7%、唯一性检查 3%，全都来自 `Data` 在 tight loop 里的引用计数。Swift 6.2 引入 Span 家族（`Span`、`RawSpan`、`MutableSpan`、`OutputSpan`、`UTF8Span`），核心特性是 non-escapable：编译器把 span 的生命周期绑定到底层 collection，无法逃出作用域，因此运行时不需要 retain/release。
+**第 5 回：RawSpan + OutputSpan による参照カウントの排除（[26:27](https://developer.apple.com/videos/play/wwdc2025/312/?time=1587)）。** プロファイルでは `swift_retain` が 7%、`swift_release` が 7%、唯一性チェックが 3% を占めていました。これらはすべて、タイトなループ内での `Data` の参照カウントに由来していました。Swift 6.2 は Span ファミリー（`Span`、`RawSpan`、`MutableSpan`、`OutputSpan`、`UTF8Span`）を導入しました。核心の特性は non-escapable です。コンパイラは span のライフタイムを元の collection にバインドし、スコープから脱出できないため、実行時に retain/release が不要になります。
 
 ```swift
 @available(macOS 16.0, *)
@@ -134,13 +134,13 @@ extension RawSpan {
 }
 ```
 
-**关键点：**
-- `RawSpan` 是 non-escapable，类型本身就拒绝被返回到外层作用域。
-- `unsafeLoadUnaligned(as:)` 名字带 unsafe 是因为加载某些类型可能不安全；加载 `UInt8` 这样的内置整数永远安全。
-- `_extracting(droppingFirst: 1)` 返回一个新的 `RawSpan`，不复制数据，只移动起始位置。
-- 调用方用 `data.bytes` 拿到 `RawSpan` 后传进解析方法，全程零 retain/release。
+**ポイント：**
+- `RawSpan` は non-escapable で、型自体が外側のスコープへの返却を拒否します。
+- `unsafeLoadUnaligned(as:)` の名前に unsafe が含まれるのは、特定の型を読み込む場合に安全でない可能性があるためです。`UInt8` のような組み込み整数を読み込む場合は常に安全です。
+- `_extracting(droppingFirst: 1)` は新しい `RawSpan` を返します。データをコピーせず、開始位置だけを移動します。
+- 呼び出し側は `data.bytes` で `RawSpan` を取得し、パースメソッドに渡します。retain/release はゼロです。
 
-最终版用 `Data(rawCapacity:)` 配合 `OutputSpan` 完成写入：
+最終版では `Data(rawCapacity:)` と `OutputSpan` を組み合わせて書き込みを行います。
 
 ```swift
 /// Parses an image from the given QOI data.
@@ -172,43 +172,43 @@ mutating func parseQOI(from input: inout RawSpan) -> QOI? {
 }
 ```
 
-**关键点：**
-- `Data(rawCapacity:)` 是 Swift 6.2 新初始化器，提供一个 `OutputRawSpan` 闭包用于逐步填入未初始化内存。
-- `outputSpan.count` 取代了上一版手写的 `offset` 变量，由 `OutputSpan` 自身记录写入进度。
-- `previousPixel.write(to: &outputSpan, channels:)` 直接 `append` 到 output span，无需经过 `Data` 中间层。
-- 配合 `[InlineArray](https://github.com/apple/swift-binary-parsing)` 的 pixel cache，整段解析里 `swift_retain`/`swift_release` 完全消失。
+**ポイント：**
+- `Data(rawCapacity:)` は Swift 6.2 の新しいイニシャライザで、未初期化メモリを段階的に埋めるための `OutputRawSpan` クロージャを提供します。
+- `outputSpan.count` は、前の版で手動で管理していた `offset` 変数に代わり、`OutputSpan` 自身が書き込み進捗を記録します。
+- `previousPixel.write(to: &outputSpan, channels:)` は output span に直接 `append` し、`Data` の中間層を経由しません。
+- `[InlineArray](https://github.com/apple/swift-binary-parsing)` の pixel cache と組み合わせることで、パース全体で `swift_retain`/`swift_release` が完全に消えます。
 
-[28:51 处](https://developer.apple.com/videos/play/wwdc2025/312/?time=1731)给出最终对比：内存管理优化让解析快了 6 倍；叠加前面的算法修复，比原版快 700 倍，且没有任何 unsafe 代码。Nate 还顺手开源了 [Swift Binary Parsing](https://github.com/apple/swift-binary-parsing)，里面的 `ParserSpan` 就是基于这套机制。
+[28:51 の箇所](https://developer.apple.com/videos/play/wwdc2025/312/?time=1731)で最終的な比較が示されます。メモリ管理の最適化だけでパースは 6 倍高速になりました。さらに前の段階のアルゴリズム修正を重ねると、初版から 700 倍高速になり、unsafe コードは一切ありません。Nate 氏は [Swift Binary Parsing](https://github.com/apple/swift-binary-parsing) もオープンソース化しました。中の `ParserSpan` は、この仕組みをベースにしています。
 
 ---
 
 ## 核心启发
 
-- **做什么：把性能瓶颈搜索路径标准化为「Time Profiler 找热点 → Allocations 看分配源 → Reveal in Xcode 跳到代码」**。
-  - 为什么值得做：session 里这套流程跑了五次，每次都在 30 秒内定位到具体一行代码。把它做成肌肉记忆，后续遇到真实数据卡顿不会再靠猜。
-  - 怎么开始：右键 test 选 Profile，在 Instruments 里加 Time Profiler + Allocations 两个工具，开 Invert Call Tree，先看自己代码里第一个出现的符号。
+- **やること：パフォーマンスボトルネックの探索パスを「Time Profiler でホットスポットを探す → Allocations で割り当て元を確認 → Reveal in Xcode でコードにジャンプ」に標準化する。**
+  - なぜ価値があるか：セッションではこのフローが 5 回実行され、毎回 30 秒以内に具体的な 1 行のコードを特定できました。これを身体に覚え込ませておけば、実際のデータで動作が重くなった際に推測に頼る必要がなくなります。
+  - どう始めるか：テストを右クリックして Profile を選択し、Instruments で Time Profiler と Allocations の 2 つのツールを追加します。Invert Call Tree をオンにし、自分のコードの中で最初に現れるシンボルを確認します。
 
-- **做什么：审计自己代码里所有定长容器，能换 InlineArray 的换掉**。
-  - 为什么值得做：固定大小的 lookup table、缓存、ring buffer 用普通 `Array` 会带来引用计数、唯一性检查、堆分配三重开销。换成 `InlineArray<N, T>` 编译期就锁死，运行时全没。
-  - 怎么开始：grep 自己工程里 `Array(repeating:count:)`、`[T](repeating:count:)` 这类初始化，逐个判断是否定长、是否需要共享，符合条件的换 `InlineArray`。
+- **やること：自分のコード内の固定長コンテナを監査し、InlineArray に置き換えられるものは置き換える。**
+  - なぜ価値があるか：固定サイズの lookup table、キャッシュ、ring buffer に普通の `Array` を使うと、参照カウント、唯一性チェック、ヒープ割り当ての 3 重のオーバーヘッドが生じます。`InlineArray<N, T>` に変更すると、コンパイル時に固定され、実行時のオーバーヘッドはゼロになります。
+  - どう始めるか：自分のプロジェクトで `Array(repeating:count:)`、`[T](repeating:count:)` といったイニシャライザを grep し、固定長かつ共有が不要かを 1 つずつ判断し、条件に合うものを `InlineArray` に置き換えます。
 
-- **做什么：解析二进制格式时用 `RawSpan`/`OutputSpan` 替换 `Data` 作为中间层**。
-  - 为什么值得做：`Data` 在 tight loop 里的 retain/release 占了本场 14% CPU。Span 家族用 non-escapable 把生命周期绑定到底层 collection，无 retain/release，编译器还会替你拒绝危险的返回。
-  - 怎么开始：parser 入口仍然收 `Data`，进函数后立刻 `data.bytes` 取 `RawSpan` 传到底层；写出用 `Data(rawCapacity:)` 给的 `OutputSpan`。
+- **やること：バイナリフォーマットをパースする際、中間層として `Data` の代わりに `RawSpan`/`OutputSpan` を使う。**
+  - なぜ価値があるか：タイトなループ内での `Data` の retain/release が、本セッションで CPU の 14% を占めていました。Span ファミリーは non-escapable でライフタイムを元の collection にバインドするため、retain/release が不要になり、コンパイラが危険な返却を拒否してくれます。
+  - どう始めるか：パーサーのエントリポイントでは引き続き `Data` を受け取りますが、関数内ですぐに `data.bytes` で `RawSpan` を取得し、下位レイヤーに渡します。書き出しは `Data(rawCapacity:)` が提供する `OutputSpan` を使います。
 
-- **做什么：把跨方法共享的「状态变量」从 class 移到包含它们的 struct**。
-  - 为什么值得做：class 属性的访问需要运行时 exclusivity 检查（`swift_beginAccess`/`swift_endAccess`），在循环里成本不低；struct 的属性访问大多在编译期就能 enforce。
-  - 怎么开始：找出 parser/encoder 之类对象里只为「分组属性」存在的内嵌 class，把属性提到外层 struct，并把读写它们的方法标 `mutating`。
+- **やること：メソッド間で共有する「状態変数」を class からそれを含む struct に移動する。**
+  - なぜ価値があるか：class のプロパティアクセスには実行時の exclusivity チェック（`swift_beginAccess`/`swift_endAccess`）が必要で、ループ内ではそれなりのコストがかかります。struct のプロパティアクセスは、ほとんどがコンパイル時に強制できます。
+  - どう始めるか：parser や encoder などのオブジェクトの中で、プロパティをグループ化するために存在する内包 class を見つけ、プロパティを外側の struct に移動し、それらを読み書きするメソッドを `mutating` にマークします。
 
-- **做什么：性能 profile 时把目标代码循环 50 次以上**。
-  - 为什么值得做：优化到一定程度后单次执行太快，Instruments 采样不足，火焰图会失真。Nate 在第三轮就遇到这个问题，加了 50 次循环后才看清 `swift_beginAccess` 的来源。
-  - 怎么开始：在 XCTest 里写一个 perf 专用 case，外层包 `for _ in 0..<50 { ... }`，profile 这个 case 而非生产 entry。
+- **やること：パフォーマンスプロファイル時に対象コードを 50 回以上ループする。**
+  - なぜ価値があるか：最適化が進むと 1 回の実行が短くなりすぎて、Instruments のサンプリングが不足し、フレームグラフが歪みます。Nate 氏も第 3 回でこの問題に遭遇し、50 回のループを追加して初めて `swift_beginAccess` の発生源が見えました。
+  - どう始めるか：XCTest 内にパフォーマンス専用のケースを書き、外側を `for _ in 0..<50 { ... }` で包みます。プロファイル対象はこのケースで、本番のエントリポイントではありません。
 
 ---
 
 ## 关联 Session
 
-- [Embracing Swift concurrency](/articles/wwdc2025-268) — Swift 并发模型与本场内存优化思路同源，关注 task 生命周期与隔离。
-- [Optimize SwiftUI performance with Instruments](/articles/wwdc2025-306) — 同样基于 Instruments，但专攻 SwiftUI 视图更新与 diff 性能。
-- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — Swift 6.2 跨语言互操作，里面也用到了 value generics 与 non-escapable。
-- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — `AttributedString` 内部对 storage 的处理思路，可印证 Span 的应用场景。
+- [Embracing Swift concurrency](/articles/wwdc2025-268) — Swift 並行モデルと本セッションのメモリ最適化の考え方は同根です。task のライフタイムと隔離に注目します。
+- [Optimize SwiftUI performance with Instruments](/articles/wwdc2025-306) — 同じく Instruments をベースにしていますが、SwiftUI のビュー更新と diff パフォーマンスを専門に扱います。
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — Swift 6.2 のクロス言語相互運用です。value generics と non-escapable も使用されています。
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — `AttributedString` 内部の storage 処理の考え方は、Span の適用シーンを裏付けるものです。

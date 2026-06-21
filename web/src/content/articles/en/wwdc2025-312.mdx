@@ -24,21 +24,21 @@ relatedSessions:
 
 ## Highlight
 
-> Nate Cook 用一个 QOI 图片解析器演示了五轮优化，配合 Swift 6.2 的 InlineArray 和 Span，让解析速度比初版快了 700 倍，且全程不使用 unsafe 代码。
+> Nate Cook walked through five rounds of optimization on a QOI image parser. With Swift 6.2's InlineArray and Span, the final version ran 700 times faster than the first, and not a single line of unsafe code was used.
 
 ---
 
-## 核心内容
+## Core Content
 
-Nate Cook 在 WWDC25 现场打开了自己写的 QOI 图片查看器。点开一个几 KB 的小图标，秒开。换成一张稍大的鸟类照片，等了好几秒才出来。这就是性能问题登场的方式：在测试数据上一切正常，遇到真实数据就卡。
+At WWDC25, Nate Cook opened a QOI image viewer he had built himself. A small icon of a few KB opened instantly. Switching to a slightly larger bird photo, it took several seconds to appear. That is how a performance problem enters the stage: everything works fine on test data, then chokes on real data.
 
-他没有掏出宏大的架构，而是把 Instruments 跑起来，从一个工具找问题，再回到代码改一行。整场 session 围绕同一个 QOI 解析器做了五轮迭代——修算法、删分配、消独占性检查、把堆内存搬到栈上、用 Span 干掉引用计数。每一步都先在 Instruments 里看到症状（platform_memmove 占满火焰图、近百万次 transient 分配、`swift_beginAccess` 频繁出现、`swift_retain`/`swift_release` 各占 7%），再用 Swift 6.2 引入的 InlineArray、RawSpan、OutputSpan 把这些症状解掉。最终，原版的二次复杂度变成线性，再叠加内存管理优化，整体快了 700 倍。
+He did not pull out grand architecture. He fired up Instruments, found the problem with one tool, then went back to the code and changed one line. The entire session revolved around five iterations of the same QOI parser -- fixing the algorithm, removing allocations, eliminating exclusivity checks, moving heap memory to the stack, and killing reference counts with Span. At each step, he first saw the symptom in Instruments (`platform_memmove` dominating the flame graph, nearly a million transient allocations, `swift_beginAccess` showing up frequently, `swift_retain`/`swift_release` each taking 7%), then used Swift 6.2's InlineArray, RawSpan, and OutputSpan to cure it. In the end, the original quadratic complexity became linear, and combined with the memory management optimizations, the whole thing ran 700 times faster.
 
 ---
 
-## 详细内容
+## Detailed Content
 
-**第一轮：算法错误（[07:01](https://developer.apple.com/videos/play/wwdc2025/312/?time=421)）。** 火焰图上 `platform_memmove` 占了绝大多数采样。原因在 `readByte()` 用 `Data.dropFirst()` 然后再用 `Data.init` 包一次，每读一个字节就把剩余 data 整体复制一份。改成 `popFirst()`：
+**Round 1: Algorithm error ([07:01](https://developer.apple.com/videos/play/wwdc2025/312/?time=421)).** The flame graph showed `platform_memmove` taking most samples. The culprit was `readByte()` using `Data.dropFirst()` and then wrapping the remaining data in `Data.init`, copying the entire remaining data on every single byte read. Changed to `popFirst()`:
 
 ```swift
 import Foundation
@@ -52,12 +52,12 @@ extension Data {
 }
 ```
 
-**关键点：**
-- `popFirst()` 是 `Collection` 的方法，从前端弹出一个元素并把起始位置后移一字节，O(1)。
-- `Data` 本身设计成可以从两端缩，因此这里不会触发整体复制。
-- 这一行的修改让解析时间从二次复杂度降回线性。
+**Key points:**
+- `popFirst()` is a `Collection` method. It pops one element from the front and shifts the start position by one byte, O(1).
+- `Data` is designed to shrink from both ends, so this does not trigger a full copy.
+- This one-line change brought parsing time from quadratic complexity back to linear.
 
-**第二轮：消除中间分配（[12:53](https://developer.apple.com/videos/play/wwdc2025/312/?time=773)）。** Allocations 工具显示一张图触发了近百万次短命分配。源头是这条链式调用：`readEncodedPixels(...).flatMap { decodePixels(...) }.prefix(...).flatMap { $0.data(channels:) }`。每个像素都要 new 一个 3 或 4 元素的小数组、再 flatten、再拷进 `Data`。改写思路是先按最终大小一次性分配 `Data`，再逐像素写入：
+**Round 2: Eliminate intermediate allocations ([12:53](https://developer.apple.com/videos/play/wwdc2025/312/?time=773)).** The Allocations tool showed that one image triggered nearly a million short-lived allocations. The source was this chain: `readEncodedPixels(...).flatMap { decodePixels(...) }.prefix(...).flatMap { $0.data(channels:) }`. Every pixel created a new small array of 3 or 4 elements, then flattened it, then copied it into `Data`. The rewrite pre-allocated a `Data` of the final size, then wrote pixels one by one:
 
 ```swift
 extension QOIParser {
@@ -89,15 +89,15 @@ extension QOIParser {
 }
 ```
 
-**关键点：**
-- `totalBytes = pixelCount * channels.rawValue`：根据 header 直接算出最终大小，不靠运行时增长。
-- `Data(repeating: 0, count: totalBytes)`：一次性分配，后续不再 realloc。
-- `offset` 变量手动跟踪写入位置，每次 `write(to:at:channels:)` 把数据原地写进 buffer。
-- 改写后总分配数从近百万降到个位数，执行时间再砍一半多。
+**Key points:**
+- `totalBytes = pixelCount * channels.rawValue`: compute the final size directly from the header, no runtime growth.
+- `Data(repeating: 0, count: totalBytes)`: allocate once, no realloc afterward.
+- The `offset` variable tracks the write position manually; each `write(to:at:channels:)` writes data in-place into the buffer.
+- After the rewrite, total allocations dropped from nearly a million to single digits, and execution time was cut by more than half.
 
-**第三轮：消除 exclusivity 检查（[16:53 起](https://developer.apple.com/videos/play/wwdc2025/312/?time=1013)）。** 由于改进太明显，Nate 把测试循环 50 次以增加采样。filter `swift_beginAccess` 后看到 `previousPixel` 和 `pixelCache` 两个属性触发了运行时独占性检查。原因是这两个属性放在一个 class `State` 里，class 的属性需要运行时 enforce exclusivity。把它们直接挪到 parser struct 上后，同时把方法标 `mutating`，`swift_beginAccess` 从火焰图里完全消失。
+**Round 3: Eliminate exclusivity checks ([starting at 16:53](https://developer.apple.com/videos/play/wwdc2025/312/?time=1013)).** Because the improvement was so large, Nate wrapped the test loop 50 times to get more samples. Filtering for `swift_beginAccess`, he saw that `previousPixel` and `pixelCache` triggered runtime exclusivity checks. The reason was that these two properties lived inside a class `State`; class properties need runtime exclusivity enforcement. Moving them directly onto the parser struct, and marking the methods `mutating`, made `swift_beginAccess` vanish completely from the flame graph.
 
-**第四轮：InlineArray 替换固定大小数组（[19:47](https://developer.apple.com/videos/play/wwdc2025/312/?time=1187)）。** `pixelCache` 是一个 64 元素、永远不变长的数组。Swift 6.2 的 `InlineArray` 用 value generics 把大小写进类型：
+**Round 4: InlineArray replaces fixed-size arrays ([19:47](https://developer.apple.com/videos/play/wwdc2025/312/?time=1187)).** `pixelCache` is a 64-element array that never grows. Swift 6.2's `InlineArray` bakes the size into the type with value generics:
 
 ```
 var array: InlineArray<3, Int> = [1, 2, 3]
@@ -113,13 +113,13 @@ let bigger: InlineArray<6, Int> = array
 // error: Cannot assign value of type 'InlineArray<3, Int>' to type 'InlineArray<6, Int>'
 ```
 
-**关键点：**
-- 类型签名 `InlineArray<3, Int>`：`3` 是 value generic 参数，编译期就知道大小。
-- 不支持 `append`/`remove`，赋值给不同 size 的 InlineArray 会编译报错。
-- 元素直接内联存储（栈上或 struct 内部），没有独立堆分配，没有引用计数，没有 copy-on-write，每次赋值真复制。
-- 适合「定长、原地修改、不共享」的场景，不适合需要互相共享/copy-on-write 的场景。
+**Key points:**
+- Type signature `InlineArray<3, Int>`: `3` is a value generic parameter, the size is known at compile time.
+- Does not support `append`/`remove`; assigning to an InlineArray of a different size is a compile error.
+- Elements are stored inline (on the stack or inside the struct), no separate heap allocation, no reference counting, no copy-on-write, every assignment is a true copy.
+- Fits "fixed length, in-place mutation, no sharing" scenarios; not suitable for shared/copy-on-write use cases.
 
-**第五轮：RawSpan + OutputSpan 干掉引用计数（[26:27](https://developer.apple.com/videos/play/wwdc2025/312/?time=1587)）。** profile 里 `swift_retain` 7%、`swift_release` 7%、唯一性检查 3%，全都来自 `Data` 在 tight loop 里的引用计数。Swift 6.2 引入 Span 家族（`Span`、`RawSpan`、`MutableSpan`、`OutputSpan`、`UTF8Span`），核心特性是 non-escapable：编译器把 span 的生命周期绑定到底层 collection，无法逃出作用域，因此运行时不需要 retain/release。
+**Round 5: RawSpan + OutputSpan kill reference counts ([26:27](https://developer.apple.com/videos/play/wwdc2025/312/?time=1587)).** The profile showed `swift_retain` at 7%, `swift_release` at 7%, and uniqueness checks at 3%, all coming from `Data` reference counting in a tight loop. Swift 6.2 introduced the Span family (`Span`, `RawSpan`, `MutableSpan`, `OutputSpan`, `UTF8Span`). The core trait is non-escapable: the compiler binds the span's lifetime to the underlying collection, so it cannot escape the scope, and the runtime needs no retain/release.
 
 ```swift
 @available(macOS 16.0, *)
@@ -134,13 +134,13 @@ extension RawSpan {
 }
 ```
 
-**关键点：**
-- `RawSpan` 是 non-escapable，类型本身就拒绝被返回到外层作用域。
-- `unsafeLoadUnaligned(as:)` 名字带 unsafe 是因为加载某些类型可能不安全；加载 `UInt8` 这样的内置整数永远安全。
-- `_extracting(droppingFirst: 1)` 返回一个新的 `RawSpan`，不复制数据，只移动起始位置。
-- 调用方用 `data.bytes` 拿到 `RawSpan` 后传进解析方法，全程零 retain/release。
+**Key points:**
+- `RawSpan` is non-escapable; the type itself refuses to be returned to an outer scope.
+- `unsafeLoadUnaligned(as:)` has "unsafe" in the name because loading certain types may be unsafe; loading a built-in integer like `UInt8` is always safe.
+- `_extracting(droppingFirst: 1)` returns a new `RawSpan` without copying data, only moving the start position.
+- The caller gets a `RawSpan` via `data.bytes`, passes it into the parsing method, and the whole path has zero retain/release.
 
-最终版用 `Data(rawCapacity:)` 配合 `OutputSpan` 完成写入：
+The final version uses `Data(rawCapacity:)` with `OutputSpan` for writing:
 
 ```swift
 /// Parses an image from the given QOI data.
@@ -172,43 +172,43 @@ mutating func parseQOI(from input: inout RawSpan) -> QOI? {
 }
 ```
 
-**关键点：**
-- `Data(rawCapacity:)` 是 Swift 6.2 新初始化器，提供一个 `OutputRawSpan` 闭包用于逐步填入未初始化内存。
-- `outputSpan.count` 取代了上一版手写的 `offset` 变量，由 `OutputSpan` 自身记录写入进度。
-- `previousPixel.write(to: &outputSpan, channels:)` 直接 `append` 到 output span，无需经过 `Data` 中间层。
-- 配合 `[InlineArray](https://github.com/apple/swift-binary-parsing)` 的 pixel cache，整段解析里 `swift_retain`/`swift_release` 完全消失。
+**Key points:**
+- `Data(rawCapacity:)` is a new Swift 6.2 initializer. It provides an `OutputRawSpan` closure for gradually filling uninitialized memory.
+- `outputSpan.count` replaces the hand-written `offset` variable from the previous version; `OutputSpan` tracks write progress itself.
+- `previousPixel.write(to: &outputSpan, channels:)` appends directly to the output span, no `Data` middle layer needed.
+- Combined with the pixel cache from `[InlineArray](https://github.com/apple/swift-binary-parsing)`, `swift_retain`/`swift_release` disappear entirely from the parsing path.
 
-[28:51 处](https://developer.apple.com/videos/play/wwdc2025/312/?time=1731)给出最终对比：内存管理优化让解析快了 6 倍；叠加前面的算法修复，比原版快 700 倍，且没有任何 unsafe 代码。Nate 还顺手开源了 [Swift Binary Parsing](https://github.com/apple/swift-binary-parsing)，里面的 `ParserSpan` 就是基于这套机制。
-
----
-
-## 核心启发
-
-- **做什么：把性能瓶颈搜索路径标准化为「Time Profiler 找热点 → Allocations 看分配源 → Reveal in Xcode 跳到代码」**。
-  - 为什么值得做：session 里这套流程跑了五次，每次都在 30 秒内定位到具体一行代码。把它做成肌肉记忆，后续遇到真实数据卡顿不会再靠猜。
-  - 怎么开始：右键 test 选 Profile，在 Instruments 里加 Time Profiler + Allocations 两个工具，开 Invert Call Tree，先看自己代码里第一个出现的符号。
-
-- **做什么：审计自己代码里所有定长容器，能换 InlineArray 的换掉**。
-  - 为什么值得做：固定大小的 lookup table、缓存、ring buffer 用普通 `Array` 会带来引用计数、唯一性检查、堆分配三重开销。换成 `InlineArray<N, T>` 编译期就锁死，运行时全没。
-  - 怎么开始：grep 自己工程里 `Array(repeating:count:)`、`[T](repeating:count:)` 这类初始化，逐个判断是否定长、是否需要共享，符合条件的换 `InlineArray`。
-
-- **做什么：解析二进制格式时用 `RawSpan`/`OutputSpan` 替换 `Data` 作为中间层**。
-  - 为什么值得做：`Data` 在 tight loop 里的 retain/release 占了本场 14% CPU。Span 家族用 non-escapable 把生命周期绑定到底层 collection，无 retain/release，编译器还会替你拒绝危险的返回。
-  - 怎么开始：parser 入口仍然收 `Data`，进函数后立刻 `data.bytes` 取 `RawSpan` 传到底层；写出用 `Data(rawCapacity:)` 给的 `OutputSpan`。
-
-- **做什么：把跨方法共享的「状态变量」从 class 移到包含它们的 struct**。
-  - 为什么值得做：class 属性的访问需要运行时 exclusivity 检查（`swift_beginAccess`/`swift_endAccess`），在循环里成本不低；struct 的属性访问大多在编译期就能 enforce。
-  - 怎么开始：找出 parser/encoder 之类对象里只为「分组属性」存在的内嵌 class，把属性提到外层 struct，并把读写它们的方法标 `mutating`。
-
-- **做什么：性能 profile 时把目标代码循环 50 次以上**。
-  - 为什么值得做：优化到一定程度后单次执行太快，Instruments 采样不足，火焰图会失真。Nate 在第三轮就遇到这个问题，加了 50 次循环后才看清 `swift_beginAccess` 的来源。
-  - 怎么开始：在 XCTest 里写一个 perf 专用 case，外层包 `for _ in 0..<50 { ... }`，profile 这个 case 而非生产 entry。
+At [28:51](https://developer.apple.com/videos/play/wwdc2025/312/?time=1731), the final comparison is given: memory management optimizations alone made parsing 6 times faster; stacked on top of the earlier algorithm fixes, the result is 700 times faster than the original, with no unsafe code. Nate also open-sourced [Swift Binary Parsing](https://github.com/apple/swift-binary-parsing); the `ParserSpan` inside is built on this same mechanism.
 
 ---
 
-## 关联 Session
+## Core Takeaways
 
-- [Embracing Swift concurrency](/articles/wwdc2025-268) — Swift 并发模型与本场内存优化思路同源，关注 task 生命周期与隔离。
-- [Optimize SwiftUI performance with Instruments](/articles/wwdc2025-306) — 同样基于 Instruments，但专攻 SwiftUI 视图更新与 diff 性能。
-- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — Swift 6.2 跨语言互操作，里面也用到了 value generics 与 non-escapable。
-- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — `AttributedString` 内部对 storage 的处理思路，可印证 Span 的应用场景。
+- **What to do: standardize your performance bottleneck search path as "Time Profiler finds hot spots -> Allocations shows allocation sources -> Reveal in Xcode jumps to code".**
+  - Why it matters: this workflow ran five times in the session, each time pinpointing a specific line of code within 30 seconds. Turn it into muscle memory, and you will not have to guess when real data causes stutter.
+  - How to start: right-click a test and choose Profile, add Time Profiler + Allocations in Instruments, turn on Invert Call Tree, and look at the first symbol that appears in your own code.
+
+- **What to do: audit every fixed-size container in your code and swap in InlineArray where possible.**
+  - Why it matters: fixed-size lookup tables, caches, and ring buffers using plain `Array` carry triple overhead -- reference counting, uniqueness checks, and heap allocation. Switching to `InlineArray<N, T>` locks the size at compile time and removes all runtime cost.
+  - How to start: grep your project for `Array(repeating:count:)`, `[T](repeating:count:)` and similar initializers. Check each one: is the size fixed? does it need sharing? If it fits, swap to `InlineArray`.
+
+- **What to do: when parsing binary formats, replace `Data` as the intermediate layer with `RawSpan`/`OutputSpan`.**
+  - Why it matters: `Data` retain/release in a tight loop ate 14% CPU in this session. The Span family uses non-escapable to bind the lifetime to the underlying collection, so there is no retain/release, and the compiler will reject dangerous returns for you.
+  - How to start: the parser entry still takes `Data`; inside the function, immediately call `data.bytes` to get a `RawSpan` and pass it down. For writing, use the `OutputSpan` from `Data(rawCapacity:)`.
+
+- **What to do: move "state variables" shared across methods from a class to the struct that contains them.**
+  - Why it matters: class property access needs runtime exclusivity checks (`swift_beginAccess`/`swift_endAccess`), which are not cheap in a loop. Struct property access is mostly enforced at compile time.
+  - How to start: find inner classes inside parser/encoder objects that exist only to "group properties." Lift those properties to the outer struct, and mark methods that read or write them `mutating`.
+
+- **What to do: loop your target code 50+ times when profiling performance.**
+  - Why it matters: once optimized enough, a single run is too fast for Instruments to sample, and the flame graph distorts. Nate hit this in round three; only after adding a 50x loop did `swift_beginAccess` show its source clearly.
+  - How to start: write a dedicated perf case in XCTest, wrap it in `for _ in 0..<50 { ... }`, and profile that case instead of the production entry point.
+
+---
+
+## Related Sessions
+
+- [Embracing Swift concurrency](/articles/wwdc2025-268) -- Swift concurrency model and this session's memory optimization share the same roots; watch for task lifetime and isolation.
+- [Optimize SwiftUI performance with Instruments](/articles/wwdc2025-306) -- also based on Instruments, but focused on SwiftUI view updates and diff performance.
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) -- Swift 6.2 cross-language interop; also uses value generics and non-escapable.
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) -- the internal storage handling in `AttributedString` mirrors Span use cases.
