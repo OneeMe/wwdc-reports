@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Translate Chinese prose segments to EN or JA via googletrans."""
+"""Translate Chinese prose segments to EN or JA via deep-translator."""
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 
 dest = sys.argv[1]  # en or ja
+target = "en" if dest == "en" else "ja"
 segments = json.load(sys.stdin)
 results = {}
 
@@ -18,8 +19,8 @@ def translate_one(key, text):
     if not text.strip() or not has_cjk(text):
         return key, text
     try:
-        translator = Translator()
-        return key, translator.translate(text, dest=dest).text
+        translator = GoogleTranslator(source="zh-CN", target=target)
+        return key, translator.translate(text)
     except Exception as e:
         print(f"warn: {e}", file=sys.stderr)
         return key, text
