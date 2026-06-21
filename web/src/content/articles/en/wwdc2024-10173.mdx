@@ -24,48 +24,48 @@ relatedSessions:
 
 ## Highlight
 
-> 堆内存通常是应用内存占用的大头，Apple 提供了从 Xcode Memory Report 到 Instruments Allocations 的完整工具链来诊断瞬态增长、持续增长和内存泄漏三类问题。
+> Heap memory is typically the largest portion of app memory usage, and Apple provides a complete toolchain from Xcode Memory Report to Instruments Allocations to diagnose transient spikes, sustained growth, and memory leaks.
 
 ---
 
-## 核心内容
+## Core Content
 
-堆内存（heap memory）是应用运行时动态分配的内存区域，通过 `malloc`、`calloc`、Swift/ObjC 的对象实例化来使用。堆内存通常是应用内存占用的大头，因为 dirty 页面会被计入应用的内存限制（[04:22](https://developer.apple.com/videos/play/wwdc2024/10173/?time=262)）。这场 Session 系统讲解了五类堆内存问题：瞬态增长（内存尖刺）、持续增长（只增不减）、内存泄漏（对象无法释放）、运行时性能问题（频繁分配/释放导致卡顿），以及如何用 Apple 的工具链逐一排查。
+Heap memory is the dynamically allocated memory region used at app runtime, accessed via `malloc`, `calloc`, Swift/ObjC object instantiation, and similar mechanisms. Heap memory is typically the largest portion of app memory usage because dirty pages count toward the app's memory limit ([04:22](https://developer.apple.com/videos/play/wwdc2024/10173/?time=262)). This session systematically covers five heap memory problem types: transient growth (memory spikes), sustained growth (only increasing), memory leaks (objects that can't be released), runtime performance issues (stuttering from frequent allocation/deallocation), and how to troubleshoot each with Apple's toolchain.
 
-工具链覆盖四个层面：Xcode Memory Report（看整体趋势）、Instruments Allocations（看分配历史和调用栈）、Memory Graph Debugger（看对象引用关系）、命令行工具（`heap`、`malloc_history`、`vmmap`、`Leaks`）（[04:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=250)）。
+The toolchain spans four levels: Xcode Memory Report (overall trends), Instruments Allocations (allocation history and call stacks), Memory Graph Debugger (object reference relationships), and command-line tools (`heap`, `malloc_history`, `vmmap`, `Leaks`) ([04:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=250)).
 
-Session 用 Destination Video 示例项目做演示。第一个问题是反复打开图片选择器导致内存尖刺到接近 1GB，最终 OOM 崩溃（[05:46](https://developer.apple.com/videos/play/wwdc2024/10173/?time=346)）。通过 Allocations Instrument 追踪发现，每次打开都创建了大量未释放的 autorelease pool 内容页，原因是循环中调用 Objective-C 框架 API 时产生的 autoreleased 对象都累积到同一个 pool 中（[10:54](https://developer.apple.com/videos/play/wwdc2024/10173/?time=654)）。解决方案是用嵌套的 `autoreleasepool` 包裹循环体，确保每次迭代结束时立即释放（[12:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=730)）。
+The session uses the Destination Video sample project. The first problem: repeatedly opening the image picker causes memory to spike near 1GB, eventually OOM crashing ([05:46](https://developer.apple.com/videos/play/wwdc2024/10173/?time=346)). Tracking with the Allocations Instrument reveals each open creates many unreleased autorelease pool content pages—the cause is autoreleased objects from calling Objective-C framework APIs in a loop all accumulating in the same pool ([10:54](https://developer.apple.com/videos/play/wwdc2024/10173/?time=654)). The fix is wrapping the loop body in nested `autoreleasepool` blocks to ensure immediate release after each iteration ([12:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=730)).
 
-第二个问题是内存持续增长。修复瞬态增长后，发现内存呈阶梯状上升——每次打开图片选择器都会增长且不回落（[13:09](https://developer.apple.com/videos/play/wwdc2024/10173/?time=789)）。用 Mark Generation 功能分离出各时段的持续分配，发现大量 Data 存储分配来自 ThumbnailLoader（[15:23](https://developer.apple.com/videos/play/wwdc2024/10173/?time=923)）。通过 Memory Graph Debugger 追踪引用链，发现这些对象被全局缓存 `globalImageCache` 持有，而缓存键用的是当前时间而非文件创建时间——导致每次调用都生成新的缓存条目（[18:58](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1138)）。
+The second problem is sustained memory growth. After fixing transient growth, memory rises in steps—each image picker open grows memory without falling back ([13:09](https://developer.apple.com/videos/play/wwdc2024/10173/?time=789)). Using Mark Generation to separate persistent allocations from each period reveals many Data storage allocations from ThumbnailLoader ([15:23](https://developer.apple.com/videos/play/wwdc2024/10173/?time=923)). Memory Graph Debugger traces the reference chain— these objects are held by global cache `globalImageCache`, and the cache key uses current time instead of file creation time, generating new cache entries on every call ([18:58](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1138)).
 
-第三个问题是内存泄漏。Memory Graph Debugger 发现 ThumbnailRenderer、ThumbnailLoader 和一个闭包上下文形成了引用循环（[21:43](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1303)）。闭包默认强捕获了 renderer，导致三者互相强引用无法释放。解法是用 `[weak renderer]` 捕获列表（[23:40](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1420)）。
+The third problem is memory leaks. Memory Graph Debugger finds ThumbnailRenderer, ThumbnailLoader, and a closure context forming a reference cycle ([21:43](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1303)). The closure strongly captures renderer by default, causing mutual strong references that prevent release. The fix is using a `[weak renderer]` capture list ([23:40](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1420)).
 
 ---
 
-## 详细内容
+## Detailed Content
 
-### 堆内存基础
+### Heap Memory Basics
 
-堆内存是应用虚拟内存的一部分，用于存放动态分配和长期存活的对象。每块堆分配来自 16KB 的内存页，页面有三种状态（[02:05](https://developer.apple.com/videos/play/wwdc2024/10173/?time=125)）：
+Heap memory is part of app virtual memory, storing dynamically allocated and long-lived objects. Each heap allocation comes from 16KB memory pages with three states ([02:05](https://developer.apple.com/videos/play/wwdc2024/10173/?time=125)):
 
-- **Clean**：未写入或只读映射，可随时丢弃
-- **Dirty**：已写入，计入内存占用，压力下会被压缩或换出
-- **Swapped**：已压缩或写入磁盘
+- **Clean**: Not written or read-only mapped; can be discarded anytime
+- **Dirty**: Written; counts toward memory usage; compressed or swapped under pressure
+- **Swapped**: Compressed or written to disk
 
-只有 Dirty 和 Swapped 计入应用的 memory footprint。堆内存通常占大头（[02:51](https://developer.apple.com/videos/play/wwdc2024/10173/?time=171)）。
+Only Dirty and Swapped count toward the app's memory footprint. Heap memory typically dominates ([02:51](https://developer.apple.com/videos/play/wwdc2024/10173/?time=171)).
 
-MallocStackLogging 是重要的调试功能，记录每个分配的调用栈和时间戳（[03:47](https://developer.apple.com/videos/play/wwdc2024/10173/?time=227)），可在 Xcode Scheme 的 Diagnostics 标签页勾选启用。
+MallocStackLogging is an important debugging feature recording each allocation's call stack and timestamp ([03:47](https://developer.apple.com/videos/play/wwdc2024/10173/?time=227)), enabled in the Xcode Scheme's Diagnostics tab.
 
-### 瞬态增长：Autorelease Pool
+### Transient Growth: Autorelease Pool
 
-瞬态增长的特征是内存呈尖刺状——快速上升然后回落。这会触发内存压力，导致系统压缩/换出内存甚至终止应用（[07:56](https://developer.apple.com/videos/play/wwdc2024/10173/?time=476)）。
+Transient growth appears as memory spikes—rapid rise then fall. This triggers memory pressure, causing the system to compress/swap memory or even terminate the app ([07:56](https://developer.apple.com/videos/play/wwdc2024/10173/?time=476)).
 
-在 Allocations Instrument 中，可以通过两种方式定位（[08:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=490)）：
+In the Allocations Instrument, two approaches locate the cause ([08:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=490)):
 
-1. **Created & Still Living**：选中从波谷到波峰的时间段，查看哪些分配在增长后仍存活
-2. **Created & Destroyed**：选中较大时间段，查看哪些分配在该时段内被创建并销毁
+1. **Created & Still Living**: Select the period from trough to peak, view allocations still alive after growth
+2. **Created & Destroyed**: Select a larger period, view allocations created and destroyed in that timeframe
 
-修复瞬态增长的关键代码（[12:16](https://developer.apple.com/videos/play/wwdc2024/10173/?time=736)）：
+Key fix code for transient growth ([12:16](https://developer.apple.com/videos/play/wwdc2024/10173/?time=736)):
 
 ```swift
 func loadThumbnails(with renderer: ThumbnailRenderer) {
@@ -78,16 +78,16 @@ func loadThumbnails(with renderer: ThumbnailRenderer) {
 }
 ```
 
-**关键点：**
-- `autoreleasepool` 创建一个局部作用域，其中产生的 autoreleased 对象会在作用域结束时被释放
-- 原代码中循环产生的 autoreleased 对象都累积到线程的顶层 pool 中，直到循环结束才释放
-- 嵌套 pool 确保每次迭代后立即释放，避免内存尖刺
+Key points:
+- `autoreleasepool` creates a local scope where autoreleased objects are released when the scope ends
+- In the original code, autoreleased objects from the loop accumulated in the thread's top-level pool until the loop finished
+- Nested pools ensure immediate release after each iteration, avoiding memory spikes
 
-### 持续增长：缓存键错误
+### Sustained Growth: Wrong Cache Key
 
-持续增长的特征是内存呈阶梯状上升——每次操作后增长但不回落。用 Mark Generation 功能可以分离不同时间段产生的持续分配（[14:08](https://developer.apple.com/videos/play/wwdc2024/10173/?time=848)）。
+Sustained growth appears as step-wise memory rise—growing after each operation without falling back. Mark Generation separates persistent allocations from different time periods ([14:08](https://developer.apple.com/videos/play/wwdc2024/10173/?time=848)).
 
-修复缓存键错误的关键代码（[19:28](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1168)）：
+Key fix code for wrong cache key ([19:28](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1168)):
 
 ```swift
 func faultThumbnail(from photoURL: URL) {
@@ -105,16 +105,16 @@ func faultThumbnail(from photoURL: URL) {
 }
 ```
 
-**关键点：**
-- 原代码使用 `Date.now` 生成缓存键，导致每次调用都生成不同的键
-- 同一个文件每次访问都会创建新的 `PhotoThumbnail` 对象并加入全局缓存
-- 修复后使用文件的创建时间戳，确保相同文件使用同一缓存键
+Key points:
+- Original code used `Date.now` to generate cache keys, creating a different key on every call
+- The same file created a new `PhotoThumbnail` object and joined the global cache on every access
+- After the fix, file creation timestamp ensures the same file uses the same cache key
 
-### 内存泄漏：引用循环
+### Memory Leaks: Reference Cycles
 
-内存泄漏是可达但永远不会再使用的对象。闭包默认强捕获引用，容易形成引用循环（[22:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1330)）。
+Memory leaks are reachable objects that will never be used again. Closures strongly capture references by default, easily forming reference cycles ([22:10](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1330)).
 
-修复引用循环的关键代码（[23:40](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1420)）：
+Key fix code for reference cycles ([23:40](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1420)):
 
 ```swift
 // 错误：闭包强捕获 renderer
@@ -129,21 +129,21 @@ loader.completionHandler = { [weak renderer] in
 }
 ```
 
-**关键点：**
-- 闭包默认强捕获所有引用的变量
-- `[weak renderer]` 创建弱引用，避免形成引用循环
-- `guard let renderer` 确保在闭包执行时对象仍然存在
+Key points:
+- Closures strongly capture all referenced variables by default
+- `[weak renderer]` creates a weak reference, breaking the reference cycle
+- `guard let renderer` ensures the object still exists when the closure executes
 
-Memory Graph Debugger 会用黄色三角形标记泄漏的对象（[20:03](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1203)），可以按类型筛选定位泄漏源。
+Memory Graph Debugger marks leaking objects with yellow triangles ([20:03](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1203)), filterable by type to locate leak sources.
 
-### 引用类型：weak vs unowned
+### Reference Types: weak vs unowned
 
-`weak` 和 `unowned` 都可以避免强引用循环，但行为不同（[26:51](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1611)）：
+Both `weak` and `unowned` can break strong reference cycles but behave differently ([26:51](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1611)):
 
-- **weak**：总是可选类型，对象释放后自动变为 `nil`，需要额外分配 weak reference storage
-- **unowned**：直接持有对象地址，不占用额外内存，但访问已释放对象会崩溃
+- **weak**: Always optional; automatically becomes `nil` when object is released; requires extra weak reference storage allocation
+- **unowned**: Directly holds object address; no extra memory; crashes if accessing deallocated object
 
-性能差异示例（[30:11](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1811)）：
+Performance difference example ([30:11](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1811)):
 
 ```swift
 // weak 需要为每个对象分配额外的 weak reference storage
@@ -153,14 +153,14 @@ weak var holder: Swallow?
 unowned let holder: Swallow
 ```
 
-**关键点：**
-- weak 引用需要分配额外的存储空间来跟踪弱引用
-- unowned 引用无额外开销，但必须保证被引用对象生命周期更长
-- 使用 weak 时需检查 `swift_weakLoadStrong()` 等 runtime 函数的调用频率
+Key points:
+- weak references require extra storage to track weak references
+- unowned references have no extra overhead but must guarantee the referenced object outlives the reference
+- When using weak, check call frequency of runtime functions like `swift_weakLoadStrong()`
 
-### 引用循环的隐式陷阱
+### Implicit Traps in Reference Cycles
 
-将方法赋值给闭包属性时会隐式捕获 `self`（[29:07](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1747)）：
+Assigning methods to closure properties implicitly captures `self` ([29:07](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1747)):
 
 ```swift
 class ByteProducer {
@@ -189,67 +189,67 @@ generator = { [unowned self] data in
 }
 ```
 
-**关键点：**
-- 方法作为闭包使用时会隐式捕获 `self`
-- 需要用显式闭包和捕获列表来控制引用类型
-- unowned 适用于闭包生命周期明确不超出被捕获对象的情况
+Key points:
+- Using methods as closures implicitly captures `self`
+- Use explicit closures and capture lists to control reference type
+- unowned applies when closure lifetime clearly doesn't exceed the captured object
 
-### 工具使用建议
+### Tool Usage Recommendations
 
-- **MallocStackLogging**：开发时启用，记录分配调用栈（[03:47](https://developer.apple.com/videos/play/wwdc2024/10173/?time=227)）
-- **Memory Graph Debugger**：暂停时捕获内存快照，查看引用关系（[04:32](https://developer.apple.com/videos/play/wwdc2024/10173/?time=272)）
-- **Instruments Allocations**：分析内存趋势和分配历史（[05:15](https://developer.apple.com/videos/play/wwdc2024/10173/?time=315)）
-- **命令行工具**：`heap`、`malloc_history`、`vmmap`、`Leaks` 用于离线分析（[04:50](https://developer.apple.com/videos/play/wwdc2024/10173/?time=290)）
-
----
-
-## 核心启发
-
-**1. 在循环中调用框架 API 时使用嵌套 autoreleasepool**
-
-当循环中调用会产生 autoreleased 对象的 API（尤其是 Objective-C 框架）时，用嵌套的 `autoreleasepool` 包裹循环体。这能确保每次迭代结束时立即释放临时对象，避免内存尖刺。
-
-**为什么值得做：** 原始实现会导致所有 autoreleased 对象累积到线程的顶层 pool 中，直到 pool 被 drain 才释放——在循环中这可能需要很长时间。
-
-**怎么开始：** 在循环中添加 `autoreleasepool { ... }`，用 Xcode Memory Report 或 Instruments Allocations 验证内存尖刺是否消失。
-
-**2. 为缓存数据使用稳定的键**
-
-缓存时必须确保键能唯一标识数据，且同一数据的多次访问能命中缓存。使用文件 URL 作为键时，应结合文件的修改时间或创建时间，而非当前时间。
-
-**为什么值得做：** 错误的缓存键会导致缓存永远 miss，每次访问都创建新对象并加入缓存，造成内存持续增长。
-
-**怎么开始：** 审查所有缓存代码，确认缓存键的稳定性。对于文件资源，使用文件属性（如 `creationDate` 或 `contentModificationDate`）而非运行时时间。
-
-**3. 闭包捕获引用时默认使用 weak，仅在保证生命周期时用 unowned**
-
-闭包默认强捕获引用，容易形成引用循环。使用 `[weak self]` 打破循环是安全做法。当闭包生命周期明确不超出被捕获对象时（如内部闭包、同步回调），可以用 `[unowned self]` 节省 weak reference storage 的开销。
-
-**为什么值得做：** weak 引用需要为每个对象分配额外的存储空间，在大量对象时开销显著。unowned 无额外开销但访问已释放对象会崩溃。
-
-**怎么开始：** 在所有闭包中使用捕获列表。默认使用 `weak`，分析后确认生命周期关系时再考虑 `unowned`。
-
-**4. 用 Mark Generation 追踪持续增长的来源**
-
-当内存呈阶梯状增长时，用 Instruments Allocations 的 Mark Generation 功能在不同时间点标记，可以分离出各时段产生的持续分配。
-
-**为什么值得做：** 持续增长可能来自多个来源，Mark Generation 能将增长按时间分段，帮助定位具体哪段代码导致了增长。
-
-**怎么开始：** 在 Instruments 中重现增长模式，在增长前后点击 Mark Generation 按钮，然后按增长大小排序查看各代际的分配类型。
-
-**5. 验证修复后检查连锁泄漏**
-
-修复一个内存泄漏后，可能发现其他泄漏也消失了——因为被泄漏对象引用的其他对象也会随之泄漏（[24:08](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1448)）。
-
-**为什么值得做：** 泄漏对象可能持有其他对象的强引用，修复根因泄漏后，被持有的对象也能正常释放。
-
-**怎么开始：** 修复泄漏后重新运行 Memory Graph Debugger，确认泄漏数量减少或消失，并检查是否有新的根因泄漏。
+- **MallocStackLogging**: Enable during development to record allocation call stacks ([03:47](https://developer.apple.com/videos/play/wwdc2024/10173/?time=227))
+- **Memory Graph Debugger**: Capture memory snapshots when paused to view reference relationships ([04:32](https://developer.apple.com/videos/play/wwdc2024/10173/?time=272))
+- **Instruments Allocations**: Analyze memory trends and allocation history ([05:15](https://developer.apple.com/videos/play/wwdc2024/10173/?time=315))
+- **Command-line tools**: `heap`, `malloc_history`, `vmmap`, `Leaks` for offline analysis ([04:50](https://developer.apple.com/videos/play/wwdc2024/10173/?time=290))
 
 ---
 
-## 关联 Session
+## Core Takeaways
 
-- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — Swift 中非复制类型的入门，了解什么是复制以及如何避免不必要的开销
-- [Explore Swift performance](/articles/wwdc2024-10217) — 深入 Swift 如何在抽象和性能之间取得平衡，了解影响性能的 Swift 语言特性
-- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Swift 在服务端应用中的应用，涵盖关键框架和工具
-- [Go further with Swift Testing](/articles/wwdc2024-10195) — 深入 Swift Testing 框架，学习如何编写测试套件和利用高级特性
+**1. Use nested autoreleasepool when calling framework APIs in loops**
+
+When loops call APIs that produce autoreleased objects (especially Objective-C frameworks), wrap the loop body in nested `autoreleasepool`. This ensures temporary objects are released immediately after each iteration, avoiding memory spikes.
+
+**Why it's worth it:** The original implementation accumulates all autoreleased objects in the thread's top-level pool until the pool is drained—in a loop this can take a long time.
+
+**How to start:** Add `autoreleasepool { ... }` in the loop; verify memory spikes disappear with Xcode Memory Report or Instruments Allocations.
+
+**2. Use stable keys for cached data**
+
+When caching, ensure keys uniquely identify data and that repeated access to the same data hits the cache. When using file URLs as keys, combine file modification or creation time—not current time.
+
+**Why it's worth it:** Wrong cache keys cause perpetual cache misses—each access creates new objects and adds them to cache, causing sustained memory growth.
+
+**How to start:** Audit all caching code for key stability. For file resources, use file attributes (like `creationDate` or `contentModificationDate`) rather than runtime time.
+
+**3. Default to weak for closure captures; use unowned only when lifecycle is guaranteed**
+
+Closures strongly capture by default, easily forming reference cycles. Using `[weak self]` to break cycles is the safe approach. When closure lifetime clearly doesn't exceed the captured object (internal closures, synchronous callbacks), `[unowned self]` saves weak reference storage overhead.
+
+**Why it's worth it:** weak references require extra storage per object—significant overhead with many objects. unowned has no extra overhead but crashes on deallocated access.
+
+**How to start:** Use capture lists in all closures. Default to `weak`; consider `unowned` only after confirming lifecycle relationships.
+
+**4. Use Mark Generation to track sustained growth sources**
+
+When memory rises in steps, use Instruments Allocations' Mark Generation to mark at different time points, separating persistent allocations from each period.
+
+**Why it's worth it:** Sustained growth may come from multiple sources—Mark Generation segments growth by time, helping locate which code caused the increase.
+
+**How to start:** Reproduce the growth pattern in Instruments, click Mark Generation before and after growth, then sort by growth size to view allocation types per generation.
+
+**5. Check for cascading leaks after fixing**
+
+After fixing one memory leak, other leaks may disappear too—because objects held by leaked objects also leak ([24:08](https://developer.apple.com/videos/play/wwdc2024/10173/?time=1448)).
+
+**Why it's worth it:** Leaked objects may hold strong references to other objects; fixing the root leak allows held objects to release normally.
+
+**How to start:** After fixing a leak, rerun Memory Graph Debugger to confirm leak count decreased or disappeared, and check for new root-cause leaks.
+
+---
+
+## Related Sessions
+
+- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — Introduction to noncopyable types in Swift, understanding copying and avoiding unnecessary overhead
+- [Explore Swift performance](/articles/wwdc2024-10217) — How Swift balances abstraction and performance, and Swift language features affecting performance
+- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Swift for server applications, covering key frameworks and tools
+- [Go further with Swift Testing](/articles/wwdc2024-10195) — Deep dive into Swift Testing framework, writing test suites and using advanced features
