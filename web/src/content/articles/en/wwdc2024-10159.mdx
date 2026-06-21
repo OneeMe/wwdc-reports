@@ -24,25 +24,25 @@ relatedSessions:
 
 ## Highlight
 
-> iOS 18 的 per-grouped-channel palettization 让 Stable Diffusion 的 4-bit 压缩从生成噪声恢复到接近无损，体积仅增加 0.8%。
+> iOS 18's per-grouped-channel palettization brings Stable Diffusion 4-bit compression back from noisy output to near-lossless quality, with only a 0.8% size increase.
 
 ---
 
-## 核心内容
+## Core Content
 
-把一个 5GB 的 Stable Diffusion 模型塞进 iPhone，听起来不太现实。但 Core ML Tools 的压缩管线一直在缩短这个距离。iOS 17 的 palettization 能把模型压到一半甚至更小，6-bit 时还能正常出图，4-bit 就彻底崩了——16 个聚类中心要映射整个权重矩阵，精度根本撑不住。
+Fitting a 5GB Stable Diffusion model onto an iPhone sounds unrealistic. But Core ML Tools' compression pipeline keeps closing that gap. iOS 17 palettization could shrink models to half size or smaller—6-bit still produced usable images, but 4-bit completely collapsed. Sixteen cluster centers had to map an entire weight matrix; precision couldn't hold up.
 
-iOS 18 把压缩粒度从 per-tensor 推进到了 per-grouped-channel。每 16 个 channel 共享一张查找表，4-bit 压缩下 Stable Diffusion 的体积从 1.29GB 微增到 1.3GB，但生成质量从"不可辨认"恢复到"接近 6-bit"。同一个 "Cat in a tuxedo, oil on canvas" 提示词，两种粒度天差地别。
+iOS 18 pushes compression granularity from per-tensor to per-grouped-channel. Every 16 channels share one lookup table. Under 4-bit compression, Stable Diffusion grows from 1.29GB to 1.3GB, but generation quality recovers from "unrecognizable" to "close to 6-bit." The same "Cat in a tuxedo, oil on canvas" prompt produces dramatically different results between the two granularities.
 
-苹果还做了两件重要的事。第一，剪枝和量化/调色板压缩可以叠加了——sparse palettization 和 sparse quantization 让两种技术的压缩收益并存。第二，新增了 calibration data 辅助的后训练压缩工作流，介于 data-free 和 fine-tuning 之间，用 128 个样本就能让 40% 稀疏化的 Stable Diffusion 从"输出噪声"变回"正常出图"。对大模型来说，fine-tuning 太贵，data-free 太粗糙，calibration 正好补了这个空档。
+Apple also did two important things. First, pruning and quantization/palettization can now stack—sparse palettization and sparse quantization preserve compression gains from both techniques. Second, a new calibration-data-assisted post-training compression workflow sits between data-free and fine-tuning. With just 128 samples, a 40%-sparse Stable Diffusion goes from "outputting noise" back to "generating normally." For large models, fine-tuning is too expensive and data-free is too coarse—calibration fills that gap.
 
 ---
 
-## 详细内容
+## Detailed Content
 
 ### Per-grouped-channel palettization
 
-iOS 17 只支持 per-tensor palettization：整个权重矩阵共享一张查找表。4-bit 时只有 16 个聚类中心，对大矩阵误差过大。iOS 18 允许每 group_size 个 channel 共享一张查找表，大幅提高粒度（[07:02](https://developer.apple.com/videos/play/wwdc2024/10159?time=422)）。
+iOS 17 only supports per-tensor palettization: the entire weight matrix shares one lookup table. At 4-bit, there are only 16 cluster centers—too much error for large matrices. iOS 18 lets every `group_size` channels share one lookup table, greatly improving granularity ([07:02](https://developer.apple.com/videos/play/wwdc2024/10159?time=422)).
 
 ```python
 import coremltools as ct
@@ -58,15 +58,16 @@ opt_config = ct.optimize.coreml.OptimizationConfig(global_config=config)
 compressed_model = palettize_weights(model, opt_config)
 ```
 
-关键点：
-- `nbits=4`：4-bit 压缩，查找表有 2^4 = 16 个聚类中心
-- `granularity="per_grouped_channel"`：每 group_size 个 channel 共享一张查找表，而非整张 tensor 共享一张
-- `group_size=16`：每 16 个 channel 一组，组数越多查找表越多，精度越高但体积略增
-- 4-bit per-grouped-channel 压缩后 Stable Diffusion 从 1.29GB 增到 1.3GB，但生成质量接近 6-bit（[08:56](https://developer.apple.com/videos/play/wwdc2024/10159?time=536)）
+Key points:
 
-### Calibration data 辅助的后训练压缩
+- `nbits=4`: 4-bit compression; lookup table has 2^4 = 16 cluster centers
+- `granularity="per_grouped_channel"`: every `group_size` channels share one lookup table, not the entire tensor
+- `group_size=16`: 16 channels per group; more groups mean more lookup tables, higher precision, slightly larger size
+- After 4-bit per-grouped-channel compression, Stable Diffusion grows from 1.29GB to 1.3GB, but generation quality approaches 6-bit ([08:56](https://developer.apple.com/videos/play/wwdc2024/10159?time=536))
 
-Data-free 压缩在高压缩比下精度下降快。Fine-tuning 压缩精度好但耗时长、需要大量数据。calibration 工作流用少量样本做校准，介于两者之间（[10:41](https://developer.apple.com/videos/play/wwdc2024/10159?time=641)）。
+### Post-training compression with calibration data
+
+Data-free compression loses accuracy quickly at high compression ratios. Fine-tuning compression preserves accuracy but takes long and needs lots of data. The calibration workflow uses a small sample set to calibrate, sitting between the two ([10:41](https://developer.apple.com/videos/play/wwdc2024/10159?time=641)).
 
 ```python
 from coremltools.optimize.torch.layerwise_compressor import LayerwiseCompressor
@@ -79,13 +80,14 @@ pruner = LayerwiseCompressor(model, prune_config)
 sparse_model = pruner.compress(calibration_data_loader)
 ```
 
-关键点：
-- `target_sparsity=0.4`：40% 的权重被剪枝置零
-- `n_samples=128`：calibration 只需 128 个样本，远少于 fine-tuning 所需
-- `calibration_data_loader`：用户自定义的数据加载器，提供模型输入格式的样本
-- 40% 稀疏化后 Stable Diffusion 从 1.3GB 降到 1.1GB，data-free 时输出噪声，calibration 后正常出图（[12:52](https://developer.apple.com/videos/play/wwdc2024/10159?time=772)）
+Key points:
 
-稀疏化后还可叠加 palettization 进一步压缩：
+- `target_sparsity=0.4`: 40% of weights are pruned to zero
+- `n_samples=128`: calibration needs only 128 samples—far fewer than fine-tuning
+- `calibration_data_loader`: user-defined data loader providing samples in the model's input format
+- After 40% sparsification, Stable Diffusion drops from 1.3GB to 1.1GB; data-free outputs noise, calibration restores normal images ([12:52](https://developer.apple.com/videos/play/wwdc2024/10159?time=772))
+
+After sparsification, you can stack palettization for further compression:
 
 ```python
 from coremltools.optimize.torch.post_training_quantization import PostTrainingPalettizer
@@ -99,18 +101,19 @@ palettizer = PostTrainingPalettizer(sparse_model, palett_config)
 sparse_palettized_model = palettizer.compress(calibration_data_loader)
 ```
 
-关键点：
-- 在已经稀疏化的模型上再做 4-bit palettization，即 sparse palettization
-- 同一份 calibration_data_loader 可以复用
-- 最终的 PyTorch 模型可以无缝转换为 Core ML 格式
+Key points:
 
-### Stateful model 与 KV-cache
+- Applying 4-bit palettization on an already sparse model is sparse palettization
+- The same `calibration_data_loader` can be reused
+- The final PyTorch model converts seamlessly to Core ML format
 
-Core ML 现在支持 stateful model。状态张量在多次推理间持久化，自动原地更新，不再需要手动把输出复制回输入（[15:55](https://developer.apple.com/videos/play/wwdc2024/10159?time=955)）。
+### Stateful model and KV-cache
 
-这对 Transformer 的 KV-cache 是天然匹配。KV-cache 在每次 token 生成时保存 Key/Value 向量，避免重复计算。用 stateful model 实现后，KV-cache 可以原地更新，大张量不再需要在 I/O 间来回拷贝（[18:24](https://developer.apple.com/videos/play/wwdc2024/10159?time=1104)）。
+Core ML now supports stateful models. State tensors persist across inferences and update in place automatically—no more manually copying outputs back to inputs ([15:55](https://developer.apple.com/videos/play/wwdc2024/10159?time=955)).
 
-转换 stateful 模型时，用 `ct.StateType` 声明状态：
+This is a natural fit for Transformer KV-cache. KV-cache stores Key/Value vectors during each token generation to avoid recomputation. With stateful models, KV-cache updates in place—large tensors no longer need to be copied back and forth between I/O ([18:24](https://developer.apple.com/videos/play/wwdc2024/10159?time=1104)).
+
+When converting a stateful model, declare state with `ct.StateType`:
 
 ```python
 import coremltools as ct
@@ -136,37 +139,38 @@ model = ct.convert(
 )
 ```
 
-关键点：
-- `ct.StateType`：新增 API，声明状态张量的名称、类型和形状
-- `name="keyCache"/"valueCache"`：需与 PyTorch 模型中 `register_buffer` 使用的名称一致
-- `states` 参数传入 `ct.convert`，转换后的 Core ML 模型自动成为 stateful 模型
-- `minimum_deployment_target=ct.target.iOS18`：stateful model 需要 iOS 18
+Key points:
 
-### SDPA 算子融合
+- `ct.StateType`: new API to declare state tensor name, type, and shape
+- `name="keyCache"/"valueCache"`: must match names used in `register_buffer` in the PyTorch model
+- Pass `states` to `ct.convert`; the converted Core ML model automatically becomes stateful
+- `minimum_deployment_target=ct.target.iOS18`: stateful models require iOS 18
 
-iOS 18 的 Core ML Tools 会将 PyTorch 的 Scaled Dot Product Attention（SDPA）算子整体保留，而非拆散成多个小算子。SDPA 算子在 Apple Silicon GPU 上运行效率更高（[19:21](https://developer.apple.com/videos/play/wwdc2024/10159?time=1161)）。
+### SDPA operator fusion
+
+iOS 18 Core ML Tools preserves PyTorch's Scaled Dot Product Attention (SDPA) operator as a whole rather than splitting it into multiple small operators. SDPA runs more efficiently on Apple Silicon GPU ([19:21](https://developer.apple.com/videos/play/wwdc2024/10159?time=1161)).
 
 ### Multi-function model
 
-多个 Core ML 模型可以合并为一个 multi-function model，共享权重自动去重。典型场景是同一个 base model 挂不同 adapter（如 LoRA），每个 adapter 对应一个 function，base model 权重只存一份（[27:20](https://developer.apple.com/videos/play/wwdc2024/10159?time=1640)）。
+Multiple Core ML models can merge into one multi-function model; shared weights are automatically deduplicated. A typical scenario is one base model with different adapters (such as LoRA)—each adapter maps to one function, base model weights stored once ([27:20](https://developer.apple.com/videos/play/wwdc2024/10159?time=1640)).
 
 ---
 
-## 核心启发
+## Core Takeaways
 
-- **做什么**：为大模型端侧部署建立 per-grouped-channel 压缩实验矩阵。尝试不同的 bit 数（8/6/4）、group_size（8/16/32）和压缩技术组合（palettization / quantization / pruning），找到精度与体积的最佳平衡。**为什么值得做**：per-grouped-channel 在 4-bit 下相比 per-tensor 几乎不增加体积就能大幅提升精度，是大模型压缩的默认选择。**怎么开始**：从 `OpPalettizerConfig(nbits=4, granularity="per_grouped_channel", group_size=16)` 开始，用你的模型跑一轮对比。
+- **What to build**: Build a per-grouped-channel compression experiment matrix for on-device large model deployment. Try different bit counts (8/6/4), `group_size` values (8/16/32), and compression technique combinations (palettization / quantization / pruning) to find the best accuracy-size balance. **Why it's worth doing**: Per-grouped-channel at 4-bit dramatically improves accuracy over per-tensor with almost no size increase—it's the default choice for large model compression. **How to start**: Begin with `OpPalettizerConfig(nbits=4, granularity="per_grouped_channel", group_size=16)` and run a comparison on your model.
 
-- **做什么**：将现有的 KV-cache 实现迁移到 stateful Core ML model。**为什么值得做**：KV-cache 张量通常很大，stateful model 支持原地更新，省去了 I/O 拷贝开销，对 LLM 推理速度有明显提升。**怎么开始**：在 PyTorch 模型中用 `register_buffer` 声明 KV-cache，转换时通过 `ct.StateType` 传入 `ct.convert`，设置 `minimum_deployment_target=ct.target.iOS18`。
+- **What to build**: Migrate your existing KV-cache implementation to a stateful Core ML model. **Why it's worth doing**: KV-cache tensors are typically large; stateful models support in-place updates, eliminating I/O copy overhead and noticeably improving LLM inference speed. **How to start**: Declare KV-cache with `register_buffer` in your PyTorch model, pass `ct.StateType` to `ct.convert`, and set `minimum_deployment_target=ct.target.iOS18`.
 
-- **做什么**：用 calibration data 工作流替代 data-free 压缩。**为什么值得做**：高压缩比下 data-free 压缩精度崩塌，calibration 只需 128 个样本就能恢复可用精度，成本远低于 fine-tuning。**怎么开始**：准备 128 个典型输入样本，用 `LayerwiseCompressor` 的 `n_samples=128` 做 calibration，对比 data-free 和 calibration 后的输出质量。
+- **What to build**: Replace data-free compression with the calibration data workflow. **Why it's worth doing**: Data-free compression collapses at high compression ratios; calibration restores usable accuracy with just 128 samples at far lower cost than fine-tuning. **How to start**: Prepare 128 typical input samples, run calibration with `LayerwiseCompressor`'s `n_samples=128`, and compare output quality before and after calibration.
 
-- **做什么**：将多个 adapter 合并为 multi-function Core ML model。**为什么值得做**：不同 adapter 共享 base model 权重，存储空间从 N 份降到 1 份 + N 个小 adapter，加载和切换也更快。**怎么开始**：分别转换各 adapter 模型为 Core ML 格式，用 `MultiFunctionDescriptor` 指定合并规则，调用 `save_multifunction` 生成合并模型。
+- **What to build**: Merge multiple adapters into a multi-function Core ML model. **Why it's worth doing**: Different adapters share base model weights—storage drops from N copies to 1 base + N small adapters, with faster loading and switching. **How to start**: Convert each adapter model to Core ML separately, specify merge rules with `MultiFunctionDescriptor`, and call `save_multifunction` to generate the merged model.
 
 ---
 
-## 关联 Session
+## Related Sessions
 
-- [Train your machine learning and AI models on Apple GPUs](/articles/wwdc2024-10160) — 用 Metal 在 Apple Silicon 上训练 PyTorch/JAX/TensorFlow 模型
-- [Deploy machine learning and AI models on-device with Core ML](/articles/wwdc2024-10161) — Core ML 模型在设备端的性能优化、执行与模型拼接
-- [What's new in Create ML](/articles/wwdc2024-10183) — Create ML 框架更新，含交互式数据源预览和目标追踪模板
-- [Discover Swift enhancements in the Vision framework](/articles/wwdc2024-10163) — Vision 框架 Swift API 重设计，新增图像美学和全身姿态检测
+- [Train your machine learning and AI models on Apple GPUs](/articles/wwdc2024-10160) — Train PyTorch/JAX/TensorFlow models on Apple Silicon with Metal
+- [Deploy machine learning and AI models on-device with Core ML](/articles/wwdc2024-10161) — On-device Core ML performance optimization, execution, and model stitching
+- [What's new in Create ML](/articles/wwdc2024-10183) — Create ML framework updates, including interactive data source previews and object tracking templates
+- [Discover Swift enhancements in the Vision framework](/articles/wwdc2024-10163) — Vision framework Swift API redesign with image aesthetics and holistic body pose detection
