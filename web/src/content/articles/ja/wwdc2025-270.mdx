@@ -24,23 +24,23 @@ relatedSessions:
 
 ## Highlight
 
-> 用 `nonisolated` 类型加 `@concurrent` 方法把图片处理移出主线程，配合 `async let` 并行执行贴纸提取和颜色计算，把超过 10 秒的 Severe Hang 消除。
+> `nonisolated` 型と `@concurrent` メソッドで画像処理をメインスレッドの外に追い出し、`async let` でステッカー抽出と色計算を並列実行することで、10 秒を超える Severe Hang を解消します。
 
 ---
 
-## 核心内容
+## 概要
 
-Sima 在做一个把照片做成贴纸册的 app，跑起来一切正常，直到她加了「贴纸抠图 + 主色提取」这一步。Instruments 的 Time Profiler 给出了直接的判决：Severe Hang，最重的栈帧停留在 PhotoProcessor 上，主线程被阻塞超过 10 秒（[11:23](https://developer.apple.com/videos/play/wwdc2025/270/?time=683)）。滚动卡死、点击没反应，问题不在算法，而在「这段计算根本不该跑在主线程」。
+Sima さんは、写真をステッカーブックに仕立てる app を開発していました。動作も問題なかったのですが、「ステッカーの切り抜き + メインカラー抽出」という処理を追加した途端、状況が一変します。Instruments の Time Profiler が下した判定は明確で、Severe Hang。最も重いスタックフレームは PhotoProcessor 上に留まり、メインスレッドが 10 秒以上ブロックされていました（[11:23](https://developer.apple.com/videos/play/wwdc2025/270/?time=683)）。スクロールが固まり、タップにも反応しない。問題はアルゴリズムではなく、「この計算をそもそもメインスレッドで動かすべきではなかった」という点にあります。
 
-Xcode 26 默认开启的 main actor by default 模式让事情更隐蔽：所有类型默认绑定到 `@MainActor`，只要不主动声明，就会被串行排到主线程上跑。这节课的核心思路是把代码沿着这条路径推进——先用 `async/await` 让 UI 能等待异步加载；再用 `nonisolated` + `@concurrent` 把昂贵计算搬到后台；接着用 `async let` 让两条独立任务并行；最后用 `withTaskGroup` 处理数量不固定的并发工作。每一步都先用 Instruments 观察到具体的性能问题，再用刚好够用的 concurrency 工具去解决它，不提前引入额外复杂度。
+Xcode 26 でデフォルトとなった main actor by default モードは、こうした問題をより見えにくくします。すべての型はデフォルトで `@MainActor` に紐付き、明示的に宣言しない限りメインスレッド上で逐次実行されてしまうのです。本セッションの中心となる考え方は、次のような道筋でコードを進化させていくことにあります。まず `async/await` で UI が非同期ロードを待てるようにし、次に `nonisolated` + `@concurrent` で重い計算をバックグラウンドへ移し、続いて `async let` で独立した 2 つのタスクを並列化、最後に `withTaskGroup` で個数が動的に変わる並行処理を扱います。各ステップでは、まず Instruments で具体的なパフォーマンス問題を観測してから、ちょうど必要なだけの concurrency 機能を投入する形を取り、不要な複雑さを先回りして導入することはありません。
 
 ---
 
-## 详细内容
+## 詳細
 
-**第一步：用 `task` 触发异步加载（[06:29](https://developer.apple.com/videos/play/wwdc2025/270/?time=389)）**
+**ステップ 1: `task` で非同期ロードを起動する（[06:29](https://developer.apple.com/videos/play/wwdc2025/270/?time=389)）**
 
-PhotosPickerItem 提供 `loadTransferable`，它本身就是异步的。把 `loadPhoto` 标 `async`，调用处加 `await`：
+PhotosPickerItem が提供する `loadTransferable` は、それ自体が非同期です。`loadPhoto` を `async` でマークし、呼び出し側で `await` を付けます。
 
 ```swift
 func loadPhoto(_ item: SelectedPhoto) async {
@@ -55,13 +55,13 @@ func loadPhoto(_ item: SelectedPhoto) async {
 }
 ```
 
-关键点：
+ポイント:
 
-- `async` 标记函数可以包含挂起点；`await` 标记一个具体的挂起点。
-- `loadTransferable` 在挂起期间，主线程腾出来处理 UI 事件，框架在后台跑加载。
-- `loadPhoto` 恢复执行时回到主线程，更新 `processedPhotos` 字典是安全的。
+- `async` 修飾された関数はサスペンドポイントを含むことができ、`await` は具体的なサスペンドポイントを示します。
+- `loadTransferable` のサスペンド中はメインスレッドが解放されて UI イベントを処理でき、フレームワークがバックグラウンドでロードを進めます。
+- `loadPhoto` の再開時にはメインスレッドへ戻ってくるため、`processedPhotos` ディクショナリの更新は安全です。
 
-在 SwiftUI 里通过 `task` modifier 启动这个异步函数：
+SwiftUI 側では `task` modifier でこの非同期関数を起動します。
 
 ```
 StickerPlaceholder()
@@ -70,14 +70,14 @@ StickerPlaceholder()
     }
 ```
 
-关键点：
+ポイント:
 
-- `task` 会在 view 出现时启动，view 消失时自动取消。
-- 配合 LazyHStack，只有屏幕上可见的 placeholder 才会触发加载，避免做无用功。
+- `task` は view が表示されたタイミングで開始し、view が消えたタイミングで自動的にキャンセルされます。
+- LazyHStack と組み合わせれば、画面上に見えている placeholder のみがロードを起こすため、無駄な処理を避けられます。
 
-**第二步：把 PhotoProcessor 移出主线程（[14:13](https://developer.apple.com/videos/play/wwdc2025/270/?time=853)）**
+**ステップ 2: PhotoProcessor をメインスレッドの外へ移す（[14:13](https://developer.apple.com/videos/play/wwdc2025/270/?time=853)）**
 
-加上贴纸抠图后跑起来卡顿严重，Instruments 显示主线程被堵超过 10 秒。原因是 main actor by default 模式让 PhotoProcessor 默认绑在主线程：
+ステッカーの切り抜き処理を加えた途端、深刻なカクつきが発生しました。Instruments でもメインスレッドが 10 秒以上ブロックされている様子が見えています。原因は、main actor by default モードによって PhotoProcessor がデフォルトでメインスレッドにバインドされていたことです。
 
 ```swift
 nonisolated struct PhotoProcessor {
@@ -104,16 +104,16 @@ nonisolated struct PhotoProcessor {
 }
 ```
 
-关键点：
+ポイント:
 
-- `nonisolated` 加在 struct 上，整个类型脱离 MainActor，所有方法和属性自动 nonisolated（Swift 6.1 新特性）。
-- `@concurrent` 是新属性，告诉 Swift 这个方法**总是**切到后台线程执行，不再继承调用方的 actor。
-- `async` 让调用方需要 `await`——这是「跨线程切换」在类型层面的可见标记。
-- 调用点变成 `await PhotoProcessor().process(data: data)`，主线程在等待期间继续处理滚动手势。
+- `nonisolated` を struct に付けると、型全体が MainActor から外れ、すべてのメソッドとプロパティが自動的に nonisolated 扱いになります（Swift 6.1 の新機能）。
+- `@concurrent` は新しい属性で、このメソッドを **常に** バックグラウンドスレッドで実行するよう Swift に伝えます。呼び出し側の actor を継承しなくなります。
+- `async` が付くことで、呼び出し側には `await` が必須になります。「スレッド切り替えが起こる」ことを型レベルで明示するマーカーになっているわけです。
+- 呼び出し箇所は `await PhotoProcessor().process(data: data)` の形になり、メインスレッドは待機中もスクロールジェスチャの処理を継続できます。
 
-**第三步：把贴纸提取和颜色计算并行化（[20:55](https://developer.apple.com/videos/play/wwdc2025/270/?time=1255)）**
+**ステップ 3: ステッカー抽出と色計算を並列化する（[20:55](https://developer.apple.com/videos/play/wwdc2025/270/?time=1255)）**
 
-抠图和取色相互独立，可以同时跑，用 `async let`：
+切り抜きと色抽出は互いに独立しているので、`async let` を使って同時に走らせます。
 
 ```swift
 nonisolated struct PhotoProcessor {
@@ -139,15 +139,15 @@ nonisolated struct PhotoProcessor {
 }
 ```
 
-关键点：
+ポイント:
 
-- `async let` 立即启动子任务，把 sticker 和 colors 两条计算扔到不同线程并发执行。
-- `await sticker`、`await colors` 是真正等待结果的地方；两条任务大约同时完成，总耗时接近耗时较长的那条。
-- ColorExtractor 从存储属性挪到 `extractColors` 局部变量——并发任务各自创建独立实例，避免共享可变像素缓冲区导致的数据竞争。
+- `async let` は子タスクを即座に起動し、sticker と colors の 2 つの計算を別々のスレッドで並行実行します。
+- `await sticker`、`await colors` こそが本当に結果を待つ場所です。2 つのタスクはほぼ同時に終わるため、合計時間は長い方のタスクの所要時間に近くなります。
+- ColorExtractor をストアドプロパティから `extractColors` のローカル変数に移している点も重要です。並行タスクごとに独立したインスタンスを生成することで、共有可変なピクセルバッファによるデータ競合を防ぎます。
 
-**第四步：处理 SwiftUI 闭包中的数据竞争（[24:20](https://developer.apple.com/videos/play/wwdc2025/270/?time=1460)）**
+**ステップ 4: SwiftUI クロージャ内のデータ競合を扱う（[24:20](https://developer.apple.com/videos/play/wwdc2025/270/?time=1460)）**
 
-`visualEffect` 闭包是 `@Sendable` 的，SwiftUI 会在后台线程调用它。直接读 `viewModel.selection`（@MainActor 状态）会编译错。解法是在捕获列表里把值拷出来：
+`visualEffect` のクロージャは `@Sendable` であり、SwiftUI はバックグラウンドスレッドからこれを呼び出します。`viewModel.selection`（@MainActor 状態）を直接読もうとするとコンパイルエラーになります。解決策は、キャプチャリストで値をコピーしておくことです。
 
 ```swift
 .visualEffect { [selection = viewModel.selection] content, proxy in
@@ -165,14 +165,14 @@ nonisolated struct PhotoProcessor {
 }
 ```
 
-关键点：
+ポイント:
 
-- `[selection = viewModel.selection]` 在主线程上完成快照；闭包内部使用拷贝出来的 `selection`，不再回访 `self`。
-- 值类型（数组、ID）拷贝便宜，又天然 Sendable，跨线程读取安全。
+- `[selection = viewModel.selection]` の部分はメインスレッド上でスナップショットを取り終えています。クロージャ内ではコピー済みの `selection` を使うので、`self` には触れません。
+- 値型（配列や ID）はコピーが安価で、しかも本質的に Sendable であるため、スレッドをまたいだ読み取りも安全です。
 
-**第五步：用 TaskGroup 并发处理整个相册（[29:00](https://developer.apple.com/videos/play/wwdc2025/270/?time=1740)）**
+**ステップ 5: TaskGroup でアルバム全体を並行処理する（[29:00](https://developer.apple.com/videos/play/wwdc2025/270/?time=1740)）**
 
-进入 grid 视图时要把所有照片一次性处理完，数量在运行时才知道，用 TaskGroup：
+グリッド表示に入る際は、すべての写真を一気に処理します。個数は実行時にしか分からないため、TaskGroup を使います。
 
 ```swift
 func processAllPhotos() async {
@@ -195,52 +195,52 @@ func processAllPhotos() async {
 }
 ```
 
-关键点：
+ポイント:
 
-- `withTaskGroup` 适合任务数量在编译期不固定的场景，`async let` 不行。
-- `group.addTask` 在循环里动态加子任务；TaskGroup 遵循 AsyncSequence。
-- `for await result in group` 按**完成顺序**而非提交顺序拿结果，最快做完的先写进 dictionary。
-- 整个 group 在 `await withTaskGroup` 退出时自动等所有子任务结束——结构化并发避免任务泄漏。
-
----
-
-## 核心启发
-
-**1. 先 profile 再加 concurrency**
-
-为什么值得做：没有测量数据的优化是盲目的。Sima 在 session 里反复用 Instruments 的 Time Profiler 确认主线程阻塞的事实，再决定要不要切线程。
-
-怎么开始：在 Xcode 选 Product → Profile，跑 Time Profiler，看 heaviest stack trace 里有没有自己的代码挂在主线程。看到 Severe Hang 才动手。
-
-**2. 用 `nonisolated` + `@concurrent` 描述「这个类型不属于主线程」**
-
-为什么值得做：main actor by default 模式让默认在主线程跑，这对 UI 代码合理，对计算代码致命。把 `nonisolated` 加在类型上，整个类型脱离 MainActor；`@concurrent` 加在 async 方法上，强制切后台线程。比在每个调用点手写 `Task { @concurrent in ... }` 更清晰。
-
-怎么开始：识别项目里的纯计算类型（图片处理、解码、签名等），加 `nonisolated struct` 或 `nonisolated class`，把入口方法标 `@concurrent async`。
-
-**3. 数据竞争优先用「不共享」解决**
-
-为什么值得做：ColorExtractor 一开始是 PhotoProcessor 的存储属性，并发调用就会冲突。把它改成函数局部变量，每个任务一个独立实例，问题消失。比加锁、加 actor 更省事。
-
-怎么开始：碰到 Sendable 报错时先问——这个可变状态真的需要共享吗？如果每次调用都能新建一个，就别让它当属性。
-
-**4. SwiftUI 的 `@Sendable` 闭包用捕获列表拷值**
-
-为什么值得做：`visualEffect`、`onGeometryChange` 这类闭包会在后台调用。在闭包里访问 `self.someMainActorProperty` 编译错；在捕获列表里拷一份值类型快照就解决了。
-
-怎么开始：见到「Sending main actor-isolated value to nonisolated context」错误，先看闭包是不是 `@Sendable`，再用 `[x = self.x]` 拷出来。
-
-**5. 任务数量动态时用 TaskGroup，固定时用 `async let`**
-
-为什么值得做：`async let` 是结构化并发的最简形式，但只能开固定条数。处理「相册里所有照片」这类运行时才知数量的场景，必须用 `withTaskGroup`，并通过 `for await` 按完成顺序消费结果。
-
-怎么开始：写并发批处理时先数任务条数——固定 2~3 条用 `async let`；循环里 addTask 用 TaskGroup；提交完别忘 `for await result in group` 收结果。
+- `withTaskGroup` はタスク数がコンパイル時に固定できないケースに向きます。`async let` では対応できません。
+- `group.addTask` を使ってループの中で動的に子タスクを追加します。TaskGroup は AsyncSequence に準拠しています。
+- `for await result in group` は提出順ではなく **完了順** で結果を取得するため、最も早く終わったものから順に dictionary に書き込まれます。
+- group 全体は `await withTaskGroup` を抜ける際にすべての子タスクの完了を自動的に待ちます。構造化並行性によりタスクのリークが防がれます。
 
 ---
 
-## 关联 Session
+## 重要なポイント
 
-- [What’s new in Swift](/articles/wwdc2025-245) — Swift 6.2 的语言更新，包括 `@concurrent`、`nonisolated` 类型修饰这些本节用到的特性。
-- [Code-along: Explore localization with Xcode](/articles/wwdc2025-225) — 同系列 code-along，用一个 sample app 一步步演示 Xcode 的本地化流程。
-- [Meet Containerization](/articles/wwdc2025-346) — 用 Swift 写的开源容器项目，展示 Swift 在系统级并发场景下的工程实践。
-- [Get started with Game Center](/articles/wwdc2025-214) — Game Center 入门，体会 SwiftUI app 接入系统服务时常见的异步 API 模式。
+**1. concurrency を入れる前に、まず profile**
+
+なぜやる価値があるか: 計測データのない最適化は盲目です。本セッションの Sima さんも、Instruments の Time Profiler でメインスレッドのブロックという事実を確認したうえで、スレッドを切るかどうかを判断していました。
+
+始め方: Xcode の Product → Profile から Time Profiler を実行し、heaviest stack trace の中に自分のコードがメインスレッドにぶら下がっていないかを確認しましょう。Severe Hang を見つけてから手を動かせば十分です。
+
+**2. `nonisolated` + `@concurrent` で「この型はメインスレッドのものではない」と表現する**
+
+なぜやる価値があるか: main actor by default モードはデフォルトでメインスレッドに乗せて動かしますが、これは UI コードには合理的でも、計算コードには致命的です。`nonisolated` を型に付けて MainActor から切り離し、`@concurrent` を async メソッドに付けてバックグラウンドスレッドへの切り替えを強制します。呼び出し側で毎回 `Task { @concurrent in ... }` と書くより、ずっと意図が明確になります。
+
+始め方: プロジェクト内の純粋な計算系の型（画像処理、デコード、署名など）を洗い出し、`nonisolated struct` や `nonisolated class` に変え、エントリーポイントとなるメソッドを `@concurrent async` でマークしましょう。
+
+**3. データ競合は「共有しない」で解くのが第一選択**
+
+なぜやる価値があるか: ColorExtractor は当初 PhotoProcessor のストアドプロパティでしたが、並行に呼ばれた時点で衝突します。これを関数のローカル変数に変え、タスクごとに独立したインスタンスにすれば、問題そのものが消滅します。ロックや actor を持ち出すよりずっと手軽です。
+
+始め方: Sendable のエラーに遭遇したら、まず「この可変状態は本当に共有が必要か?」と自問しましょう。呼び出しのたびに作り直せるなら、わざわざプロパティにする必要はありません。
+
+**4. SwiftUI の `@Sendable` クロージャでは、キャプチャリストで値をコピーする**
+
+なぜやる価値があるか: `visualEffect` や `onGeometryChange` のようなクロージャはバックグラウンドから呼ばれます。クロージャ内で `self.someMainActorProperty` にアクセスするとコンパイルエラーになりますが、キャプチャリストで値型のスナップショットを取れば解決します。
+
+始め方: 「Sending main actor-isolated value to nonisolated context」というエラーを見たら、まずクロージャが `@Sendable` かどうかを確認し、`[x = self.x]` の形で値を取り出してください。
+
+**5. 動的な個数は TaskGroup、固定なら `async let`**
+
+なぜやる価値があるか: `async let` は構造化並行性の最もシンプルな形ですが、固定個数のタスクしか開けません。「アルバム内のすべての写真」のように実行時に個数が決まるケースでは `withTaskGroup` が必須となり、結果は `for await` で完了順に消費していきます。
+
+始め方: 並行バッチ処理を書く前に、タスクの個数を数えましょう。固定の 2 〜 3 個なら `async let`、ループ内で addTask するなら TaskGroup。提出が終わったら `for await result in group` で結果の回収を忘れずに。
+
+---
+
+## 関連 Session
+
+- [What’s new in Swift](/articles/wwdc2025-245) — Swift 6.2 の言語アップデート。本セッションで使った `@concurrent` や `nonisolated` 型修飾といった新機能が含まれます。
+- [Code-along: Explore localization with Xcode](/articles/wwdc2025-225) — 同シリーズの code-along。1 つの sample app を題材に、Xcode のローカライゼーション手順をステップごとに紹介します。
+- [Meet Containerization](/articles/wwdc2025-346) — Swift で書かれたオープンソースのコンテナプロジェクト。システムレベルの並行処理シーンにおける Swift の実装例を見せてくれます。
+- [Get started with Game Center](/articles/wwdc2025-214) — Game Center の入門編。SwiftUI app からシステムサービスを利用する際によくある非同期 API のパターンを体感できます。

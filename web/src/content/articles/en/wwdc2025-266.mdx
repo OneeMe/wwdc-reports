@@ -24,17 +24,17 @@ relatedSessions:
 
 ## Highlight
 
-> SwiftUI 的 `View` 协议默认带 `@MainActor` 隔离，`Shape.path(in:)`、`visualEffect`、`Layout`、`onGeometryChange` 等 API 的闭包则被标为 `@Sendable`，由 SwiftUI 调度到后台线程执行。
+> SwiftUI's `View` protocol is isolated to `@MainActor` by default. Closures on APIs like `Shape.path(in:)`, `visualEffect`, `Layout`, and `onGeometryChange` are marked `@Sendable`, and SwiftUI dispatches them to background threads.
 
-## 核心内容
+## Core content
 
-Data race 是 SwiftUI 老用户最熟悉的麻烦：动画卡顿、状态错乱，甚至数据丢失。在 Swift 6 之前，开发者要靠纪律和经验，自己判断哪些代码跑在主线程，哪些不是。一旦写错，bug 几乎只能在运行时复现。
+Data races are the oldest headache for SwiftUI developers: stuttering animation, broken state, even lost data. Before Swift 6, you had to rely on discipline and experience to know which code ran on the main thread and which did not. Get it wrong and the bug usually only showed up at runtime.
 
-Daniel 用一个「颜色提取 app」做导览，分三站讲解 SwiftUI 在 Swift 并发体系下的位置。第一站 Main Actor Meadows：`View` 协议本身就标注了 `@MainActor`，所以你写的 struct、`body`、`@State` 全部默认在主线程，连 `@Observable` 的 model 也不需要手动加注解。第二站 Concurrency Cliffs：`Shape.path(in:)`、`visualEffect`、`Layout` 协议方法、`onGeometryChange` 这几个 API，SwiftUI 会主动把闭包丢到后台线程算，这些参数因此被标 `@Sendable`，编译器替你拦截 data race。第三站 Camp：解释为什么 Button 的 action 是同步闭包——因为长任务前后的 UI 状态切换（比如 loading 动画）必须同步发出，异步函数里的 `await` 会引入 suspension，可能错过下一帧的刷新窗口。
+Daniel walks through a "color extractor app" in three stops, each one mapping SwiftUI onto a piece of Swift's concurrency model. Stop one, Main Actor Meadows: the `View` protocol itself is `@MainActor`, so your structs, your `body`, and `@State` all run on the main thread by default. Even an `@Observable` model needs no extra annotation. Stop two, Concurrency Cliffs: SwiftUI actively pushes the closures of `Shape.path(in:)`, `visualEffect`, `Layout` protocol methods, and `onGeometryChange` onto background threads. Their parameters are marked `@Sendable`, so the compiler catches data races for you. Stop three, Camp: it explains why a Button action is a synchronous closure — UI state changes around a long task (a loading animation, say) must fire synchronously, because an `await` introduces a suspension and may miss the next frame's window.
 
-## 详细内容
+## Detailed content
 
-整个 session 围绕一个 `ColorExtractorView` 展开（[02:45](https://developer.apple.com/videos/play/wwdc2025/266/?time=165)）：
+The whole session is built around one `ColorExtractorView` ([02:45](https://developer.apple.com/videos/play/wwdc2025/266/?time=165)):
 
 ```swift
 struct ColorExtractorView: View {
@@ -66,13 +66,13 @@ struct ColorExtractorView: View {
 }
 ```
 
-关键点：
+Key points:
 
-- `View` 协议声明了 `@MainActor`，`ColorExtractorView` 通过 conformance 推断出 `@MainActor` 隔离，`body` 和 `@State` 都在主线程。
-- `model` 实例在 view 声明里 `@State` 创建，Swift 会自动把它带进 `@MainActor` 隔离，所以 `ColorExtractor` 这个 `@Observable` class 不用单独加注解。
-- 点击手势里 `withAnimation` 同步切到 loading 状态，再用 `Task` 跳进异步上下文调用 `extractColorScheme()`，结果回来后再同步切回。这段闭包同样继承了 `@MainActor`。
+- The `View` protocol is declared `@MainActor`, so `ColorExtractorView` infers `@MainActor` isolation through conformance. `body` and `@State` run on the main thread.
+- The `model` instance is created with `@State` in the view declaration, and Swift carries it into the `@MainActor` isolation automatically. The `@Observable` class `ColorExtractor` needs no separate annotation.
+- The tap gesture flips to the loading state synchronously with `withAnimation`, then enters an async context with `Task` to call `extractColorScheme()`, and flips back synchronously when the result returns. This closure inherits `@MainActor` too.
 
-后台线程的入口长这样（[08:26](https://developer.apple.com/videos/play/wwdc2025/266/?time=506)）：
+The entry to a background thread looks like this ([08:26](https://developer.apple.com/videos/play/wwdc2025/266/?time=506)):
 
 ```swift
 struct SchemeContentView: View {
@@ -101,29 +101,29 @@ struct SchemeContentView: View {
 }
 ```
 
-关键点：
+Key points:
 
-- `visualEffect` 的闭包标了 `@Sendable`，SwiftUI 可能在后台线程调用它，目的是把高频的视觉计算从主线程剥离（[11:12](https://developer.apple.com/videos/play/wwdc2025/266/?time=672)）。
-- 闭包要读 `pulse`，直接写 `pulse` 等价于 `self.pulse`，编译器会报错——`self` 是 `@MainActor` 的 `View`，把它送进非隔离闭包后再访问 `@MainActor` 属性会触发 data race 检查。
-- 修法是用捕获列表 `[pulse]` 拷贝一份。`Bool` 是值类型且 sendable，闭包里只读这份本地拷贝，从此不再依赖 `self`，绕开了跨 actor 访问（[15:52](https://developer.apple.com/videos/play/wwdc2025/266/?time=952)）。
+- The closure on `visualEffect` is marked `@Sendable`, and SwiftUI may call it on a background thread. The goal is to lift high-frequency visual computation off the main thread ([11:12](https://developer.apple.com/videos/play/wwdc2025/266/?time=672)).
+- The closure needs to read `pulse`. Writing `pulse` is the same as `self.pulse`, and the compiler rejects it: `self` is a `@MainActor` `View`, and reaching for a `@MainActor` property after handing `self` to a non-isolated closure trips the data-race check.
+- The fix is a capture list, `[pulse]`, which copies the value. `Bool` is a value type and sendable. The closure reads only this local copy, no longer depends on `self`, and skips the cross-actor access ([15:52](https://developer.apple.com/videos/play/wwdc2025/266/?time=952)).
 
-第三站讲为什么不该把异步状态变更直接写进视图（[19:15](https://developer.apple.com/videos/play/wwdc2025/266/?time=1155)）。`await` 会插入 suspension point，运行时可以暂停任意时长再恢复，恢复时机可能已经错过这一帧的 deadline，动画因此跟不上手势。Daniel 的建议是用一段 state 做桥：state 发起 `Task`，async 工作完成后用同步赋值改 state，UI 通过 `@Observable` 自动响应——视图代码本身保持同步。这样还有副作用：把异步逻辑剥离出去后，单元测试不需要 import SwiftUI 也能跑（[23:48](https://developer.apple.com/videos/play/wwdc2025/266/?time=1428)）。
+Stop three explains why you should not write async state changes directly into the view ([19:15](https://developer.apple.com/videos/play/wwdc2025/266/?time=1155)). An `await` inserts a suspension point, and the runtime may pause for any length of time before resuming. By the time it resumes, the frame's deadline may already be gone, and the animation falls behind the gesture. Daniel's advice is to bridge with state: the state kicks off a `Task`, the async work assigns back to state synchronously when it finishes, and the UI reacts through `@Observable`. The view code itself stays synchronous. There is a side benefit: once async logic moves out, unit tests can run without importing SwiftUI ([23:48](https://developer.apple.com/videos/play/wwdc2025/266/?time=1428)).
 
-## 核心启发
+## Core takeaways
 
-1. **相信 `@MainActor` 默认值**。Swift 6.2 的新 language mode 会给整个 module 隐式加 `@MainActor`。升级老 app 时先打开它，删掉视图层手写的 `@MainActor`——大概率能掉一大批冗余注解。
+1. **Trust the `@MainActor` default**. Swift 6.2's new language mode adds `@MainActor` to the whole module implicitly. Turn it on first when you upgrade an old app, then strip the hand-written `@MainActor` from the view layer — odds are a large pile of redundant annotations falls out.
 
-2. **闭包要外部值，先用捕获列表拷一份**。看到 `@Sendable` 闭包里访问 `self.someState` 编译报错，第一反应是 `[someState]` 而不是去把属性改成 `nonisolated`。前者只复制必要数据，后者会把数据安全的责任推给你自己。
+2. **To pull an outside value into a closure, copy it through a capture list**. When a `@Sendable` closure fails to compile on `self.someState`, reach for `[someState]` first, not `nonisolated`. The first copies only what you need; the second hands the responsibility for data safety back to you.
 
-3. **把异步逻辑搬出 view，用 state 桥接**。视图里只放同步的 state 读写，长任务交给 model/manager，结果通过 `@Observable` 的同步 mutation 回来。`Task` 在 view 里的角色仅限于「通知 model 一个 UI 事件」，不要在 `Task` 里做时间敏感的 UI 改动。
+3. **Move async logic out of the view and bridge with state**. Keep the view to synchronous state reads and writes. Hand long tasks to a model or manager, and let the result return through a synchronous mutation on `@Observable`. A `Task` in the view should only "tell the model about a UI event" — never make a time-sensitive UI change inside it.
 
-4. **动画相关的 state 变更必须同步触发**。`withAnimation { isLoading = true }` 要写在 `onTapGesture` 这种同步 callback 里，不要写在 `await` 之后。`await` 之后的恢复时机不可控，可能错过帧 deadline。
+4. **State changes tied to animation must fire synchronously**. Write `withAnimation { isLoading = true }` inside a synchronous callback like `onTapGesture`, not after an `await`. The resume time after an `await` is out of your hands and may miss the frame deadline.
 
-5. **用 `Mutex` 让自定义 class 变 sendable**。如果非要在并发任务间共享一个引用类型，`Synchronization.Mutex` 是 Apple 官方文档推荐的工具，比自己写 lock 更稳。
+5. **Use `Mutex` to make a custom class sendable**. If you really must share a reference type across concurrent tasks, `Synchronization.Mutex` is what Apple's docs recommend, and it is steadier than rolling your own lock.
 
-## 关联 Session
+## Related sessions
 
-- [Embracing Swift concurrency](/articles/wwdc2025-268) — Swift 并发模型的入门导览，本 session 多次引用作为前置阅读。
-- [Elevate an app with Swift concurrency](/articles/wwdc2025-270) — 讲如何把高负载工作从主线程卸下，配合本 session 的 Concurrency Cliffs 食用。
-- [What's new in SwiftUI](/articles/wwdc2025-256) — SwiftUI 2025 新特性总览，包括本 session 涉及的 `onScrollVisibilityChange` 等 API。
-- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — 同样以 `@Observable` model + `@State` 桥接异步工作的实战示例。
+- [Embracing Swift concurrency](/articles/wwdc2025-268) — A primer on Swift's concurrency model. This session cites it repeatedly as required reading.
+- [Elevate an app with Swift concurrency](/articles/wwdc2025-270) — How to lift heavy work off the main thread. Pairs with the Concurrency Cliffs stop in this session.
+- [What's new in SwiftUI](/articles/wwdc2025-256) — A tour of SwiftUI's 2025 features, including APIs this session touches like `onScrollVisibilityChange`.
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — A hands-on example of bridging async work with an `@Observable` model and `@State`, in the same shape as this session.

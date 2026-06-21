@@ -24,21 +24,21 @@ relatedSessions:
 
 ## Highlight
 
-> MetalFX 在 Apple 平台首次加入帧插值，配合新的去噪上采样器和光线追踪 intersection function buffer，让 Cyberpunk 2077 级别的路径追踪在 Apple Silicon 上跑得动。
+> MetalFX adds frame interpolation on Apple platforms for the first time. Together with the new denoised upscaler and the ray tracing intersection function buffer, it lets Cyberpunk 2077-class path tracing run on Apple Silicon.
 
 ---
 
-## 核心内容
+## Core Content
 
-游戏渲染的难题摆在台面上：Cyberpunk 2077 这种级别的画面，每个像素都很贵，分辨率和帧率同时拉高就跑不动。过去 MetalFX 只有时序上采样器一个工具，开发者要么牺牲分辨率，要么牺牲帧率，要么手写一套帧间插值的脏活——而手写帧插值要处理 UI 渲染、节拍控制、双缓冲队列，工程量极大。
+The hard problem in game rendering is on the table: at the visual level of Cyberpunk 2077, every pixel is expensive, and pushing resolution and frame rate together breaks the budget. MetalFX used to ship only one tool, the temporal upscaler. Developers had to give up resolution, give up frame rate, or hand-roll their own frame interpolation — and rolling your own means handling UI rendering, pacing, and double-buffered queues. That is a lot of work.
 
-WWDC25 这场 Session 给出了三件武器：MetalFX 帧插值器（Frame Interpolator）把已经渲染好的两帧之间凭空生成一帧，原生集成进 Metal 管线；MetalFX 去噪上采样器（Denoised Upscaler）把光追的降噪和上采样合成一步，省掉每个场景的手工调参；光追这边新增 intersection function buffer，让 DirectX 的 shader binding table 能直接平移过来。三个特性可以叠加：先用 intersection function buffer 优化光追、再用去噪上采样器把光线预算压下来、最后用帧插值器把帧率翻倍。
+This WWDC25 session hands developers three new weapons. The MetalFX Frame Interpolator generates a frame between two already-rendered frames out of thin air, and is built into the Metal pipeline natively. The MetalFX Denoised Upscaler folds ray-traced denoising and upscaling into a single step, removing per-scene hand tuning. On the ray tracing side, the new intersection function buffer lets a DirectX shader binding table port over directly. The three features stack: use the intersection function buffer to optimize ray tracing, use the denoised upscaler to cut the ray budget, then use the frame interpolator to double the frame rate.
 
 ---
 
-## 详细内容
+## Detailed Content
 
-帧插值器的接入只要五张纹理：当前帧颜色、上一帧颜色、深度、运动向量、输出。如果已经接了 MetalFX 上采样器，运动向量和深度可以直接复用。把 `temporalScaler` 传给 `MTLFXFrameInterpolatorDescriptor.scaler` 还能拿到组合性能加成（[08:35](https://developer.apple.com/videos/play/wwdc2025/211/?time=515)）。
+Hooking up the frame interpolator takes only five textures: current frame color, previous frame color, depth, motion vectors, and output. If you have already wired up the MetalFX upscaler, you can reuse motion vectors and depth. Pass `temporalScaler` to `MTLFXFrameInterpolatorDescriptor.scaler` to get a combined performance bonus ([08:35](https://developer.apple.com/videos/play/wwdc2025/211/?time=515)).
 
 ```objc
 // Create and configure the interpolator descriptor
@@ -59,13 +59,13 @@ interpolator.motionTexture = motionTexture;
 interpolator.outputTexture = outputTexture;
 ```
 
-关键点：
-- `desc.scaler = temporalScaler`：把已有的 MetalFX 时序上采样器对象交给插值器，让两者共享中间结果，比独立调用更省。
-- `depthReversed = YES`：声明使用反向 Z（远处接近 0、近处接近 1），现代引擎几乎都用反向 Z 提高深度精度。
-- `motionVectorScaleX/Y`：把运动向量从归一化坐标缩放到像素坐标，必须填对，否则插值会出鬼影。
-- 五张输入纹理一次性绑定：颜色、上一帧颜色、深度、运动、输出。少一张就跑不起来。
+Key points:
+- `desc.scaler = temporalScaler`: hand the existing MetalFX temporal upscaler object to the interpolator so the two share intermediate results. This is cheaper than calling them independently.
+- `depthReversed = YES`: declare reversed Z (far near 0, near near 1). Almost every modern engine uses reversed Z for better depth precision.
+- `motionVectorScaleX/Y`: scale motion vectors from normalized coordinates to pixel coordinates. Get this wrong and the interpolator produces ghosting.
+- Bind all five input textures at once: color, previous color, depth, motion, output. Miss one and it will not run.
 
-去噪上采样器（Denoised Upscaler）的迁移路径很短——在已经接好的 `MTLFXTemporalScalerDescriptor` 基础上加四张辅助纹理就行（[13:02](https://developer.apple.com/videos/play/wwdc2025/211/?time=782)）。
+The migration path to the Denoised Upscaler is short — start from a working `MTLFXTemporalScalerDescriptor` and add four auxiliary textures ([13:02](https://developer.apple.com/videos/play/wwdc2025/211/?time=782)).
 
 ```objc
 MTLFXTemporalScalerDescriptor* desc = [MTLFXTemporalScalerDescriptor new];
@@ -86,13 +86,13 @@ desc.outputHeight = _screenHeight;
 temporalScaler = [desc newTemporalDenoisedScalerWithDevice:_device];
 ```
 
-关键点：
-- 前四行是普通时序上采样器就要填的：颜色格式、输出格式、深度格式、运动格式。
-- 新增四张噪声自由的辅助纹理：漫反射反照率（diffuse albedo）、镜面反射反照率（specular albedo）、法线（normals）、粗糙度（roughness）。游戏的 G-buffer 里通常都有，直接复用。
-- `newTemporalDenoisedScalerWithDevice:` 这一行是分水岭：换成这个工厂方法，就拿到了同时做去噪和上采样的对象。
-- 法线必须用世界空间、且纹理类型要带符号位，否则相机方向一转质量就掉。这点 Session 在 [22:00](https://developer.apple.com/videos/play/wwdc2025/211/?time=1320) 反复强调。
+Key points:
+- The first four lines are what any temporal upscaler needs: color format, output format, depth format, motion format.
+- Four new noise-free auxiliary textures: diffuse albedo, specular albedo, normals, and roughness. A game's G-buffer usually has all four — reuse them directly.
+- The line `newTemporalDenoisedScalerWithDevice:` is the watershed. Switch to this factory method and you get an object that does denoising and upscaling in one shot.
+- Normals must be in world space, and the texture type must be signed. Otherwise quality drops the moment the camera turns. The session hits this point hard at [22:00](https://developer.apple.com/videos/play/wwdc2025/211/?time=1320).
 
-光追这边引入了 intersection function buffer，把 DirectX 的 shader binding table 移植成本压到最低。地面是 instance 和 geometry 两级 offset 索引（[16:04](https://developer.apple.com/videos/play/wwdc2025/211/?time=964)）：
+For ray tracing, the new intersection function buffer cuts the cost of porting a DirectX shader binding table to almost zero. The host side uses a two-level offset index across instances and geometry ([16:04](https://developer.apple.com/videos/play/wwdc2025/211/?time=964)):
 
 ```objc
 MTLAccelerationStructureInstanceDescriptor *grassInstanceDesc, *treeInstanceDesc = . . .;
@@ -100,7 +100,7 @@ grassInstanceDesc.intersectionFunctionTableOffset = 0;
 treeInstanceDesc.intersectionFunctionTableOffset  = 1;
 ```
 
-shader 端则用 `intersection_function_buffer` 标签声明 intersector，再设置 ray type 数量和 base id（[13:01](https://developer.apple.com/videos/play/wwdc2025/211/?time=781)）：
+On the shader side, declare the intersector with the `intersection_function_buffer` tag, then set the ray type count and base id ([13:01](https://developer.apple.com/videos/play/wwdc2025/211/?time=781)):
 
 ```metal
 metal::raytracing::intersector<intersection_function_buffer, instancing, triangle> trace;
@@ -108,41 +108,41 @@ trace.set_geometry_multiplier(2); // Number of ray types, defaults to 1
 trace.set_base_id(1);             // Set ray type index, defaults to 0
 ```
 
-关键点：
-- `geometry_multiplier(2)`：声明每个 geometry 有两种 ray type（比如主光线和阴影光线），决定了 buffer 的步长。
-- `set_base_id(1)`：当前正在追的是第二种 ray type（base id = 1，阴影光线）；如果追主光线就填 0。
-- 和 DirectX 不同，Metal 把 buffer 地址和 stride 放在 shader 里设，DirectX 放在 host 端 dispatch 时设。SIMD group 内所有线程必须设同一个值，否则行为未定义。
-- 移植 DirectX 项目时，instance offset、ray type index、geometry multiplier 三个概念一一对应，只是 Metal 把 geometry offset 也交给开发者控制，DirectX 是自动生成。
+Key points:
+- `geometry_multiplier(2)`: declares two ray types per geometry (for example, primary rays and shadow rays). This sets the buffer stride.
+- `set_base_id(1)`: the current trace is the second ray type (base id = 1, shadow rays). For primary rays, pass 0.
+- Unlike DirectX, Metal sets the buffer address and stride in the shader. DirectX sets them on the host at dispatch time. All threads in a SIMD group must set the same value, or behavior is undefined.
+- When porting a DirectX project, instance offset, ray type index, and geometry multiplier map one-to-one. The only difference is that Metal hands geometry offset to the developer; DirectX generates it automatically.
 
-帧插值的节拍（pacing）是最容易踩坑的地方。Session 给了一个 `PresentThread` 辅助类做参考实现（[12:45](https://developer.apple.com/videos/play/wwdc2025/211/?time=765)），用 `MTLSharedEvent` + `kqueue` 的 `EVFILT_TIMER` 做亚毫秒级节拍控制，确保插值帧和真实帧按等长间隔上屏。判断节拍是否对的简单方法：开 Metal HUD，看 Frame Interval 直方图——只有一两个 bucket 就是对的，超过两个就是节拍掉了。
+Pacing for frame interpolation is the easiest place to trip. The session ships a reference `PresentThread` helper ([12:45](https://developer.apple.com/videos/play/wwdc2025/211/?time=765)) that uses `MTLSharedEvent` plus `kqueue`'s `EVFILT_TIMER` for sub-millisecond pacing, so interpolated frames and real frames hit the screen at equal intervals. The simple way to check pacing: turn on the Metal HUD and look at the Frame Interval histogram. One or two buckets means pacing is correct; more than two means pacing is broken.
 
-另外两个新工具值得记一下：`MTLFX_EXPOSURE_TOOL_ENABLED` 环境变量开启后会在画面上叠加一张灰色棋盘格，曝光值传对了就是恒定中灰、传错了会闪烁（[04:25](https://developer.apple.com/videos/play/wwdc2025/211/?time=265)）；reactive mask 让开发者把粒子、烟花这种没有写进 motion/depth 的透明效果标出来，避免上采样把它们当成纹理细节给糊掉（[06:46](https://developer.apple.com/videos/play/wwdc2025/211/?time=406)）。
-
----
-
-## 核心启发
-
-- **做什么**：把已有的 MetalFX 上采样器升级为帧插值器
-  - 为什么值得做：渲染管线只需要在 tone-mapping 之后多插一步，运动向量和深度可以复用，工程量小但能直接把目标帧率翻倍。30 FPS 的输入就够用，比硬抠优化划算得多。
-  - 怎么开始：先用 Metal HUD 看当前帧率和 frame interval 直方图确认基线；然后按 `MTLFXFrameInterpolatorDescriptor` 接最小可用版本，UI 先用 Composited UI 模式（最简单，让插值器自己 unblend）；跑通后再考虑 Offscreen UI 或 Every-Frame UI 提升质量。
-
-- **做什么**：把光追的降噪环节替换成 MetalFX 去噪上采样器
-  - 为什么值得做：传统 denoiser 每个场景都要美术手工调参，去噪上采样器是机器学习模型，零调参就出片，还能把 ray budget 压下来——同样的画质用更少的光线。
-  - 怎么开始：先确认 G-buffer 里有 normals（世界空间、带符号位）、diffuse albedo、specular albedo、roughness 这四张；接好之后再加 specular hit distance、denoiser strength mask、transparency overlay 三个可选输入精修质量；金属材质的 diffuse albedo 记得调暗，颜色应该在 specular albedo 里。
-
-- **做什么**：从 DirectX 移植光追游戏时优先用 intersection function buffer
-  - 为什么值得做：DirectX 的 shader binding table 和 Metal 4 的 intersection function buffer 概念几乎一一对应，instance offset、ray type、geometry multiplier 都能直接平移，shader 改动比之前的 visible function table 路线少得多。
-  - 怎么开始：先在 instance descriptor 上设 `intersectionFunctionTableOffset`，再在 geometry descriptor 上设同样的字段；shader 里用 `intersector<intersection_function_buffer, ...>` 声明，把 `set_geometry_multiplier` 设成 ray type 数量、`set_base_id` 设当前 ray type 索引；最后把 buffer、size、stride 通过 `intersection_function_buffer_arguments` 传给 `trace.intersect`。
-
-- **做什么**：用 `MTLFX_EXPOSURE_TOOL_ENABLED` 环境变量校准上采样器的 exposure 输入
-  - 为什么值得做：曝光值传错会导致 flickering 和 ghosting，但肉眼很难直接判断哪里错；棋盘格调试器是 Apple 给的"试纸"，开一下就知道有没有问题。
-  - 怎么开始：在 Xcode 的 scheme 里加这个环境变量，跑游戏看画面上的灰色棋盘格。恒定中灰就是对的；过暗、过亮或运行时颜色变化都说明 exposure 和 tone mapper 不匹配，需要调整传给 upscaler 的值。
+Two more new tools are worth a note. The `MTLFX_EXPOSURE_TOOL_ENABLED` environment variable overlays a gray checkerboard on the image. Pass the right exposure and the checkerboard stays a steady mid-gray; pass the wrong value and it flickers ([04:25](https://developer.apple.com/videos/play/wwdc2025/211/?time=265)). The reactive mask lets developers tag transparent effects like particles and fireworks that do not write motion or depth, so the upscaler does not smear them out as if they were texture detail ([06:46](https://developer.apple.com/videos/play/wwdc2025/211/?time=406)).
 
 ---
 
-## 关联 Session
+## Core Takeaways
 
-- [Discover Metal 4](/articles/wwdc2025-205) — Metal 4 的入门介绍，看完再来这场会更顺
-- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — 把机器学习推理直接编进 Metal 命令缓冲区
-- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — SceneKit 弃用之后的 3D 项目迁移路径
-- [Engage players with the Apple Games app](/articles/wwdc2025-215) — 新版 Apple Games 应用如何成为玩家分发入口
+- **What to do**: upgrade the existing MetalFX upscaler to a frame interpolator
+  - Why it pays off: the render pipeline only needs one extra step after tone-mapping. Motion vectors and depth are reusable. The work is small and it doubles the target frame rate. A 30 FPS input is enough — far cheaper than grinding more low-level optimization.
+  - How to start: use the Metal HUD to read current frame rate and the frame interval histogram for a baseline. Then wire up a minimal `MTLFXFrameInterpolatorDescriptor` and start with Composited UI mode for the UI (the simplest path — let the interpolator unblend it). Once that runs, move to Offscreen UI or Every-Frame UI for higher quality.
+
+- **What to do**: replace the ray tracing denoiser with the MetalFX Denoised Upscaler
+  - Why it pays off: a traditional denoiser needs hand-tuning per scene. The Denoised Upscaler is a machine learning model that ships shippable output with zero tuning, and it lets you cut the ray budget — same image quality with fewer rays.
+  - How to start: confirm your G-buffer has the four required textures: normals (world space, signed), diffuse albedo, specular albedo, and roughness. Once that runs, add three optional inputs — specular hit distance, denoiser strength mask, and transparency overlay — to refine quality. For metallic surfaces, darken the diffuse albedo; the color should live in the specular albedo.
+
+- **What to do**: when porting a ray tracing game from DirectX, reach for the intersection function buffer first
+  - Why it pays off: the DirectX shader binding table and the Metal 4 intersection function buffer map one-to-one. Instance offset, ray type, and geometry multiplier port over directly, and the shader changes are far smaller than on the older visible function table path.
+  - How to start: set `intersectionFunctionTableOffset` on the instance descriptor and the same field on the geometry descriptor. In the shader, declare `intersector<intersection_function_buffer, ...>`, set `set_geometry_multiplier` to the ray type count and `set_base_id` to the current ray type index. Finally, pass the buffer, size, and stride through `intersection_function_buffer_arguments` to `trace.intersect`.
+
+- **What to do**: use the `MTLFX_EXPOSURE_TOOL_ENABLED` environment variable to calibrate the exposure input to the upscaler
+  - Why it pays off: a wrong exposure value causes flickering and ghosting, but the eye cannot easily tell where the error is. The checkerboard debugger is Apple's litmus test — turn it on and you know.
+  - How to start: add the environment variable to the Xcode scheme and run the game. A steady mid-gray checkerboard is correct. If it is too dark, too bright, or shifts color at runtime, exposure and the tone mapper do not match, and the value passed to the upscaler needs to change.
+
+---
+
+## Related Sessions
+
+- [Discover Metal 4](/articles/wwdc2025-205) — an introduction to Metal 4; watch this first and the current session goes down easier
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — how to encode machine learning inference directly into the Metal command buffer
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — the migration path for 3D projects after SceneKit's deprecation
+- [Engage players with the Apple Games app](/articles/wwdc2025-215) — how the new Apple Games app becomes the distribution entry point for players
