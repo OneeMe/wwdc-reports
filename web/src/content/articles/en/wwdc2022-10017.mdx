@@ -21,27 +21,27 @@ relatedSessions:
 
 ## Highlight
 
-> Session 以黑白老照片自动上色为例，串起模型搜索、PyTorch 到 Core ML 转换、Xcode 性能评估、Swift 集成和 Instruments 调优，并把 90ms 的静态图片模型优化成约 16ms 的实时摄像头方案。
+> Using automatic colorization of old black-and-white photos as an example, this session walks through model discovery, PyTorch-to-Core ML conversion, Xcode performance evaluation, Swift integration, and Instruments tuning—and optimizes a 90ms static-image model into a ~16ms real-time camera solution.
 
 ---
 
-## 核心内容
+## Core Content
 
-很多 App 想加入机器学习功能，第一步并不是写模型代码。开发者先要判断：这个问题是否适合机器学习，模型从哪里来，怎样放进 Apple 平台，转换后是否正确，目标设备上是否够快。
+Many apps want to add machine learning, but the first step is not writing model code. Developers first need to decide whether the problem suits ML, where the model comes from, how to bring it to Apple platforms, whether conversion is correct, and whether it is fast enough on target devices.
 
-这场 Session 用一个具体任务回答这些问题：把地下室旧盒子里的黑白家庭照片自动上色。人工修图需要专业摄影师和图像编辑工具，机器学习可以把流程缩短到几秒。
+This session answers those questions with a concrete task: automatically colorizing black-and-white family photos from an old box in the basement. Manual retouching requires a professional photographer and image editing tools; machine learning can shorten the process to seconds.
 
-Apple 的示例流程很直接。先找到一个开源 PyTorch 模型 Colorizer；再用 coremltools 转成 Core ML；接着用 Python 验证转换结果；然后用 Xcode 14 的 Core ML Performance Report 看设备预测时间；最后用 Core Image 和 Core ML 把模型接进 Swift App。
+Apple's example flow is straightforward. Find an open-source PyTorch Colorizer model; convert it with coremltools; validate the conversion in Python; use Xcode 14's Core ML Performance Report to see on-device prediction time; then integrate the model into a Swift app with Core Image and Core ML.
 
-静态图片版本已经够用。Performance Report 显示，原模型在 iPad Pro M1 和 iPadOS 16 上预测约 90ms。需求变成实时摄像头后，这个数字不够了：30fps 摄像头约每 30ms 产生一帧，90ms 会让每次上色期间丢掉两到三帧。
+The static-image version is already useful. The Performance Report shows the original model predicting in about 90ms on iPad Pro M1 with iPadOS 16. When the requirement shifts to a real-time camera, that number is not enough: a 30fps camera produces a frame roughly every 30ms, and 90ms means losing two to three frames during each colorization.
 
-后半段因此进入优化流程。演讲者改动模型架构，用 PyTorch on Metal 在 Apple Silicon 上重新训练，再转换、验证、集成。新模型完全跑在 Neural Engine 上，预测时间约 16ms。最后用 Instruments 的 Core ML 模板发现 App 排队提交预测和误设 60fps 的问题，改成上一帧预测结束后再处理下一帧，并把摄像头设回 30fps。
+The second half therefore enters optimization. The presenter changes the model architecture, retrains with PyTorch on Metal on Apple Silicon, then converts, validates, and integrates. The new model runs entirely on the Neural Engine with prediction time around 16ms. Finally, Instruments' Core ML template reveals the app queuing predictions and mistakenly setting 60fps; the fix is to process the next frame only after the previous prediction finishes, and set the camera back to 30fps.
 
-## 详细内容
+## Detailed Content
 
-### 1. 把 RGB 图像拆成模型需要的 L 通道（[03:06](https://developer.apple.com/videos/play/wwdc2022/10017/?time=186)）
+### 1. Split RGB images into the L channel the model needs ([03:06](https://developer.apple.com/videos/play/wwdc2022/10017/?time=186))
 
-Colorizer 使用 Lab 色彩空间。Lab 有三个通道：L 表示亮度，a 和 b 表示颜色分量。输入黑白图时，模型只需要 L 通道，然后预测新的 a、b 通道。
+Colorizer uses the Lab color space. Lab has three channels: L for lightness, and a and b for color components. For black-and-white input, the model needs only the L channel, then predicts new a and b channels.
 
 ```python
 from skimage import color
@@ -50,13 +50,13 @@ in_lab = color.rgb2lab(in_rgb)
 in_l = in_lab[:,:,0]
 ```
 
-关键点：
+Key points:
 
-- `color.rgb2lab(in_rgb)` 把 RGB 图像转换到 Lab 色彩空间。
-- `in_lab[:,:,0]` 取出第一个通道，也就是亮度 L。
-- a、b 两个颜色通道在输入阶段被丢弃，留给模型预测。
+- `color.rgb2lab(in_rgb)` converts the RGB image to Lab color space.
+- `in_lab[:,:,0]` extracts the first channel, lightness L.
+- The a and b color channels are discarded at input and left for the model to predict.
 
-模型输出后，要把输入 L 和预测出的 a、b 重新拼回 Lab，再转回 RGB。
+After model output, recombine input L with predicted a and b back into Lab, then convert to RGB.
 
 ```python
 from skimage import color
@@ -67,16 +67,16 @@ out_lab = torch.cat((in_l, out_ab), dim=1)
 out_rgb = color.lab2rgb(out_lab.data.numpy()[0,…].transpose((1,2,0)))
 ```
 
-关键点：
+Key points:
 
-- `torch.cat((in_l, out_ab), dim=1)` 把原始亮度和模型输出的颜色分量按通道拼接。
-- `out_lab.data.numpy()` 把张量转成 NumPy 数据，供图像处理库使用。
-- `transpose((1,2,0))` 把通道维移到最后，匹配 `lab2rgb` 期望的图像布局。
-- `color.lab2rgb(...)` 得到最终彩色图像。
+- `torch.cat((in_l, out_ab), dim=1)` concatenates original lightness and model output color components along the channel dimension.
+- `out_lab.data.numpy()` converts the tensor to NumPy data for image processing libraries.
+- `transpose((1,2,0))` moves the channel dimension last to match the layout `lab2rgb` expects.
+- `color.lab2rgb(...)` produces the final color image.
 
-### 2. 用 coremltools 转换 PyTorch 模型（[03:56](https://developer.apple.com/videos/play/wwdc2022/10017/?time=236)）
+### 2. Convert the PyTorch model with coremltools ([03:56](https://developer.apple.com/videos/play/wwdc2022/10017/?time=236))
 
-找到开源模型后，下一步是让它在 Apple 平台上运行。示例用 coremltools 把 PyTorch 模型转成 Core ML 的 `mlpackage`。
+After finding an open-source model, the next step is running it on Apple platforms. The example uses coremltools to convert the PyTorch model to a Core ML `mlpackage`.
 
 ```python
 import coremltools as ct
@@ -94,24 +94,24 @@ coreml_model = ct.convert(traced_model,
 coreml_model.save("Colorizer.mlpackage")
 ```
 
-关键点：
+Key points:
 
-- `Colorizer().eval()` 加载模型架构和权重，并切到推理模式。
-- `example_input` 定义一个 1 通道、256×256 的输入样例。
-- `torch.jit.trace` 用样例输入 trace PyTorch 模型，得到可转换表示。
-- `ct.convert` 把 traced 模型转换成 Core ML 模型，并声明输入名称和形状。
-- `save("Colorizer.mlpackage")` 生成可以拖进 Xcode 的模型包。
+- `Colorizer().eval()` loads model architecture and weights and switches to inference mode.
+- `example_input` defines a sample input with 1 channel and 256×256 size.
+- `torch.jit.trace` traces the PyTorch model with the sample input to produce a convertible representation.
+- `ct.convert` converts the traced model to Core ML and declares input name and shape.
+- `save("Colorizer.mlpackage")` generates a model package you can drag into Xcode.
 
-### 3. 在 Python 里验证 Core ML 模型（[04:26](https://developer.apple.com/videos/play/wwdc2022/10017/?time=266)）
+### 3. Validate the Core ML model in Python ([04:26](https://developer.apple.com/videos/play/wwdc2022/10017/?time=266))
 
-转换成功不等于功能正确。演讲者在 Python 中直接运行 Core ML 模型，检查它和原 PyTorch 模型的流程是否一致。
+Conversion success does not mean correct functionality. The presenter runs the Core ML model directly in Python to verify it matches the original PyTorch flow.
 
 ```python
 import coremltools as ct
 from PIL import Image
 from skimage import color
 
-in_img = Image.open(“image.png").convert("RGB")
+in_img = Image.open("image.png").convert("RGB")
 in_rgb = np.array(in_img)
 in_lab = color.rgb2lab(in_rgb, channel_axis=2)
 
@@ -127,19 +127,19 @@ out_rgb = color.lab2rgb(out_lab, channel_axis=2).astype(np.uint8)
 out_img = Image.fromarray(out_rgb)
 ```
 
-关键点：
+Key points:
 
-- `Image.open(...).convert("RGB")` 读取测试图片并统一为 RGB。
-- `color.rgb2lab(..., channel_axis=2)` 按最后一维作为颜色通道转换到 Lab。
-- `np.split(..., axis=-1)` 拆出 L、a、b 三个通道。
-- `np.expand_dims(..., 0)` 增加 batch 维，形成模型输入。
-- `coreml_model.predict({"input": in_l})` 用转换后的 Core ML 模型预测颜色通道。
-- `np.concatenate([in_l, out_ab], axis=1)` 把输入亮度和输出颜色合并。
-- `color.lab2rgb` 转回 RGB，用 `Image.fromarray` 生成可查看图片。
+- `Image.open(...).convert("RGB")` reads the test image and normalizes to RGB.
+- `color.rgb2lab(..., channel_axis=2)` converts to Lab with the last dimension as color channels.
+- `np.split(..., axis=-1)` splits out L, a, and b channels.
+- `np.expand_dims(..., 0)` adds a batch dimension to form model input.
+- `coreml_model.predict({"input": in_l})` runs the converted Core ML model to predict color channels.
+- `np.concatenate([in_l, out_ab], axis=1)` merges input lightness and output color.
+- `color.lab2rgb` converts back to RGB; `Image.fromarray` produces a viewable image.
 
-### 4. 在 Swift App 中接入模型（[07:11](https://developer.apple.com/videos/play/wwdc2022/10017/?time=431)）
+### 4. Integrate the model in a Swift app ([07:11](https://developer.apple.com/videos/play/wwdc2022/10017/?time=431))
 
-Swift 里的集成流程和 Python 一样：提取亮度，送入 Core ML，取回两个颜色通道，再重建 RGB 图像。
+Swift integration follows the same flow as Python: extract lightness, send to Core ML, retrieve two color channels, then rebuild the RGB image.
 
 ```swift
 import CoreImage
@@ -160,17 +160,17 @@ func colorize(image inputImage: CIImage) throws -> CIImage {
 }
 ```
 
-关键点：
+Key points:
 
-- `extractLightness(from:)` 对应 Python 里的 RGB 到 Lab，再取 L 通道。
-- `ColorizerInput(inputWith:)` 把亮度图像准备成 Core ML 输入。
-- `colorizer.prediction(input:)` 执行模型推理。
-- `extractColorChannels(from:)` 把模型输出的两个 `MLShapedArray` 转成 Core Image 可处理的图像。
-- `reconstructRGBImage` 把 L、a、b 三个通道合成 Lab，再转回 RGB。
+- `extractLightness(from:)` corresponds to RGB to Lab and taking the L channel in Python.
+- `ColorizerInput(inputWith:)` prepares the lightness image as Core ML input.
+- `colorizer.prediction(input:)` runs model inference.
+- `extractColorChannels(from:)` converts the model's two `MLShapedArray` outputs into Core Image-processable images.
+- `reconstructRGBImage` combines L, a, and b into Lab, then converts back to RGB.
 
-### 5. 用 Core Image 做 Lab 转换和通道合成（[07:41](https://developer.apple.com/videos/play/wwdc2022/10017/?time=461)、[08:51](https://developer.apple.com/videos/play/wwdc2022/10017/?time=531)）
+### 5. Use Core Image for Lab conversion and channel composition ([07:41](https://developer.apple.com/videos/play/wwdc2022/10017/?time=461), [08:51](https://developer.apple.com/videos/play/wwdc2022/10017/?time=531))
 
-演讲者没有在 Swift 里手写色彩空间转换。Core Image 提供了新的 `convertRGBtoLab` 和 `convertLabToRGB` 过滤器。
+The presenter does not hand-write color space conversion in Swift. Core Image provides new `convertRGBtoLab` and `convertLabToRGB` filters.
 
 ```swift
 import CoreImage.CIFilterBuiltins
@@ -192,14 +192,14 @@ func extractLightness(from inputImage: CIImage) -> CIImage {
 }
 ```
 
-关键点：
+Key points:
 
-- `CIFilter.convertRGBtoLab()` 把输入图像从 RGB 转成 Lab。
-- `normalize = true` 让亮度值落在模型需要的归一化范围。
-- `CIFilter.colorMatrix()` 用矩阵筛出 L 通道。
-- `rVector`、`gVector`、`bVector` 都取输入的第一个分量，让输出图像只保留亮度。
+- `CIFilter.convertRGBtoLab()` converts input from RGB to Lab.
+- `normalize = true` keeps lightness values in the normalized range the model needs.
+- `CIFilter.colorMatrix()` filters out the L channel with a matrix.
+- `rVector`, `gVector`, and `bVector` all take the first component of input so output retains only lightness.
 
-模型输出是两个 `MLShapedArray`。示例把它们转成两个单通道 `CIImage`。
+The model outputs two `MLShapedArray` values. The example converts them into two single-channel `CIImage` instances.
 
 ```swift
 func extractColorChannels(from output: ColorizerOutput) -> (CIImage, CIImage) {
@@ -223,15 +223,15 @@ func extractColorChannels(from output: ColorizerOutput) -> (CIImage, CIImage) {
 }
 ```
 
-关键点：
+Key points:
 
-- `output_aShapedArray.scalars` 和 `output_bShapedArray.scalars` 取出模型预测的颜色分量。
-- `Data(bytes:count:)` 把浮点数组包装成图像可读的字节数据。
-- `CIImage(bitmapData:...)` 为每个颜色分量创建单通道 Core Image 图像。
-- `bytesPerRow: 4 * 256` 对应 256 像素宽、每个 Float 4 字节。
-- `CIFormat.Lh` 表示单通道浮点图像格式。
+- `output_aShapedArray.scalars` and `output_bShapedArray.scalars` extract predicted color components.
+- `Data(bytes:count:)` wraps float arrays into byte data readable as images.
+- `CIImage(bitmapData:...)` creates single-channel Core Image images for each color component.
+- `bytesPerRow: 4 * 256` corresponds to 256-pixel width with 4 bytes per Float.
+- `CIFormat.Lh` is the single-channel float image format.
 
-最后用自定义 `CIKernel` 把三个通道合成 Lab 图像，再转回 RGB。
+Finally, use a custom `CIKernel` to combine three channels into a Lab image, then convert back to RGB.
 
 ```swift
 func reconstructRGBImage(l lightness: CIImage,
@@ -251,14 +251,14 @@ func reconstructRGBImage(l lightness: CIImage,
 }
 ```
 
-关键点：
+Key points:
 
-- `CIKernel.kernels(withMetalString:)` 从 Metal 字符串创建 Core Image kernel。
-- `kernel.apply` 以亮度图像范围为输出范围，把 L、a、b 作为参数传入。
-- `CIFilter.convertLabToRGBFilter()` 把合成后的 Lab 图像转回 RGB。
-- `normalize = true` 和前面的 RGB 到 Lab 转换保持配套。
+- `CIKernel.kernels(withMetalString:)` creates a Core Image kernel from a Metal string.
+- `kernel.apply` uses the lightness image extent as output range and passes L, a, and b as arguments.
+- `CIFilter.convertLabToRGBFilter()` converts the combined Lab image back to RGB.
+- `normalize = true` pairs with the earlier RGB-to-Lab conversion.
 
-通道合成本身只有一个很小的 kernel。
+Channel composition itself is a small kernel.
 
 ```swift
 let source = """
@@ -270,21 +270,21 @@ let source = """
 """
 ```
 
-关键点：
+Key points:
 
-- `imL`、`imA`、`imB` 分别代表亮度、a 通道和 b 通道图像采样。
-- `float4(imL.r, imA.r, imB.r, imL.a)` 把三个单通道值放回 Lab 图像的前三个分量。
-- alpha 使用 `imL.a`，保持输入亮度图像的透明度。
+- `imL`, `imA`, and `imB` represent lightness, a channel, and b channel image samples.
+- `float4(imL.r, imA.r, imB.r, imL.a)` puts three single-channel values back into the first three components of a Lab image.
+- Alpha uses `imL.a` to preserve input lightness image transparency.
 
-### 6. 从 90ms 静态处理走向 16ms 实时处理（[05:17](https://developer.apple.com/videos/play/wwdc2022/10017/?time=317)、[12:45](https://developer.apple.com/videos/play/wwdc2022/10017/?time=765)）
+### 6. From 90ms static processing to 16ms real-time processing ([05:17](https://developer.apple.com/videos/play/wwdc2022/10017/?time=317), [12:45](https://developer.apple.com/videos/play/wwdc2022/10017/?time=765))
 
-Xcode 14 的 Core ML Performance Report 可以对 Core ML 模型做基于时间的分析。演讲者把模型拖进 Xcode，几秒内看到原模型在 iPad Pro M1 上约 90ms。这个速度适合静态照片。
+Xcode 14's Core ML Performance Report provides time-based analysis of Core ML models. The presenter drags the model into Xcode and sees the original model at about 90ms on iPad Pro M1 within seconds. That speed suits static photos.
 
-实时摄像头需要更低延迟。演讲者改动模型架构并重新训练，使用 PyTorch on Metal 利用 Apple Silicon 加速训练。新模型的 Performance Report 显示，它完全运行在 Neural Engine 上，预测时间约 16ms。
+Real-time camera needs lower latency. The presenter changes model architecture and retrains using PyTorch on Metal to accelerate training on Apple Silicon. The new model's Performance Report shows it running entirely on the Neural Engine with prediction time around 16ms.
 
-Performance Report 只说明模型本身。App 运行后仍然不顺滑，Instruments 的 Core ML 模板显示预测请求在堆积：第二次预测在第一次还没完成时就提交给 Core ML，后续请求继续排队。演讲者还发现摄像头帧率误设为 60fps。
+The Performance Report only describes the model itself. The app still does not run smoothly; Instruments' Core ML template shows prediction requests stacking: the second prediction is submitted before the first completes, and subsequent requests keep queuing. The presenter also finds the camera frame rate mistakenly set to 60fps.
 
-下面是概念性控制流，表达 Session 中的修复思路；不是官方代码片段。
+Below is conceptual control flow expressing the session's fix; it is not official code.
 
 ```swift
 // Conceptual pseudocode based on the runtime issue shown in Instruments.
@@ -295,27 +295,27 @@ if previousPredictionDidFinish {
 cameraFrameRate = 30
 ```
 
-关键点：
+Key points:
 
-- `previousPredictionDidFinish` 表示只在上一次预测完成后处理新帧。
-- `processNextCameraFrame()` 对应一次 Core ML 预测请求，避免请求排队。
-- `cameraFrameRate = 30` 对应演讲中把误设的 60fps 改回目标 30fps。
-- 这个修复让 Core ML 正确地一次向 Neural Engine 派发一个预测，实时效果才稳定。
+- `previousPredictionDidFinish` means process a new frame only after the previous prediction completes.
+- `processNextCameraFrame()` corresponds to one Core ML prediction request, avoiding request queuing.
+- `cameraFrameRate = 30` matches the presenter's fix of changing the mistaken 60fps back to the target 30fps.
+- This fix lets Core ML correctly dispatch one prediction at a time to the Neural Engine for stable real-time results.
 
-## 核心启发
+## Core Takeaways
 
-- **做一个旧照片扫描上色工具**：用 Vision 的 `VNDetectRectangleRequest` 找到取景画面里的照片区域，再把裁剪结果送入 Core ML Colorizer。Session 在 [15:26](https://developer.apple.com/videos/play/wwdc2022/10017/?time=926) 展示了这个组合。
+- **Build an old photo scan colorization tool**: Use Vision's `VNDetectRectangleRequest` to find photo regions in the viewfinder, then send cropped results to the Core ML Colorizer. The session demonstrates this combination at [15:26](https://developer.apple.com/videos/play/wwdc2022/10017/?time=926).
 
-- **给现有图片 App 加一个“本地 ML 预检”流程**：模型进 App 前，先用 coremltools 在 Python 里跑同一张输入图，确认 Core ML 输出和原模型流程一致，再进入 Swift 集成。
+- **Add a "local ML pre-check" flow to an existing image app**: Before the model enters the app, run the same input image through coremltools in Python to confirm Core ML output matches the original model flow, then proceed to Swift integration.
 
-- **把模型性能评估提前到原型阶段**：设计功能时就把候选模型拖进 Xcode 14 Performance Report，记录目标设备的预测时间和计算单元分布，避免 UI 做完后才发现实时性不够。
+- **Move model performance evaluation to the prototype stage**: When designing a feature, drag candidate models into Xcode 14 Performance Report and record prediction time and compute unit distribution on target devices to avoid discovering real-time limitations after the UI is done.
 
-- **做一个摄像头实时滤镜的排队保护**：摄像头每帧都来，但 Core ML 预测需要时间。用 Instruments 检查预测是否堆积，再把处理策略改成“上一帧完成后再接下一帧”。
+- **Build queue protection for real-time camera filters**: Camera frames arrive every frame, but Core ML prediction takes time. Use Instruments to check whether predictions are stacking, then change processing to "accept the next frame only after the previous one completes."
 
-- **用 Apple Silicon 训练小型替代模型**：如果开源模型太慢，保留同样输入输出形状，换更轻的架构，用 PyTorch on Metal 重新训练，再按转换、验证、集成的流程替换模型。
+- **Train a smaller replacement model on Apple Silicon**: If an open-source model is too slow, keep the same input/output shape, switch to a lighter architecture, retrain with PyTorch on Metal, then replace the model following convert-validate-integrate flow.
 
-## 关联 Session
+## Related Sessions
 
-- [Optimize your Core ML usage](/articles/wwdc2022-10027) — 继续讲 Xcode Performance Report、Core ML Instrument 和 on-device 推理优化。
-- [Get to know Create ML Components](/articles/wwdc2022-10019) — 介绍用 Transformer 和 Estimator 组合自定义机器学习任务。
-- [Compose advanced models with Create ML Components](/articles/wwdc2022-10020) — 讲时序管线、增量训练和更复杂的模型组合方式。
+- [Optimize your Core ML usage](/articles/wwdc2022-10027) — Continues with Xcode Performance Report, Core ML Instrument, and on-device inference optimization.
+- [Get to know Create ML Components](/articles/wwdc2022-10019) — Introduces combining Transformer and Estimator for custom machine learning tasks.
+- [Compose advanced models with Create ML Components](/articles/wwdc2022-10020) — Covers temporal pipelines, incremental training, and more complex model composition.
