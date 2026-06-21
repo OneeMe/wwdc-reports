@@ -21,28 +21,27 @@ relatedSessions:
     code: "10226"
     description: "Use AVAudioSession to record stereo input from supported iPhone and iPad microphones."
 ---
-
 ## Highlight
 
-> 2020 年的 macOS 和 iOS 为实时音频线程提供 Audio Workgroups，让内核知道多个线程共享同一个音频截止时间，从而减少低延迟合成和信号处理中的 glitch 风险。
+> macOS and iOS in 2020 provide Audio Workgroups for real-time audio threads, letting the kernel know that multiple threads share the same audio deadline, reducing the risk of glitches in low-latency compositing and signal processing.
 
-## 核心内容
+## Core Content
 
-做专业音频应用时，延迟不是一个抽象指标。合成器和信号处理代码要在很短的音频周期里产出结果。以前，开发者可以创建自己的 realtime thread（实时线程），把工作拆到多个 CPU 核心上跑。问题在于，调度器只看到一组普通线程，看不到它们正在追赶同一个音频 deadline（截止时间）。
+When doing professional audio applications, latency is not an abstract metric. The synthesizer and signal processing code must produce results in very short audio cycles. Previously, developers could create their own realtime threads and split the work across multiple CPU cores. The problem is that the scheduler only sees a normal set of threads, not that they are chasing the same audio deadline.
 
-Core Audio 自己管理的 I/O thread 已经知道每个 render cycle（渲染周期）的开始和截止时间。音频服务器会唤醒客户端线程，等待它产出音频，再写入硬件。如果客户端太慢，线程错过截止时间，用户听到的就是 discontinuity 或 glitch（音频中断）。
+The I/O thread managed by Core Audio itself already knows the start and end time of each render cycle. The audio server will wake up the client thread, wait for it to produce audio, and then write it to the hardware. If the client is too slow and the thread misses its deadline, the user will hear discontinuity or glitch (audio interruption).
 
-Audio Workgroups 补上了这一层语义。一个 workgroup 由一个或多个线程组成，master thread（主线程）在每个工作周期告诉内核：工作从何时开始，何时必须结束。这样，性能控制器不只根据“应用用了多少线程”做判断，还能知道这些线程在同一个实时音频任务里协作。
+Audio Workgroups complement this layer of semantics. A workgroup consists of one or more threads. The master thread (main thread) tells the kernel in each work cycle: when the work starts and when it must end. In this way, the performance controller not only makes judgments based on "how many threads are used by the application", but also knows that these threads are cooperating in the same real-time audio task.
 
-这场 session 的重点很窄：如果你的 app 或 Audio Unit 自己创建实时音频线程，就要把这些线程加入正确的 workgroup。系统框架管理的线程会自动加入；你自己创建的线程，需要显式处理。
+The focus of this session is narrow: if your app or Audio Unit creates its own real-time audio threads, you need to add these threads to the correct workgroup. Threads managed by the system framework will be added automatically; threads you create yourself need to be processed explicitly.
 
-## 详细内容
+## Detailed Content
 
-### 设备 I/O 并行线程：加入设备的 workgroup
+### Device I/O parallel thread: join the workgroup of the device
 
-（[04:00](https://developer.apple.com/videos/play/wwdc2020/10224/?time=240)）典型场景是一个 app 同时渲染三条复杂轨道。I/O thread 负责最终混音，两个辅助实时线程并行计算轨道内容。它们和 I/O thread 使用同一个截止时间，但默认不在设备 workgroup 中。
+([04:00](https://developer.apple.com/videos/play/wwdc2020/10224/?time=240)) A typical scenario is an app rendering three complex tracks at the same time. The I/O thread is responsible for the final mix, and two auxiliary real-time threads calculate track content in parallel. They use the same deadline as I/O threads, but are not in the device workgroup by default.
 
-解决方式是先取得设备的 `os_workgroup`。在 macOS 上，可以通过 HAL API 从 audio device 取得；在各个平台上，也可以从 input/output audio unit、AUHAL 或 AURemoteIO 的属性取得。线程启动后调用 `os_workgroup_join`，线程结束前调用 `os_workgroup_leave`。
+The solution is to obtain the equipment first`os_workgroup`. On macOS, it can be obtained from the audio device through the HAL API; on various platforms, it can also be obtained from the properties of the input/output audio unit, AUHAL or AURemoteIO. Called after the thread starts`os_workgroup_join`, called before the thread ends`os_workgroup_leave`。
 
 ```text
 设备 I/O 并行线程工作流
@@ -52,18 +51,18 @@ Audio Workgroups 补上了这一层语义。一个 workgroup 由一个或多个�
 4. 在线程结束前调用 os_workgroup_leave。
 ```
 
-关键点：
+Key points:
 
-- 第 1 步的来源可以是 macOS 的 HAL API，也可以是 input/output audio unit、AUHAL 或 AURemoteIO。
-- 第 2 步只需要在线程中执行一次，作用是把当前实时线程加入设备 workgroup。
-- 第 3 步对应 transcript 里的三条复杂 track 场景：I/O thread 等待辅助线程，再混合最终结果。
-- 第 4 步在线程结束前执行，避免线程生命周期结束后还留在 workgroup 语义中。
+- The source for step 1 can be macOS's HAL API, or it can be the input/output audio unit, AUHAL, or AURemoteIO.
+- Step 2 only needs to be executed once in the thread, and its function is to add the current real-time thread to the device workgroup.
+- Step 3 corresponds to the three complex track scenarios in transcript: the I/O thread waits for the auxiliary thread and then mixes the final result.
+- Step 4 is executed before the thread ends to avoid remaining in the workgroup semantics after the thread life cycle ends.
 
-### 异步实时线程：创建自己的工作周期
+### Asynchronous real-time thread: create your own work cycle
 
-（[05:25](https://developer.apple.com/videos/play/wwdc2020/10224/?time=325)）另一类辅助线程不跟设备 I/O 同步。它们有自己的节奏和截止时间，例如后台提前计算一段合成结果，再交给 I/O thread 消费。它们不能加入设备 workgroup，因为 deadline 不同。
+([05:25](https://developer.apple.com/videos/play/wwdc2020/10224/?time=325)) Another type of worker thread is not synchronized with device I/O. They have their own rhythm and deadline. For example, a synthesis result is calculated in advance in the background and then handed over to the I/O thread for consumption. They cannot join the device workgroup because the deadlines are different.
 
-这时要创建独立 workgroup。session 给出的 API 是 `AudioWorkIntervalCreate`、`os_workgroup_interval_start` 和 `os_workgroup_interval_finish`。master thread 在每个周期开始时报告 start time 和 deadline，周期结束时报告 finish。
+At this time, an independent workgroup needs to be created. The API given by session is`AudioWorkIntervalCreate`、`os_workgroup_interval_start`and`os_workgroup_interval_finish`. The master thread reports start time and deadline at the beginning of each cycle and finish at the end of the cycle.
 
 ```text
 异步 realtime thread 工作流
@@ -74,20 +73,20 @@ Audio Workgroups 补上了这一层语义。一个 workgroup 由一个或多个�
 5. 每个工作周期结束时调用 os_workgroup_interval_finish。
 ```
 
-关键点：
+Key points:
 
-- `AudioWorkIntervalCreate` 用来创建和设备 I/O 不同 cadence（节奏）的 workgroup。
-- `os_workgroup_join` 仍然只需要在线程加入 workgroup 时调用一次。
-- `startTime` 可以是当前时间；如果你知道周期实际开始时间，也可以传入最近过去的时间点。
-- `deadline` 必须大于 `startTime`，两者单位都是 `mach_absolute_time`。
-- session 特别提醒，不要假设 `mach_absolute_time` 是纳秒；需要用 `mach_timebase_info` 换算频率。
-- `os_workgroup_interval_finish` 告诉内核本周期已经完成，让性能控制器得到完整的工作周期信息。
+- `AudioWorkIntervalCreate`Used to create workgroups with a different cadence than device I/O.
+- `os_workgroup_join`Still only needs to be called once when the thread joins the workgroup.
+- `startTime`This can be the current time; if you know the actual start time of the cycle, you can also pass in a time point in the recent past.
+- `deadline`must be greater than`startTime`, both units are`mach_absolute_time`。
+- session special reminder, don’t make assumptions`mach_absolute_time`is nanosecond; need to use`mach_timebase_info`Conversion frequency.
+- `os_workgroup_interval_finish`Tells the kernel that this cycle has completed, allowing the performance controller to get complete work cycle information.
 
-### Audio Unit 辅助线程：观察宿主的渲染上下文
+### Audio Unit auxiliary thread: observe the host's rendering context
 
-（[07:03](https://developer.apple.com/videos/play/wwdc2020/10224/?time=423)）大多数 Audio Unit 不会创建自己的实时线程。少数大型插件会把一次 render request（渲染请求）拆到多个线程上。插件面对的难点是：宿主传进来的线程上下文不固定，可能是设备 I/O thread，也可能是宿主的非实时 worker thread。
+([07:03](https://developer.apple.com/videos/play/wwdc2020/10224/?time=423)) Most Audio Units do not create their own real-time thread. A few large plug-ins will split a render request into multiple threads. The difficulty faced by the plug-in is that the thread context passed in by the host is not fixed. It may be a device I/O thread or a non-real-time worker thread of the host.
 
-为了解决这个问题，Apple 在 2020 年引入 `AURenderContextObserver`。Audio Unit 实现 render context observer property，系统会在每次 render request 之前调用这个 block，并传入包含 `os_workgroup` 的 context struct。插件在发现 workgroup 变化时，把自己的辅助实时线程加入新的 workgroup。
+To solve this problem, Apple introduced in 2020`AURenderContextObserver`. Audio Unit implements render context observer property. The system will call this block before each render request and pass in the`os_workgroup`context struct. When the plug-in detects changes in the workgroup, it adds its own auxiliary real-time thread to the new workgroup.
 
 ```text
 Audio Unit render context 工作流
@@ -97,17 +96,17 @@ Audio Unit render context 工作流
 4. 如果 context 的 workgroup 改变，就把辅助 realtime threads 加入新的 workgroup。
 ```
 
-关键点：
+Key points:
 
-- `AURenderContextObserver` 是 Audio Unit 开发者实现的 render context observer property。
-- context struct 里的 `os_workgroup` 是当前 render request 对应的 workgroup。
-- workgroup 可能每次渲染都变化，插件不能在初始化时缓存一个永久值。
-- 辅助实时线程要跟随 observer 看到的 workgroup 变化，重新加入当前 render request 的 workgroup。
-- host 不应该主动调用 observer；session 明确说明系统会在 host render 时自动完成这件事。
+- `AURenderContextObserver`It is the render context observer property implemented by Audio Unit developers.
+- in context struct`os_workgroup`Is the workgroup corresponding to the current render request.
+- The workgroup may change every render, and plugins cannot cache a permanent value on initialization.
+- The auxiliary real-time thread should follow the workgroup changes seen by the observer and rejoin the workgroup of the current render request.
+- The host should not actively call the observer; the session clearly states that the system will automatically complete this when the host renders.
 
-### 线程数量：让 workgroup 给出并行上限
+### Number of threads: let the workgroup give the upper limit of parallelism
 
-（[09:21](https://developer.apple.com/videos/play/wwdc2020/10224/?time=561)）创建并行 worker thread 时，不要只按 CPU core 数量盲目全开。Audio Workgroups 提供 `os_workgroup_max_parallel_threads`，可以根据已知 workgroup 推荐可用的并行线程数。
+([09:21](https://developer.apple.com/videos/play/wwdc2020/10224/?time=561)) When creating parallel worker threads, don’t blindly open them all based on the number of CPU cores. Provided by Audio Workgroups`os_workgroup_max_parallel_threads`, the number of available parallel threads can be recommended based on known workgroups.
 
 ```text
 推荐并行线程数工作流
@@ -116,42 +115,42 @@ Audio Unit render context 工作流
 3. realtime render 阶段只使用 API 推荐的线程数量。
 ```
 
-关键点：
+Key points:
 
-- `os_workgroup_max_parallel_threads` 必须在知道 workgroup 后才能调用。
-- Audio Unit 可能要等到 realtime render 阶段才拿到 workgroup。
-- session 建议初始化时可以按 CPU core 数创建线程，渲染时只启用推荐数量。
-- 这个数量是每个渲染周期真正参与工作的线程数，不等于已创建线程总数。
+- `os_workgroup_max_parallel_threads`Must be called after the workgroup is known.
+- Audio Unit may have to wait until the realtime render stage to get the workgroup.
+- It is recommended that threads be created according to the number of CPU cores during session initialization, and only the recommended number is enabled during rendering.
+- This number is the number of threads that actually participate in work per rendering cycle, and is not equal to the total number of threads created.
 
-## 核心启发
+## Core Takeaways
 
-### 1. 给大型合成器加并行渲染模式
+### 1. Add parallel rendering mode to large compositors
 
-- **做什么**：把多个 oscillator、filter 或 effect chain 拆到辅助实时线程中并行计算。
-- **为什么值得做**：session 说明并行线程如果加入设备 workgroup，内核会知道它们和 I/O thread 共享同一个截止时间。
-- **怎么开始**：先从 HAL、AUHAL 或 AURemoteIO 取得设备 `os_workgroup`，在线程启动后调用 `os_workgroup_join`，再记录启用前后的 overload 或 glitch 次数。
+- **What to do**: Split multiple oscillators, filters or effect chains into auxiliary real-time threads for parallel calculations.
+- **Why is it worth doing**: session description If parallel threads join the device workgroup, the kernel will know that they share the same deadline as the I/O thread.
+- **How ​​to start**: Get the device from HAL, AUHAL or AURemoteIO`os_workgroup`, called after the thread starts`os_workgroup_join`, and then record the number of overload or glitch before and after activation.
 
-### 2. 为离线预计算建立独立实时周期
+### 2. Establish an independent real-time period for offline precomputation
 
-- **做什么**：给提前计算音频片段的 worker 线程建立独立 cadence，避免把不同 deadline 的任务塞进设备 I/O workgroup。
-- **为什么值得做**：session 明确区分了 parallel-to-device 和 asynchronous-to-device 两种线程，后者需要自己的 workgroup。
-- **怎么开始**：用 `AudioWorkIntervalCreate` 创建 workgroup，在 master thread 的每个周期调用 `os_workgroup_interval_start` 和 `os_workgroup_interval_finish`。
+- **What to do**: Create an independent cadence for the worker thread that calculates audio clips in advance to avoid stuffing tasks with different deadlines into the device I/O workgroup.
+- **Why it's worth doing**: session clearly distinguishes parallel-to-device and asynchronous-to-device threads, the latter requires its own workgroup.
+- **How ​​to start**: Use`AudioWorkIntervalCreate`Create a workgroup and call it in each cycle of the master thread`os_workgroup_interval_start`and`os_workgroup_interval_finish`。
 
-### 3. 让复杂 Audio Unit 适配不同宿主
+### 3. Adapt complex Audio Units to different hosts
 
-- **做什么**：插件在不同宿主 app 中运行时，动态跟随宿主当前 render request 对应的 workgroup。
-- **为什么值得做**：session 指出 Audio Unit 不知道宿主传入的是设备 I/O thread 还是其他 worker context，只能在 render time 观察。
-- **怎么开始**：实现 `AURenderContextObserver`，比较本次 context 的 `os_workgroup` 是否变化，再把自己的辅助实时线程切换到新 workgroup。
+- **What**: When the plug-in runs in different host apps, it dynamically follows the workgroup corresponding to the host's current render request.
+- **Why is it worth doing**: session points out that the Audio Unit does not know whether the host passes in the device I/O thread or other worker context, and can only observe it at render time.
+- **How ​​to start**: Implementation`AURenderContextObserver`, compare this context's`os_workgroup`Whether it changes, then switch its auxiliary real-time thread to the new workgroup.
 
-### 4. 用推荐线程数控制 CPU 压力
+### 4. Use the recommended number of threads to control CPU pressure
 
-- **做什么**：为实时音频引擎增加“预创建线程、按周期启用”的调度层。
-- **为什么值得做**：session 给出 `os_workgroup_max_parallel_threads`，用于决定当前 workgroup 下应使用多少并行线程。
-- **怎么开始**：初始化时创建固定 worker pool，render time 取得 workgroup 后查询推荐数量，只唤醒需要参与当前周期的 worker。
+- **What to do**: Add a "pre-created thread, periodic enablement" scheduling layer to the real-time audio engine.
+- **Why is it worth doing**: given by session`os_workgroup_max_parallel_threads`, used to determine how many parallel threads should be used under the current workgroup.
+- **How ​​to start**: Create a fixed worker pool during initialization, query the recommended number after obtaining the workgroup at render time, and only wake up workers who need to participate in the current cycle.
 
-## 关联 Session
+## Related Sessions
 
-- [Port your Mac app to Apple silicon](/articles/wwdc2020-10214) — 讲 Universal Mac、低层代码和插件在 Apple silicon 迁移中的注意事项。
-- [Explore the new system architecture of Apple silicon Macs](/articles/wwdc2020-10686) — 补充 SoC 架构、统一内存和框架性能收益。
-- [Identify trends with the Power and Performance API](/articles/wwdc2020-10057) — 展示如何把性能指标和诊断数据接入团队工具。
-- [Record stereo audio with AVAudioSession](/articles/wwdc2020-10226) — 同属 WWDC 2020 音频开发主题，聚焦移动设备内置麦克风的立体声录音。
+- [Port your Mac app to Apple silicon](/articles/wwdc2020-10214) — Talk about considerations for Universal Mac, low-level code and plug-ins in Apple silicon migration.
+- [Explore the new system architecture of Apple silicon Macs](/articles/wwdc2020-10686) — Complements SoC architecture, unified memory, and framework performance gains.
+- [Identify trends with the Power and Performance API](/articles/wwdc2020-10057) — Shows how to integrate performance metrics and diagnostic data into team tools.
+- [Record stereo audio with AVAudioSession](/articles/wwdc2020-10226) — Also part of the WWDC 2020 audio development theme, focusing on stereo recording of built-in microphones in mobile devices.
