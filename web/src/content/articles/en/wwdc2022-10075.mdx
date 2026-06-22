@@ -1,0 +1,364 @@
+---
+title: "Use SwiftUI with AppKit"
+description: "discover how the shortcuts app uses both swiftui and appkit to create a top-tier experience on macos. follow along with the shortcuts team as we explore how you can host swiftui views in appkit code, handle layout and sizing, participate in the responder chain, enable navigational focus, and more. we'll also show you how to host appkit views, helping you migrate existing code into a swiftui layout within your app."
+date: 2022-06-10
+tags: ["SwiftUI", "AppKit", "macOS", "WWDC 2022"]
+thumbnail: "/images/sessions/2022/10075.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10075/"
+sessionId: "wwdc2022-10075"
+year: "2022"
+relatedSessions:
+  - title: "Use SwiftUI with UIKit"
+    code: "10072"
+    description: "Host SwiftUI views in UIKit applications, and use SwiftUI to build collection views and table view cells."
+  - title: "Bring your iOS app to the Mac"
+    code: "10076"
+    description: "Explains the path to bring iOS applications to macOS, suitable for reading together with the Mac interface integration."
+  - title: "The SwiftUI cookbook for navigation"
+    code: "10054"
+    description: "Use NavigationStack and NavigationSplitView to organize the navigation structure of SwiftUI App."
+  - title: "Compose custom layouts with SwiftUI"
+    code: "10056"
+    description: "Build more flexible SwiftUI layouts using Grid, Layout, and AnyLayout."
+---
+## Highlight
+
+> Ian from the Shortcuts team used Shortcuts App as a practical case to systematically explain various scenarios of mixing SwiftUI and AppKit in macOS Apps.
+
+## Core Content
+
+After Shortcuts arrived on macOS, the team faced a common problem: the Mac App already had AppKit windows, split views, collection views, menus, and response chains, but many cross-platform interfaces had already been written in SwiftUI.Rewriting everything is expensive, and embedding directly will encounter state, layout, focus, and performance issues.
+
+Ian's approach is to take apart the actual interface of Shortcuts and talk about it.The left sidebar is SwiftUI`List`, the outer window is still`NSSplitViewController`.Using the shortcut grid`NSCollectionView`, hosting SwiftUI shortcut cards in a single cell.The editor is a SwiftUI View, but it responds to the cut, copy, paste, and custom commands in the AppKit main menu.Finally, the AppleScript editor is still AppKit`NSView`, need to be put into SwiftUI layout.
+
+The core of this session is not to require you to migrate your entire Mac App at once.It gives a set of seams:`NSHostingController`、`NSHostingView`、`ObservableObject`、`NSViewRepresentable`, coordinator, Responder Chain and Focus.Each seam corresponds to a migration scenario, and SwiftUI can be adopted piece by piece.
+
+## Detailed Content
+
+### Host SwiftUI sidebar in AppKit split view
+
+([01:29](https://developer.apple.com/videos/play/wwdc2022/10075/?time=89)) The outer layer of the Shortcuts main window is AppKit split view, and the left sidebar uses SwiftUI`List`accomplish.The selected items are maintained inside the sidebar, and the options are`SidebarItem`Enumeration representation.
+
+```swift
+struct SidebarView: View {
+    @State private var selectedItem: SidebarItem
+    
+    var body: some View {
+        List(selection: $selectedItem) {
+            ...
+            Section("Shortcuts") { ... }
+            Section("Folders") { ... }
+        }
+    }
+}
+
+enum SidebarItem: Hashable {
+    case gallery
+    case allShortcuts
+    ...
+    case folder(Folder)
+}
+```
+
+Key points:
+- `SidebarView`It is an ordinary SwiftUI View, which can describe the sidebar interface independently.
+- `@State private var selectedItem`Save the currently selected position.
+- `List(selection:)`Bind list selection to state.
+- `Section("Shortcuts")`and`Section("Folders")`Navigation grouping corresponding to Shortcuts.
+- `SidebarItem: Hashable`Make each navigation target available as a list selection value.
+
+([01:53](https://developer.apple.com/videos/play/wwdc2022/10075/?time=113)) Put this SwiftUI sidebar into AppKit, the entrance is`NSHostingController`.It is used like a normal view controller, so it can be wrapped directly as`NSSplitViewItem`。
+
+```swift
+let splitViewController = NSSplitViewController()
+
+let sidebar = NSHostingController(rootView: SidebarView(...))
+let splitViewItem = NSSplitViewItem(viewController: sidebar)
+splitViewController.addSplitViewItem(splitViewItem)
+```
+
+Key points:
+- `NSSplitViewController()`AppKit still manages the window structure.
+- `NSHostingController(rootView:)`Put SwiftUI`SidebarView`Becomes a view controller available to AppKit.
+- `NSSplitViewItem(viewController:)`Receives a managed controller, no additional bridging layer is required.
+- `addSplitViewItem`Add SwiftUI sidebar to split view.
+
+### Use shared models to pass selection status back to AppKit
+
+([03:06](https://developer.apple.com/videos/play/wwdc2022/10075/?time=186)) Sidebar selections initially only existed inside SwiftUI.The details page on the right is managed by AppKit split view, and you need to know the selected item.Ian's solution is to move the state outside SwiftUI`ObservableObject`。
+
+```swift
+class SelectionModel: ObservableObject {
+
+    @Published var selectedItem: SidebarItem = .allShortcuts
+
+}
+
+// AppKit Window Controller
+cancellable = selectionModel.$selectedItem.sink { newItem in
+    // update the NSSplitViewController detail
+}
+```
+
+Key points:
+- `SelectionModel`It is a reference type and can be held by AppKit and SwiftUI at the same time.
+- `ObservableObject`Let SwiftUI refresh the view when the model changes.
+- `@Published var selectedItem`Exposes the current selection and spawns a Combine publisher.
+- AppKit window controller subscription`$selectedItem`。
+- `sink`in`newItem`used to update`NSSplitViewController`details area.
+
+This pattern is suitable for existing AppKit architecture.State is not locked in the SwiftUI view tree, and AppKit controllers can continue to handle window coordination.
+
+### Reuse NSHostingView in collection view cell
+
+([04:37](https://developer.apple.com/videos/play/wwdc2022/10075/?time=277)) The cells of collection view and table view will be reused.Repeatedly adding and removing subviews while scrolling will slow down the interface.The official recommendation is: create each cell once`NSHostingView`, then only replace its`rootView`。
+
+```swift
+class ShortcutItemView: NSCollectionViewItem {
+    private var hostingView: NSHostingView<ShortcutView>?
+
+    func displayShortcut(_ shortcut: Shortcut) {
+        let shortcutView = ShortcutView(shortcut: shortcut)
+
+        if let hostingView = hostingView {
+            hostingView.rootView = shortcutView
+        } else {
+            let newHostingView = NSHostingView(rootView: shortcutView)
+            view.addSubview(newHostingView)
+            setupConstraints(for: newHostingView)
+            self.hostingView = newHostingView
+        }
+    }
+}
+```
+
+Key points:
+- `ShortcutItemView`Still AppKit`NSCollectionViewItem`。
+- `hostingView`Cache the SwiftUI managed view within the current cell.
+- `displayShortcut(_:)`Called by the data source when configuring the cell.
+- `ShortcutView(shortcut:)`Generate a new SwiftUI description for the current model.
+- already`hostingView`Update only when`rootView`, to avoid rebuilding the entire managed view hierarchy.
+- Created when content is displayed for the first time`NSHostingView`, add cell, and set Auto Layout constraints.
+
+([06:08](https://developer.apple.com/videos/play/wwdc2022/10075/?time=368)) When the cell rolls off the screen and then displays another shortcut, SwiftUI will reuse the original structure and only update the changed images, text, and background.This detail is important: reuse`NSHostingView`Let AppKit's cell reuse and SwiftUI's view update model cooperate.
+
+### Let SwiftUI managed views participate in AppKit layout and window size
+
+（[06:35](https://developer.apple.com/videos/play/wwdc2022/10075/?time=395)）`NSHostingController`and`NSHostingView`The intrinsic size will be generated based on the ideal width and ideal height of the SwiftUI view.SwiftUI also generates constraints for minimum size and maximum size, which are used by AppKit Auto Layout.
+
+This brings up two practical rules.
+
+First, embed`NSHostingView`Finally, you still have to add constraints to it and the parent view on the AppKit side.Internal to SwiftUI`frame`Layout modifications such as this change the constraints imposed by the managed view, such as fixed width.
+
+Second, if`HostingView`is the top-level of the window`contentView`, SwiftUI updates the minimum and maximum size of the window based on the content.Whether the window can be scaled horizontally or vertically will change with the SwiftUI content.
+
+([07:55](https://developer.apple.com/videos/play/wwdc2022/10075/?time=475)) Modal display can also use the hosting controller directly.Popover, sheet and modal window all use AppKit API, and the content size is provided by SwiftUI.
+
+```swift
+viewController.present(NSHostingController(rootView: ...), 
+    asPopoverRelativeTo: rect, of: view, 
+    preferredEdge: .maxY, behavior: .transient)
+```
+
+Key points:
+- `NSHostingController(rootView:)`Directly as the popover's content controller.
+- `asPopoverRelativeTo: rect`Specify which area the popover will pop up from.
+- `of: view`Specify the reference view.
+- `preferredEdge: .maxY`Specify the preferred popup direction.
+- `behavior: .transient`Use AppKit's transient popover behavior.
+
+([08:15](https://developer.apple.com/videos/play/wwdc2022/10075/?time=495)) The sheet is shorter, you only need to pass the hosting controller`presentAsSheet`。
+
+```swift
+viewController.presentAsSheet(NSHostingController(rootView: ...))
+```
+
+Key points:
+- `presentAsSheet`It is the sheet display method of AppKit.
+- SwiftUI view passed`NSHostingController`Enter sheet.
+- The sheet's content dimensions are determined by the hosted SwiftUI content.
+
+([08:22](https://developer.apple.com/videos/play/wwdc2022/10075/?time=502)) modal window can set the title and then call`presentAsModalWindow`。
+
+```swift
+let hostingController = NSHostingController(rootView: ModalView())
+hostingController.title = "Window Title"
+viewController.presentAsModalWindow(hostingController)
+```
+
+Key points:
+- `ModalView()`is SwiftUI content.
+- `hostingController.title`Will become the window title of the modal window.
+- `presentAsModalWindow`Displays a modal window that blocks interaction.
+- Window size will adapt to SwiftUI content.
+
+([08:45](https://developer.apple.com/videos/play/wwdc2022/10075/?time=525)) macOS Ventura has a new API to control automatic constraints.Minimum, intrinsic, and maximum size constraints are created by default.You can adjust it as needed`sizingOptions`。
+
+```swift
+hostingController.sizingOptions = [.minSize, .intrinsicContentSize, .maxSize]
+```
+
+Key points:
+- `sizingOptions`Controls which size constraints are automatically created by the hosting controller.
+- `.minSize`Corresponds to the minimum size.
+- `.intrinsicContentSize`Corresponds to the ideal content size.
+- `.maxSize`Corresponds to the maximum size.
+- If the outer AppKit already provides constraints, or you want the view to always be elastic, you can reduce these options.
+
+### Let SwiftUI View enter the responsive chain and focus system
+
+([10:47](https://developer.apple.com/videos/play/wwdc2022/10075/?time=647)) The editor of Shortcuts is SwiftUI View, but the main menu is in AppKit.After the menu item is triggered, the selector is passed along the response chain from the first responder.The concept corresponding to first responder in SwiftUI is focused view.
+
+```swift
+Image(...)
+    .focusable()
+    .copyable { ... }
+    .cuttable { ... }
+    .pasteDestination(payloadType: Image.self) { ... }
+```
+
+Key points:
+- `Image(...)`Is a SwiftUI View that needs to receive keyboard and menu commands.
+- `.focusable()`Make this view the focus target.
+- `.copyable`Provides processing for copying data to pasteboard.
+- `.cuttable`Provides shear processing.
+- `.pasteDestination(payloadType:)`Declare the types of paste data that can be received.
+
+([11:02](https://developer.apple.com/videos/play/wwdc2022/10075/?time=662)) In addition to copy, cut, and paste, SwiftUI can also handle arrow keys, Escape, AppKit standard selectors, and custom selectors.
+
+```swift
+struct ShortcutsEditorView: View {
+    var body: some View {
+        ScrollView { ... }
+            .onMoveCommand { moveSelection(direction: $0) }
+            .onExitCommand { cancelOperations() }
+            .onCommand(#selector(NSResponder.selectAll(_:)) { selectAllActions() }
+            .onCommand(#selector(moveActionUp(_:)) { moveSelectedAction(.up) }
+            .onCommand(#selector(moveActionDown(_:)) { moveSelectedAction(.down) }
+    }
+}
+```
+
+Key points:
+- `ScrollView { ... }`Is the Shortcuts editor body.
+- `.onMoveCommand`Handles arrow key movement selection.
+- `.onExitCommand`Handles exit commands such as Escape.
+- `#selector(NSResponder.selectAll(_:))`Accepts AppKit's select all standard command.
+- `#selector(moveActionUp(_:))`and`#selector(moveActionDown(_:))`Receives Shortcuts custom menu commands.
+- The code snippet comes from the official video. The example omits the specific implementation and some closing symbols, focusing on the location of the command mount.
+
+([11:28](https://developer.apple.com/videos/play/wwdc2022/10075/?time=688)) When testing keyboard navigation, turn Full Keyboard Navigation on and off in Keyboard System Settings.Many controls are only focusable when this setting is on.
+
+### Hosting AppKit NSView in SwiftUI
+
+([12:37](https://developer.apple.com/videos/play/wwdc2022/10075/?time=757)) The migration direction can also be reversed.Shortcuts' AppleScript editor is an AppKit control that is placed into a SwiftUI editor layout.SwiftUI provides`NSViewRepresentable`and`NSViewControllerRepresentable`, used to describe an AppKit view or view controller as a SwiftUI view.
+
+([15:18](https://developer.apple.com/videos/play/wwdc2022/10075/?time=918)) Original AppKit controls have their own properties and delegates.
+
+```swift
+class ScriptEditorView: NSView {
+    var sourceCode: String
+    var isEditable: Bool
+    weak var delegate: ScriptEditorViewDelegate?
+}
+
+protocol ScriptEditorViewDelegate: AnyObject {
+    func sourceCodeDidChange(in view: ScriptEditorView) -> Void
+}
+```
+
+Key points:
+- `ScriptEditorView`Inherited from`NSView`, indicating that it is an existing AppKit control.
+- `sourceCode`Save editor text.
+- `isEditable`Controls whether editing is allowed.
+- `delegate`Responsible for notifying AppKit side changes.
+- `sourceCodeDidChange`Called when the source code changes.
+
+([15:40](https://developer.apple.com/videos/play/wwdc2022/10075/?time=940)) The SwiftUI container puts the source code status in`@State`, the Compile button reads the same status.
+
+```swift
+struct ScriptEditorContainerView: View {
+    @State var sourceCode: String = ""
+
+    var body: some View {
+        VStack {
+            CompileButton { compile(code: sourceCode) }
+            Divider()
+            ScriptEditorRepresentable(sourceCode: $sourceCode)
+        }
+    }
+}
+```
+
+Key points:
+- `@State var sourceCode`Is a single source of state on the SwiftUI side.
+- `CompileButton`The handler uses the current`sourceCode`Compile the code.
+- `Divider()`Separate button and editor.
+- `ScriptEditorRepresentable(sourceCode: $sourceCode)`Pass the binding into the AppKit wrapper.
+
+（[16:13](https://developer.apple.com/videos/play/wwdc2022/10075/?time=973)）`NSViewRepresentable`Responsible for creating, updating, and coordinating AppKit views.The coordinator receives the delegate callback and writes back the SwiftUI binding.
+
+```swift
+struct ScriptEditorRepresentable: NSViewRepresentable {
+    @Binding var sourceCode: String
+
+    func makeNSView(context: Context) -> ScriptEditorView {
+        let scriptEditor = ScriptEditorView(frame: .zero)
+        scriptEditor.delegate = context.coordinator
+        return scriptEditor
+    }
+
+    func updateNSView(_ nsView: ScriptEditorView, context: Context) {
+        if sourceCode != scriptEditor.sourceCode {
+            scriptEditor.sourceCode = sourceCode
+        }
+        scriptEditor.isEditable = context.environment.isEnabled
+        // Make sure coordinator has a reference to the current value 
+        // of the binding:
+        context.coordinator.representable = self
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(representable: self)
+    }
+}
+
+class Coordinator: NSObject, ScriptEditorViewDelegate {
+    var representable: ScriptEditorRepresentable
+
+    init(representable: ScriptEditorRepresentable) { ... }
+
+    func sourceCodeDidChange(in view: ScriptEditorView) {
+        representable.sourceCode = view.sourceCode
+    }
+}
+```
+
+Key points:
+- `@Binding var sourceCode`Let the wrapper read and write SwiftUI container state.
+- `makeNSView`create`ScriptEditorView`, suitable for one-time setup.
+- `scriptEditor.delegate = context.coordinator`Hand off AppKit delegate events to the coordinator.
+- `updateNSView`Called when SwiftUI state or environment changes.
+- `if sourceCode != scriptEditor.sourceCode`Avoid setting properties repeatedly because setting the source code triggers extra work.
+- `context.environment.isEnabled`Maps to AppKit`isEditable`。
+- `context.coordinator.representable = self`Keep the binding in coordinator to the latest value.
+- `sourceCodeDidChange`Write AppKit editing results back to SwiftUI.
+
+In the official clip`updateNSView`The parameter name is`nsView`, appeared in the condition`scriptEditor`.The original text of the video clip is retained here; in actual projects, the AppKit view instance obtained by the current method should be used.
+
+## Core Takeaways
+
+- **Make a hybrid Mac sidebar**: Keep the AppKit window and split view, and only change the sidebar to SwiftUI`List`.Why it’s worth doing: The navigation structure is often best migrated first because it has clear boundaries.How to start: Use`NSHostingController(rootView:)`Wrap the SwiftUI sidebar and put the shared selection state inside`ObservableObject`。
+
+- **Migrate complex cells to SwiftUI**: in`NSCollectionViewItem`or`NSTableCellView`For internal use`NSHostingView`Display the card interface.Why it’s worth doing: Writing card layouts in SwiftUI is more straightforward, and AppKit is still responsible for high-performance list containers.How to start: cache one per cell`NSHostingView`, only replace the`rootView`。
+
+- **Connect Mac menu commands to SwiftUI editor**: Make SwiftUI editor respond to select all, arrow keys, Escape and custom menu items.Why it's worth it: Mac users expect menu bars and keyboard shortcuts to be available.How to start: Add interactive views`.focusable()`, then use`.onCommand`、`.onMoveCommand`、`.onExitCommand`Receive commands.
+
+- **Put existing AppKit controls into SwiftUI pages**: Keep script editors, image editors, complex text controls, etc. mature`NSView`.Why it’s worth doing: Some controls have had behaviors and delegate ecosystems for many years, and the risk of rewriting is high.How to get started: Create`NSViewRepresentable`,use`makeNSView`To initialize, use`updateNSView`To synchronize state and environment, use coordinator to connect delegate.
+
+## Related Sessions
+
+- [Use SwiftUI with UIKit](/articles/wwdc2022-10072) — The same talk about hybrid UI framework, but the object is replaced by UIKit, suitable for comparison`UIHostingController`and cell integration methods.
+- [Bring your iOS app to the Mac](/articles/wwdc2022-10076) — Introducing the path to bringing your iOS app to the Mac, which can be read in conjunction with the AppKit/SwiftUI hybrid migration strategy.
+- [The SwiftUI cookbook for navigation](/articles/wwdc2022-10054) — Talk about SwiftUI’s navigation model, suitable for supplementing understanding of sidebars, columns, and navigation states.
+- [Compose custom layouts with SwiftUI](/articles/wwdc2022-10056) — Talk about SwiftUI layout capabilities, suitable for in-depth understanding of managed view size and layout behavior.

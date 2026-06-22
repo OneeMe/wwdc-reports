@@ -1,0 +1,205 @@
+---
+title: "Bring advanced speech-to-text to your app with SpeechAnalyzer"
+description: "discover the new speechanalyzer api for speech to text. we"
+date: 2026-06-10
+tags: ["機械学習"]
+thumbnail: "/images/sessions/2025/277.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/277/"
+sessionId: "wwdc2025-277"
+year: "2025"
+relatedSessions:
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+  - title: "Develop for Shortcuts and Spotlight with App Intents"
+    code: "260"
+    description: "learn about how building app intents that make actions available and work best w"
+---
+
+## Highlight
+
+> iOS 26 で登場した SpeechAnalyzer は、SFSpeechRecognizer を全く新しいオンデバイスモデルで置き換える API です。長時間音声・遠距離音声・低レイテンシのリアルタイム書き起こしに対応し、モデルはシステム領域に格納されるため App のサイズやメモリを消費しません。
+
+---
+
+## 主要内容
+
+iOS 10 で導入された SFSpeechRecognizer は Siri のモデルを利用しており、短い文の口述筆記向けに設計されたものでした。そのため会議や講義のような長時間音声では精度が大きく落ち、遠距離マイクのシナリオでも認識率が著しく低下します。さらに利用したい言語については、ユーザー自身に「設定」で Siri やキーボードの音声入力を有効化してもらう必要があり、開発者にとっては扱いづらいフローでした。Notes、Voice Memos、Journal といった Apple 純正 App でも、より高度な音声機能を実装する際にここがボトルネックになっていました。
+
+iOS 26 では、この旧 API を置き換える形で SpeechAnalyzer が導入されます。アーキテクチャとしては、SpeechAnalyzer クラスが分析セッションを管理し、そこに SpeechTranscriber モジュールを追加することで書き起こしセッションになります。開発者は AsyncSequence 経由で音声 buffer を流し込み、結果は別の AsyncSequence から非同期に受け取ります。すべての操作は音声タイムライン上の timecode で揃えられ、サンプル単位の精度が保証されるため、入力と結果の処理を独立した task に分離できます。
+
+ベースとなるモデルは Apple が新規に学習したもので、長時間音声・遠距離・会話シナリオすべてに最適化されており、旧モデルよりも高速です。モデルはシステム領域に格納されるため App のダウンロードサイズや実行時メモリには計上されず、システムが自動で更新します。開発者は AssetInventory API を通じて、必要な言語リソースをオンデマンドでダウンロードします。現時点では中国語・英語などいくつかの言語をサポートしており、watchOS は未対応です。サポート外の言語では、代替として DictationTranscriber を利用できます。これは iOS 10 のオンデバイスモデルを再利用するものですが、ユーザーに「設定」から Siri を有効化してもらう必要はありません。
+
+---
+
+## 詳細
+
+最もシンプルなシナリオは、録音ファイルをテキストに書き起こすケースです。たった 1 つの関数で実現できます ([05:21](https://developer.apple.com/videos/play/wwdc2025/277/?time=321))。
+
+```swift
+// Set up transcriber. Read results asynchronously, and concatenate them together.
+let transcriber = SpeechTranscriber(locale: locale, preset: .offlineTranscription)
+async let transcriptionFuture = try transcriber.results
+    .reduce("") { str, result in str + result.text }
+
+let analyzer = SpeechAnalyzer(modules: [transcriber])
+if let lastSample = try await analyzer.analyzeSequence(from: file) {
+    try await analyzer.finalizeAndFinish(through: lastSample)
+} else {
+    await analyzer.cancelAndFinishNow()
+}
+
+return try await transcriptionFuture
+```
+
+ポイントは以下のとおりです。
+
+- `preset: .offlineTranscription` はファイル書き起こし向けのプリセットで、reportingOptions や attributeOptions の手動設定を省略できます。
+- `transcriber.results` は AsyncSequence なので、`reduce` ですべての断片を 1 つの文字列に連結します。
+- `async let` で結果の消費をバックグラウンドに回し、メインフローでは同時に `analyzeSequence(from:)` を呼んで input sequence にファイルを読み込ませます。
+- `finalizeAndFinish(through:)` で「もう音声入力はない」と analyzer に伝え、終了処理を行わせます。
+
+リアルタイムのシナリオはもう少し複雑で、volatile result を有効化する必要があります。SpeechTranscriber の初期化パラメータでこれを制御します ([11:02](https://developer.apple.com/videos/play/wwdc2025/277/?time=662))。
+
+```swift
+func setUpTranscriber() async throws {
+    transcriber = SpeechTranscriber(locale: Locale.current,
+                                    transcriptionOptions: [],
+                                    reportingOptions: [.volatileResults],
+                                    attributeOptions: [.audioTimeRange])
+
+    guard let transcriber else {
+        throw TranscriptionError.failedToSetupRecognitionStream
+    }
+
+    analyzer = SpeechAnalyzer(modules: [transcriber])
+
+    self.analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+}
+```
+
+ポイントは以下のとおりです。
+
+- `reportingOptions: [.volatileResults]` でリアルタイムの暫定結果を有効にします。モデルはまず大まかな推測を返し、数秒後に文脈が積み上がった段階で finalized 結果に置き換えます。
+- `attributeOptions: [.audioTimeRange]` を指定すると、各単語に対応する音声時間レンジが結果に付与され、再生ハイライトに利用できます。
+- `bestAvailableAudioFormat` は現在の transcriber モジュールが期待する音声フォーマットを返します。後ほどマイクからの PCM buffer をこのフォーマットに変換します。
+
+モデルは必ずしもデバイスにプリインストールされているわけではないので、まずチェックしてダウンロードします ([12:30](https://developer.apple.com/videos/play/wwdc2025/277/?time=750)、[12:52](https://developer.apple.com/videos/play/wwdc2025/277/?time=772))。
+
+```swift
+public func ensureModel(transcriber: SpeechTranscriber, locale: Locale) async throws {
+    guard await supported(locale: locale) else {
+        throw TranscriptionError.localeNotSupported
+    }
+
+    if await installed(locale: locale) {
+        return
+    } else {
+        try await downloadIfNeeded(for: transcriber)
+    }
+}
+
+func downloadIfNeeded(for module: SpeechTranscriber) async throws {
+    if let downloader = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
+        self.downloadProgress = downloader.progress
+        try await downloader.downloadAndInstall()
+    }
+}
+```
+
+ポイントは以下のとおりです。
+
+- `SpeechTranscriber.supportedLocales` は現在のシステムでサポートされている言語の一覧を返すので、まず検証に使います。
+- `SpeechTranscriber.installedLocales` はすでにローカルにダウンロード済みの言語を返します。
+- `AssetInventory.assetInstallationRequest(supporting:)` でインストールリクエストを発行し、返ってきた downloader オブジェクトの `progress` を UI にバインドすることで、ダウンロード進捗を表示できます。
+
+各 App が同時に保持できる言語モデルの数には上限があります。上限を超える場合は `AssetInventory.deallocate(locale:)` で利用頻度の低いモデルを解放します ([13:19](https://developer.apple.com/videos/play/wwdc2025/277/?time=799))。
+
+結果の消費側では、`isFinal` で volatile と finalized の 2 種類の結果を区別します ([13:31](https://developer.apple.com/videos/play/wwdc2025/277/?time=811))。
+
+```swift
+recognizerTask = Task {
+    do {
+        for try await case let result in transcriber.results {
+            let text = result.text
+            if result.isFinal {
+                finalizedTranscript += text
+                volatileTranscript = ""
+                updateStoryWithNewText(withFinal: text)
+                print(text.audioTimeRange)
+            } else {
+                volatileTranscript = text
+                volatileTranscript.foregroundColor = .purple.opacity(0.4)
+            }
+        }
+    } catch {
+        print("speech recognition failed")
+    }
+}
+```
+
+ポイントは以下のとおりです。
+
+- `result.isFinal == true` のときは内容を最終稿に追記し、volatile バッファをクリアします。
+- `isFinal == false` のときは半透明の紫色で表示し、これが暫定的な推測であることをユーザーに示します。
+- `text.audioTimeRange` でその文字列に対応する音声時間が取得でき、再生ハイライトに使えます。
+
+音声側は AVAudioEngine に tap を仕掛けて、PCM buffer を input builder に流し込みます ([16:01](https://developer.apple.com/videos/play/wwdc2025/277/?time=961))。
+
+```swift
+func streamAudioToTranscriber(_ buffer: AVAudioPCMBuffer) async throws {
+    guard let inputBuilder, let analyzerFormat else {
+        throw TranscriptionError.invalidAudioDataType
+    }
+
+    let converted = try self.converter.convertBuffer(buffer, to: analyzerFormat)
+    let input = AnalyzerInput(buffer: converted)
+
+    inputBuilder.yield(input)
+}
+```
+
+ポイントは以下のとおりです。
+
+- マイクで取得した buffer のフォーマットは必ずしもモデルの期待値と一致しないため、`converter.convertBuffer(_:to:)` で `analyzerFormat` に変換します。
+- `AnalyzerInput` でラップしたものを `inputBuilder.yield` で input sequence に流し込めば、analyzer が自動で消費します。
+- 録音終了時には `analyzer?.finalizeAndFinishThroughEndOfInput()` を呼んで終了を通知します。
+
+---
+
+## 核心となる示唆
+
+- **何をやるか**: 録音系 App にリアルタイム書き起こし + 再生ハイライトを組み込みます。
+  - なぜやる価値があるか: 会議の議事録、ポッドキャストのメモ、インタビューの整理といったシナリオはどれも書き起こしを必要とします。旧来の SFSpeechRecognizer は長時間録音では実用にならず、SpeechTranscriber が直接そのギャップを埋めてくれます。
+  - どう始めるか: デモにあった Recorder + SpokenWordTranscriber の 2 クラス構成に倣い、`.volatileResults` と `.audioTimeRange` を有効化します。書き起こし中は半透明の volatile テキストを表示し、再生時は `audioTimeRange` を参照して現在の再生位置に該当する単語をハイライトします。
+
+- **何をやるか**: 書き起こし結果をそのまま Foundation Models に渡して、要約・タイトル・TODO 抽出を行います。
+  - なぜやる価値があるか: 書き起こし自体の価値はそれほど大きくなく、価値は後段の処理にあります。Apple が Notes で実装している Call Summarization も、まさにこのパイプラインです。
+  - どう始めるか: 書き起こしを reduce して AttributedString を作り、それをそのまま `LanguageModelSession` に渡してタイトルや要点を生成させます。オンデバイスモデルなのでオフラインで動作し、無料です。
+
+- **何をやるか**: 会議・講義の録音 App で `.offlineTranscription` プリセットを使い、バックグラウンドで一括書き起こしを行います。
+  - なぜやる価値があるか: 遠距離シナリオは、新モデルが旧 Siri モデルに対して最も大きく優位に立つ領域で、旧 API ではほぼ実用になりません。
+  - どう始めるか: ファイル書き起こしのシンプルな関数パターンを使い、バックグラウンドのタスクキューを用意します。ユーザーが録音を終えた時点でキューに投入し、完了したら通知します。volatile を扱う必要がなく、コード量も最小限で済みます。
+
+- **何をやるか**: 言語モデルをオンデマンドでダウンロードし、初回起動が長時間ブロックされないようにします。
+  - なぜやる価値があるか: 各 App が同時に保持できる言語モデルの数には上限があります。すべてを事前ダウンロードするのはストレージの無駄であり、失敗するリスクもあります。
+  - どう始めるか: 起動時にはダウンロードせず、ユーザーが特定の言語に切り替えたタイミングで `AssetInventory.assetInstallationRequest` を呼び出します。`downloader.progress` を SwiftUI の ProgressView にバインドし、ダウンロード完了後に書き起こしを開始します。上限を超える場合は `deallocate` で最も使われていない言語を解放します。
+
+- **何をやるか**: 未対応の言語やデバイスでは DictationTranscriber にフォールバックします。
+  - なぜやる価値があるか: SpeechTranscriber は watchOS をサポートしておらず、一部の言語もまだ対応中です。DictationTranscriber は iOS 10 の旧モデルを再利用しますが、ユーザーに「設定」から Siri を有効化してもらう必要がなくなり、SFSpeechRecognizer よりも体験が良くなります。
+  - どう始めるか: `SpeechTranscriber.supportedLocales` をチェックし、リストにない場合は DictationTranscriber を構築します。それ以外の SpeechAnalyzer の使い方は同じです。
+
+---
+
+## 関連 Session
+
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — SwiftUI App で Foundation Models フレームワークを使ってオンデバイス生成 AI 機能を開発する内容です。
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — Foundation Models フレームワークの深掘り回。guided generation などの高度な使い方を扱っており、書き起こし結果を LLM に流し込む際に必見です。
+- [Design interactive snippets](/articles/wwdc2025-281) — App Intents から呼び出されるコンパクトなビュー。書き起こしや要約結果を snippet 形式で表示できます。
+- [Develop for Shortcuts and Spotlight with App Intents](/articles/wwdc2025-260) — App Intents を使って音声書き起こしや要約などの能力を Shortcuts や Spotlight に公開する方法を扱います。

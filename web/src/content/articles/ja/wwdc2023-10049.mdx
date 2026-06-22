@@ -1,0 +1,195 @@
+---
+title: "Improve Core ML integration with async prediction"
+description: "Learn how to speed up machine learning features in your app with the latest Core ML execution engine improvements and find out how aggressive asset caching can help with inference and faster model loads."
+date: "2023-06-10"
+tags: ["Core ML", "Machine Learning", "Swift Concurrency", "Performance"]
+thumbnail: "/images/sessions/2023/10049.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10049/"
+sessionId: "wwdc2023-10049"
+year: "2023"
+relatedSessions:
+  - title: "Optimize machine learning for Metal apps"
+    code: "10050"
+    description: "Metal 上での PyTorch、TensorFlow、JAX の高速化"
+  - title: "Deploy machine learning models with Core ML Tools"
+    code: "10049"
+    description: "モデル変換と圧縮"
+  - title: "Explore machine learning in Create ML"
+    code: "10049"
+    description: "Create ML のモデル開発ワークフロー"
+---
+
+## ハイライト
+
+> iOS 17 の Core ML 推論エンジンは多くのモデルを自動的に高速化し、モデルの再コンパイルやコード変更は不要です。新しい非同期予測 API（async prediction）により、Swift Concurrency でモデル推論を並行実行でき、スループットは最大 2 倍に向上します。
+
+## 主要内容
+
+### 自動高速化: OS をアップグレードするだけで恩恵を受けられる
+
+以前はモデル推論速度を上げるには、手動でモデル精度を調整したり、再トレーニングしたり、アーキテクチャを変更する必要がありました。iOS 17 の Core ML 推論エンジンは底层で最適化されており、多くのモデルはアップグレード後に予測時間が直接短縮されます。この高速化はシステム更新とともにもたらされ、`.mlmodel` ファイルの再コンパイルやコード変更は不要です。
+
+### モデルロードのライフサイクルとキャッシュ
+
+Core ML がモデルをロードするとき、まずキャッシュを確認します。その設定とデバイスの組み合わせにキャッシュがあれば cached load を使い、なければ device-specialized compilation をトリガーして結果をキャッシュに書き込みます。この uncached load は遅い場合がありますが、以降のロードははるかに高速です。
+
+キャッシュファイルはディスク上に保存され、モデルパスと設定に紐づき、アプリ起動やデバイス再起動をまたいで有効です。ディスク容量不足、システム更新、コンパイル済みモデルの削除・変更時のみキャッシュがクリアされます。
+
+Core ML Instrument でロードイベントを観察できます。"prepare and cache" と表示されるのが uncached load、"cached" がキャッシュヒットです。パフォーマンスレポートでも uncached load 時間が表示されるようになりました。
+
+### 非同期予測 API が並行処理のボトルネックを解消
+
+従来の同期予測 API では、モデルはスレッドセーフではなく actor 内で直列実行する必要がありました。入力準備とモデル推論が同じキューに直列化され、GPU 利用率が低く、UI もカクつきます。
+
+iOS 17 では `prediction()` の async 版が導入されました。スレッドセーフで Swift Concurrency に対応します。ColorizingService を actor から通常の class に変更すると、複数の予測を並行実行できます。`Task.cancel()` と組み合わせれば、ユーザーが素早くスクロールしたときに未完了の予測をキャンセルできます。
+
+デモでは LazyVGrid で画像を表示し、async API に切り替えた後、初期ビューの着色時間が 2 秒から 1 秒に短縮され、スループットが約 2 倍に向上しました。
+
+### メモリ制御: 無制限の並行は避ける
+
+並行予測は複数の入出力セットを同時にロードするため、メモリピークが急上昇する可能性があります。フロー制御を追加し、たとえば in-flight 予測を最大 2 つに制限します。カメラストリームデータでは、古いフレームを直接破棄して蓄積を防ぎます。
+
+## 詳細
+
+### デバイス算力の可用性を確認する
+
+（[08:29](https://developer.apple.com/videos/play/wwdc2023/10049/?time=509)）
+
+一部の体験では Neural Engine が性能や消費電力の要件を満たす必要があります。iOS 17 では `MLComputeDevice` と `availableComputeDevices` API が追加され、ランタイムでデバイスがサポートする算力ユニットを確認できます。
+
+```swift
+import CoreML
+
+let model = try await MLModel.load(contentsOf: modelURL)
+
+// Neural Engine があるか確認
+let hasNeuralEngine = model.availableComputeDevices.contains {
+    if case .neuralEngine = $0 { return true }
+    return false
+}
+
+if hasNeuralEngine {
+    // Neural Engine を必要とするモデルを使用
+}
+```
+
+**キーポイント:**
+- `MLModel.load(contentsOf:)` は非同期でモデルをロードします
+- `availableComputeDevices` は現在のデバイスがサポートする算力ユニットのリストを返します
+- `MLComputeDevice` は `.cpu`、`.gpu`、`.neuralEngine` などの case を持つ列挙型です
+
+### 非同期予測 API の使い方
+
+（[17:33](https://developer.apple.com/videos/play/wwdc2023/10049/?time=1053)）
+
+```swift
+import CoreML
+
+class ColorizingService {
+    private let colorizerModel: Colorizer
+    
+    init() throws {
+        let config = MLModelConfiguration()
+        colorizerModel = try Colorizer(configuration: config)
+    }
+    
+    func colorize(image: UIImage) async throws -> UIImage? {
+        // タスクがキャンセルされたか確認
+        guard !Task.isCancelled else { return nil }
+        
+        // 入力を準備（モデルが要求するサイズにスケール）
+        let resizedImage = image.resized(to: CGSize(width: 256, height: 256))
+        guard let pixelBuffer = resizedImage.pixelBuffer else { return nil }
+        
+        // 非同期予測
+        let input = ColorizerInput(image: pixelBuffer)
+        let output = try await colorizerModel.prediction(input: input)
+        
+        return UIImage(pixelBuffer: output.colorizedImage)
+    }
+}
+```
+
+**キーポイント:**
+- `try await colorizerModel.prediction(input:)` が新しい非同期 API です
+- メソッド冒頭で `Task.isCancelled` を確認し、キャンセル済みタスクの入力準備を避けます
+- actor 分離は不要になり、複数の予測を並行実行できます
+- SwiftUI の `.task` modifier と組み合わせると、ビューが消えたときに自動キャンセルされます
+
+### フロー制御で並行数を制限する
+
+（[21:17](https://developer.apple.com/videos/play/wwdc2023/10049/?time=1277)）
+
+```swift
+actor ColorizingService {
+    private let colorizerModel: Colorizer
+    private var inFlightCount = 0
+    private let maxInFlight = 2
+    
+    func colorize(image: UIImage) async throws -> UIImage? {
+        // 利用可能なスロットができるまで待機
+        while inFlightCount >= maxInFlight {
+            try await Task.sleep(nanoseconds: 10_000_000) // 10ms
+        }
+        
+        inFlightCount += 1
+        defer { inFlightCount -= 1 }
+        
+        guard !Task.isCancelled else { return nil }
+        
+        let resizedImage = image.resized(to: CGSize(width: 256, height: 256))
+        guard let pixelBuffer = resizedImage.pixelBuffer else { return nil }
+        
+        let input = ColorizerInput(image: pixelBuffer)
+        let output = try await colorizerModel.prediction(input: input)
+        
+        return UIImage(pixelBuffer: output.colorizedImage)
+    }
+}
+```
+
+**キーポイント:**
+- actor で `inFlightCount` を制御し、スレッドセーフを保証します
+- `maxInFlight = 2` で同時進行の予測数を制限します
+- `defer` でメソッド終了時にカウンターが正しくデクリメントされます
+- カメラストリームでは待機せず `return nil` して古いフレームを破棄します
+
+### 3 つの予測 API の選択
+
+（[22:04](https://developer.apple.com/videos/play/wwdc2023/10049/?time=1324)）
+
+| シナリオ | 推奨 API |
+|------|---------|
+| 同期コンテキスト、入力間隔がモデル遅延よりはるかに長い | 同期 `prediction(input:)` |
+| 入力がバッチで到着 | `predictions(from:)` バッチ API |
+| 非同期コンテキスト、大量の入力が時間経過とともに個別に到着 | 非同期 `prediction(input:)` |
+
+ML Program と Pipeline モデルタイプが並行予測の恩恵を最も受けます。並行処理を追加する前に、Instruments の Core ML + Allocations テンプレートでプロファイルし、ユースケースに本当に役立つか確認してください。
+
+## 重要ポイント
+
+**1. リアルタイムフィルターカメラ**
+- **何を作るか**: Core ML モデルでカメラ映像にリアルタイムのスタイル転送や人像セグメンテーションフィルターを適用
+- **価値がある理由**: 非同期予測 API でフレーム処理がメインスレッドをブロックせず、フロー制御でメモリ爆発を防げます
+- **始め方**: `AVCaptureVideoDataOutput` でフレームを取得し、`.task` 内で非同期 `prediction()` を呼び、`maxInFlight = 1` で最新フレームのみ処理
+
+**2. バッチ写真スマート分類**
+- **何を作るか**: アルバムから 100 枚選び、Core ML モデルで自動分類（風景/人像/美食）
+- **価値がある理由**: 並行予測で直列の数十秒から数秒に短縮し、ユーザーは待たされません
+- **始め方**: `PhotosPicker` で画像を選択し、`TaskGroup` で並行予測を呼び、並行数を 3〜5 に制限
+
+**3. オフライン音声認識アシスタント**
+- **何を作るか**: 完全オフラインの音声テキスト変換 + 意図認識。ネットワーク不要
+- **価値がある理由**: iOS 17 推論エンジンの高速化 + 非同期 API で、エッジ音声モデルの応答がより速くなります
+- **始め方**: `SFSpeechRecognizer` で音声ストリームを取得し、Core ML 音響モデルに分割投入、async sequence で結果を処理
+
+**4. スマートアルバム重複排除**
+- **何を作るか**: ローカルアルバムをスキャンし、画像埋め込みモデルで類似写真を検出
+- **価値がある理由**: バッチ並行で特徴ベクトル抽出し、スキャン時間を大幅短縮
+- **始め方**: `PHAsset` で写真を走査し、Vision で特徴を抽出、Core ML モデルで類似度行列を計算
+
+## 関連セッション
+
+- [Optimize machine learning for Metal apps](/articles/wwdc2023-10050) — PyTorch 2.0、TensorFlow、JAX の Metal 上での加速
+- [Deploy machine learning models with Core ML Tools](/articles/wwdc2023-10049) — モデル変換、量子化、圧縮
+- [Explore machine learning in Create ML](/articles/wwdc2023-10049) — Create ML での対話的開発と評価

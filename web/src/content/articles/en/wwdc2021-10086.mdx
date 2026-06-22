@@ -1,0 +1,296 @@
+---
+title: "What's new in CloudKit"
+description: "cloudkit provides a secure, convenient, and reliable cloud database for your apps — and it's only getting better. discover how you can unravel your threads with support for async/await and convenience api additions. we'll also show you how to encourage collaboration between people using your app through sharing entire record zones of data, and explore how to adopt cloudkit features like encrypted values and help protect sensitive data within your app."
+date: "2021-06-08"
+tags: ["System Services", "Privacy & Security"]
+thumbnail: "/images/sessions/2021/10086.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10086/"
+sessionId: "wwdc2021-10086"
+year: "2021"
+relatedSessions:
+  - title: "Apple's privacy pillars in focus"
+    code: "10085"
+    description: "at apple, we believe that privacy is a fundamental human right. learn about our four privacy pillars and the technical approaches that keep your users' data safe."
+  - title: "Meet CloudKit Console"
+    code: "10087"
+    description: "discover the new cloudkit console, a web-based tool for managing your cloudkit containers and databases."
+  - title: "Build dynamic iOS apps with the Create ML framework"
+    code: "10038"
+    description: "discover how you can use the create ml framework to build dynamic iOS apps that leverage on-device machine learning."
+---
+## Highlight
+
+> CloudKit has received three core upgrades in iOS 15: native support for Swift async/await to make asynchronous code more linear, encrypted fields (encryptedValues) to automatically enable end-side encryption of sensitive data, and Zone Sharing to eliminate the need to build a record hierarchy for entire zone data sharing.These improvements lower the barrier to entry for using CloudKit while improving data security and collaboration capabilities.
+
+## Core Content
+
+### From callback hell to async/await
+
+（[00:38](https://developer.apple.com/videos/play/wwdc2021/10086/?time=38)）
+
+CloudKit's API is divided into two layers: Convenience API (functions on CKContainer and CKDatabase) for novices and Operation API (NSOperation subclass) for production environments.The Operation API supports advanced features such as batch operations, paging, change tracking, etc., but the code complexity is also much higher.
+
+iOS 15 introduces async/await variants for the Convenience API.Compare the logic of deleting records in the same paragraph:
+
+**Old code (callback style):**
+
+```swift
+func deleteLastPerson(completionHandler: ((Result<Void, Error>) -> Void)? = nil) {
+    database.delete(withRecordID: lastPersonRecordId) { recordId, error in
+        if let recordId = recordId {
+            os_log("Record with ID \(recordId.recordName) was deleted.")
+        }
+        if let error = error {
+            self.reportError(error)
+            completionHandler?(.failure(error))
+        } else {
+            completionHandler?(.success(()))
+        }
+    }
+}
+```
+
+**New code (async/await):**
+
+```swift
+func deleteLastPerson() async throws {
+    do {
+        let recordId = try await database.deleteRecord(with: lastPersonRecordId)
+        os_log("Record with ID \(recordId.recordName) was deleted.")
+    } catch {
+        self.reportError(error)
+        throw error
+    }
+}
+```
+
+Key points:
+- New API eliminates optional value unpacking and conditional branches
+- Control flow becomes linear for error handling`try/catch`
+- Each Convenience API function has two versions: with completionHandler and async
+
+### Batch operations also support async
+
+（[09:14](https://developer.apple.com/videos/play/wwdc2021/10086/?time=554)）
+
+The previous Convenience API could only operate on a single line.iOS 15 adds a new batch modification function:
+
+```swift
+func deleteLastPeople() async throws {
+    let recordIds = [lastPersonRecordId, penultimatePersonRecordId]
+    let (_, deleteResults) = try await database.modifyRecords(deleting: recordIds)
+
+    for (recordId, deleteResult) in deleteResults {
+        switch deleteResult {
+        case .failure(let error):
+            self.reportError(error, itemId: recordId)
+        case .success:
+            os_log("Record with ID \(recordId.recordName) was deleted.")
+        }
+    }
+}
+```
+
+Key points:
+- `modifyRecords(deleting:)`return`(saveResults, deleteResults)`two dictionaries
+- Use for each result`Result`Type wrapper to clearly differentiate between success and failure
+- Function-level errors only represent the failure of the operation itself (such as network unavailability). The error of a single record is in`deleteResults`middle
+
+### Result type clarifies callback responsibilities
+
+（[05:39](https://developer.apple.com/videos/play/wwdc2021/10086/?time=339)）
+
+The CloudKit Operation API previously reported errors with two sets of callbacks: per-item completion block and per-operation completion block.The same error may appear in two places, making it easy for developers to get confused.
+
+iOS 15 redesigns callbacks with the Swift.Result type:
+
+```swift
+// Old API: error parameters are spread across multiple optional parameters
+fetchRecordsOp.perRecordCompletionBlock = { record, recordID, error in
+    // error may be CKError.unknownItem
+}
+fetchRecordsOp.fetchRecordsCompletionBlock = { recordsByRecordID, operationError in
+    // operationError may be CKError.partialFailure
+    // Individual errors must also be parsed from partialErrorsByItemID
+}
+
+// New API: the Result type clearly distinguishes per-item and per-operation outcomes
+fetchRecordsOp.perRecordResultBlock = { recordID, result in
+    // result is .success(record) or .failure(CKError.unknownItem)
+}
+fetchRecordsOp.fetchRecordsResultBlock = { result in
+    // result is .success, so individual errors are no longer reported twice
+}
+```
+
+Key points:
+- `perRecordResultBlock`Report only the success or failure of a single record
+- `fetchRecordsResultBlock`Reports only the overall success or failure of the operation
+- All CKOperations now expose per-item callbacks
+
+## Detailed Content
+
+### Encrypted fields: Protect sensitive data with one line of code
+
+（[13:43](https://developer.apple.com/videos/play/wwdc2021/10086/?time=823)）
+
+CloudKit previously only provided automatic encryption for CKAsset.iOS 15 extends this capability so that strings, numbers, dates, CLLocations, and arrays can be directly stored encrypted.
+
+```swift
+// Device 1: set an encrypted value
+let record = CKRecord(recordType: "MedicalData")
+record.encryptedValues["diagnosis"] = "Hypertension"
+record.encryptedValues["bloodPressure"] = 140.0
+
+let modifyOp = CKModifyRecordsOperation(recordsToSave: [record])
+database.add(modifyOp)
+
+// Device 2: automatically decrypt after reading
+let fetchOp = CKFetchRecordsOperation(recordIDs: [recordID])
+fetchOp.perRecordResultBlock = { recordID, result in
+    switch result {
+    case .success(let record):
+        let diagnosis = record.encryptedValues["diagnosis"] as? String
+        let bp = record.encryptedValues["bloodPressure"] as? Double
+        print("Diagnosis: \(diagnosis ?? ""), BP: \(bp ?? 0)")
+    case .failure(let error):
+        print("Fetch failed: \(error)")
+    }
+}
+database.add(fetchOp)
+```
+
+Key points:
+- `encryptedValues`It is a new attribute of CKRecord and its usage is the same as that of ordinary fields.
+- Encryption is done on the device and key material is stored in iCloud Keychain
+- Support CloudKit sharing function, only participants of CKShare can decrypt related fields
+- CKAsset is encrypted by default and cannot be set to encryptedValue again
+- CKReference cannot be encrypted because the server needs to see the reference relationship
+
+### Account status check
+
+（[16:35](https://developer.apple.com/videos/play/wwdc2021/10086/?time=995)）
+
+Encryption operations require a valid iCloud account.New in iOS 15`temporarilyUnavailable`state:
+
+```swift
+let container = CKContainer.default()
+
+// Check account status
+let status = try await container.accountStatus()
+
+switch status {
+case .available:
+    // Encrypted operations can be performed
+    print("Account is available")
+case .noAccount:
+    // Guide the user to sign in to iCloud
+    print("No iCloud account")
+case .restricted:
+    // Restricted by parental controls or configuration
+    print("Account is restricted")
+case .temporarilyUnavailable:
+    // The account is signed in but not ready; guide the user to Settings for verification
+    print("Account temporarily unavailable")
+case .couldNotDetermine:
+    // Network issue or system error
+    print("Could not determine account status")
+}
+
+// Listen for account status changes
+NotificationCenter.default.addObserver(
+    forName: .CKAccountChanged,
+    object: nil,
+    queue: .main
+) { _ in
+    print("iCloud account changed")
+}
+```
+
+Key points:
+- `temporarilyUnavailable`It is a new status in iOS 15, indicating that the account is logged in but requires verification.
+- Users should be directed to the Settings App to complete verification
+- pass`CKAccountChanged`Notify monitoring status changes
+
+### Zone Sharing: Sharing the entire zone no longer requires a level
+
+（[21:10](https://developer.apple.com/videos/play/wwdc2021/10086/?time=1270)）
+
+Before CloudKit can share, it is necessary to build a record hierarchy (parent references) and create a CKShare with the root record.iOS 15 introduces Zone Sharing, which can directly share the entire recording area.
+
+**Old Way: Record Level Sharing**
+
+```swift
+// Create the record hierarchy
+let zone = CKRecordZone(zoneName: "MyZone")
+let fileRecordA = CKRecord(recordType: "File", recordID: CKRecord.ID(zoneID: zone.zoneID))
+let fileRecordB = CKRecord(recordType: "File", recordID: CKRecord.ID(zoneID: zone.zoneID))
+let folderRecord = CKRecord(recordType: "Folder", recordID: CKRecord.ID(zoneID: zone.zoneID))
+
+fileRecordA.setParent(folderRecord)
+fileRecordB.setParent(folderRecord)
+
+// Create a share with folder as the root record
+let share = CKShare(rootRecord: folderRecord)
+let (saveResults, _) = try await database.modifyRecords(saving: [folderRecord, share])
+```
+
+**New way: Zone Sharing**
+
+```swift
+// Share the entire zone directly
+let zone = CKRecordZone(zoneName: "MyZone")
+let share = CKShare(recordZoneID: zone.zoneID)
+
+let (saveResults, _) = try await database.modifyRecords(saving: [share])
+for (recordID, saveResult) in saveResults {
+    // Handle each result
+}
+```
+
+Key points:
+- Zone Sharing does not require parent references
+- Each Zone can only have one Zone-wide share
+- The record name of Zone-wide share is fixed to`CKRecordNameZoneWideShare`
+- Cannot coexist in the same Zone with layer sharing
+- When accepting Zone Share,`rootRecord`and`hierarchicalRootRecordID`is nil
+
+### Choice of two sharing methods
+
+（[24:59](https://developer.apple.com/videos/play/wwdc2021/10086/?time=1499)）
+
+| Scenario | Recommended method |
+|------|---------|
+| Data naturally forms a hierarchy (folder-file) | Hierarchical sharing (rootRecord + parent references) |
+| Zone is a tiled collection of records | Zone Sharing |
+| Requires multiple independent shares in the same Zone | Hierarchical sharing |
+
+Use cases within Apple:
+- Hierarchical sharing: Notes, Reminders, iCloud Drive folders
+- Zone Sharing: HomeKit Secure Video, HomePod multi-user
+
+## Core Takeaways
+
+### 1. Refactor CloudKit code with async/await
+
+If your project is still using completion blocks to call CloudKit, migrating to async/await can significantly reduce maintenance costs.Start with the simplest single operation and gradually replace batch operations.
+
+How to start: Find out all`database.save()`、`database.fetch()`callback call, replaced by`try await database.saveRecord()`and`try await database.record(for:)`.Xcode's autocompletion prompts for available async variants.
+
+### 2. Enable encrypted fields for sensitive data
+
+Any personally identifiable information, medical records, financial data stored in CloudKit should use`encryptedValues`.The cost is next to zero, but the privacy promise is an order of magnitude higher.
+
+How to get started: Audit your existing CloudKit data model to identify sensitive fields.Will`record["field"]`Replace with`record.encryptedValues["field"]`.Confirm in the CloudKit Console that the field type appears with a prefix such as "Encrypted String".
+
+### 3. Simplify collaboration with Zone Sharing
+
+If your app has "shared project/shared workspace" requirements and the data model is flat (no obvious parent-child relationship), Zone Sharing is much simpler than building an artificial hierarchy.
+
+How to get started: Create a custom Zone and put all the records that need to be shared into it.initialization`CKShare(recordZoneID:)`and save.The recipient joins through the standard CloudKit sharing process.
+
+## Related Sessions
+
+- [Apple's privacy pillars in focus](/articles/wwdc2021-10085) — Technical implementation details of Apple’s four privacy pillars
+- [Meet CloudKit Console](/articles/wwdc2021-10087) — A new web version of CloudKit management tool
+- [Build dynamic iOS apps with the Create ML framework](/articles/wwdc2021-10038) — Train personalized machine learning models on the device

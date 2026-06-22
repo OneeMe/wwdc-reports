@@ -1,0 +1,170 @@
+---
+title: "Optimize SwiftUI performance with Instruments"
+description: "discover the new swiftui instrument. we"
+date: 2026-06-10
+tags: ["Swift", "SwiftUI", "開発ツール"]
+thumbnail: "/images/sessions/2025/306.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/306/"
+sessionId: "wwdc2025-306"
+year: "2025"
+relatedSessions:
+  - title: "Code-along: Cook up a rich text experience in SwiftUI with AttributedString"
+    code: "280"
+    description: "learn how to build a rich text experience with swiftui"
+  - title: "Embracing Swift concurrency"
+    code: "268"
+    description: "join us to learn the core swift concurrency concepts. concurrency helps you impr"
+  - title: "Explore Swift and Java interoperability"
+    code: "307"
+    description: "learn how you can mix swift and java in a single codebase. we"
+  - title: "Improve memory usage and performance with Swift"
+    code: "312"
+    description: "discover ways to improve the performance and memory management of your swift cod"
+---
+
+## ハイライト
+
+> 本セッションでは、Instruments 26 に新たに追加された SwiftUI Instrument について紹介します。これは、主に以下の 2 種類のパフォーマンス問題を診断するのに役立ちます。1 つ目は「長い body 更新」（View body の実行時間が長くなり、結果として hitch が発生する問題）で、2 つ目は「不要な更新」（過剰な View body の更新がフレーム予算を圧迫する問題）です。
+
+---
+
+## 主要内容
+
+Steven は Landmarks アプリのデモ中に、よくある問題に直面しました。リストのスクロールがなめらかではないのですが、どこでカクついているのかがわからないのです。SwiftUI でのパフォーマンスデバッグは、これまで非常に苦労するものでした。body にブレークポイントを仕掛けても、コールスタックには AttributeGraph の再帰呼び出しが並び、どの View がどの理由で再実行されたのかがまったく見えてきません。開発者はコードを推測で修正し、手触りで速くなったかどうかを判断するしかありませんでした。
+
+Instruments 26 は、直接的な答えを与えてくれます。新しい SwiftUI Instrument は、SwiftUI 内部の更新プロセスを可視化します。Update Groups では SwiftUI がいつ処理を行っているかが表示され、Long View Body Updates ではどの View の body が長時間実行されているかが示されます（赤とオレンジで、hitch を引き起こす可能性の高い順に並びます）。Cause & Effect Graph では、「ユーザーの操作 → 状態変更 → View body の再実行」という因果の連鎖を、クリック可能なグラフとして描き出します。Steven は一度 trace を記録するだけで、`LandmarkListItemView` の `distance` 計算プロパティを特定しました。body 実行のたびに `MeasurementFormatter` と `NumberFormatter` が作成されており、1 回あたり 1 ミリ秒程度ですが、画面上の数十個の cell に掛かると、1 フレームの deadline を超えてしまうのです。
+
+---
+
+## 詳細
+
+フレーム予算の基本は次の通りです（[09:55](https://developer.apple.com/videos/play/wwdc2025/306/?time=595)）。各フレームで、アプリはまずイベントを処理し、次に UI 更新（再実行が必要なすべての view body を含む）を行い、最後にシステムにレンダリングを委譲します。これらすべては、frame deadline までに完了しなければなりません。1 つの body が時間を超過すると、次のフレームがレンダラーに間に合わなくなり、画面は前のフレームで止まってしまいます。これが hitch です。
+
+Steven がプロファイリングした問題のコードは次のようになっていました（[08:47](https://developer.apple.com/videos/play/wwdc2025/306/?time=527)）。
+
+```swift
+struct LandmarkListItemView: View {
+    @Environment(ModelData.self) private var modelData
+    let landmark: Landmark
+
+    var body: some View {
+        Image(landmark.thumbnailImageName)
+            // ...
+            .overlay(alignment: .bottom) {
+                if let distance {
+                    Text(distance)
+                }
+            }
+    }
+
+    private var distance: String? {
+        guard let currentLocation = modelData.locationFinder.currentLocation else { return nil }
+        let distance = currentLocation.distance(from: landmark.clLocation)
+
+        let numberFormatter = NumberFormatter()
+        numberFormatter.numberStyle = .decimal
+        numberFormatter.maximumFractionDigits = 0
+
+        let formatter = MeasurementFormatter()
+        formatter.locale = Locale.current
+        formatter.unitStyle = .medium
+        formatter.unitOptions = .naturalScale
+        formatter.numberFormatter = numberFormatter
+        return formatter.string(from: Measurement(value: distance, unit: UnitLength.meters))
+    }
+}
+```
+
+ポイント：
+
+- `body` は `distance` 計算プロパティを介して間接的に距離文字列を読み取っており、body が再実行されるたびに完全なフォーマット処理が発生します。
+- `NumberFormatter` と `MeasurementFormatter` は、Foundation 内でも「作成コストが高い」ことで知られるオブジェクトです。これらを body の呼び出しパスに置くことは、毎回の body 実行で「作成 + 設定 + 文字列生成」のコストを支払うことを意味します。
+- Time Profiler は、`distance` フレームを直接指し示し、最も重いサブフレームがこの 2 つの formatter です。これはまさに「body 内で計算を行う」というアンチパターンの教科書的な例です。
+
+修正方法は、フォーマット処理を `LocationFinder` に移し、結果をキャッシュすることです（[12:13](https://developer.apple.com/videos/play/wwdc2025/306/?time=733)）。
+
+```swift
+@Observable
+class LocationFinder: NSObject {
+    var currentLocation: CLLocation?
+    private let formatter: MeasurementFormatter
+
+    var landmarks: [Landmark] = [] {
+        didSet { updateDistances() }
+    }
+
+    private var distanceCache: [Landmark.ID: String] = [:]
+
+    private func updateDistances() {
+        guard let currentLocation else { return }
+        self.distanceCache = landmarks.reduce(into: [:]) { result, landmark in
+            let distance = self.formatter.string(
+                from: Measurement(
+                    value: currentLocation.distance(from: landmark.clLocation),
+                    unit: UnitLength.meters
+                )
+            )
+            result[landmark.id] = distance
+        }
+    }
+
+    func distance(from landmark: Landmark) -> String? {
+        distanceCache[landmark.id]
+    }
+}
+```
+
+ポイント：
+
+- `formatter` は `init` 内で一度だけ作成し、プロパティとして保持します。これにより、body が毎回再作成することを避けられます。
+- `distanceCache: [Landmark.ID: String]` は、フォーマット済みの文字列を landmark id ごとに保存します。body では、もう辞書を参照するだけです。
+- `updateDistances()` は `currentLocation` または `landmarks` が変化したときにのみ呼び出されます。コストは「毎回の body 実行」から「位置が変化するたび」に分散されます。
+
+2 つ目の問題は、より隠蔽的です。不要な更新です（[16:51](https://developer.apple.com/videos/play/wwdc2025/306/?time=1011)）。Steven がお気に入りボタンを追加したところ、任意の landmark のハートマークをタップすると、リスト内のすべての `LandmarkListItemView` の body が再実行されてしまいました。Cause & Effect Graph には、`isFavorite(_:)` メソッドが `favoritesCollection.landmarks` という配列にアクセスしているため、各 cell の body は「配列全体」に依存を持っていることが示されていました。修正方法は、各 landmark に独立した view model を作成し、依存の粒度を単一オブジェクトに落とすことです（[17:20](https://developer.apple.com/videos/play/wwdc2025/306/?time=1040)、[29:21](https://developer.apple.com/videos/play/wwdc2025/306/?time=1761)）。
+
+```swift
+@Observable @MainActor
+class ModelData {
+    @Observable class ViewModel {
+        var isFavorite: Bool
+        init(isFavorite: Bool = false) { self.isFavorite = isFavorite }
+    }
+
+    @ObservationIgnored private var viewModels: [Landmark.ID: ViewModel] = [:]
+
+    private func viewModel(for landmark: Landmark) -> ViewModel {
+        if viewModels[landmark.id] == nil {
+            viewModels[landmark.id] = ViewModel()
+        }
+        return viewModels[landmark.id]!
+    }
+
+    func isFavorite(_ landmark: Landmark) -> Bool {
+        viewModel(for: landmark).isFavorite
+    }
+}
+```
+
+ポイント：
+
+- `@Observable class ViewModel` は、「お気に入りかどうか」という状態を、landmark ごとに独立した観察可能オブジェクトに分割します。
+- `@ObservationIgnored private var viewModels` は、`viewModels` 辞書自体が依存追跡に参加しないようにします。SwiftUI は、辞書の変化によってすべての cell が再実行されることはありません。
+- `isFavorite(_:)` 内では `viewModel(for: landmark).isFavorite` にアクセスするため、cell の body は自分の ViewModel のみに依存します。他の landmark のハートマークをタップしても、自分には影響しません。
+
+---
+
+## 重要ポイント
+
+- **formatter やその他の高コストオブジェクトを body から移動する**：なぜ価値があるか — `NumberFormatter` と `MeasurementFormatter` は作成コストが高く、リスト内の数十個の cell × 毎フレーム = メインスレッドが簡単に時間を超過してしまいます。どう始めるか — このようなオブジェクトをプロパティとして保持するか、model 層でフォーマット結果をキャッシュし、body ではキャッシュを参照するだけにします。
+- **新しい SwiftUI Instrument でベースライン trace を一度実行する**：なぜ価値があるか — 目視や print デバッグでは、どの view body が長時間実行されているか、どの view が不要に再実行されているかを把握するのは困難です。どう始めるか — Xcode 26 で Command-I を押し、SwiftUI テンプレートを選択します。まず Long View Body Updates の赤とオレンジの項目を確認し、次に Cause & Effect Graph で「自分が変更していないのに更新されている」View を見つけます。
+- **@Observable の依存粒度を細かく分割する**：なぜ価値があるか — 1 つのコレクションプロパティにアクセスすると、そのプロパティに依存するすべての View が更新対象になり、単一要素の変化で View グループ全体が再実行されてしまいます。どう始めるか — 各要素に対して独立した `@Observable` 子オブジェクトを作成し、観察に参加させたくないコンテナフィールドには `@ObservationIgnored` を付与します。
+- **頻繁に変化する値は Environment に入れない**：なぜ価値があるか — `@Environment` の値が変化すると、その値を読み取るすべての View が更新チェックの対象になります。どう始めるか — timer、geometry proxy、スクロールオフセットなどの高頻度な値は、ローカルの `@State` または専用の `@Observable` オブジェクトで保持し、読み取り範囲に応じて影響半径を限定します。
+
+---
+
+## 関連セッション
+
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — SwiftUI の AttributedString を使ったリッチテキスト編集体験の構築
+- [Embracing Swift concurrency](/articles/wwdc2025-268) — Swift 並行処理の核心概念。メインスレッドの処理が UI フレーム予算に与える影響を理解する
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — 同一コードベースでの Swift と Java の混在利用
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Swift コードレベルでのメモリとパフォーマンスの最適化手法

@@ -1,0 +1,270 @@
+---
+title: "Meet the Now Playing framework"
+description: "Get a first look at Now Playing, a Swift framework that connects your app's media playback to system surfaces like the Lock Screen, Control Center, Dynamic Island, and CarPlay."
+date: "2026-06-10"
+tags: ["NowPlaying", "MediaSession", "Observation", "AppExtension", "APNs"]
+thumbnail: "/images/sessions/2026/312.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/312/"
+sessionId: "wwdc2026-312"
+year: "2026"
+relatedSessions:
+  - title: "Meet the Now Playing framework"
+    code: "312"
+    description: "Use declarative protocols and App Extensions to connect local and remote media playback to the system Now Playing interface"
+  - title: "What's new in Swift"
+    code: "262"
+    description: "The underlying mechanics and best practices for the `@Observable` macro, which helps explain the state observation model NowPlaying relies on"
+  - title: "What's new in SwiftUI"
+    code: "269"
+    description: "How SwiftUI integrates with system frameworks; NowPlaying's declarative design follows the same philosophy"
+  - title: "What's new in UIKit"
+    code: "278"
+    description: "How UIKit apps can work with the NowPlaying framework, plus state-management guidance for modern UIKit"
+  - title: "What's new in MusicKit"
+    code: "254"
+    description: "APIs for music content that directly relate to NowPlaying content types such as `MusicContent`"
+---
+
+## Highlight
+
+> Apple introduces the NowPlaying framework, replacing the dictionary-based `MPNowPlayingInfoCenter` API with declarative protocols and `@Observable`. Your app's media playback can now sync automatically to the Lock Screen, Control Center, Dynamic Island, and CarPlay. With Remote Media Sessions and Media Sharing Extensions, playback controls for external devices such as third-party speakers can also appear in native system interfaces.
+
+## Core Content
+
+Every developer who has built audio or video playback has dealt with this scene: the user presses pause on their headphones, or taps next from the Lock Screen, and your app has to respond in several places. The old approach was to stuff a dictionary into `MPNowPlayingInfoCenter`. The keys were string constants, types were checked at runtime, and state updates had to be triggered manually. The code felt like whack-a-mole, and the Lock Screen progress bar and pause button often drifted out of sync with the app's internal state.
+
+The NowPlaying framework rewrites that process.
+
+([01:00](https://developer.apple.com/videos/play/wwdc2026/312/?time=60)) Its core idea is this: make your playback model conform to a protocol, let the system track state changes automatically through Swift's `@Observable`, and then update every system surface for you. You do not manually tell the Lock Screen "we are now at second 3". You just update the `elapsedTime` property in your model, and the system refreshes itself.
+
+This directly addresses a long-standing pain point: state synchronization. The old dictionary API was imperative. Every field change required another set operation. The system could not know exactly what changed, so it had to refresh broadly. With `@Observable`, the system can diff precisely and update only the changed parts, which also makes Lock Screen and Dynamic Island animations smoother.
+
+([05:04](https://developer.apple.com/videos/play/wwdc2026/312/?time=304)) Another major change is support for remote playback devices. If your app can control a smart speaker, users previously returned to iPhone and saw nothing about that device in Control Center. With Remote Media Sessions, the speaker's state can be pushed to iPhone through APNs, and the system displays the same playback interface in Control Center. The experience matches local playback.
+
+([10:31](https://developer.apple.com/videos/play/wwdc2026/312/?time=631)) Finally, there are Media Sharing Extensions. Supporting casting protocols used to mean embedding a corresponding SDK inside your app, increasing binary size. Now the protocol implementation is managed by the system. The app only calls the system device picker, and after the user chooses a device, playback routing is handled automatically.
+
+## Details
+
+### Connect local playback to the system Now Playing interface
+
+([01:56](https://developer.apple.com/videos/play/wwdc2026/312/?time=116)) Suppose you have a playback model that references an audio engine and exposes a property for the currently playing item:
+
+```swift
+import Observation
+
+@Observable
+final class PlayerModel {
+    let player: SoundPlayer
+    var sound: Sound { player.currentSound }
+
+    init(player: SoundPlayer) {
+        self.player = player
+    }
+}
+```
+
+To connect this model to the system Now Playing interface, make it conform to `MediaSessionRepresentable`:
+
+```swift
+import NowPlaying
+
+extension PlayerModel: MediaSessionRepresentable {
+    var id: String { "ambient-sound-session" }
+
+    var content: (any MediaContentRepresentable)? {
+        return GenericContent(
+            id: sound.id,
+            title: sound.name,
+            subtitle: sound.description,
+            type: .audio,
+            duration: .live,
+            artwork: Artwork(id: sound.id) { size in
+                let data = try await self.artworkData(size: size)
+                return try ArtworkRepresentation(data: data)
+            }
+        )
+    }
+
+    var playbackSnapshot: MediaPlaybackSnapshot? {
+        MediaPlaybackSnapshot(
+            state: player.isPlaying ? .playing() : .paused
+        )
+    }
+
+    var commands: [MediaCommand] {[
+        .play { self.player.play() },
+        .pause { self.player.pause() },
+        .previous { self.player.previous() },
+        .next { self.player.next() }
+    ]}
+}
+```
+
+Key points:
+- `id` identifies the session, not the song. Do not change it when tracks change, or the system will treat them as two different sessions and Dynamic Island animations will break.
+- `content` describes what is playing. NowPlaying provides dedicated types such as `MusicContent`, `PodcastContent`, and `MovieContent`, and `GenericContent` covers other cases.
+- `duration` can be `.live`, `.continuous`, or a concrete duration. The system adjusts the progress style based on this value.
+- `artwork` takes an async closure. The system calls it when it needs artwork at a specific size. Do not do synchronous blocking work inside the closure.
+- `playbackSnapshot` returns the current playback state. For content with a duration, also include the `elapsedTime` parameter.
+- `commands` defines the operations your app supports. Each command maps to a closure that the system calls when the user triggers it from the Lock Screen or Control Center.
+
+([04:31](https://developer.apple.com/videos/play/wwdc2026/312/?time=271)) After the protocol conformance, connect the model to the system with `MediaSession`:
+
+```swift
+import NowPlaying
+
+struct PlayerController {
+    let player: SoundPlayer
+    let model: PlayerModel
+    let session: MediaSession<PlayerModel>
+
+    init() {
+        self.player = SoundPlayer()
+        self.model = PlayerModel(player: player)
+        self.session = MediaSession(model)
+    }
+}
+```
+
+Key points:
+- `MediaSession` starts observing the model during initialization, and state changes sync automatically to system surfaces.
+- Initialize it near the audio engine and keep their lifetimes aligned. When the engine is destroyed, release the session too.
+
+### Connect remote playback devices to the system
+
+([05:04](https://developer.apple.com/videos/play/wwdc2026/312/?time=304)) Suppose your app can control a smart speaker, and the speaker communicates through your own server. To show this remote playback state in iPhone Control Center, you need three things: APNs push notifications, an App Extension, and a model conforming to `RemoteMediaSessionRepresentable`.
+
+The data flow is: speaker state changes -> your server -> APNs push to iPhone -> the system wakes the App Extension -> the extension provides the updated session representation -> the system refreshes the Control Center UI.
+
+([06:42](https://developer.apple.com/videos/play/wwdc2026/312/?time=402)) First, create the App Extension:
+
+```swift
+import ExtensionFoundation
+import NowPlaying
+
+@main
+final class SampleAppExtension: @MainActor RemoteMediaSessionExtension {
+    var configuration: some AppExtensionConfiguration {
+        RemoteMediaSessionExtensionConfiguration(extension: self)
+    }
+
+    var extensionPoint: AppExtensionPoint {
+        AppExtensionPoint.Identifier(host: "com.apple.nowplaying", name: "remote-media")
+    }
+
+    func session(_ state: RemotePlayerState) async throws -> RemotePlayerModel {
+        RemotePlayerModel(state: state)
+    }
+}
+```
+
+Key points:
+- `RemoteMediaSessionExtension` is the extension's entry protocol.
+- `extensionPoint` must use `"com.apple.nowplaying"` as the host and `"remote-media"` as the name.
+- `session(_:)` is called when the system needs to update UI or handle an interaction. The incoming `state` comes from the APNs push payload.
+- The extension is woken on demand. Do not maintain long-lived connections or large caches inside it.
+
+([07:23](https://developer.apple.com/videos/play/wwdc2026/312/?time=443)) The remote playback model is similar to the local model, with a few remote-specific properties:
+
+```swift
+import Observation
+
+@Observable
+@MainActor
+final class RemotePlayerModel {
+    let client: ServerClient
+    var state: RemotePlayerState
+
+    init(state: RemotePlayerState) {
+        self.client = ServerClient(sessionID: state.sessionID)
+        self.state = state
+    }
+}
+```
+
+([07:40](https://developer.apple.com/videos/play/wwdc2026/312/?time=460)) Make it conform to `RemoteMediaSessionRepresentable`:
+
+```swift
+import NowPlaying
+
+extension RemotePlayerModel: @MainActor RemoteMediaSessionRepresentable {
+    var id: String { state.sessionID }
+
+    var content: (any MediaContentRepresentable)? {
+        GenericContent(
+            id: state.sound.id,
+            title: state.sound.name,
+            subtitle: state.sound.description,
+            type: .audio,
+            duration: .live,
+            artwork: Artwork(id: state.sound.id) { size in
+                let data = try await self.artworkData(size: size)
+                return try ArtworkRepresentation(data: data)
+            }
+        )
+    }
+
+    var playbackSnapshot: MediaPlaybackSnapshot? {
+        MediaPlaybackSnapshot(
+            state: state.isPlaying ? .playing() : .paused
+        )
+    }
+
+    var commands: [MediaCommand] {[
+        .play { try await self.client.send(.play) },
+        .pause { try await self.client.send(.pause) },
+        .previous { try await self.client.send(.previous) },
+        .next { try await self.client.send(.next) }
+    ]}
+
+    var devices: [MediaDevice] {
+        state.devices.map { device in
+            MediaDevice(
+                id: device.id,
+                name: device.name,
+                type: .speaker,
+                capabilities: [
+                    .absoluteVolume(device.volume) { volume in
+                        // Send the volume change to the server
+                    }
+                ]
+            )
+        }
+    }
+
+    func update(_ state: RemotePlayerState) {
+        self.state = state
+    }
+}
+```
+
+Key points:
+- Closures in `commands` no longer operate on a local player directly; they send commands to the server.
+- `devices` tells the system which devices participate in this session. Each device needs a stable ID, a name, a type, and capabilities such as volume control.
+- `update(_:)` is called when a new APNs push arrives and updates the model state. Because the model is `@Observable`, NowPlaying automatically detects the change and refreshes system UI.
+
+### Media Sharing Extensions
+
+([10:31](https://developer.apple.com/videos/play/wwdc2026/312/?time=631)) Media Sharing Extensions are APIs that let iPhone send media to other speakers and TVs through a unified system device picker.
+
+The traditional approach was to embed the SDK for each casting protocol in your app. Media Sharing Extensions move protocol implementation into the system layer, so apps no longer need to care about the specific playback technology. As new protocols are added, apps that already integrated the API can use them directly without adopting more SDKs.
+
+## Key Ideas
+
+- **Build a focused white-noise or meditation app**: Use `GenericContent` plus `duration: .continuous` to describe infinitely looping ambience. Users can pause or switch sounds directly from the Lock Screen without opening the app. Entry API: `MediaSessionRepresentable` plus `MediaSession`.
+
+- **Replace the old Now Playing implementation in an existing music app**: Move dictionary calls to `MPNowPlayingInfoCenter` into `MediaSessionRepresentable`, and use `@Observable` to eliminate state desynchronization bugs. Start by wrapping old logic in an adapter, then replace it gradually. Entry API: `MediaSession`.
+
+- **Build an iOS companion app for a smart-speaker brand**: Use `RemoteMediaSessionExtension` plus APNs so users can control the speaker directly from iPhone Control Center with an experience as native as Apple Music. You need a push server that syncs speaker state to APNs in real time. Entry API: `RemoteMediaSessionRepresentable` plus `RemoteMediaSessionExtension`.
+
+- **Build a podcast app with multi-device switching**: Use `MediaSession` for local playback, `RemoteMediaSession` for remote speakers, and Media Sharing Extensions so users can switch playback targets with the system device picker. Entry API: `MediaSessionRepresentable` plus `RemoteMediaSessionRepresentable` plus Media Sharing Extensions.
+
+- **Show third-party audio content in CarPlay**: NowPlaying integration automatically covers the CarPlay interface, with no extra CarPlay-specific code. Once `MediaSessionRepresentable` is done well, CarPlay's Now Playing card shows your content automatically. Entry API: `MediaSession`.
+
+## Related Sessions
+
+- [Meet the Now Playing framework](/articles/wwdc2026-312) - Use declarative protocols and App Extensions to connect local and remote media playback to the system Now Playing interface
+- [What's new in Swift](/articles/wwdc2026-262) - The underlying mechanics and best practices for the `@Observable` macro, which helps explain the state observation model NowPlaying relies on
+- [What's new in SwiftUI](/articles/wwdc2026-269) - How SwiftUI integrates with system frameworks; NowPlaying's declarative design follows the same philosophy
+- [What's new in UIKit](/articles/wwdc2026-278) - How UIKit apps can work with the NowPlaying framework, plus state-management guidance for modern UIKit
+- [What's new in MusicKit](/articles/wwdc2026-254) - APIs for music content that directly relate to NowPlaying content types such as `MusicContent`

@@ -1,0 +1,275 @@
+---
+title: "Supercharge device connectivity with Wi-Fi Aware"
+description: "learn how to create peer-to-peer network connections with wi-fi aware. we"
+date: 2026-06-10
+tags: ["Privacy and Security", "System Services"]
+thumbnail: "/images/sessions/2025/228.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/228/"
+sessionId: "wwdc2025-228"
+year: "2025"
+relatedSessions:
+  - title: "Meet AccessorySetupKit"
+    code: "10203"
+    description: "The official WWDC24 introduction to accessory pairing flows, directly matching this session's Wi-Fi Aware pairing path."
+  - title: "What's new in Network framework"
+    code: "234"
+    description: "New Network framework capabilities that underpin Wi-Fi Aware Listener, Browser, and Connection APIs."
+  - title: "Integrate privacy into your development process"
+    code: "246"
+    description: "Align privacy and permissions during app design, complementing Wi-Fi Aware's pairing authorization model."
+---
+
+## Highlight
+
+> Wi-Fi Aware is a global standard maintained by the Wi-Fi Alliance. It lets iPhone and iPad keep their existing Wi-Fi internet connection while also opening a peer-to-peer, encrypted, low-latency direct link with another device.
+
+---
+
+## Core Content
+
+In the past, building an app that moved files between two devices, controlled an accessory, or mirrored a screen in real time meant assembling the whole stack yourself: handle discovery, then pairing, then key exchange, then link encryption, while watching that you did not knock the user off their main Wi-Fi. The results did not interoperate across vendors, and battery and bandwidth were hard to keep in check.
+
+WWDC25 introduces the **Wi-Fi Aware framework** and rewrites this flow. It builds on a global standard maintained by the Wi-Fi Alliance, so it works across platforms and across vendors. The device keeps its normal Wi-Fi connection, and the peer-to-peer link runs at the Wi-Fi layer with the whole path automatically authenticated and encrypted. It supports high throughput, low latency, and many devices at once. The developer only deals with two high-level flows: **Pairing** (establish trust once) and **Connecting** (a paired device connects on demand). The system handles key exchange and link encryption. You do not touch the protocol details.
+
+There is a second layer to the story: the pairing entry point is split between two frameworks. `DeviceDiscoveryUI` covers app-to-app or app-to-device pairing in general, and supports both Apple and third-party devices. `AccessorySetupKit` is for accessory makers, and pairs Bluetooth and Wi-Fi Aware in the same flow. After pairing, you get a `WAPairedDevice`. Hand it to Network framework's `NetworkListener` or `NetworkBrowser`, and the connection comes up.
+
+---
+
+## Details
+
+### Service declaration: Info.plist as the single source of truth
+
+The core concept in Wi-Fi Aware is the **Service**. The service name must be unique, no longer than 15 characters, and limited to letters, digits, and hyphens. It is built from a unique name plus a protocol (tcp or udp), for example `_file-service._tcp`. Register the service name with IANA to avoid collisions.
+
+A service has two roles: **Publisher** (offers the service, listens for connections) and **Subscriber** (consumes the service, browses for devices). One app can play both roles. The `WiFiAwareServices` dictionary in `Info.plist` declares which services the app can use. Setting `Publishable` or `Subscribable` decides the role. The app can only use services declared in `Info.plist`.
+
+After declaring the service, code looks up the capability check and the service handle ([06:57](https://developer.apple.com/videos/play/wwdc2025/228/?time=417)):
+
+```swift
+import WiFiAware
+
+// Check whether the device supports Wi-Fi Aware
+guard WACapabilities.supportedFeatures.contains(.wifiAware) else { return }
+
+// Publishable services declared in Info.plist
+extension WAPublishableService {
+    public static var fileService: WAPublishableService {
+        allServices["_file-service._tcp"]!
+    }
+}
+
+// Subscribable services declared in Info.plist
+extension WASubscribableService {
+    public static var fileService: WASubscribableService {
+        allServices["_file-service._tcp"]!
+    }
+    public static var droneService: WASubscribableService {
+        allServices["_drone-service._udp"]!
+    }
+}
+```
+
+**Key points:**
+
+- `WACapabilities.supportedFeatures.contains(.wifiAware)`: the capability gate. Old devices return early, so later API calls do not throw not-available errors.
+- `WAPublishableService.allServices[...]`: pull a publishable handle by the service name from Info.plist. The force-unwrap is intentional — if the lookup fails, the plist is missing the declaration, which is a developer-time error.
+- `WASubscribableService.allServices[...]`: same idea. Wrap the service in a static property so call sites can refer to it cleanly.
+- `_file-service._tcp` is declared as both publishable and subscribable, matching the symmetric case where the app is both server and client. `_drone-service._udp` is subscribable only, matching the case where the app controls an external accessory.
+
+### Pairing entry: two paths
+
+**DeviceDiscoveryUI** brings up the system pairing UI directly with SwiftUI views ([10:33](https://developer.apple.com/videos/play/wwdc2025/228/?time=633)):
+
+```swift
+import DeviceDiscoveryUI
+import WiFiAware
+import SwiftUI
+
+// Listener (Publisher) device: bring up the advertising UI
+DevicePairingView(.wifiAware(.connecting(to: .fileService, from: .selected([])))) {
+    // View shown to the user before the system UI appears
+} fallback: {
+    // View shown when an error occurs
+}
+
+// Browser (Subscriber) device: bring up the picker UI
+DevicePicker(.wifiAware(.connecting(to: .selected([]), from: .fileService))) { endpoint in
+    // Handle the paired network endpoint
+} label: {
+    // View shown to the user before the system UI appears
+} fallback: {
+    // View shown when an error occurs
+}
+```
+
+**Key points:**
+
+- `DevicePairingView(.wifiAware(.connecting(to:from:)))`: the Publisher side. `to` names the service to advertise; `from: .selected([])` opens it to all initiators.
+- `DevicePicker`: the Subscriber side. The callback hands you a network endpoint that you can pass to `NetworkConnection`.
+- Both views accept a `fallback` view, which serves as a fallback UI when the device is not supported or something fails at runtime.
+
+**AccessorySetupKit** is for accessory makers, and pairs Bluetooth and Wi-Fi Aware in a single flow ([12:29](https://developer.apple.com/videos/play/wwdc2025/228/?time=749)):
+
+```swift
+import AccessorySetupKit
+
+// Configure the discovery descriptor (Subscriber)
+let descriptor = ASDiscoveryDescriptor()
+descriptor.wifiAwareServiceName = "_drone-service._udp"
+descriptor.wifiAwareModelNameMatch = .init(string: "Example Model")
+descriptor.wifiAwareVendorNameMatch = .init(string: "Example Inc", compareOptions: .literal)
+let item = ASPickerDisplayItem(name: "My Drone",
+                               productImage: UIImage(named: "DroneProductImage")!,
+                               descriptor: descriptor)
+
+// Create and activate the session
+let session = ASAccessorySession()
+session.activate(on: sessionQueue) { event in
+    // Callback when the device is added successfully; event: .accessoryAdded
+    // Look up the WAPairedDevice with ASAccessoryWiFiAwarePairedDeviceID
+}
+// Present the picker
+session.showPicker(for: [item]) { error in
+    // Error handling
+}
+```
+
+**Key points:**
+
+- `ASDiscoveryDescriptor` narrows the target hardware with three filters: `wifiAwareServiceName`, `ModelNameMatch`, and `VendorNameMatch`.
+- `ASPickerDisplayItem` packs an icon, a name, and a descriptor into one entry. You can pass several entries to `showPicker` at once.
+- After pairing, `event` carries an `ASAccessoryWiFiAwarePairedDeviceID`. Use it to look up the `WAPairedDevice` you need for the connection.
+
+### Access paired devices
+
+After pairing, the paired-device list is exposed as an async sequence ([13:51](https://developer.apple.com/videos/play/wwdc2025/228/?time=831)):
+
+```swift
+import Foundation
+import WiFiAware
+
+var device: WAPairedDevice // Get it with WAPairedDevice.allDevices
+
+// Access WAPairedDevice properties
+let pairingName = device.pairingInfo?.pairingName
+let vendorName = device.pairingInfo?.vendorName
+let modelName = device.pairingInfo?.modelName
+
+// Create a filter
+let filter = #Predicate<WAPairedDevice> {
+    $0.pairingInfo?.vendorName.starts(with: "Example Inc") ?? false
+}
+
+// Get all currently matching paired devices
+// Every device addition, removal, or update produces a new snapshot
+for try await devices in WAPairedDevice.allDevices(matching: filter) {
+    // Handle the new snapshot
+}
+```
+
+**Key points:**
+
+- `WAPairedDevice.allDevices(matching:)` returns an `AsyncSequence`. Every change to the paired list pushes a full snapshot, which is convenient for driving UI.
+- `#Predicate<WAPairedDevice>` is the Swift Predicate macro. It pins the filter at compile time.
+- The user can remove a pairing in Settings at any time, so the app must follow this sequence and update its state.
+
+### Build the connection: hand it to Network framework
+
+After the service is declared and pairing is done, the connection uses the standard Network framework API ([16:54](https://developer.apple.com/videos/play/wwdc2025/228/?time=1014)):
+
+```swift
+import WiFiAware
+import Network
+
+// Listener (Publisher) side: construct a NetworkListener
+let listener = try NetworkListener(for:
+        .wifiAware(.connecting(to: .fileService, from: .matching(deviceFilter))),
+    using: .parameters {
+        TLS()
+    })
+    .onStateUpdate { listener, state in
+        // State update
+    }
+
+// Browser (Subscriber) side: construct a NetworkBrowser
+let browser = NetworkBrowser(for:
+        .wifiAware(.connecting(to: .matching(deviceFilter), from: .fileService))
+    )
+    .onStateUpdate { browser, state in
+        // State update
+    }
+```
+
+**Key points:**
+
+- `NetworkListener(for: .wifiAware(...))`: wraps a Wi-Fi Aware service as a regular Network framework listener. Parameters such as TLS follow the standard Network framework patterns.
+- `from: .matching(deviceFilter)`: the Listener uses the filter to limit who can connect; the Browser uses it to limit which devices to find.
+- `.onStateUpdate`: watches the underlying radio for ready, running, failed, and cancelled states. This is the first place to look when a connection does not come up.
+
+### Performance tuning
+
+The default is `.bulk` + `.bestEffort`, which fits file-transfer-style workloads. For video or control workloads that need low latency, switch to `.realtime` + `.interactiveVideo` ([21:11](https://developer.apple.com/videos/play/wwdc2025/228/?time=1271)):
+
+```swift
+// Listener (Publisher) side
+let listener = try NetworkListener(for:
+        .wifiAware(.connecting(to: .fileService, from: .matching(deviceFilter))),
+    using: .parameters {
+        TLS()
+    }
+    .wifiAware { $0.performanceMode = .realtime }
+    .serviceClass(.interactiveVideo))
+
+// Browser (Subscriber) side
+let connection = NetworkConnection(to: endpoint, using: .parameters {
+        TLS()
+    }
+    .wifiAware { $0.performanceMode = .realtime }
+    .serviceClass(.interactiveVideo))
+
+// Both sides can read the performance report
+let performanceReport = try await connection.currentPath?.wifiAware?.performance
+```
+
+**Key points:**
+
+- `performanceMode = .realtime`: low-latency mode. It costs more battery, so only turn it on for interactive scenarios.
+- `serviceClass(.interactiveVideo)`: a QoS class that asks the link to schedule this traffic ahead of others. The other options are `.voice`, `.background`, and `.bestEffort`.
+- `connection.currentPath?.wifiAware?.performance`: runtime metrics like throughput, latency, and signal strength. Use them in the UI to tell the user to "move closer."
+
+---
+
+## Takeaways
+
+**1. Add a "nearby device direct link" capability to the app**
+
+Why it pays off: many iPad and iPhone collaboration scenarios (whiteboards, file transfer, real-time mirroring) used to go through a cloud relay or local Wi-Fi service discovery, and were at the mercy of the router and network isolation. Wi-Fi Aware does peer-to-peer at the Wi-Fi layer and bypasses NAT and corporate network limits.
+
+How to start: declare a symmetric service name as both publishable and subscribable in Info.plist. Use `DeviceDiscoveryUI` to get a minimal pairing demo working first, then replace the existing `URLSession` calls with an endpoint-based `NetworkConnection`.
+
+**2. Accessory apps: use AccessorySetupKit to handle Bluetooth and Wi-Fi Aware in one shot**
+
+Why it pays off: hardware accessories often use Bluetooth for discovery and control, and Wi-Fi for bulk data. In the past, that meant two separate pairing rounds and a broken experience. `AccessorySetupKit` packs both links together, and the user only confirms a PIN once.
+
+How to start: when filling in `ASDiscoveryDescriptor`, set the Bluetooth fields and the `wifiAwareServiceName`, `VendorNameMatch`, and `ModelNameMatch` together so the user gets full functionality on first setup.
+
+**3. Switch video and control workloads to `.realtime` + `.interactiveVideo`**
+
+Why it pays off: the default `.bulk + .bestEffort` gets de-prioritized when several devices share the air. Latency may look small but jitter is high. Drone control, remote camera preview, and AR sync are all sensitive to jitter.
+
+How to start: in the `.parameters` closure of `NetworkListener` or `NetworkConnection`, add `.wifiAware { $0.performanceMode = .realtime }.serviceClass(.interactiveVideo)`. Read `performanceReport` in the UI so the user can see live link quality.
+
+**4. Drive the paired-device list UI with `WAPairedDevice.allDevices`**
+
+Why it pays off: the user can remove a paired device in Settings at any time. `allDevices` is an `AsyncSequence` and pushes a full snapshot on every change. That is more reliable than keeping a local cache.
+
+How to start: in the SwiftUI view that manages devices, use `.task` to run `for try await devices in WAPairedDevice.allDevices(matching: filter)` once. Write `devices` into `@State` and the UI updates on its own.
+
+---
+
+## Related Sessions
+
+- [Meet AccessorySetupKit](/articles/wwdc2024-10203) — the WWDC24 official course on accessory pairing flow. It is the prerequisite for using Wi-Fi Aware with accessories.
+- [What's new in Network framework](/articles/wwdc2025-234) — new Network framework capabilities. Wi-Fi Aware's Listener, Browser, and Connection all sit on top of it.
+- [Integrate privacy into your development process](/articles/wwdc2025-246) — fold privacy and permission decisions into the dev process. It pairs well with the Wi-Fi Aware pairing authorization model.
+- [What's new in passkeys](/articles/wwdc2025-279) — also under the privacy and security theme. Passkeys and Wi-Fi Aware both follow the "credentials stay on the device, the standard is cross-platform" direction.

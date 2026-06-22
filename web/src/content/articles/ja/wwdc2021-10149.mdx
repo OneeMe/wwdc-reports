@@ -1,0 +1,282 @@
+---
+title: "Enhance your app with Metal ray tracing"
+description: "Achieve photorealistic 3D scenes in your apps and games through ray tracing, a core part of the Metal graphics framework and shading language. We'll explore the latest improvements in implementing ray tracing."
+date: "2021-06-07"
+tags: ["Metal", "Ray Tracing", "Graphics", "GPU"]
+thumbnail: "/images/sessions/2021/10149.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10149/"
+sessionId: "wwdc2021-10149"
+year: "2021"
+relatedSessions:
+  - title: "Explore hybrid rendering with Metal ray tracing"
+    code: "10150"
+    description: "ライトトレースとラスタライゼーションのハイブリッドレンダリング"
+  - title: "Optimize high-end games for Apple GPUs"
+    code: "10148"
+    description: "Apple GPU TBDR アーキテクチャ ゲームの最適化"
+  - title: "Discover Metal debugging, profiling, and asset creation tools"
+    code: "10157"
+    description: "Xcode 13 の Metal デバッグとパフォーマンス分析ツール"
+---
+## ハイライト
+
+> メタル レイ トレーシングには、レンダー パイプラインから直接レイを放出する (コンピューティング パスは必要ありません)、インライン交差のセクター間オブジェクトの代わりに交差クエリを実行する、プロダクション レベルのレンダリングをサポートするモーション ブラーと拡張された制限という 3 つの新しい機能が追加されます。
+
+## 主要内容
+
+反射や影などのレイ トレーシング効果をレンダリングに追加したいと考えています。昨年の API では、追加のコンピューティング パスを作成し、G バッファ データをメモリに書き込み、ライト トレースのためにそれを読み取る必要がありました。これにより、メモリ帯域幅のオーバーヘッドが増加し、レンダリング パイプラインが中断されます。
+
+今年の Metal では、レンダー パスを離れることなく、レンダー パイプラインから直接レイを放出できるようになります。
+
+## 詳細
+
+### レンダーパイプラインからレイを放出する
+
+（[02:21](https://developer.apple.com/videos/play/wwdc2021/10149/?time=141)）
+
+昨年のワークフロー: レンダー パス → コンピューティング パス (レイ トレーシング) → 別のレンダー パスを開く必要がある場合があります。中間データはメモリ内でやり取りされます。
+
+今年のワークフロー: レンダー パス内で直接ライトを放射し、中間データはタイル メモリに残ります。
+
+設定方法：
+
+```metal
+// 交差関数の定義
+[[intersection(triangle, triangle_data, instancing)]]
+bool sphereIntersection(...)
+
+// レンダーパイプライン記述子のリンク関数
+let linkedFunctions = MTLLinkedFunctions()
+linkedFunctions.functions = ["sphereIntersection"]
+renderPipelineDescriptor.fragmentLinkedFunctions = linkedFunctions
+```
+
+```swift
+// intersection function table を作成
+let functionTable = renderPipelineState.makeIntersectionFunctionTable(
+    descriptor: tableDescriptor,
+    stage: .fragment
+)
+
+// 填充 table
+let functionHandle = renderPipelineState.functionHandle(
+    name: "sphereIntersection",
+    stage: .fragment
+)
+functionTable.setFunction(functionHandle, index: 0)
+```
+
+（[04:48](https://developer.apple.com/videos/play/wwdc2021/10149/?time=288)）
+
+**キーポイント:**
+- リンクされた関数がレンダー パイプラインのフラグメント ステージに追加されました
+- `makeIntersectionFunctionTable`新しい`stage`パラメータ
+- function handle 也是 stage-specific
+- レンダーエンコーダにバインドされたバッファインデックス
+
+フラグメント シェーダーで光線を放出します。
+
+```metal
+fragment float4 rayTracedFragment(...) {
+    // バインド加速構造体と交差関数テーブル
+    intersector<instancing, triangle_data> intersector;
+    intersector.set_acceleration_structure(accelerationStructure);
+    intersector.set_intersection_function_table(intersectionFunctionTable);
+
+    // 光を発する
+    ray ray;
+    ray.origin = worldPosition;
+    ray.direction = reflect(viewDirection, normal);
+
+    auto intersection = intersector.intersect(ray, primitiveAccelerationStructure);
+
+    // 用交点结果着色
+    return shadeIntersection(intersection);
+}
+```
+
+（[05:57](https://developer.apple.com/videos/play/wwdc2021/10149/?time=357)）
+
+**キーポイント:**
+- アクセラレーション構造と関数テーブルの両方がレンダー エンコーダーにバインドされています
+- shader 中使用方式和 compute kernel 相同
+- タイル メモリの最適化を使用すると、G バッファの書き込みを回避できます。
+
+### 交差クエリ: より柔軟なレイ トラバーサル
+
+（[07:23](https://developer.apple.com/videos/play/wwdc2021/10149/?time=443)）
+
+昨年のセクター間オブジェクトは、完全なトラバーサル ロジックをカプセル化しました。単純なカスタム交差 (アルファ テストなど) の場合、完全な交差関数を作成すると重すぎる可能性があります。
+
+交差クエリを使用すると、シェーダー内でトラバーサル プロセスをインラインで制御できます。
+
+```metal
+// 用 intersection query 做 alpha test
+intersection_query<instancing, triangle_data> query;
+query.reset(ray, accelerationStructure, intersectionFunctionTable);
+
+while (query.next()) {
+    switch (query.get_candidate_type()) {
+        case intersection_query::candidate_type::triangle: {
+            // 三角交差点情報の取得
+            float2 barycentrics = query.get_candidate_triangle_barycentric_coord();
+            float distance = query.get_candidate_ray_distance();
+
+            // 采样 alpha texture
+            float alpha = sampleAlphaTexture(barycentrics, distance);
+
+            // アルファ テストに合格した場合は、交差を送信します。
+            if (alpha > 0.5) {
+                query.commit_triangle_intersection();
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// 最終交点を取得する
+if (query.get_committed_intersection_type() == ...)
+```
+
+（[10:36](https://developer.apple.com/videos/play/wwdc2021/10149/?time=636)）
+
+**キーポイント:**
+- `query.next()`すべての候補交差点を横断する
+- `get_candidate_type()`交差点の種類を決定する
+- 自定义逻辑决定是否 `commit_triangle_intersection()`
+- トラバース後のクエリ`get_committed_intersection_type()`
+
+インターセクターまたは交差クエリを選択します。
+
+|シナリオ |推奨されるソリューション |
+|------|----------|
+|既存のセクター間コードがある |引き続きインターセクター | を使用します。
+|他の API からクエリ コードを移植する |交差クエリを使用する |
+| 简单自定义求交（如 alpha test） | intersection query |
+| 复杂自定义求交逻辑 | intersector |
+|パフォーマンス重視、比較する必要があります |両方試してみてください |
+
+（[12:21](https://developer.apple.com/videos/play/wwdc2021/10149/?time=741)）
+
+### User Instance ID 和 Instance Transform
+
+（[13:52](https://developer.apple.com/videos/play/wwdc2021/10149/?time=832)）
+
+新しい API を使用すると、インスタンスごとにカスタム ID を指定し、交差部分でインスタンスの変換行列を読み取ることができます。
+
+```swift
+// ユーザーインスタンスIDの設定
+let instanceDescriptor = MTLAccelerationStructureMotionInstanceDescriptor()
+instanceDescriptor.userID = 42 // 自定义值
+instanceDescriptor.transformationMatrix = transform
+```
+
+```metal
+// 交差関数の読み込み
+uint userID = intersection.user_instance_id;
+float4x4 transform = intersection.instance_transform;
+```
+
+（[14:48](https://developer.apple.com/videos/play/wwdc2021/10149/?time=888)）
+
+**キーポイント:**
+- `user_instance_id` 是 32 位自定义值
+- 材料テーブルのインデックス作成とカスタム データのエンコードに使用可能
+- `instance_transform`インスタンスの変換行列を直接読み取る
+- 外部マッピング テーブルを自分で保守する必要はありません
+
+### 拡張された制限: より大きなシーン
+
+（[18:29](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1109)）
+
+実稼働グレードのシナリオは、デフォルトのアクセラレーション構造の制限を超える可能性があります。拡張制限モードでは、次の上限が追加されます。
+
+- primitive 数量
+- geometry 数量
+- instance 数量
+- mask 大小
+
+有効にする方法:
+
+```swift
+// 加速構造を構築するときに有効になります
+let descriptor = MTLPrimitiveAccelerationStructureDescriptor()
+descriptor.usage = .extendedLimits
+
+// shader 内でマーク
+intersector<extended_limits, instancing> intersector;
+```
+
+（[19:18](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1158)）
+
+**キーポイント:**
+- extended limits 可能影响性能
+- 必要な場合のみ有効にする
+- 加速構造と交差点の両方をマークする必要があります
+
+### Motion Blur：运动模糊
+
+（[19:39](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1179)）
+
+実際のカメラの露出は瞬間的なものではありません。露光中に物体が動くとブラーが発生します。 Metal は、レイ トレーシングでのこのエフェクトのシミュレーションをサポートするようになりました。
+
+原理: 各レイは時間値をランダムにサンプリングし、メタルは対応する時点のシーン状態で交差を実行します。
+
+```metal
+// ランダムな時間値を生成（露出間隔内）
+float time = randomInRange(exposureStart, exposureEnd);
+
+// 時と光を共に交差点へ
+ray.time = time;
+auto intersection = intersector.intersect(ray, accelerationStructure);
+```
+
+（[22:38](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1358)）
+
+2 つのアニメーションがサポートされています。
+
+**インスタンス モーション**: オブジェクト全体の剛体変形。低コストで翻訳・回転に適しています。
+
+```swift
+// キーフレーム変換マトリックスの提供
+let motionDescriptor = MTLAccelerationStructureMotionInstanceDescriptor()
+motionDescriptor.motionTransformsStartIndex = 0
+motionDescriptor.motionTransformsCount = 2
+```
+
+**プリミティブ モーション**: 各頂点は独立して動きます。コストが高く、変形アニメーション（キャラクタースキニングなど）に適しています。
+
+```swift
+// 各キーフレームに頂点バッファを提供する
+let keyframeData = MTLMotionKeyframeData(buffer: vertexBuffer, offset: 0)
+let geometryDescriptor = MTLMotionTriangleGeometryDescriptor()
+geometryDescriptor.vertexBuffers = [keyframeData0, keyframeData1]
+```
+
+（[25:56](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1556)）
+
+**キーポイント:**
+- instance motion 比 primitive motion 快
+- 両方のアニメーションを同時に使用できます
+- メタルはキーフレーム間を自動的に補間します
+- シェーダー内のマーク`instance_motion`または`primitive_motion`
+
+## 重要ポイント
+
+1. **ライト トレース反射をレンダー パイプラインから直接実行します**。タイル メモリの最適化を利用して、コンピューティング パスと G バッファーの間を行き来する必要がなくなりました。入口API：`renderPipelineDescriptor.fragmentLinkedFunctions` + intersector in fragment shader。
+
+2. **交差クエリを使用してアルファ テストを実行します**。数行のコードで完全な交差関数を置き換えることができ、単純なカスタム交差に適しています。入口API：`intersection_query` + `commit_triangle_intersection()`。
+
+3. **ユーザー インスタンス ID を使用したマテリアル検索の簡素化**。マテリアル インデックスをインスタンス ID に直接エンコードし、交差部分から直接読み取ります。入口API：`MTLAccelerationStructureMotionInstanceDescriptor.userID`。
+
+4. **プロダクション レンダリングの拡張制限を有効にします**。大規模なシーンには、より大きなアクセラレーション構造の制約が必要になります。入口API：`descriptor.usage = .extendedLimits`。
+
+5. **モーション ブラーを使用してリアリズムを高めます**。各レイはランダムな時間値をサンプリングし、Metal が自動的に補間を処理します。入口API：`ray.time` + `instance_motion`/`primitive_motion` tag。
+
+## 関連セッション
+
+- [Explore hybrid rendering with Metal ray tracing](/articles/wwdc2021-10150)— ライトトレースとラスタライゼーションの混合レンダリング
+- [Optimize high-end games for Apple GPUs](/articles/wwdc2021-10148)— Apple GPU TBDR アーキテクチャ ゲームの最適化
+- [Discover Metal debugging, profiling, and asset creation tools](/articles/wwdc2021-10157) — Xcode 13 の Metal デバッグとパフォーマンス分析ツール

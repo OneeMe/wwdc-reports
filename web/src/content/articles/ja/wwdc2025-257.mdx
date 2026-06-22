@@ -1,0 +1,260 @@
+---
+title: "Optimize home electricity usage with EnergyKit"
+description: "learn how to support energykit in your app so people can optimize electricity usage at home. this can help people run appliances or charge evs during times when electricity is cleaner and cheaper. get"
+date: 2026-06-10
+tags: ["EnergyKit", "HomeKit", "EV", "再生可能エネルギー", "Swift Concurrency"]
+thumbnail: "/images/sessions/2025/257.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/257/"
+sessionId: "wwdc2025-257"
+year: "2025"
+relatedSessions:
+  - title: "Finish tasks in the background"
+    code: "227"
+    description: "バックグラウンドタスクで ElectricityGuidance を継続的に更新します"
+  - title: "Demystify concurrency in SwiftUI"
+    code: "266"
+    description: "EnergyKit の AsyncSequence を SwiftUI で消費する方法を理解します"
+  - title: "Meet the Smart Home"
+    code: "242"
+    description: "Home app と HomeKit Home の全体的な機能背景"
+  - title: "Build a UIKit document-based app"
+    code: "260"
+    description: "同時期の system services フレームワークにおける別のシステム統合パターン"
+---
+
+## Highlight
+
+> EnergyKit は、電力グリッドのクリーン度と電気料金のリアルタイム予測を AsyncSequence の形で App に開放します。これにより、EV やスマートサーモスタットは負荷をよりクリーンで安価な時間帯にシフトできるようになります。
+
+---
+
+## 主要内容
+
+夕方 6:30 に EV をプラグインすると、車は自動的に充電を開始します。これがほとんどの App のデフォルト動作です。問題は、6:30 から 9:00 までの時間帯が米国の多くのタイムゾーンで電力需要のピークに当たることです。電気料金は最も高く、電力グリッドでは石炭火力やガス火力の発電機の寄与が最大になります。深夜になって風力発電が稼働し、負荷が下がる頃には、車はとっくに満充電になっています。ユーザーはより多くの料金を払い、しかもより汚れた電気を使っていることになります。Home App の Grid Forecast 機能は昨年の時点でこの問題をユーザーに可視化していましたが、サードパーティ製の App では「いつ電気がよりクリーンになるか」というシグナルを自前の充電スケジューリングに取り込むことができませんでした。
+
+WWDC25 で発表された EnergyKit は、Grid Forecast を支えているデータをそのままフレームワークとして公開します。中心となる抽象は `EnergyVenue`（HomeKit Home に紐付いた物理的な充電地点）と `ElectricityGuidance`（0 から 1 の予測値で、低いほどクリーン／安価）です。EV メーカーやサーモスタットメーカーは、24 時間ウィンドウのガイダンス値を取得し、「すぐ充電を始める」を「ガイダンス値が最も低い数時間に充電する」へと差し替えられるようになります。これに付随する `LoadEvent` フィードバックチャネルを通じて、実際の充電挙動を EnergyKit に書き戻すと、最終的に「今回の充電期間中にどれだけクリーンな時間帯の電気を使ったか」というインサイトが生成され、ユーザーの目に届きます。データ一式は Core Data でローカル保存され、エンドツーエンド暗号化された状態で CloudKit に同期され、HomeKit Home のメンバー間で共有されます。
+
+---
+
+## 詳細
+
+EnergyKit の組み込みは 4 ステップで完結します。venue の選択、guidance の購読、LoadEvents の報告、そして insights のクエリです。
+
+最初のステップは onboarding です（[03:13](https://developer.apple.com/videos/play/wwdc2025/257/?time=193)）。ユーザーが App 内で特定の充電地点について Clean Energy Charging を有効化すると、App はその近辺の `EnergyVenue` 一覧を取得してユーザーに選択させ、選ばれた venue の UUID をローカルに永続化します。起動のたびに venue がまだ存在するか再検証します。
+
+```swift
+// Retrieve an EnergyVenue
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+
+    let venue: EnergyVenue
+
+    init?(venueID: UUID) async {
+        guard let energyVenue = await EnergyVenue.venue(for: venueID) else {
+            return nil
+        }
+        venue = energyVenue
+    }
+}
+```
+
+ポイント:
+
+- `EnergyVenue.venue(for:)` は async 呼び出しです。venue のメタデータをシステムサービスから取得する可能性があるためです。
+- 戻り値は optional です。ユーザーが Home App で venue を削除した場合に無効になり得るので、イニシャライザは failable になっています。
+- 永続化すべきは `UUID` であり、venue オブジェクトそのものではありません。venue 自体は起動のたびに解決し直します。
+
+2 つ目のステップは guidance の購読です（[06:03](https://developer.apple.com/videos/play/wwdc2025/257/?time=363)）。`ElectricityGuidance.Query` で action の種類を指定します。EV は `.shift`（同じ電力量をより良い時間帯にずらす）、サーモスタットは `.reduce`（消費そのものを減らす）です。`sharedService.guidance(...)` は AsyncSequence を返し、グリッドの予測が更新されるたびに新しい値をプッシュしてきます。
+
+```swift
+// Fetch ElectricityGuidance
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+    // The current active guidance.
+    var guidance: ElectricityGuidance?
+
+    fileprivate func streamGuidance(
+        venueID: UUID,
+        update: (_ guidance: ElectricityGuidance) -> Void
+    ) async throws {
+        let query = ElectricityGuidance.Query(suggestedAction: .shift)
+        for try await currentGuidance in ElectricityGuidance.sharedService.guidance(
+            using: query,
+            at: venueID
+        ) {
+            update(currentGuidance)
+          	break
+        }
+    }
+}
+```
+
+ポイント:
+
+- `Query(suggestedAction: .shift)` で「自分はシフト型の負荷（EV）である」とシステムに明示的に伝えます。システムはこのセマンティクスに沿って予測を最適化します。
+- `for try await` は AsyncSequence の標準的な消費方法であり、`throws` と組み合わせてネットワークや権限の失敗を扱えます。
+- `break` は「一度きりの消費」を表現しています。最新の guidance を 1 件だけ取り出してスケジュールを生成し、それ以降は監視を続けません。
+- `update` をプロパティに直接書き込むのではなくコールバックにしているのは、呼び出し側が actor の境界外で observable オブジェクトを更新しやすくするためです。
+
+長期的に追跡したい場合（充電中にグリッドが急変したら再スケジュールしたい等）は、`break` を取り除けば OK です。バックグラウンド更新のシナリオでは BackgroundTask に包む必要があります（[07:00](https://developer.apple.com/videos/play/wwdc2025/257/?time=420)）。
+
+```swift
+// Fetch ElectricityGuidance
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+    // The task used to stream guidance.
+    private var streamGuidanceTask: Task<(), Error>?
+
+    ///Start streaming guidance and store the value in the observed property 'guidance'.
+    func startGuidanceMonitoring() {
+       streamGuidanceTask?.cancel()
+        streamGuidanceTask = Task.detached { [weak self] in
+            if let venueID = self?.venue.id {
+                try? await self?.streamGuidance(venueID: venueID) { guidance in
+                    self?.guidance = guidance
+                    if Task.isCancelled {
+                        return
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+ポイント:
+
+- `streamGuidanceTask?.cancel()` で新しいストリームを起動する前に古いものをキャンセルし、並行タスクのリークを防ぎます。
+- `Task.detached` と `[weak self]` の組み合わせで、manager が解放されるときにタスクが deinit を妨げないようにします。
+- `Task.isCancelled` のチェックを update クロージャ内に置くことで、キャンセルシグナルがコールバック連鎖から速やかに抜けられるようにします。
+
+3 つ目のステップは LoadEvents によるフィードバックです（[11:30](https://developer.apple.com/videos/play/wwdc2025/257/?time=690) から）。1 回の充電セッションは `begin / active / end` の 3 種類の state で構成されます。Apple の推奨では、定常状態であれば 15 分ごとに active イベントを生成し、停止・スケジュール変更・電力急変が起きたときにもイベントを発行します。
+
+```swift
+// Start a session
+
+import EnergyKit
+
+// A controller that handles an electric vehicle
+@Observable class ElectricVehicleController {
+    // The session
+    var session: ElectricVehicleLoadEvent.Session?
+
+    // The current guidance stored at the EV
+    var currentGuidance: ElectricityGuidance
+
+    // Whether the EV is following guidance
+    var isFollowingGuidance: Bool = true
+
+    fileprivate func beginSession() {
+        session = ElectricVehicleLoadEvent.Session(
+            id: UUID(),
+            state: .begin,
+            guidanceState: .init(
+                wasFollowingGuidance: isFollowingGuidance,
+                guidanceToken: currentGuidance.guidanceToken
+            )
+        )
+    }
+}
+```
+
+ポイント:
+
+- 1 つのセッションは begin / active / end を 1 つの `UUID` で串刺しにします。3 つのイベントは同じ id を共有します。
+- `guidanceToken` はその時点で取得した guidance に紐付き、しかもそれを取得した端末でのみ有効です。
+- `wasFollowingGuidance` によって、EnergyKit は「ユーザーが手動で上書きした」のか「ガイダンス通りに実行した」のかを区別できます。
+
+計測データには Foundation の `Measurement<UnitPower>` と `Measurement<UnitEnergy>` を使い、単位はミリワットおよびミリワット時です（[11:30](https://developer.apple.com/videos/play/wwdc2025/257/?time=690)）。生成したイベントはまとめて submit します。
+
+```swift
+// Submit events
+
+import EnergyKit
+
+// A controller that handles an electric vehicle
+@Observable class ElectricVehicleController {
+    // EnergyVenue
+    // The venue at which the EV uses energy
+    var currentVenue: EnergyVenue
+
+    // Electric EV Events
+    // The list of generated EV load events
+    var events = [ElectricVehicleLoadEvent]()
+    
+    func submitEvents() async throws {
+        try await currentVenue.submitEvents(events)
+    }
+}
+```
+
+ポイント:
+
+- `submitEvents` は venue にぶら下がっています。イベントがどの充電地点に属するかは確定しているため、改めて渡す必要はありません。
+- 公式は IPC オーバーヘッドを抑えるためにバッチ送信を明確に推奨しています。さらに、**充電と充電の間でイベントを送信することは禁止**されています。
+- 送信されるデータは CloudKit のエンドツーエンド暗号化を通り、HomeKit Home の家族メンバーと共有されます。
+
+4 つ目のステップは insights のクエリです（[13:25](https://developer.apple.com/videos/play/wwdc2025/257/?time=805)）。`ElectricityInsightQuery` は `.cleanliness` と `.tariff` の OptionSet でどの観点を取得するかを決め、granularity を `.daily` にすると日次の集計値が返ります。
+
+```swift
+// Create an insight query
+
+import EnergyKit
+
+@Observable final class EnergyVenueManager  {
+    func createInsightsQuery(on date: Date) -> ElectricityInsightQuery {
+        return ElectricityInsightQuery(
+            options: .cleanliness.union(.tariff),
+            range: self.dayInterval(date: date),
+            granularity: .daily,
+            flowDirection: .imported
+        )
+    }
+}
+```
+
+ポイント:
+
+- `flowDirection: .imported` はグリッドから「電気を取り込む」（充電する）方向を指します。V2G による逆方向の放電を扱う場合は exported に切り替えます。
+- `.cleanliness` は電力量を clean / reduce / avoid の 3 つのバケットに分類し、`.tariff` は super off peak から critical peak までの 5 段階に振り分けます。
+- tariff の観点でデータが返るのは、ユーザーが Home App で電力アカウントを連携しており、かつ料金プランが time-of-use である場合に限られます。
+
+このフローを通すことで、App は「電気があるかないか」から「電気がどこから来て、いつ使うのが最も得で、ユーザーが実際にどう使ったか」を扱える存在へと変わります。
+
+---
+
+## 重要ポイント
+
+- **何をするか**: あなたの EV や蓄電池 App に Clean Energy Charging のスイッチを追加する
+  - なぜやる価値があるか: 即時充電をデフォルトにすると、ユーザーはピーク時間帯に最も高くて汚れた電気を使うことになります。EnergyKit を有効化すれば、システム側がウィンドウを計算してくれるので、App は最適な時間帯に充電を発火させるだけで済みます。これはユーザーが体感できる差別化ポイントです。
+  - 始め方: まず onboarding フローを実装し、ユーザーが充電地点ごとに `EnergyVenue` を選んで UUID を保存できるようにします。次に既存の充電トリガーロジックに `streamGuidance` 呼び出しを差し込み、戻り値に応じてその場で起動するかを判断します。
+
+- **何をするか**: LoadEvents をプロダクト分析データとして取り込む
+  - なぜやる価値があるか: LoadEvents は EnergyKit に insights を計算させるためだけのものではありません。電力／電力量／タイムスタンプ付きのきめ細かな充電ログそのものでもあります。これを App 側に戻せば、「今週のクリーン充電比率」カード、年次レビュー、コミュニティランキングなどのコンテンツに展開できます。
+  - 始め方: 充電コントローラに event cache 層を追加し、15 分ウィンドウまたは電力変化をトリガに append します。セッション終了時にまとめて `submitEvents` を呼び、同時にこのキャッシュをローカル分析用に複製しておきます。
+
+- **何をするか**: スマートサーモスタットや給湯器を `.reduce` ガイダンスに対応させる
+  - なぜやる価値があるか: EV は shift（時間帯をずらす）ですが、サーモスタットは reduce（直接消費を減らす）です。EnergyKit は同じフレームワーク内で両方のセマンティクスをカバーします。送配電が逼迫する地域のユーザーにとって、ピーク時に 1〜2 度温度を緩めることは実質的なコスト削減になります。
+  - 始め方: query の suggestedAction を `.reduce` に切り替え、ガイダンス値が高いときには目標温度を 1〜2°C 緩めるとともに、その理由をユーザーに通知します。critical peak のラベルと組み合わせれば、より積極的な戦略を取れます。
+
+- **何をするか**: BackgroundTask で長時間充電の guidance のリアルタイム性を維持する
+  - なぜやる価値があるか: 1 回の Level 2 充電は 6〜8 時間に及ぶこともあります。App をずっと前面で動かし続けることは現実的ではありません。途中で guidance が更新されたとき、それに車側が追随できる仕組みが必要です。
+  - 始め方: `streamGuidanceTask` を `BGAppRefreshTask` あるいはウィジェットの更新コールバックに包みます。guidance が閾値を超えて変化したら charging schedule を組み直し、新しい `guidanceToken` を次のバッチの LoadEvent に書き込みます。
+
+---
+
+## 関連 Session
+
+- [Finish tasks in the background](/articles/wwdc2025-227) — バックグラウンドタスクで ElectricityGuidance を継続更新する公式の推奨方法
+- [Demystify concurrency in SwiftUI](/articles/wwdc2025-266) — EnergyKit の AsyncSequence を SwiftUI で消費する方法
+- [Meet the Smart Home](/articles/wwdc2025-242) — Home app と HomeKit Home の全体的な機能の背景
+- [Build a UIKit document-based app](/articles/wwdc2025-260) — 同期 system services フレームワークの別のシステム統合パラダイム

@@ -1,0 +1,210 @@
+---
+title: "Migrate your app to Swift 6"
+description: "experience swift 6 migration in action as we update an existing sample app. learn how to migrate incrementally, module by module, and how the compiler helps you identify code that"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10169.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10169/"
+sessionId: "wwdc2024-10169"
+year: "2024"
+relatedSessions:
+  - title: "A Swift Tour: Explore Swift's features and design"
+    code: "10184"
+    description: "learn the essential features and design philosophy of the swift programming lang"
+  - title: "Demystify explicitly built modules"
+    code: "10171"
+    description: "explore how builds are changing in xcode 16 with explicitly built modules. disco"
+  - title: "Consume noncopyable types in Swift"
+    code: "10170"
+    description: "discover how noncopyable types let you express unique ownership in swift, and ho"
+  - title: "Explore Swift performance"
+    code: "10155"
+    description: "learn how swift compiles your code, and explore how different patterns affect per"
+---
+
+## Highlight
+
+> Swift 6 language mode enforces data isolation at compile time, preventing data races from sharing mutable state across actors.
+
+---
+
+## Core Content
+
+You built an app using @MainActor, async/await, and Sendable—it looks "safe." But the compiler wasn't actually stopping you from passing a class instance from the main actor to another actor—two actors holding the same reference type simultaneously can cause data races, from crashes to corrupted user data.
+
+Swift 6 language mode solves this. It introduces full data isolation enforcement: the compiler blocks all unsafe cross-actor shared state at compile time. When you add features or refactor, the compiler guards for you—new concurrency bugs can't slip in quietly.
+
+The session demonstrates the full migration flow using the CoffeeTracker app. This app had already migrated to Swift concurrency, but enabling Swift 6's Complete Concurrency Checking still surfaced over a dozen warnings. The migration strategy is target-by-target: first enable Complete Concurrency Checking for each target (warnings but no build failure), fix them one by one, then enable Swift 6 Language Mode (upgrading warnings to errors, locking in safety). The session repeatedly emphasizes one principle: don't do large-scale refactoring and enable Swift 6 at the same time—do them separately.
+
+---
+
+## Detailed Content
+
+### Migration Steps: Target by Target
+
+Each target follows a fixed flow ([07:35](https://developer.apple.com/videos/play/wwdc2024/10169/?time=455)):
+
+1. Enable Complete Concurrency Checking—the project stays in Swift 5 mode, but the compiler warns about all code that may be unsafe under Swift 6
+2. Fix all warnings one by one
+3. Enable Swift 6 Language Mode—lock in changes, preventing subsequent code from reverting to unsafe state
+4. Move to the next target and repeat
+
+Ben recommends starting migration from app extensions / the UI layer, not low-level frameworks. Two reasons: most UI code already runs on the main thread, so fewer warnings; and after migrating upper layers, interaction issues with unmigrated frameworks surface, which you can handle with tools like `@preconcurrency`.
+
+### Global Variables: Changing var to let Is the Most Common Quick Fix
+
+The most common warning after enabling Complete Checking is global `var`. Global variables are shared mutable state—any thread can read/write them, inherently risking data races. The compiler offers three fixes ([13:38](https://developer.apple.com/videos/play/wwdc2024/10169/?time=818)):
+
+```swift
+// Option 1: change var to let. Logger is Sendable, and a let declaration is immutable and thread-safe.
+let logger = Logger(
+    subsystem:
+        "com.example.apple-samplecode.Coffee-Tracker.watchkitapp.watchkitextension.ContentView",
+    category: "Root View")
+
+// Option 2: isolate with @MainActor. All access must happen on the main actor.
+@MainActor var logger = Logger(
+    subsystem:
+        "com.example.apple-samplecode.Coffee-Tracker.watchkitapp.watchkitextension.ContentView",
+    category: "Root View")
+
+// Option 3: nonisolated(unsafe). Bypass checking and guarantee safety yourself.
+nonisolated(unsafe) var logger = Logger(
+    subsystem:
+        "com.example.apple-samplecode.Coffee-Tracker.watchkitapp.watchkitextension.ContentView",
+    category: "Root View")
+```
+
+Key points:
+- `let` is the preferred approach—once a Sendable type is declared as `let`, there's no shared mutable state problem
+- `@MainActor` suits global variables that need to be mutable but are only accessed from the main actor
+- `nonisolated(unsafe)` is a last resort—it puts safety responsibility on you, and the compiler no longer checks; you should later replace it with proper architecture
+
+Ben specifically notes that Swift global variables are lazily initialized and atomically created ([16:29](https://developer.apple.com/videos/play/wwdc2024/10169/?time=989))—two threads can't simultaneously first-access and create two instances.
+
+### Sending Data Across Actors: Make Types Conform to Sendable
+
+When `CoffeeData` on the main actor sends a `[Drink]` array to `CoffeeDataStore` on another actor, the compiler warns: sending `self.currentDrinks` may cause a data race ([30:38](https://developer.apple.com/videos/play/wwdc2024/10169/?time=1838)). The fix is making `Drink` conform to `Sendable` ([33:29](https://developer.apple.com/videos/play/wwdc2024/10169/?time=2009)):
+
+```swift
+public struct Drink: Hashable, Codable, Sendable {
+    public let mgCaffeine: Double
+    public let date: Date
+    public let uuid: UUID
+    public let type: DrinkType?
+    // ...
+}
+```
+
+Key points:
+- `Drink` is a struct with all `let` value-type properties—naturally fits Sendable semantics
+- Swift auto-infers Sendable for `internal` types, but `public` types must explicitly declare it—Sendable is a promise to callers, and you may need internal mutable state later without locking in early
+- Adding `Sendable` to `Drink` eliminated three warnings in one change—finding these "one fix, many warnings" root causes is key to efficient migration
+
+After adding `Sendable`, `DrinkType` also needs the same marking ([35:04](https://developer.apple.com/videos/play/wwdc2024/10169/?time=2104)):
+
+```swift
+public enum DrinkType: Int, CaseIterable, Identifiable, Codable, Sendable {
+  // ...
+}
+```
+
+If `DrinkType` is an Objective-C type that can't conform to Sendable, mark that property with `nonisolated(unsafe)` as a transitional approach—but you take on the safety responsibility.
+
+### Handling Protocol Isolation with Unmigrated Frameworks
+
+When your `@MainActor` type needs to conform to a protocol without actor isolation marking, the compiler errors: main actor-isolated method can't satisfy nonisolated protocol requirement ([9:38](https://developer.apple.com/videos/play/wwdc2024/10169/?time=578)). The session shows two approaches:
+
+Approach one—`@preconcurrency` on conformance ([25:21](https://developer.apple.com/videos/play/wwdc2024/10169/?time=1521)):
+
+```swift
+extension Recaffeinater: @preconcurrency CaffeineThresholdDelegate {
+    public func caffeineLevel(at level: Double) {
+        if level < minimumCaffeine {
+            // TODO: alert user to drink more coffee!
+        }
+    }
+}
+```
+
+Key points:
+- `@preconcurrency` is equivalent to wrapping the method body with `MainActor.assumeIsolated`—it tells the compiler "I know this callback will run on the current actor"
+- If the callback actually runs off the main actor at runtime, the program traps (rather than producing hard-to-trace data races)
+- When the underlying framework migrates to Swift 6 and adds `@MainActor` to the protocol, `@preconcurrency` produces a "no longer needed" warning—just remove it ([26:50](https://developer.apple.com/videos/play/wwdc2024/10169/?time=1610))
+
+Approach two—manual `nonisolated` + `MainActor.assumeIsolated` ([24:15](https://developer.apple.com/videos/play/wwdc2024/10169/?time=1455)):
+
+```swift
+nonisolated public func caffeineLevel(at level: Double) {
+    MainActor.assumeIsolated {
+        if level < minimumCaffeine {
+            // TODO: alert user to drink more coffee!
+        }
+    }
+}
+```
+
+This is the manual expansion of `@preconcurrency`, suited for scenarios needing finer control.
+
+### CoreLocation Delegate Callback Isolation
+
+CoreLocation's `CLLocationManagerDelegate` callback thread depends on which thread created the `CLLocationManager`—a dynamic property the compiler can't statically check. The session's approach is putting the entire delegate class on `@MainActor`, ensuring the manager is created on the main thread so callbacks arrive on the main thread ([39:32](https://developer.apple.com/videos/play/wwdc2024/10169/?time=2372)):
+
+```swift
+@MainActor
+class CoffeeLocationDelegate: NSObject, CLLocationManagerDelegate {
+  var location: CLLocation?
+  var manager: CLLocationManager!
+
+  var latitude: CLLocationDegrees? { location?.coordinate.latitude }
+  var longitude: CLLocationDegrees? { location?.coordinate.longitude }
+
+  override init () {
+    super.init()
+    manager = CLLocationManager()
+    manager.delegate = self
+    manager.startUpdatingLocation()
+  }
+
+  nonisolated func locationManager (
+    _ manager: CLLocationManager,
+    didUpdateLocations locations: [CLLocation]
+  ) {
+    MainActor.assumeIsolated { self.location = locations.last }
+  }
+}
+```
+
+Key points:
+- With the class marked `@MainActor`, `CLLocationManager` is created on the main thread, and CoreLocation dispatches callbacks to the main thread accordingly
+- `locationManager(_:didUpdateLocations:)` is marked `nonisolated` because the protocol requirement has no actor isolation
+- Use `MainActor.assumeIsolated` internally to access main actor properties—traps if not on the main actor at runtime
+
+---
+
+## Core Takeaways
+
+- **What to do**: Enable Complete Concurrency Checking first, then fix warnings one by one—not manual auditing.
+  Why it's worth it: The compiler precisely identifies unsafe code, far more efficient than line-by-line manual review. After enabling, the project still compiles and runs—doesn't block delivery.
+  How to start: In Xcode, select target -> Build Settings -> search "Swift Concurrency Checking" -> set to Complete.
+
+- **What to do**: Prioritize changing global `var` to `let`.
+  Why it's worth it: The most numerous and simplest warning type in migration. In the session, 7 of CoffeeKit's 11 warnings were global `var`—one `let` replacement each.
+  How to start: After enabling Complete Checking, go through the warning list and change global `var` that won't be reassigned to `let`.
+
+- **What to do**: Add `Sendable` to public value types passed across actors.
+  Why it's worth it: One `Sendable` annotation often eliminates multiple "Sending ... risks causing data races" warnings. In the session, adding `Sendable` to `Drink` fixed three warnings in one line.
+  How to start: Find types involved in "Sending ... risks causing data races" warnings—if the type is a struct/enum with all value-type or Sendable properties, add `Sendable` conformance directly.
+
+- **What to do**: Use `@preconcurrency` for protocol conformance to unmigrated frameworks.
+  Why it's worth it: When you're sure callbacks actually run on a specific actor but the protocol isn't marked yet, `@preconcurrency` is the most concise declaration. After the underlying framework migrates, the compiler automatically reminds you to remove it.
+  How to start: When you see "Main actor-isolated instance method cannot satisfy nonisolated protocol requirement", add `@preconcurrency` at the conformance declaration.
+
+---
+
+## Related Sessions
+
+- [A Swift Tour: Explore Swift's features and design](/articles/wwdc2024-10184) — Overview of Swift language core features and design philosophy
+- [Demystify explicitly built modules](/articles/wwdc2024-10171) — Changes to explicit module builds in Xcode 16
+- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — Usage and concurrency safety of Swift noncopyable types
+- [Explore Swift performance](/articles/wwdc2024-10155) — Swift compilation mechanisms and how different code patterns affect performance

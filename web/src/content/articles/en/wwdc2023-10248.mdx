@@ -1,0 +1,184 @@
+---
+title: "Analyze hangs with Instruments"
+description: "Learn how to use Instruments to analyze, understand, and fix hangs in your apps on all Apple platforms. Discover how to efficiently navigate an Instruments trace document, interpret trace data, and record additional profiling data to better understand your specific hang."
+date: "2023-06-06"
+tags: ["Developer Tools", "Performance", "Instruments"]
+thumbnail: "/images/sessions/2023/10248.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10248/"
+sessionId: "wwdc2023-10248"
+year: "2023"
+relatedSessions:
+  - title: "Track down hangs with Xcode and on-device detection"
+    code: "110363"
+    description: "WWDC22 session covering tools for finding hangs before analyzing them"
+  - title: "Demystify SwiftUI performance"
+    code: "10252"
+    description: "SwiftUI performance analysis and optimization"
+  - title: "What's new in Xcode 15"
+    code: "10250"
+    description: "Xcode 15 improvements including Hangs instrument"
+---
+## Highlight
+
+> Instruments has added Hangs templates. Together with Time Profiler and SwiftUI templates, developers can locate three types of performance issues: main thread lagging, asynchronous delay, and main thread blocking, and reduce response delays from hundreds of milliseconds to less than 100 milliseconds.
+
+## Core Content
+
+Your app user clicks a button, but the interface hangs for half a second before responding. This experience is like a light bulb that lights up delayed after pressing a switch, immediately breaking the illusion of "real interaction".
+
+Apple's research shows that latency below 100 milliseconds is almost imperceptible to discrete interactions (such as clicking a button); latency above 250 milliseconds will be noticeable to users; latency above 500 milliseconds is a real hang. Instruments' Hangs template marks micro hangs starting at 250 milliseconds, and formal hangs above 500 milliseconds.
+
+([01:52](https://developer.apple.com/videos/play/wwdc2023/10248/?time=112)) After finding a hang, the analysis is usually divided into three steps: identifying the hang type in Instruments, locating the root cause, repairing and verifying. This speech focused on the analysis session and demonstrated three typical hangs.
+
+### Main thread busy Hang
+
+([19:38](https://developer.apple.com/videos/play/wwdc2023/10248/?time=1178)) The speech uses a background selection interface as an example.`BackgroundThumbnailView`Load thumbnails directly and synchronously on the main thread:
+
+```swift
+struct BackgroundThumbnailView: View {
+    static let thumbnailSize = CGSize(width:128, height:128)
+    var background: BackyardBackground
+
+    var body: some View {
+        Image(uiImage: background.thumbnail)
+    }
+}
+```
+
+When a large number of thumbnails are displayed simultaneously in the Grid, each`background.thumbnail`Image decoding and scaling are all performed on the main thread, causing the interface to get stuck.
+
+The fix is ​​to change synchronous loading to asynchronous. Use first`ProgressView`Take a seat and pass`.task`Loading in the background:
+
+```swift
+struct BackgroundThumbnailView: View {
+    static let thumbnailSize = CGSize(width:128, height:128)
+    var background: BackyardBackground
+    @State private var image: UIImage?
+
+    var body: some View {
+        if let image {
+            Image(uiImage: image)
+        } else {
+            ProgressView()
+                .frame(width: Self.thumbnailSize.width, height: Self.thumbnailSize.height, alignment: .center)
+                .task {
+                    image = await background.thumbnail
+                }
+        }
+    }
+}
+```
+
+Key points:
+- `@State private var image`Save the asynchronously loaded image
+-`ProgressView()`Show loading indicator before image is ready
+-`.task`Modifier automatically executes asynchronous code in the background and refreshes the UI when completed
+-`background.thumbnail`Change from sync properties to`async`Computed properties, moving time-consuming operations off the main thread
+
+### Asynchronous delayed Hang
+
+([33:40](https://developer.apple.com/videos/play/wwdc2023/10248/?time=2020)) Even if using`await`, if the background task itself takes too long, the user will still see a long ProgressView. This situation manifests itself in Instruments as: the main thread is not busy, but hangs for a long time.
+
+The solution is to make the calculation of thumbnail asynchronous:
+
+```swift
+public var thumbnail: UIImage {
+    get async {
+        // compute and cache thumbnail
+    }
+}
+```
+
+In this way, decoding and scaling are completed in the background, and the main thread is only responsible for displaying the results.
+
+### Main thread blocking Hang
+
+([38:52](https://developer.apple.com/videos/play/wwdc2023/10248/?time=2332)) The most hidden category. The code looks like it uses`await`, but subsequent code still blocks the main thread:
+
+```swift
+class ColorizingService {
+    static let shared = ColorizingService()
+    func colorize(_ grayscaleImage: CGImage) async throws -> CGImage
+}
+
+struct ImageTile: View {
+    var body: some View {
+        mainContent
+            .task {
+                let colorizer = ColorizingService.shared
+                result = try await colorizer.colorize(image)
+            }
+    }
+}
+```
+
+The problem is`ColorizingService.shared`yes`@MainActor`synchronization properties on. Although`colorize`yes`async`, but access`shared`It will block the main thread itself. Even more insidiously, even if written as`await ColorizingService.shared.colorize(image)`，`shared`Synchronous access still occurs on`await`Before.
+
+The fix is ​​to avoid accessing the synchronized singleton on the main thread. The singleton reference can be obtained in advance, or refactored into an initialization method that does not rely on the main thread.
+
+## Detailed Content
+
+### Use Instruments to analyze Hang
+
+([01:52](https://developer.apple.com/videos/play/wwdc2023/10248/?time=112)) In Xcode 15, select Product > Profile, and then select the Hangs template. After recording the app running, Instruments will mark all hang intervals that exceed the threshold.
+
+The timeline area is marked with a red bar, and below is the activity of each thread. Click on a hang interval, and the details panel below will display the call stack of each thread in that time period.
+
+### Identification features of three types of Hang
+
+| Hang type | Main thread status | Identification method |
+|-----------|-----------|----------|
+| Main thread busy | 100% CPU | Time Profiler shows the main thread executing your code |
+| Asynchronous delay | Idle, waiting | Hang duration is long, main thread has no activity |
+| Main thread blocked | Idle but blocked | Call stack stalled on synchronization lock or actor-isolated code |
+
+### Grid vs LazyVGrid choice
+
+([20:26](https://developer.apple.com/videos/play/wwdc2023/10248/?time=1226)) The speech also compared`Grid`and`LazyVGrid`performance difference.`Grid`will create all subviews at once, whereas`LazyVGrid`Only created in visible areas. For large amounts of data, use`LazyVGrid`：
+
+```swift
+ScrollView {
+    LazyVGrid(columns: [.init(.adaptive(minimum: BackgroundThumbnailView.thumbnailSize.width))]) {
+        ForEach(BackyardBackground.allBackgrounds) { background in
+            BackgroundThumbnailView(background: background)
+        }
+    }
+}
+```
+
+Key points:
+- `LazyVGrid`Create a view only when the cell enters the visible area
+-`.adaptive(minimum:)`Automatically calculate the number of columns to adapt to different screen widths
+- Cooperate with asynchronous loading to avoid centralized lag during the first display.
+
+### Combine with other Instruments templates
+
+([00:55](https://developer.apple.com/videos/play/wwdc2023/10248/?time=55)) The Hangs template tells you "where it is stuck", but to know "why it is stuck", you often need to add other templates:
+- Time Profiler: View the CPU usage of each thread
+- SwiftUI: Analyze the execution time of the view body
+- Disk Activity: Check if there is synchronous I/O blocking the main thread
+- Network: Confirm whether the delay comes from network requests
+
+## Core Takeaways
+
+- **What to do**: Add asynchronous image loading to each list interface of the App
+- **Why it’s worth doing**: The most sensitive thing when users slide the list is the image loading lag. use`ProgressView` + `.task` + `async`Attribute, you can completely move the image decoding out of the main thread
+- **How to start**: Find the code that loads images directly and synchronously in the list, and change the loading logic to`async`Computed properties, used in view layer`.task`trigger
+
+- **What to do**: Create a "Hangs + Time Profiler" combination template in Instruments and release the profile regularly
+- **Why is it worth doing**: Many hangs are not obvious in the development environment because the amount of data is small and the device performance is good. Recording real user scenarios can expose problems
+- **How to start**: Product > Profile, select the Hangs template, click the red hang bar after recording, and then add Time Profiler to view the call stack
+
+- **What to do**: Audit the singleton pattern in the code and check if there is`@MainActor`Synchronous properties are accessed frequently
+- **Why it’s worth doing**:`static let shared`Cooperate`@MainActor`It is a hidden trap where the main thread is blocked. Even if subsequent code is used`await`, the synchronization operation to access the singleton itself has been blocked.
+- **How to get started**: Global search`.shared`, check its actor isolation properties. in the case of`@MainActor`, consider changing to non-isolated initialization or caching references ahead of time
+
+- **What to do**: Use`LazyVGrid`or`LazyVStack`Replace loading large amounts of data at once`Grid`/`VStack`- **Why is it worth doing**: When the list has 2000 pieces of data,`ForEach`2000 views will be created.`Lazy`Series are only created in the visible area, greatly reducing the initial loading pressure
+- **How to start**: Check all usage`Grid`、`VStack` + `ForEach`List code to evaluate whether the data volume is suitable for changing to Lazy version
+
+## Related Sessions
+
+- [Track down hangs with Xcode and on-device detection](/articles/wwdc2023-110363) — WWDC22 course, explaining how to detect hangs before and after release
+- [Demystify SwiftUI performance](/articles/wwdc2023-10252) — SwiftUI performance analysis, used with Instruments
+- [What's new in Xcode 15](/articles/wwdc2023-10250) — New features in Xcode 15, including improved Instruments and Hangs templates
+- [Swift concurrency: Behind the scenes](/articles/wwdc2023-10170) — In-depth understanding of Swift Concurrency’s threading model to help diagnose blocking caused by actor isolation

@@ -1,0 +1,250 @@
+---
+title: "Combine Metal 4 machine learning and graphics"
+description: "learn how to seamlessly combine machine learning into your graphics applications using metal 4. we"
+date: 2026-06-10
+tags: ["グラフィックスとゲーム", "機械学習"]
+thumbnail: "/images/sessions/2025/262.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/262/"
+sessionId: "wwdc2025-262"
+year: "2025"
+relatedSessions:
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Explore Metal 4 games"
+    code: "254"
+    description: "learn to optimize your game engine with the latest advancements in metal 4. we"
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+  - title: "Engage players with the Apple Games app"
+    code: "215"
+    description: "meet the games app – a new destination for players to keep up with what"
+---
+
+## Highlight
+
+> Metal 4 は機械学習を GPU タイムラインに取り込みます。新しい MTLTensor リソース、ネットワーク全体を一括で推論する MTL4MachineLearningCommandEncoder、そして shader 内にニューラルネットワークを埋め込む Shader ML の 3 つが提供されます。
+
+---
+
+## 主要内容
+
+ゲームの 1 フレームは通常、compute pass でスキニングを行い、render pass でラスタライズし、さらにもう 1 つの compute pass でアンチエイリアシングを行う、といった構成になっています。最近のトレンドは、従来の画像処理を機械学習に置き換えることです。たとえばニューラルネットワークでアップスケーリングを行い、それ以外のレンダリングを低解像度で動かしたり、fragment shader の中に小さなネットワークを埋め込んでマテリアルテクスチャをリアルタイムに展開し、ブロック圧縮フォーマットと比べてさらにメモリを半分に削減する、といったアプローチです。問題は、CoreML は汎用的な ML タスクには向いていますが、GPU タイムラインと密に噛み合わせるのは得意ではない点にあります。前フレームの G-buffer がまだ出てきていない状況で、ネットワークは何を待てばよいのか。出力テンソルがデバイスメモリを 1 往復するだけで、1 フレームの予算は使い切ってしまいます。
+
+Metal 4 では、機械学習を compute や render と同じレイヤーに引き下げ、次の 3 点セットを提供しています。MTLTensor は新しい多次元リソースで、MTLBuffer のインデックスの煩雑さや MTLTexture の 4 チャンネル制限を回避できます。MTL4MachineLearningCommandEncoder はネットワーク全体を 1 回の dispatch として GPU タイムラインへエンコードし、レンダリングと MTLBarrier や MTLFence などの同期プリミティブを共有します。Shader ML を使えば、fragment shader や compute shader の内部から直接 `matmul2d` を呼び出せるので、「latent テクスチャをサンプリング → ネットワーク推論 → シェーディング」までを 1 回の dispatch に圧縮でき、最後まで GPU スレッドから出る必要がありません。
+
+---
+
+## 詳細
+
+### MTLTensor: 多次元リソース ([03:03](https://developer.apple.com/videos/play/wwdc2025/262/?time=183))
+
+MTLTensor は rank (軸数)、各軸の extent、dataType、usage で記述されます。usage には `MTLTensorUsageMachineLearning`、`MTLTensorUsageCompute`、`MTLTensorUsageRender` を組み合わせて指定できます。MTLDevice から作成すれば不透明な最適化済みレイアウトとなり、性能面で最も有利です。MTLBuffer から作成する場合は strides を手動で指定する必要があります。最も内側の stride は 1 でなければならず、2 番目の stride は行インデックスを 1 進めたときにいくつ要素を跨ぐかを表し、パディング列をスキップする用途にも使えます。
+
+### オフライン: MTLPackage の書き出し ([08:13](https://developer.apple.com/videos/play/wwdc2025/262/?time=493))
+
+```python
+import coremltools as ct
+
+# define model in PyTorch
+# export model to an mlpackage
+
+model_from_export = ct.convert(
+    custom_traced_model,
+    inputs=[...],
+    outputs=[...],
+    convert_to='mlprogram',
+    minimum_deployment_target=ct.target.macOS16,
+)
+
+model_from_export.save('model.mlpackage')
+```
+
+ポイント:
+
+- `ct.convert` は PyTorch の traced model を Core ML mlprogram に変換します。Metal がサポートするのは mlprogram 形式の CoreML package のみです。
+- `.mlpackage` を保存したあと、コマンドラインツール `metal-package-builder` でさらに `.mtlpackage` に変換します。このフォーマットは Metal ランタイムでのロードに最適化されています。
+
+### ランタイム: パイプラインのコンパイル ([09:21](https://developer.apple.com/videos/play/wwdc2025/262/?time=561))
+
+```objc
+descriptor = [MTL4MachineLearningPipelineDescriptor new];
+descriptor.machineLearningFunctionDescriptor = functionDescriptor;
+
+[descriptor setInputDimensions:dimensions
+                 atBufferIndex:1];
+
+pipeline = [compiler newMachineLearningPipelineStateWithDescriptor:descriptor
+                                                             error:&error];
+```
+
+ポイント:
+
+- `functionDescriptor` は `[device newLibraryWithURL:@"myNetwork.mtlpackage"]` でロードした MTLLibrary に由来し、`name` フィールドでネットワークのエントリポイント (通常は `main`) を指定します。
+- `setInputDimensions:atBufferIndex:` は形状が動的なネットワーク向けです。入力サイズが固定であれば省略できます。
+- `newMachineLearningPipelineStateWithDescriptor:` は現在の device 向けに MTL4MachineLearningPipelineState へとコンパイルします。
+
+### ネットワーク dispatch のエンコード ([09:58](https://developer.apple.com/videos/play/wwdc2025/262/?time=598))
+
+```objc
+commands = [device newCommandBuffer];
+[commands beginCommandBufferWithAllocator:cmdAllocator];
+[commands useResidencySet:residencySet];
+
+/* Create intermediate heap */
+/* Configure argument table */
+
+encoder = [commands machineLearningCommandEncoder];
+[encoder setPipelineState:pipeline];
+[encoder setArgumentTable:argTable];
+[encoder dispatchNetworkWithIntermediatesHeap:heap];
+```
+
+ポイント:
+
+- `machineLearningCommandEncoder` は compute / render encoder と同じ使い方で、入出力は argument table 経由で MTLTensor をバインドします。
+- `dispatchNetworkWithIntermediatesHeap:` でネットワーク全体を一括して GPU タイムラインへエンコードします。中間テンソルは heap を再利用するため、各演算子ごとの確保と解放のオーバーヘッドが不要になります。
+
+### 中間 heap ([10:30](https://developer.apple.com/videos/play/wwdc2025/262/?time=630))
+
+```objc
+heapDescriptor = [MTLHeapDescriptor new];
+heapDescriptor.type = MTLHeapTypePlacement;
+heapDescriptor.size = pipeline.intermediatesHeapSize;
+
+heap = [device newHeapWithDescriptor:heapDescriptor];
+```
+
+ポイント:
+
+- 必ず `MTLHeapTypePlacement` を使用します。これにより、ネットワークの中間テンソルを Metal が指定オフセットに手動で配置できます。
+- size は `pipeline.intermediatesHeapSize` から取得します。これより大きい分には問題ありませんが、小さくしてはいけません。
+
+### 同期: レンダリングを ML に待たせる ([11:18](https://developer.apple.com/videos/play/wwdc2025/262/?time=678))
+
+```objc
+[encoder barrierAfterStages:MTLStageMachineLearning
+          beforeQueueStages:MTLStageVertex
+          visibilityOptions:MTL4VisibilityOptionDevice];
+```
+
+ポイント:
+
+- 新たに追加された `MTLStageMachineLearning` は `MTLStageVertex` や `MTLStageFragment` と同列で、barrier や fence でも認識されます。
+- 実際に出力を消費する pass だけを待たせれば、ML 出力に依存しない他の処理はネットワーク推論と並列に走り、GPU の使用率を最大化できます。
+
+### Shader ML: fragment shader 内でニューラルネットワークを動かす ([15:17](https://developer.apple.com/videos/play/wwdc2025/262/?time=917))
+
+```cpp
+// Metal Shading Language 4
+
+#include <metal_tensor>
+
+using namespace metal;
+
+[[fragment]]
+float4 shade_frag(tensor<device half, dextents<int, 2>> layer0Weights [[ buffer(0) ]],
+                  tensor<device half, dextents<int, 2>> layer1Weights [[ buffer(1) ]],
+                  /* other bindings */)
+{
+    // Creating input tensor
+    half inputs[INPUT_WIDTH] = { /* four latent texture samples + UV data */ };
+
+    auto inputTensor = tensor(inputs, extents<int, INPUT_WIDTH, 1>());
+    ...
+}
+```
+
+ポイント:
+
+- `metal_tensor` ヘッダは shader 内で利用できる `tensor` 型を提供します。`device` アドレス空間修飾子は、重みがデバイスメモリ上にあることを示します。
+- `dextents<int, 2>` は動的サイズの rank-2 テンソルを宣言し、インデックス型は int です。
+- 推論の入力はローカル配列から直接 inline tensor を構築し、密に詰まった配置を前提とするため strides を渡す必要はありません。
+
+### Metal Performance Primitives: matmul2d ([17:12](https://developer.apple.com/videos/play/wwdc2025/262/?time=1032))
+
+```cpp
+// Metal Shading Language 4
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+using namespace mpp;
+
+constexpr tensor_ops::matmul2d_descriptor desc(
+              /* M, N, K */ 1, HIDDEN_WIDTH, INPUT_WIDTH,
+       /* left transpose */ false,
+      /* right transpose */ true,
+    /* reduced precision */ true);
+
+tensor_ops::matmul2d<desc, execution_thread> op;
+op.run(inputTensor, layerN, intermediateN);
+
+for (auto intermediateIndex = 0; intermediateIndex < intermediateN(0); ++intermediateIndex)
+{
+    intermediateN[intermediateIndex, 0] = max(0.0f, intermediateN[intermediateIndex, 0]);
+}
+```
+
+ポイント:
+
+- `matmul2d_descriptor` の 3 組のテンプレートパラメータは順に、問題サイズ M×N×K、左右の行列を転置するか、reduced precision を使うかを表します。
+- 2 番目のテンプレートパラメータは演算に参加する実行グループを指定します。fragment shader 内では `execution_thread` (単一スレッドで完結) を使用します。simdgroup や threadgroup 全体で制御フローとデータが揃っているのであれば、`execution_simdgroup` や `execution_threadgroup` に切り替えることでハードウェア並列を活用できます。
+- 末尾の `max(0.0f, …)` は ReLU 活性化で、出力テンソルをループしながら要素ごとに活性化を適用しています。
+
+### ネットワーク出力でシェーディングする ([18:38](https://developer.apple.com/videos/play/wwdc2025/262/?time=1118))
+
+```cpp
+half3 baseColor          = half3(outputTensor[0,0], outputTensor[1,0], outputTensor[2,0]);
+half3 tangentSpaceNormal = half3(outputTensor[3,0], outputTensor[4,0], outputTensor[5,0]);
+
+half3 worldSpaceNormal = worldSpaceTBN * tangentSpaceNormal;
+
+return baseColor * saturate(dot(worldSpaceNormal, worldSpaceLightDir));
+```
+
+ポイント:
+
+- 出力テンソルを通常のサンプリング値と同じように扱います。最初の 3 チャンネルを base color、後ろの 3 チャンネルを接空間法線として利用しています。
+- fragment shader の内部だけで「latent テクスチャをサンプリング → matmul × 2 + ReLU → シェーディング」を完結させ、GPU スレッドから出ません。従来のブロック圧縮マテリアルと比較して、メモリとディスク容量を 50% 節約できます ([18:45](https://developer.apple.com/videos/play/wwdc2025/262/?time=1125))。
+
+### Metal Debugger 三点セット ([20:31](https://developer.apple.com/videos/play/wwdc2025/262/?time=1231))
+
+Scott は ambient occlusion ネットワークにノイズが乗ってしまった実バグを題材に、デバッグの流れを実演しています。
+
+1. **Dependency Viewer** は command buffer、encoder、barrier、event をグラフとして描画し、同期に問題がないかを確認するのに使います。彼はまず ML pass とレンダリング pass の間で barrier が漏れている可能性を排除しました。
+2. **MTLTensor Viewer** では dispatch ノード上で入出力テンソルをダブルクリックすると、データを可視化できます。法線の入力は正常で、出力にだけノイズが乗っていることから、問題はネットワーク内部にあると判断できました。
+3. **ML Network Debugger** はネットワーク構造図を描画し、二分探索で故障している演算子を絞り込めます。stitched region を展開すると、自作の `SignedSmoothstep` の中で `clamp` のあとに `*` を 1 つ多く打ってしまっており、本来の乗算がべき乗になっていたことが判明しました ([26:00](https://developer.apple.com/videos/play/wwdc2025/262/?time=1560))。
+
+---
+
+## 重要ポイント
+
+- **何をするか**: G-buffer 後段のアンチエイリアシング / 超解像を ML ネットワークに置き換える。
+  - 価値: メインのレンダリングを低解像度で動かせるためフレーム時間が下がります。MTL4MachineLearningCommandEncoder によりネットワークとレンダリングが barrier を共有できるので、統合コストも抑えられます。
+  - 始め方: まず PyTorch で低解像度から高解像度への軽量ネットワークを学習し、08:13 のコードに沿って mlpackage に書き出します。コマンドラインの `metal-package-builder` で mtlpackage に変換し、ランタイムでは 09:21 の手順で pipeline にコンパイルしたうえで、アンチエイリアシングの位置でネットワーク全体を dispatch します。
+
+- **何をするか**: Shader ML を使って fragment 内でニューラルマテリアル圧縮を行う。
+  - 価値: ブロック圧縮と比較してディスク容量とメモリを 50% 節約でき、肉眼ではほぼ違いが分かりません。推論はスレッド内で完結するので、中間テンソルをデバイスメモリへ書き戻す必要もありません。
+  - 始め方: 既存マテリアルの albedo / normal / roughness を、数枚の latent texture と 2 層 MLP に学習させます。15:17 の書き方に従って fragment shader 内で tensor 引数を宣言し、17:12 の `matmul2d_descriptor` で matmul を 2 回走らせ、18:38 のように出力をチャンネル分解してシェーディングに使います。
+
+- **何をするか**: G-buffer のあとにニューラルアンビエントオクルージョン pass を追加する。
+  - 価値: SSAO の画像処理ヒューリスティックを置き換えるかたちになり、品質はオフラインベイクに近づきます。ネットワーク規模が小さいのでリアルタイム予算にも収まります。
+  - 始め方: 深度のエッジとビュー空間法線を入力テンソルとし、フル畳み込みネットワークでピクセルごとの occlusion を予測するように学習します。ML Network Debugger の stitched region 展開機能を使えば、演算子レベルでの問題切り分けが可能です。
+
+- **何をするか**: 同期を粗粒度の command buffer から stage 粒度に絞り込む。
+  - 価値: ML 出力に依存しない vertex / compute の作業を推論と並列に動かせるため、GPU 使用率が向上します。
+  - 始め方: これまでの endEncoding と buffer 全体待ちを、`barrierAfterStages:MTLStageMachineLearning beforeQueueStages:` で置き換え、依存関係は Dependency Viewer で検証します。
+
+- **何をするか**: ML のデバッグを GPU Frame Capture のフローに組み込む。
+  - 価値: MTLTensor Viewer と ML Network Debugger を組み合わせると、「出力がおかしい」という、これまでコードを直して動かし直すしかなかった問題が、ダブルクリック数回で済むようになります。二分探索で演算子レベルのバグも素早く特定できます。
+  - 始め方: 視覚的な異常が出たらまず 1 フレームを capture し、「Dependency Viewer → 入出力 Tensor → Network 内部」の順で切り分け、具体的な演算子まで突き止めてから PyTorch のソースに戻ります。
+
+---
+
+## 関連 Session
+
+- [Discover Metal 4](/articles/wwdc2025-205) — Metal 4 の新機能全般の入門。command allocator や residency set などの基礎概念をカバーしています。
+- [Explore Metal 4 games](/articles/wwdc2025-254) — ゲームエンジンを Metal 4 上で最適化する道筋。MetalFX アップサンプリングとの組み合わせも紹介されています。
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — SceneKit が deprecated になった後、3D プロジェクトを RealityKit へ移行する手順。
+- [Engage players with the Apple Games app](/articles/wwdc2025-215) — 新しい Games アプリを、プレイヤーへの配信とソーシャルの入口として紹介する内容。

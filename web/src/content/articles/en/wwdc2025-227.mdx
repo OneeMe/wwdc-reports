@@ -1,0 +1,206 @@
+---
+title: "Finish tasks in the background"
+description: "discover background execution advancements and understand how the system schedules runtime. we"
+date: 2026-06-10
+tags: ["System Services"]
+thumbnail: "/images/sessions/2025/227.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/227/"
+sessionId: "wwdc2025-227"
+year: "2025"
+relatedSessions:
+  - title: "Deliver age-appropriate experiences in your app"
+    code: "299"
+    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
+  - title: "Filter and tunnel network traffic with NetworkExtension"
+    code: "234"
+    description: "learn about the apis in the networkextension framework that give your app the po"
+  - title: "Get ahead with quantum-secure cryptography"
+    code: "314"
+    description: "learn how to protect your app"
+  - title: "Optimize home electricity usage with EnergyKit"
+    code: "257"
+    description: "learn how to support energykit in your app so people can optimize electricity us"
+---
+
+## Highlight
+
+> iOS 26 introduces `BGContinuedProcessingTask`, which lets user-initiated long tasks (video export, social media posting, accessory firmware upgrades) keep running after the app moves to the background. The system supplies the progress UI and a cancel control.
+
+## Core content
+
+The user taps "Export 4K video" inside an app, then presses the home button. In the past, developers grabbed a slice of grace time with `beginBackgroundTask`; the system suspended the app within tens of seconds and the export failed. The other option was to drag the user back to the foreground and force them to stare at the progress bar. Neither path is a good experience.
+
+iOS 26 offers a third path. Apple engineer Ryan explains in the session: once an app moves to the background, it gets suspended by default and receives no CPU time. The point is to protect battery life and keep the foreground smooth. Background execution is not a right; it is a limited resource the system hands out under five rules — efficient, minimal, recoverable, polite, and adaptive ([01:02](https://developer.apple.com/videos/play/wwdc2025/227/?time=62)). Within that frame, the new `BGContinuedProcessingTask` covers one specific scenario: long tasks that the user explicitly starts, that have a clear endpoint, and whose progress can be measured. The system pops up a UI in the background that shows a title, subtitle, and progress bar, and the user can cancel at any time. The Journal app's export feature uses this API ([11:40](https://developer.apple.com/videos/play/wwdc2025/227/?time=700)).
+
+The new API does not replace the old ones. It fills the last gap in the iOS background-execution toolbox. Use `BGAppRefreshTask` to prefetch content, Background Push for server-driven updates, `BGProcessingTask` for offline ML inference or database maintenance, `beginBackgroundTask` to close out file handles, and `BGContinuedProcessingTask` for user-initiated long tasks. Each API maps to one work profile, and the system schedules resources accordingly.
+
+## Detailed content
+
+**Register an app refresh task** ([08:27](https://developer.apple.com/videos/play/wwdc2025/227/?time=507)): a SwiftUI app declares it through a scene modifier. The system schedules it by usage frequency, so frequently used apps get higher hit rates.
+
+```swift
+import BackgroundTasks
+import SwiftUI
+
+@main
+struct ColorFeed: App {
+    var body: some Scene {
+        WindowGroup {
+            // ...
+        }
+        .backgroundTask(.appRefresh("com.colorfeed.wwdc25.appRefresh")) {
+            await self.handleAppRefreshTask()
+        }
+    }
+}
+```
+
+Key points:
+- `.backgroundTask(.appRefresh(...))` is a SwiftUI scene modifier bound to a reverse-DNS identifier.
+- The closure is `async`. The system calls it when it wakes the app in the background, and the app gets suspended again after the closure returns.
+- This path does not need a `register` call in `AppDelegate`. SwiftUI does it for you.
+
+**Register and submit a processing task** ([09:45](https://developer.apple.com/videos/play/wwdc2025/227/?time=585)): use this for batch work that is not latency-sensitive, such as ML inference or database cleanup. You can require "must be charging + must have network" before it runs, which keeps the battery hit minimal.
+
+```swift
+import BackgroundTasks
+import UIKit
+
+class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) -> Bool {
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: "com.example.apple-samplecode.ColorFeed.db_cleaning",
+            using: nil
+        ) { task in
+            self.handleAppRefresh(task: task as! BGProcessingTask)
+        }
+    }
+
+    func submitProcessingTaskRequest() {
+        let request = BGProcessingTaskRequest(
+            identifier: "com.example.apple-samplecode.ColorFeed.db_cleaning"
+        )
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = true
+
+        BGTaskScheduler.shared.submit(request)! 
+    }
+}
+```
+
+Key points:
+- `register` must finish early in app launch. Otherwise, when the system wakes the app in the background, it cannot find the handler and the task fails outright ([09:56](https://developer.apple.com/videos/play/wwdc2025/227/?time=596)).
+- `using: nil` lets the system pick the callback queue.
+- `requiresExternalPower = true` says "only run while charging," which is friendly to the battery.
+- `requiresNetworkConnectivity = true` says the task needs network. The system defers it when there is no network.
+- After `submit`, the system decides when to run the task. It does not run right away.
+
+**Use begin/end background task for short cleanup** ([10:51](https://developer.apple.com/videos/play/wwdc2025/227/?time=651)): when the app is about to enter the background, get a slice of extra runtime to save state and close file handles.
+
+```swift
+import UIKit
+
+@main
+class AppDelegate: UIResponder, UIApplicationDelegate {
+    var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+   
+    func saveState() { /*  ... */ }
+
+    func handlePersistence() {
+        let app = UIApplication.shared
+        guard backgroundTaskID != .invalid else { return }
+        backgroundTaskID = app.beginBackgroundTask(withName: "Finish Export") {
+            app.endBackgroundTask(self.backgroundTaskID)
+            self.backgroundTaskID = .invalid
+        }
+
+        self.saveState()
+
+        app.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+}
+```
+
+Key points:
+- `beginBackgroundTask(withName:)` returns a token. You must hold on to it.
+- The closure is the expiration handler. The system calls it when it decides time is up, and it should do exactly one thing: call `endBackgroundTask` and exit.
+- After the work finishes, you must call `endBackgroundTask` explicitly. Otherwise, the system kills the app.
+- This is the right tool for "a few seconds of cleanup," not for long tasks.
+
+**Register a continued processing task** ([14:00](https://developer.apple.com/videos/play/wwdc2025/227/?time=840)): unlike `BGProcessingTask`, this `register` is dynamic. You only call it after the user expresses intent.
+
+```swift
+import BackgroundTasks
+
+func handleDialogConfirmation() {
+    BGTaskScheduler.shared.register("com.colorfeed.wwdc25.userTask") { task in
+        let task = task as! BGContinuedProcessingTask
+                                                                      
+        var shouldContinue = true
+        task.expirationHandler = {
+            shouldContinue = false
+        }
+
+        task.progress.totalUnitCount = 100
+        task.progress.completedUnitCount = 0
+
+        while shouldContinue {
+            // Do some work
+            task.progress.completedUnitCount += 1
+        }
+
+        task.setTaskCompleted(success: true)
+    }
+}
+```
+
+Key points:
+- The identifier must first be declared in `BGTaskSchedulerPermittedIdentifiers` in Info.plist, and it must start with the bundle ID.
+- The `expirationHandler` should only flip a flag. Check the flag in the loop and exit gracefully. Do not do heavy work inside the handler.
+- `task.progress` uses Foundation's `Progress` Reporting Protocol. The system subscribes to it to drive the UI. A task that never updates progress is treated as stuck and gets expired ([14:44](https://developer.apple.com/videos/play/wwdc2025/227/?time=884)).
+- After completion, you must call `setTaskCompleted(success:)`. The system uses this signal to free resources and close the progress UI.
+
+**Submit a continued processing request** ([15:47](https://developer.apple.com/videos/play/wwdc2025/227/?time=947)):
+
+```swift
+import BackgroundTasks
+
+func submitContinuedProcessingTaskRequest() {
+    let request = BGContinuedProcessingTaskRequest(
+        identifier: "com.colorfeed.wwdc25.userTask",
+        title: "A succinct title",
+        subtitle: "A useful and informative subtitle"
+    )
+
+    request.strategy = .fail
+
+    BGTaskScheduler.shared.submit(request)!
+}
+```
+
+Key points:
+- Both `title` and `subtitle` should be localized. They show up directly in the system UI.
+- `strategy = .fail` means "fail right away if the task cannot start now." Use it for tasks where running later carries no value. The default behavior is to queue and wait.
+- Wildcard identifiers (`bundleID.context.*`) let you append a dynamic suffix at register and submit time ([13:37](https://developer.apple.com/videos/play/wwdc2025/227/?time=817)).
+- Background GPU access needs a capability added in Xcode. At runtime, query `scheduler.supportedResources` to check whether the device supports it ([17:11](https://developer.apple.com/videos/play/wwdc2025/227/?time=1031)).
+
+## Core takeaways
+
+- **Add background continuation to "export / upload / publish"**: why it matters — the most common user complaint is "tap back and it dies." Features users pay attention to (video export, batch upload, accessory firmware upgrade) have to start over once they get cut off. How to start: inside the button handler, `register` a `BGContinuedProcessingTask`, drive your existing progress logic with `Progress`, and wire `setTaskCompleted` into the original completion callback.
+
+- **Use `BGProcessingTask` to push "midnight work" to charging time**: why it matters — embedding rebuilds, on-device indexing, cache cleanup, and ML model warmups waste user battery if you run them in the foreground. Move them to charging time and you also benefit from the system's amortized scheduling. How to start: `register` an identifier in `AppDelegate` at launch, set `requiresExternalPower = true` and `requiresNetworkConnectivity = true` on the request, then let the system queue it.
+
+- **Turn "open the app and see stale content" into "open and there is fresh content"**: why it matters — for feed apps, reading apps, and mail apps, the difference users feel often comes from that one cold-start second. How to start: register a lightweight prefetch closure with SwiftUI's `.backgroundTask(.appRefresh(...))` modifier, and use server-side Background Push as a fallback. The first runs by usage frequency; the second fires on events. Walk on both legs.
+
+- **Tasks must always report progress, or they get killed**: why it matters — `BGContinuedProcessingTask` separates "the system thinks you are stuck" from "the system thinks you are working." A task that does not update `Progress` gets expired. How to start: pipe your existing progress callbacks into `task.progress.completedUnitCount` — even an estimate beats nothing — and prepare a check point in the `expirationHandler` that can exit immediately.
+
+## Related sessions
+
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — the Declared Age Range API lets apps deliver age-appropriate content.
+- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — filtering and tunneling in the NetworkExtension framework, covering system-level network interception.
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — adopt post-quantum algorithms in CryptoKit to protect data for the next decade.
+- [Optimize home electricity usage with EnergyKit](/articles/wwdc2025-257) — EnergyKit lets apps schedule energy-hungry tasks around the home power grid.

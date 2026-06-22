@@ -1,0 +1,106 @@
+---
+title: "What’s new in BNNS Graph"
+description: "the bnns graph builder api now enables developers to write graphs of operations using the familiar swift language to generate pre- and post-processing routines and small machine-learning models. bnns "
+date: 2026-06-10
+tags: ["機械学習"]
+thumbnail: "/images/sessions/2025/276.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/276/"
+sessionId: "wwdc2025-276"
+year: "2025"
+relatedSessions:
+  - title: "Bring advanced speech-to-text to your app with SpeechAnalyzer"
+    code: "277"
+    description: "discover the new speechanalyzer api for speech to text. we"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+---
+
+## ハイライト
+
+> 昨年初登場した BNNSGraph は、CoreML パッケージからグラフをロードして推論を実行する、ファイルベースの API を提供していました。今年の BNNSGraphBuilder は全く新しい Swift DSL であり、Swift コード内で直接計算グラフを定義できます。入力引数の宣言から、オペレータの呼び出し、出力の返却まで、すべてが 1 つの makeContext クロージャの中で完結します。
+
+## 主要内容
+
+昨年の Bitcrusher デモでは、レイヤを 1 つずつ手書きする煩雑なフローを BNNSGraph がどのように置き換えるかが示されていました。しかし依然として PyTorch → CoreML パッケージ → mlmodelc というパイプラインを通す必要がありました。テンソル操作が十数個しかないオーディオエフェクトにとって、独立した Python ファイルをメンテナンスし、CoreML パッケージをビルドするコストは、得られるメリットを大きく上回ります。前処理・後処理のような小さなグラフでは、開発者は「Swift コードで BNNS のプリミティブを 1 つずつ呼び出す」か「PyTorch を経由してモデルをコンパイルする」かの間で迷い続けてきました。
+
+今年、Apple はこのフロー全体をフラットにしました。BNNSGraphBuilder では Swift クロージャ内で計算グラフを直接定義できます。`argument` を宣言し、オペレータを呼び出し、出力テンソルを return する。`BNNSGraph.makeContext` を 1 回呼び出すだけで、実行可能な context が生成されます。コードはプロジェクト内の他の Swift コードと同じソースファイルに置けて、コンパイル時に型チェックが行われ、Swift のランタイム時点で判明しているテンソル形状をグラフに渡せば、静的サイズによる性能上の恩恵も受けられます。BNNSGraph 既存のレイヤフュージョン、copy elision、ウェイト並べ替えなどの最適化と組み合わせれば、小規模なモデルや前処理・後処理グラフはもはや PyTorch という中間層を必要としません。
+
+## 詳細
+
+API のエントリポイントは新たに追加された型メソッド `BNNSGraph.makeContext` です。クロージャ引数 `builder` を使って入力の宣言、オペレータの組み立て、出力の返却を行います。次のコードは Session 8:31 で示された最小の動作例で（[8:31](https://developer.apple.com/videos/play/wwdc2025/276/?time=511)）、要素数 8 の 2 つのベクトルの要素ごとの積を計算し、その平均を求めるものです。
+
+```swift
+let context = try BNNSGraph.makeContext { builder in
+    let x = builder.argument(name: "x",
+                             dataType: Float.self,
+                             shape: [8])
+    let y = builder.argument(name: "y",
+                             dataType: Float.self,
+                             shape: [8])
+
+    let product = x * y
+    let mean = product.mean(axes: [0], keepDimensions: true)
+
+    // Prints "shape: [1] | stride: [1]".
+    print("mean", mean)
+
+    return [product, mean]
+}
+
+var args = context.argumentNames().map { name in
+    context.tensor(argument: name, fillKnownDynamicShapes: false)!
+}
+args[0].allocate(as: Float.self, count: 8)   // product
+args[1].allocate(as: Float.self, count: 1)   // mean
+args[2].allocate(initializingFrom: [1, 2, 3, 4, 5, 6, 7, 8] as [Float])
+args[3].allocate(initializingFrom: [8, 7, 6, 5, 4, 3, 2, 1] as [Float])
+
+try context.executeFunction(arguments: &args)
+```
+
+ポイントは以下のとおりです。
+
+- `BNNSGraph.makeContext { builder in ... }` は Swift クロージャを再利用可能な context にコンパイルします。通常はアプリ起動時に 1 度だけ構築すれば十分です。
+- `builder.argument(name:dataType:shape:)` で入力テンソルを宣言します。`shape: [8]` は静的な形状なので、ランタイムで動的に推論する必要はありません。
+- `x * y` は Swift の演算子をそのまま使って要素ごとの乗算をトリガーし、BNNS の element-wise multiply プリミティブと等価です。
+- `product.mean(axes:keepDimensions:)` はリダクション演算子です。`keepDimensions: true` を指定するとリダクション軸が保持され、`[1]` の形状が得られます。
+- `print("mean", mean)` はコンパイル時／グラフ構築段階で中間テンソルの shape と stride を出力するため、デバッグに便利です。
+- `return [product, mean]` で出力テンソルを決定します。`context.argumentNames()` では出力が先、入力が後の順に並びます。
+- `executeFunction(arguments:)` で実際にグラフを実行し、結果は事前に allocate された出力テンソルに書き込まれます。
+
+型システムはコンパイル時に暗黙的なデータ型の混在を拒否します。Session 12:04 で示された型に厳密な例（[12:04](https://developer.apple.com/videos/play/wwdc2025/276/?time=724)）では、`bases.pow(y: exponents.cast(to: Float16.self))` という書き方が登場します。Float16 の base と Int32 の exponent は明示的に `cast` する必要があり、そうしないと `makeContext` のコンパイルが失敗します。比較演算 `mask0 .< mask1` が返すブールテンソルも、FP16 テンソルと乗算するには `cast(to: Float16.self)` が必要です。
+
+スライスは Swift のサブスクリプト構文で表現します（[14:15](https://developer.apple.com/videos/play/wwdc2025/276/?time=855)）。`BNNSGraph.Builder.SliceRange(startIndex:endIndex:)` は末尾からのインデックスを表す負の値もサポートし、`SliceRange.fillAll` はその次元全体を保持することを意味します。BNNSGraph の内部実装ではスライスは元データへの参照として扱われるため、コピーや追加のアロケーションは発生しません。
+
+後処理の例（[19:04](https://developer.apple.com/videos/play/wwdc2025/276/?time=1144)）では、`softmax(axis:)` と `topK(_:axis:findLargest:)` の組み合わせが示されます。後者は `values` と `indices` の両方を含むタプルを返し、これは分類モデルの典型的なデコードフローです。
+
+Bitcrusher の移行例は特に分かりやすいでしょう（[21:03](https://developer.apple.com/videos/play/wwdc2025/276/?time=1263)）。元の PyTorch 版は `nn.Module` を継承し、`forward` を書き、coremltools での変換を通す必要がありました。Swift 版では `source * saturationGain`、`destination.tanh()`、`destination.round()` といった操作をテンソルに対して直接呼び出すだけで、PyTorch とほぼ 1 対 1 に対応しつつ、すべてが 1 つの Swift ファイル内で完結します。`BITCRUSHER_PRECISION` を `Float32` から `Float16` に変えるだけで（[22:34](https://developer.apple.com/videos/play/wwdc2025/276/?time=1354)）精度を切り替えられ、Session の実測でも FP16 のほうが FP32 よりも高速でした。
+
+## 重要ポイント
+
+- **何をするか**：ML モデルの前処理・後処理を Python から Swift に移し、BNNSGraphBuilder で書き直す。
+  なぜ価値があるか：前処理（クロップ、正規化、しきい値処理）や後処理（softmax、topK、NMS）はオペレータが十数個程度しかないことが多いのに、長らく独立した Python プロジェクトを 1 つ占有してきました。Swift に移行すればビジネスロジックと同じソースで管理でき、コンパイル時の型チェックで形状エラーの多くを未然に防げます。
+  どこから始めるか：最小の前処理フロー（たとえば「センタークロップ + 正規化」）を 1 つ選び、`BNNSGraph.makeContext` で書き直して、元の Python 出力との数値一致を確認するところから始めます。
+
+- **何をするか**：Logic Pro / GarageBand 向けのカスタム Audio Unit を実装する際に、Swift で直接 DSP グラフを書く。
+  なぜ価値があるか：BNNS は CPU 向け、低レイテンシ、メモリとスレッドを制御可能という、まさにオーディオのリアルタイム処理に必要な特性を備えています。Bitcrusher のようなエフェクトを BNNSGraphBuilder ですべて表現できれば、PyTorch プロジェクトをメンテナンスする必要はありません。
+  どこから始めるか：既存の saturation / quantization / dry-wet ミックスの式を `*`、`tanh()`、`round()` といった builder 操作に翻訳し、`BITCRUSHER_PRECISION` はデフォルトで `Float16` に設定します。
+
+- **何をするか**：小規模モデルのシナリオで、CoreML パッケージ経由のパスを BNNSGraphBuilder で置き換える。
+  なぜ価値があるか：CoreML パッケージのパスは成熟していて堅牢ですが、Python のツールチェーンを必要とします。モデルが数層しかなく、パラメータがランタイム変数で変動する場合には、ファイルベースの API が逆に負担になります。Swift DSL ならランタイムで判明している値を使って静的形状のグラフを生成できるため、flexible shape よりも良い性能が得られます。
+  どこから始めるか：まずは `print(mean)` などで中間テンソルの形状をデバッグし、問題ないことが確認できたら `context.executeFunction(arguments:)` でエンドツーエンドの推論を通します。
+
+## 関連セッション
+
+- [Bring advanced speech-to-text to your app with SpeechAnalyzer](/articles/wwdc2025-277) — 新しい SpeechAnalyzer API による、エンドツーエンドの音声テキスト変換。
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — SwiftUI アプリで Foundation Models を使い、生成 AI 機能を構築する。
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — Foundation Models を深掘り：guided generation、tool use、ストリーミング出力。
+- [Explore large language models on Apple silicon with MLX](/articles/wwdc2025-298) — MLX を使って Apple silicon 上で大規模言語モデルを探求する。
+- [Get started with MLX for Apple silicon](/articles/wwdc2025-315) — MLX 入門：Apple silicon で高性能な機械学習を行う。

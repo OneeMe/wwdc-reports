@@ -1,0 +1,436 @@
+---
+title: "Sync files to the cloud with FileProvider on macOS"
+description: "find out how you can use the fileprovider framework to build a comprehensive cloud sync solution. we'll show you how to approach building a file provider extension, and explore how you can effortlessly integrate your extension with file system features such as safe save, disk space management, finder integration and more."
+date: "2021-06-06"
+tags: ["App Services", "System Services", "macOS"]
+thumbnail: "/images/sessions/2021/10182.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10182/"
+sessionId: "wwdc2021-10182"
+year: "2021"
+relatedSessions:
+  - title: "What's new in CloudKit"
+    code: "10086"
+    description: "Learn about CloudKit's updates in data sharing, encrypted fields, and consoles, which are suitable as backend references for cloud file metadata and account systems."
+  - title: "Automate CloudKit tests with cktool and declarative schema"
+    code: "10118"
+    description: "Learn to use cktool to automatically test CloudKit containers to help verify the status of the cloud synchronization server."
+  - title: "What's new in AppKit"
+    code: "10054"
+    description: "Learn about the new capabilities of macOS AppKit and add background on FileProvider integration with the Mac App interface."
+  - title: "Build Mail app extensions"
+    code: "10168"
+    description: "Learn the practical way to build system-wide App Extensions on macOS."
+  - title: "Faster and simpler notarization for Mac apps"
+    code: "10261"
+    description: "Understand the notarization process before Mac App distribution, suitable for preparing to release applications with FileProvider extension."
+---
+## Highlight
+
+> Apple has added cloud synchronization capabilities based on APFS dataless files to FileProvider in macOS Monterey, allowing cloud storage services to use user space extensions to access Finder, download files on demand, synchronize local and remote changes, and replace kernel extension solutions that rely on FUSE or KAUTH.
+
+## Core Content
+
+One of the hardest things for cloud disk apps to do on macOS is to make cloud files work like local files.
+
+Users want to see their cloud drives in the Finder sidebar. The directory must be able to be opened. The file must be able to be`cat`, TextEdit, Photoshop and other common processes to read. The system also needs to be able to safely reclaim local copies when disk space is low.
+
+In the past, many cloud storage services intercepted file system calls. Common solutions are FUSE or KAUTH. They are close to the kernel and can be downloaded on demand, but at a high cost: complex security boundaries, difficult debugging, and macOS is also deprecating kernel extensions.
+
+The alternative provided by Apple in this session is the File Provider framework on macOS. Developers implement an App Extension. The system is responsible for connecting it to the Finder and file system.
+
+This extension only handles three types of things: uploading, downloading, and telling the system what changes have occurred on the remote side. The system is responsible for local file change detection, Finder status display, safe storage, disk space recycling, and file coordination.
+
+### Start with an empty directory
+
+After the user logs in to the cloud disk account, the App creates a domain. domain represents a cloud file tree that users can access. The system puts it into the Finder sidebar and creates a root directory in the file system.
+
+This root directory initially has no real file contents. It is a dataless directory provided by APFS. The user can enter the directory and see the file name, but the content has not yet been downloaded to the machine.
+
+When a process reads a dataless file, the kernel pauses the read. System call extension`fetchContents`. extension downloads the file and returns a local URL. The system fills the content into the original file and resumes the suspended reading.
+
+### Remote changes are proactively notified by extension
+
+When someone creates, deletes or modifies a file in the cloud, the machine will not automatically know. The server can send push notifications to Mac. After the App receives the notification, it tells the system`.workingSet`There are changes.
+
+The system then calls the working set's enumerator. extension passed`syncAnchor`(Sync anchor) Returns only changes since the last time. The system then asynchronously updates user-visible files.
+
+The key here is APFS compare-and-swap. When the system updates local files, it avoids overwriting local modifications that have not yet been uploaded. It also works with file coordination and advisory locking to reduce conflicts with other apps.
+
+### Local changes are merged by the system and handed over to the extension
+
+When the user saves the file locally, the system detects the change and calls`modifyItem`、`createItem`or`deleteItem`. The extension does not need to handle every underlying write event.
+
+The system will combine low-level events into operations suitable for synchronization. For example, many apps use safe save: they write a temporary file first and then replace the original file. The system recognizes this pattern and maps the item identifier to the new file ID.
+
+If the file content changes, the system will give the clone of the changed file to the extension. This way, the extension uploads a consistent version even if the user continues editing.
+
+### Disk space management is handled by the system
+
+After the local file upload is complete, the system knows it can be downloaded again. When disk space is tight, the system can automatically evict such files and turn them into dataless files again.
+
+This process does not call extension. The system selects the smallest number of least recently used files to make room for recording videos or downloading system updates.
+
+Developers can still actively trigger or prevent eviction through other methods of FileProvider, but emergency disk reclamation is handled by the system.
+
+## Detailed Content
+
+### 1. Create domain and put the cloud disk into Finder
+
+([12:31](https://developer.apple.com/videos/play/wwdc2021/10182/?time=751)) The entry of FileProvider is domain. The speech said that domain usually corresponds to a login session on the cloud service. It has a unique identifier. After creation, add it through the manager, and an entry will appear in the Finder sidebar.
+
+```swift
+import FileProvider
+
+func addFruitBasketDomain() {
+    let domain = NSFileProviderDomain(
+        identifier: NSFileProviderDomainIdentifier("fruitbasket"),
+        displayName: "FruitBasket"
+    )
+
+    NSFileProviderManager.add(domain) { error in
+        if let error = error {
+            NSLog("Failed to add FileProvider domain: \(error)")
+            return
+        }
+
+        NSLog("FileProvider domain added")
+    }
+}
+```
+
+Key points:
+
+- `import FileProvider`Introducing the FileProvider framework.
+-`NSFileProviderDomain`Represents a synchronizable file tree.
+-`identifier`It is the unique identifier of the domain and is usually bound to the user login session.
+-`displayName`Is the name displayed to the user in the Finder sidebar.
+-`NSFileProviderManager.add`Register the domain to the system.
+- completion handler is used to receive registration failure errors.
+
+If the user logs out of the account, the domain can be removed. The talk mentioned that this is also useful during the development and testing phase, as you'll be cleaning out old Finder entries repeatedly.
+
+```swift
+import FileProvider
+
+func removeFruitBasketDomain(_ domain: NSFileProviderDomain) {
+    NSFileProviderManager.remove(domain) { error in
+        if let error = error {
+            NSLog("Failed to remove FileProvider domain: \(error)")
+            return
+        }
+
+        NSLog("FileProvider domain removed")
+    }
+}
+```
+
+Key points:
+
+- Parameters`domain`Is the FileProvider domain to be removed.
+-`NSFileProviderManager.remove`Tell the system to delete this entry.
+- Call it when the user logs out to prevent the Finder from displaying the cloud disk.
+- Call it during development to clear the test domain.
+
+### 2. Enumerate directories and let dataless files appear locally first
+
+([04:26](https://developer.apple.com/videos/play/wwdc2021/10182/?time=266)) When the user opens the directory, the kernel detects`readdir`Call and pause. The enumerator of the system call extension. The extension fetches metadata from the server and returns several items to the system.
+
+The talk emphasizes that directory enumerations are paginated. You can return part of the item first. The system continues the request from where it left off.
+
+```swift
+import FileProvider
+
+final class FruitEnumerator: NSObject, NSFileProviderEnumerator {
+    func enumerateItems(
+        for observer: NSFileProviderEnumerationObserver,
+        startingAt page: NSFileProviderPage
+    ) {
+        let items: [NSFileProviderItem] = loadMetadataPage(startingAt: page)
+        let nextPage: NSFileProviderPage? = nextPageAfter(page)
+
+        observer.didEnumerate(items)
+        observer.finishEnumerating(upTo: nextPage)
+    }
+}
+```
+
+Key points:
+
+- `FruitEnumerator`accomplish`NSFileProviderEnumerator`。
+- `enumerateItems`Called when the system needs the directory contents.
+-`observer`Is the extension reply system object.
+-`page`Indicates which page this enumeration starts from.
+-`loadMetadataPage`Represents reading metadata such as file name, size, version, etc. from the server.
+-`observer.didEnumerate(items)`Hand over the item on this page to the system.
+-`observer.finishEnumerating(upTo:)`End this page and tell the system if there is a next page.
+
+These items will become visible directory items in the Finder. The file contents have not been downloaded yet, so they are still dataless files.
+
+### 3. Download content when reading dataless files
+
+([03:36](https://developer.apple.com/videos/play/wwdc2021/10182/?time=216)) When the process reads the dataless file, the system calls`fetchContents`. The extension downloads the file contents to a location on disk, then uses a completion handler to pass the URL to the system.
+
+```swift
+import FileProvider
+
+final class FruitProvider: NSObject, NSFileProviderReplicatedExtension {
+    func fetchContents(
+        for itemIdentifier: NSFileProviderItemIdentifier,
+        version requestedVersion: NSFileProviderItemVersion?,
+        request: NSFileProviderRequest,
+        completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
+    ) -> Progress {
+        let progress = Progress(totalUnitCount: 100)
+
+        downloadFile(for: itemIdentifier, version: requestedVersion) { localURL, item, error in
+            if let error = error {
+                completionHandler(nil, nil, error)
+                return
+            }
+
+            completionHandler(localURL, item, nil)
+        }
+
+        return progress
+    }
+}
+```
+
+Key points:
+
+- `FruitProvider`accomplish`NSFileProviderReplicatedExtension`。
+- `itemIdentifier`It is a file that the system requires to download.
+-`requestedVersion`for`nil`, the documentation states downloading the latest version.
+-`request`Carry the information requested by the system this time.
+-`completionHandler`The first parameter is the downloaded local file URL.
+-`completionHandler`The second parameter is the final item status of the file.
+- return`Progress`, the system can display the download progress in Finder.
+
+In the demonstration, the speaker used Terminal to execute`cat`Read a dataless file. Xcode breakpoint stops at`fetchContents`hour,`cat`Also blocked. The cloud icon in Finder turns into a progress indicator. After the completion handler is called, the system replaces the downloaded content into a file visible to the user.`cat`Continue execution.
+
+([11:58](https://developer.apple.com/videos/play/wwdc2021/10182/?time=718)) The same file is executed for the second time`cat`, the breakpoint is no longer triggered. The file is already a normal local file, and extension will not be called when reading.
+
+### 4. Use working set to synchronize remote changes
+
+([05:27](https://developer.apple.com/videos/play/wwdc2021/10182/?time=327)) The entrance to remote changes is`.workingSet`. When there are changes on the server side, the App notifies the system. The system then requests the working set enumerator for the`syncAnchor`subsequent changes.
+
+```swift
+import FileProvider
+
+func notifyRemoteChanges() {
+    NSFileProviderManager.default.signalEnumerator(for: .workingSet) { error in
+        if let error = error {
+            NSLog("Failed to signal working set: \(error)")
+            return
+        }
+
+        NSLog("Working set signaled")
+    }
+}
+```
+
+Key points:
+
+- `.workingSet`is the special enumerator mentioned in the speech.
+-`signalEnumerator(for:)`Reminder system: There are content changes at the specified location.
+- The completion handler only indicates that the signal operation is completed, not that the system has finished pulling in the changes.
+- This method can be called after the remote push notification reaches the Mac.
+
+The working set enumerator needs to implement the current synchronization anchor point and the enumeration of changes starting from a certain anchor point.
+
+```swift
+import FileProvider
+
+final class WorkingSetEnumerator: NSObject, NSFileProviderEnumerator {
+    func currentSyncAnchor(
+        completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void
+    ) {
+        completionHandler(loadCurrentServerChangeToken())
+    }
+
+    func enumerateChanges(
+        for observer: NSFileProviderChangeObserver,
+        from syncAnchor: NSFileProviderSyncAnchor
+    ) {
+        let changes = loadServerChanges(after: syncAnchor)
+
+        observer.didUpdate(changes.updatedItems)
+        observer.didDeleteItems(withIdentifiers: changes.deletedItemIdentifiers)
+        observer.finishEnumeratingChanges(upTo: changes.newSyncAnchor, moreComing: false)
+    }
+}
+```
+
+Key points:
+
+- `currentSyncAnchor`Returns the current server-side change cursor.
+-`syncAnchor`Defined by extension, the system is only responsible for saving the last enumerated location.
+-`enumerateChanges`Returns the change after the specified anchor point.
+-`observer.didUpdate`Return the newly added or modified item to the system.
+-`observer.didDeleteItems`Return the deleted item identifier to the system.
+-`finishEnumeratingChanges`Return the new anchor point for next use by the system.
+
+The system will then asynchronously update user-visible files and use APFS compare-and-swap to avoid losing local changes, the presentation said.
+
+### 5. Upload local creation, modification and deletion
+
+([06:50](https://developer.apple.com/videos/play/wwdc2021/10182/?time=410)) Local modifications go in the opposite direction. The system detects local item changes and then calls the extension's`modifyItem`. The parameters contain the exact changed fields.
+
+([14:37](https://developer.apple.com/videos/play/wwdc2021/10182/?time=877)) The speech suggested finally implementing sync up and showing create flow. The system hands the new item, focus field, and content URL to the extension. The extension is uploaded to the server, and then the completion handler is used to return the confirmed item from the remote end.
+
+```swift
+import FileProvider
+
+final class UploadingProvider: NSObject, NSFileProviderReplicatedExtension {
+    func createItem(
+        basedOn itemTemplate: NSFileProviderItem,
+        fields: NSFileProviderItemFields,
+        contents url: URL?,
+        options: NSFileProviderCreateItemOptions,
+        request: NSFileProviderRequest,
+        completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
+    ) -> Progress {
+        let progress = Progress(totalUnitCount: 100)
+
+        uploadNewItem(itemTemplate, changedFields: fields, contents: url) { remoteItem, remainingFields, error in
+            if let error = error {
+                completionHandler(nil, fields, false, error)
+                return
+            }
+
+            completionHandler(remoteItem, remainingFields, false, nil)
+        }
+
+        return progress
+    }
+}
+```
+
+Key points:
+
+- `itemTemplate`It is an item that the system requires to create.
+-`fields`Describes which fields need processing, such as content or extended attributes.
+-`url`Is the file content location; folders and symbolic links may have no content.
+-`uploadNewItem`Represents uploading local new items to the server.
+-`remoteItem`It is the final item status after being accepted by the server.
+- The completion handler confirms that the system has handed this change to the extension.
+
+The same goes for local modifications. system call`modifyItem`, and provide a file clone when the content changes, so that the upload process can get a stable version.
+
+```swift
+import FileProvider
+
+final class ModifyingProvider: NSObject, NSFileProviderReplicatedExtension {
+    func modifyItem(
+        _ item: NSFileProviderItem,
+        baseVersion version: NSFileProviderItemVersion,
+        changedFields: NSFileProviderItemFields,
+        contents newContents: URL?,
+        options: NSFileProviderModifyItemOptions,
+        request: NSFileProviderRequest,
+        completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
+    ) -> Progress {
+        let progress = Progress(totalUnitCount: 100)
+
+        uploadModifiedItem(item, baseVersion: version, changedFields: changedFields, contents: newContents) { finalItem, remainingFields, error in
+            if let error = error {
+                completionHandler(nil, changedFields, false, error)
+                return
+            }
+
+            completionHandler(finalItem, remainingFields, false, nil)
+        }
+
+        return progress
+    }
+}
+```
+
+Key points:
+
+- `item`Is the locally modified item.
+-`version`This is the version this modification is based on.
+-`changedFields`Tell the extension which fields have changed.
+-`newContents`Is the stable content URL provided by the system.
+-`finalItem`It is the final state after the server-side processing is completed.
+- If the server detects a conflict, the local file can reflect the cloud truth through the final item status.
+
+### 6. Finder integration: icon decoration, menu and preflight reminder
+
+([15:59](https://developer.apple.com/videos/play/wwdc2021/10182/?time=959)) FileProvider also provides optional system integration points.
+
+Icon decoration can add badges to Finder items, emboss folders, or display sharing status. Developers provide custom artwork through the UTType declared in the app.
+
+```xml
+<key>NSExtensionFileProviderDecorations</key>
+<array>
+    <dict>
+        <key>Identifier</key>
+        <string>com.example.fruitbasket.shared</string>
+        <key>BadgeImageType</key>
+        <string>com.example.fruitbasket.shared-badge</string>
+        <key>Category</key>
+        <string>Badge</string>
+    </dict>
+</array>
+```
+
+Key points:
+
+- `NSExtensionFileProviderDecorations`in extension`Info.plist`Decoration in the statement.
+-`Identifier`It is a decorative logo.
+-`BadgeImageType`Points to the UTType artwork declared in the App.
+-`Category`Indicates that this type of decoration is used for badges.
+
+Context menu actions allow users to perform custom actions in the Finder right-click menu. The speech mentioned that there are two types of actions, with and without UI. The applicable files are provided by`Info.plist`in`NSPredicate`Decide.
+
+```xml
+<key>NSExtensionFileProviderActions</key>
+<array>
+    <dict>
+        <key>Identifier</key>
+        <string>com.example.fruitbasket.share</string>
+        <key>ActivationRule</key>
+        <string>TRUEPREDICATE</string>
+    </dict>
+</array>
+```
+
+Key points:
+
+- `NSExtensionFileProviderActions`Declare the Finder context menu action.
+-`Identifier`Distinguish between different actions.
+-`ActivationRule`Use predicate to control which files display this action.
+- Suitable for operations such as "share link", "view cloud version" and "open in web page".
+
+Preflight alerts are used to pop up warnings before users perform actions that may have side effects. Lecture notes, reminder UI and trigger conditions are also passed`Info.plist`configuration.
+
+## Core Takeaways
+
+1. **What to do**: Create a native Finder entry for the team cloud disk.
+   **Why it’s worth doing**: FileProvider domain can map each login account to a Finder sidebar entry, so users don’t have to enter your app to find files.
+   **How ​​to start**: Create first`NSFileProviderDomain`,use`NSFileProviderManager.add`Register; then implement directory enumerator so that the root directory can list server folders.
+
+2. **What to do**: Make a "download only when opened" material library.
+   **Why it’s worth doing**: APFS dataless files allow Finder to display the complete directory structure first, and then trigger it when the content is read.`fetchContents`, which can save local disk.
+   **How ​​to start**: Let enumerator return remote material metadata; in`fetchContents(for:version:request:completionHandler:)`Download the original image or video to a local URL.
+
+3. **What to do**: Add a Finder sharing status badge to the design file.
+   **Why it’s worth doing**: Icon decoration can display the file sharing status directly in the Finder, without the user having to open the webpage to view permissions.
+   **How ​​to start**: In`Info.plist`Declare FileProvider decorations and use item metadata to determine which files should share the badge.
+
+4. **What to do**: Implement Finder right-click "Copy Shared Link".
+   **Why it’s worth doing**: Context menu actions can place high-frequency operations of cloud services next to files, reducing the need for users to switch between Finder and web pages.
+   **How ​​to start**: In`Info.plist`Declare the FileProvider action, use predicate to limit ordinary files or folders, and then request the server to generate a link in the action handler.
+
+5. **What it does**: Secure local editing synchronization for large file uploads.
+   **Why it’s worth doing**: The system provides file clone when the content changes, and the extension can upload stable versions without being interrupted by subsequent editing by users.
+   **How ​​to get started**: Implementation`modifyItem(_:baseVersion:changedFields:contents:options:request:completionHandler:)`, only in`changedFields`Read when the content changes`contents`URL and upload it.
+
+## Related Sessions
+
+- [What's new in CloudKit](/articles/wwdc2021-10086) — CloudKit serves as a backend reference for cloud metadata, permissions, and user data.
+- [Automate CloudKit tests with cktool and declarative schema](/articles/wwdc2021-10118) — Use the command line to test cloud schema and data status, suitable for synchronizing service development processes.
+- [What's new in AppKit](/articles/wwdc2021-10054) — Learn about updates to the system interface that bring macOS Apps closer to the Finder experience.
+- [Build Mail app extensions](/articles/wwdc2021-10168) — Learn how to build macOS App Extension and system integration ideas.
+- [Faster and simpler notarization for Mac apps](/articles/wwdc2021-10261) — Mac Apps with FileProvider extension need to complete notarization before publishing.

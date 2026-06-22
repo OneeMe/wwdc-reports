@@ -1,0 +1,210 @@
+---
+title: "Migrate your app to Swift 6"
+description: "experience swift 6 migration in action as we update an existing sample app. learn how to migrate incrementally, module by module, and how the compiler helps you identify code that"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10169.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10169/"
+sessionId: "wwdc2024-10169"
+year: "2024"
+relatedSessions:
+  - title: "A Swift Tour: Explore Swift's features and design"
+    code: "10184"
+    description: "learn the essential features and design philosophy of the swift programming lang"
+  - title: "Demystify explicitly built modules"
+    code: "10171"
+    description: "explore how builds are changing in xcode 16 with explicitly built modules. disco"
+  - title: "Consume noncopyable types in Swift"
+    code: "10170"
+    description: "discover how noncopyable types let you express unique ownership in swift, and ho"
+  - title: "Explore Swift performance"
+    code: "10155"
+    description: "learn how swift compiles your code, and explore how different patterns affect per"
+---
+
+## ハイライト
+
+> Swift 6 言語モードはコンパイル時にデータ分離を強制し、actor 間で可変状態を共有することによるデータ競合を防ぎます。
+
+---
+
+## 主要内容
+
+@MainActor、async/await、Sendable を使ったアプリ——一見「安全」に見えます。しかしコンパイラは、class インスタンスを main actor から別の actor に渡すことを実際には阻止していません。2 つの actor が同じ参照型を同時に保持すると、データ競合が起き、クラッシュからユーザーデータ破損まで起こり得ます。
+
+Swift 6 言語モードがこれを解決します。完全なデータ分離の強制を導入し、コンパイラがコンパイル時にすべての安全でない actor 間共有状態を阻止します。新機能追加やリファクタリング時、コンパイラが代わりにチェックし、新しい並行バグが静かに混入することを防ぎます。
+
+セッションは CoffeeTracker App を例に完全な移行フローをデモします。この App は既に Swift concurrency に移行済みでしたが、Swift 6 の Complete Concurrency Checking を有効にすると十数個の警告が依然として現れました。移行戦略は target ごとに段階的に進めることです。各 target で Complete Concurrency Checking を先に有効化（警告は出るがコンパイルは阻止しない）、1 件ずつ解決し、その後 Swift 6 Language Mode を有効化（警告をエラーに昇格し、安全状態を固定）。セッションは繰り返し 1 つの原則を強調します。大規模リファクタリングと Swift 6 有効化を同時に行わない——別々に進める。
+
+---
+
+## 詳細
+
+### 移行ステップ: target ごとに進める
+
+各 target の移行は固定フローに従います（[07:35](https://developer.apple.com/videos/play/wwdc2024/10169/?time=455)）:
+
+1. Complete Concurrency Checking を有効化——プロジェクトは Swift 5 モードのままだが、コンパイラは Swift 6 で安全でない可能性のあるすべてのコードに警告
+2. すべての警告を 1 件ずつ解決
+3. Swift 6 Language Mode を有効化——変更を固定し、後続コードが安全でない状態に戻るのを防止
+4. 次の target に移り、上記を繰り返す
+
+Ben は App extension / UI 層から移行を始めることを推奨し、低レベルフレームワークではなく。理由は 2 つ: UI 層の大部分は main thread 上で動作し、警告が少ない。上位層の移行後、未移行フレームワークとの相互作用問題が表面化し、`@preconcurrency` などのツールで対処できる。
+
+### グローバル変数: var を let に変更が最も一般的なクイックフィックス
+
+Complete Checking 有効化後、最も一般的な警告はグローバル `var` です。グローバル変数は共有可変状態で、任意のスレッドが読み書きでき、本質的にデータ競合リスクがあります。コンパイラは 3 つの修正方法を提供（[13:38](https://developer.apple.com/videos/play/wwdc2024/10169/?time=818)）:
+
+```swift
+// オプション 1：var を let に変更。Logger は Sendable 型で、let 宣言後は不変なのでスレッドセーフ
+let logger = Logger(
+    subsystem:
+        "com.example.apple-samplecode.Coffee-Tracker.watchkitapp.watchkitextension.ContentView",
+    category: "Root View")
+
+// オプション 2：@MainActor で隔離。すべてのアクセスは main actor 上で行う必要がある
+@MainActor var logger = Logger(
+    subsystem:
+        "com.example.apple-samplecode.Coffee-Tracker.watchkitapp.watchkitextension.ContentView",
+    category: "Root View")
+
+// オプション 3：nonisolated(unsafe)。チェックを回避し、安全性は自分で保証する
+nonisolated(unsafe) var logger = Logger(
+    subsystem:
+        "com.example.apple-samplecode.Coffee-Tracker.watchkitapp.watchkitextension.ContentView",
+    category: "Root View")
+```
+
+キーポイント:
+- `let` が第一選択——Sendable 型を `let` で宣言すれば、共有可変状態の問題は存在しない
+- `@MainActor` は可変が必要だが main actor からのみアクセスするグローバル変数向け
+- `nonisolated(unsafe)` は最終手段——安全責任は自分に移り、コンパイラはチェックしない。後で正しいアーキテクチャに置き換えるべき
+
+Ben は特に、Swift のグローバル変数は遅延初期化かつ原子作成であることを指摘（[16:29](https://developer.apple.com/videos/play/wwdc2024/10169/?time=989)）。2 スレッドが同時に初回アクセスして 2 インスタンスを作成することはない。
+
+### actor 間データ送信: 型を Sendable に準拠させる
+
+main actor 上の `CoffeeData` が別 actor 上の `CoffeeDataStore` に `[Drink]` 配列を送ると、コンパイラは警告: `self.currentDrinks` の送信がデータ競合を引き起こす可能性（[30:38](https://developer.apple.com/videos/play/wwdc2024/10169/?time=1838)）。解決方法は `Drink` を `Sendable` に準拠させること（[33:29](https://developer.apple.com/videos/play/wwdc2024/10169/?time=2009)）:
+
+```swift
+public struct Drink: Hashable, Codable, Sendable {
+    public let mgCaffeine: Double
+    public let date: Date
+    public let uuid: UUID
+    public let type: DrinkType?
+    // ...
+}
+```
+
+キーポイント:
+- `Drink` は struct で、すべてのプロパティが `let` の値型——Sendable セマンティクスに自然に適合
+- `internal` 型は Swift が自動的に Sendable を推論するが、`public` 型は明示的宣言が必要——Sendable は呼び出し元への約束であり、将来内部可変状態が必要になる可能性がある
+- `Drink` に `Sendable` を追加する 1 行の変更で 3 つの警告が解消——この「1 か所の変更で大量警告を消す」根本原因を見つけることが効率的移行の鍵
+
+`Sendable` 追加後、`DrinkType` も同期してマークが必要（[35:04](https://developer.apple.com/videos/play/wwdc2024/10169/?time=2104)）:
+
+```swift
+public enum DrinkType: Int, CaseIterable, Identifiable, Codable, Sendable {
+  // ...
+}
+```
+
+`DrinkType` が Sendable に準拠できない Objective-C 型の場合、そのプロパティに `nonisolated(unsafe)` を付けて過渡的対応可能——ただし安全責任は自分が負う。
+
+### 未移行フレームワークの protocol 分離問題の処理
+
+`@MainActor` 型が actor 分離マークのない protocol に準拠する必要があると、コンパイラはエラー: Main actor-isolated メソッドが nonisolated の protocol requirement を満たせない（[9:38](https://developer.apple.com/videos/play/wwdc2024/10169/?time=578)）。セッションは 2 つの解決方法を示します:
+
+方法 1——conformance に `@preconcurrency` を付与（[25:21](https://developer.apple.com/videos/play/wwdc2024/10169/?time=1521)）:
+
+```swift
+extension Recaffeinater: @preconcurrency CaffeineThresholdDelegate {
+    public func caffeineLevel(at level: Double) {
+        if level < minimumCaffeine {
+            // TODO: alert user to drink more coffee!
+        }
+    }
+}
+```
+
+キーポイント:
+- `@preconcurrency` はメソッド本体を `MainActor.assumeIsolated` で包むのと同等——「このコールバックは現在の actor 上で実行されると分かっている」とコンパイラに伝える
+- ランタイムでコールバックが main actor 外で実行されると、プログラムは trap（追跡困難なデータ競合ではなく）
+- 下位フレームワークも Swift 6 に移行し protocol に `@MainActor` を追加すると、`@preconcurrency` は「不要になった」警告を出し、削除するだけ（[26:50](https://developer.apple.com/videos/play/wwdc2024/10169/?time=1610)）
+
+方法 2——手動で `nonisolated` + `MainActor.assumeIsolated`（[24:15](https://developer.apple.com/videos/play/wwdc2024/10169/?time=1455)）:
+
+```swift
+nonisolated public func caffeineLevel(at level: Double) {
+    MainActor.assumeIsolated {
+        if level < minimumCaffeine {
+            // TODO: alert user to drink more coffee!
+        }
+    }
+}
+```
+
+`@preconcurrency` の手動展開版。より細かい制御が必要なシーン向け。
+
+### CoreLocation delegate コールバックの分離処理
+
+CoreLocation の `CLLocationManagerDelegate` コールバックスレッドは `CLLocationManager` を作成したスレッドに依存——コンパイラが静的チェックできない動的属性。セッションの方法は delegate クラス全体を `@MainActor` に置き、manager を main thread で作成してコールバックも main thread に（[39:32](https://developer.apple.com/videos/play/wwdc2024/10169/?time=2372)）:
+
+```swift
+@MainActor
+class CoffeeLocationDelegate: NSObject, CLLocationManagerDelegate {
+  var location: CLLocation?
+  var manager: CLLocationManager!
+
+  var latitude: CLLocationDegrees? { location?.coordinate.latitude }
+  var longitude: CLLocationDegrees? { location?.coordinate.longitude }
+
+  override init () {
+    super.init()
+    manager = CLLocationManager()
+    manager.delegate = self
+    manager.startUpdatingLocation()
+  }
+
+  nonisolated func locationManager (
+    _ manager: CLLocationManager,
+    didUpdateLocations locations: [CLLocation]
+  ) {
+    MainActor.assumeIsolated { self.location = locations.last }
+  }
+}
+```
+
+キーポイント:
+- クラスに `@MainActor` を付けると、`CLLocationManager` は main thread で作成され、CoreLocation はコールバックも main thread にディスパッチ
+- `locationManager(_:didUpdateLocations:)` は protocol requirement に actor 分離がないため `nonisolated` とマーク
+- 内部で `MainActor.assumeIsolated` を使い main actor 上のプロパティにアクセス。ランタイムで main actor 外なら trap
+
+---
+
+## 重要ポイント
+
+- **やること**: 先に Complete Concurrency Checking を有効化し、警告を 1 件ずつ修正。手動監査ではなく。
+  価値がある理由: コンパイラが不安全なコードを正確に指摘。人手で 1 行ずつ確認するよりはるかに効率的。有効化後もプロジェクトは正常にコンパイル・実行可能で、納品を阻害しない。
+  始め方: Xcode で target を選択 -> Build Settings -> "Swift Concurrency Checking" を検索 -> Complete に設定。
+
+- **やること**: グローバル `var` を `let` に変更を優先。
+  価値がある理由: 移行中で最も数が多く、修正が最も簡単な警告タイプ。セッションで CoffeeKit の 11 警告中 7 つがグローバル `var`——`let` 1 行置換で解消。
+  始め方: Complete Checking 有効化後、警告リストを順に確認し、再代入されないグローバル `var` を `let` に変更。
+
+- **やること**: actor 間で渡す public 値型に `Sendable` を追加。
+  価値がある理由: 1 つの `Sendable` 注釈で複数の "Sending ... risks causing data races" 警告を消せることが多い。セッションで `Drink` に `Sendable` を追加する 1 行で 3 警告解消。
+  始め方: "Sending ... risks causing data races" 警告に関与する型を特定。struct/enum で全プロパティが値型または Sendable 型なら、直接 `Sendable` 準拠を追加。
+
+- **やること**: 未移行フレームワークの protocol conformance に `@preconcurrency` を使用。
+  価値がある理由: コールバックが特定 actor 上で実行されると確信できるが protocol にまだ分離マークがない場合、`@preconcurrency` が最も簡潔な宣言方式。下位フレームワーク移行後、コンパイラが自動的に削除を促す。
+  始め方: "Main actor-isolated instance method cannot satisfy nonisolated protocol requirement" 警告に遭遇したら、conformance 宣言に `@preconcurrency` を追加。
+
+---
+
+## 関連セッション
+
+- [A Swift Tour: Explore Swift's features and design](/articles/wwdc2024-10184) — Swift 言語のコア機能と設計哲学の概観
+- [Demystify explicitly built modules](/articles/wwdc2024-10171) — Xcode 16 の明示的モジュールビルド機構の変化
+- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — Swift noncopyable 型の用法と並行安全性
+- [Explore Swift performance](/articles/wwdc2024-10155) — Swift コンパイル機構と異なるコードパターンが性能に与える影響

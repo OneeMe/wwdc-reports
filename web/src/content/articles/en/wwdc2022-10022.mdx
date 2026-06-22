@@ -1,0 +1,255 @@
+---
+title: "Create camera extensions with Core Media IO"
+description: "discover how you can use core media io to easily create macos system extensions for software cameras, hardware cameras, and creative cameras. we'll introduce you to our modern replacement for legacy dal plug-ins — these extensions are secure, fast, and fully-compatible with any app that uses a camera input. we'll take you through the core media io apis and share how they can support camera manufacturers, video conferencing apps with special effects features, creative app ideas, and more."
+date: 2026-06-10
+tags: ["WWDC 2022", "Photos & Camera", "macOS"]
+thumbnail: "/images/sessions/2022/10022.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10022/"
+sessionId: "wwdc2022-10022"
+year: "2022"
+relatedSessions:
+  - title: "Capture machine-readable codes and text with VisionKit"
+    code: "10025"
+    description: "meet the data scanner in visionkit: this framework combines avcapture and vision to enable live capture of machine-readable codes and text through a simple swift api."
+  - title: "Add Live Text interaction to your app"
+    code: "10026"
+    description: "learn how you can bring live text support for still photos or paused video frames to your app."
+  - title: "What's new in the Photos picker"
+    code: "10023"
+    description: "phpicker provides simple and secure integration between your app and the system photos library."
+  - title: "Create parametric 3D room scans with RoomPlan"
+    code: "10127"
+    description: "roomplan can help your app quickly create simplified parametric 3d scans of a room."
+---
+
+## Highlight
+
+> macOS 12.3 replaces DAL plug-ins with SystemExtensions-based Camera Extensions, letting third-party software cameras, hardware cameras, and creative cameras run as sandboxed daemons usable by all camera apps including FaceTime.
+
+---
+
+## Core Content
+
+Building a third-party camera on macOS often used DAL plug-ins. They have existed since macOS 10.7 and can drive hardware cameras or publish virtual cameras.
+
+The problem is the security boundary. DAL plug-ins load third-party code directly into the app process. A buggy plug-in can crash the app; a malicious plug-in exposes the app to attack. FaceTime, QuickTime Player, and Photo Booth do not support them, and many third-party camera apps load them only after disabling library validation or System Integrity Protection ([00:56](https://developer.apple.com/videos/play/wwdc2022/10022/?time=56)).
+
+Camera Extensions are a new architecture introduced in macOS 12.3. Extension code runs in a separate sandboxed daemon process; buffers are validated before delivery to apps; the framework handles IPC between extension and app and distributes buffers to multiple clients ([01:50](https://developer.apple.com/videos/play/wwdc2022/10022/?time=110)).
+
+For users, it still looks like a normal camera. Camera Extensions expose through existing AVFoundation capture APIs, appear like built-in cameras in camera apps, and can appear in FaceTime's camera picker ([03:36](https://developer.apple.com/videos/play/wwdc2022/10022/?time=216)).
+
+The session divides usage into three categories.
+
+The first is pure software cameras. They can generate color bars, test patterns, programmatic video at different frame rates and resolutions, or play prerendered content to test A/V sync ([04:02](https://developer.apple.com/videos/play/wwdc2022/10022/?time=242)).
+
+The second is hardware camera drivers. They can work with DriverKit Extensions to access hardware, or use legacy IOVideoFamily kexts when truly needed. For non-standard USB Video Class cameras, extensions can override Apple's default UVC extension by declaring specific vendor and product IDs ([04:30](https://developer.apple.com/videos/play/wwdc2022/10022/?time=270)).
+
+The third is creative cameras. An extension reads another physical camera's feed, applies filters, composites multiple feeds, and publishes the result as a new camera stream. The CIFilterCam demo follows this pattern: a configuration app selects source camera and Core Image filter; FaceTime and Photo Booth both see the updated virtual camera feed ([06:05](https://developer.apple.com/videos/play/wwdc2022/10022/?time=365)).
+
+## Detailed Content
+
+### 1. Distribution model: extensions ship with the app
+
+Camera Extensions build on the SystemExtensions framework. The extension executable lives in the app bundle. The app calls SystemExtensions to install, upgrade, or downgrade the extension; deleting the app uninstalls the Camera Extension for all users via SystemExtensions ([07:29](https://developer.apple.com/videos/play/wwdc2022/10022/?time=449)).
+
+This model removes separate installers and supports App Store distribution.
+
+```text
+Conceptual flow: install button triggers system extension activation request
+1. Locate the Camera Extension embedded in the app bundle
+2. Create OSSystemExtensionRequest to activate the extension
+3. Set OSSystemExtensionRequestDelegate to record installation status
+4. Submit the request to the SystemExtensions framework
+```
+
+Key points:
+
+- `OSSystemExtensionRequest` corresponds to activation/deactivation requests created by install and uninstall buttons in the session.
+- The request targets the Camera Extension embedded in the app bundle.
+- `OSSystemExtensionRequestDelegate` receives installation status; the session example logs results in delegate methods.
+- This is a conceptual flow; specific identifiers and error handling depend on your target configuration.
+
+One development pitfall: system extensions can only be installed by apps located in `/Applications`. In the session demo, installation failed when running the app directly and succeeded after moving it to `/Applications` ([12:57](https://developer.apple.com/videos/play/wwdc2022/10022/?time=777)).
+
+Info.plist also has critical configuration. The Camera Extension Info.plist identifies itself via `CMIOExtensionMachServiceName`; CoreMedia IO's registerassistant will not launch extensions missing this key. Extension entitlements must enable App Sandbox, and the App Group prefix must match the Mach service name to pass validation ([11:01](https://developer.apple.com/videos/play/wwdc2022/10022/?time=661)).
+
+```text
+Conceptual configuration checklist:
+- Info.plist: CMIOExtensionMachServiceName
+- Info.plist: system extension usage description
+- Entitlements: App Sandbox = YES
+- Entitlements: App Group prefix matches MachServiceName
+```
+
+Key points:
+
+- `CMIOExtensionMachServiceName` is the entry point registerassistant uses to find and launch the extension.
+- The usage description appears in the system extension authorization flow.
+- App Sandbox is required for the extension to run.
+- Mismatched App Group naming causes extension validation to fail.
+
+### 2. Provider, Device, Stream: three objects make one camera
+
+The main CoreMedia IO Extension classes are Provider, Device, and Stream. Provider owns Device; Device owns Stream; all three can have properties ([22:04](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1324)).
+
+When creating them, you supply `ProviderSource`, `DeviceSource`, and `StreamSource` respectively. Source objects implement protocols; the framework handles boilerplate.
+
+```text
+Conceptual flow: Provider is the service entry point
+1. Implement a source object conforming to CMIOExtensionProviderSource
+2. Create CMIOExtensionProvider with this source
+3. Call Provider's startService, passing the provider instance
+4. Publish devices and streams under the provider as needed
+```
+
+Key points:
+
+- `CMIOExtensionProviderSource` is one of the source protocols you implement for extension behavior.
+- `CMIOExtensionProvider` is the extension's underlying object managing device publication.
+- `startService` is the service launch entry; the session explicitly says to pass the provider to it.
+- Real projects also create device source and stream source and add streams to devices.
+
+Provider can add and remove devices on demand, for example for hot-plug events. It also receives client process connection notifications so you can decide whether to publish devices to certain apps ([22:35](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1355)).
+
+Device manages streams. It has a localized name, UUID device ID, and optional legacy ID. `localizedName` flows through to AVFoundation as `AVCaptureDevice.localizedName`; device ID becomes `AVCaptureDevice.uniqueIdentifier`. When migrating an old DAL plug-in and preserving published identifiers, provide a legacy device ID ([23:40](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1420)).
+
+```text
+Conceptual configuration: Device layer needs stable name and identity
+- localizedName: name shown in camera picker
+- deviceID: UUID device identifier
+- legacyDeviceID: preserve old uniqueIdentifier when migrating DAL plug-in
+```
+
+Key points:
+
+- `localizedName` affects the name users see in the camera picker.
+- `deviceID` is the stable device identifier in the new architecture.
+- `legacyDeviceID` is only for migrating old DAL plug-ins when compatibility is required.
+- AVFoundation only consumes the first input stream; multiple input streams are not all consumed.
+
+Stream is the object that actually sends sample buffers. It publishes `CMIOExtensionStreamFormat`, defines valid frame rates, configures active format, drives buffer timing with standard or custom clock, and delivers sample buffers to clients ([25:44](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1544)).
+
+```text
+Conceptual configuration: Stream layer describes format, frame rate, and timing
+- stream formats: available video formats published to clients
+- active format index: currently used video format
+- frame duration: maximum frame rate
+- max frame duration: minimum frame rate
+- clock: time source driving each sample buffer
+```
+
+Key points:
+
+- `CMIOExtensionStreamFormat` maps to `AVCaptureDeviceFormat`.
+- Clients can read/write active format index to switch current format.
+- Frame duration corresponds to maximum frame rate; max frame duration to minimum frame rate.
+- Sample buffer timing is driven by standard or custom clock.
+
+### 3. Creative cameras: configuration app controls extension via properties
+
+The CIFilterCam demo shows how creative cameras interact. The configuration app has source camera selection, filter selection, bypass button, and live preview backed by `AVCaptureVideoPreviewLayer` ([15:02](https://developer.apple.com/videos/play/wwdc2022/10022/?time=902)).
+
+The useful part is in the extension. When FaceTime and Photo Booth both select CIFilterCam, changing the filter in the configuration app updates both apps; changing the source camera updates all apps using CIFilterCam ([16:29](https://developer.apple.com/videos/play/wwdc2022/10022/?time=989)).
+
+```text
+Conceptual flow: configuration app controls creative camera
+1. User selects source camera in configuration app
+2. User selects Core Image filter
+3. Configuration app writes extension properties via CoreMedia IO C property interface
+4. Extension processes subsequent buffers with new properties
+5. All apps using CIFilterCam see changes synchronously
+```
+
+Key points:
+
+- Source camera selection corresponds to "use this camera" configuration changes in the demo.
+- Filter selection corresponds to "use this other filter" configuration changes.
+- This is a conceptual flow; the session does not provide copy-paste property write code.
+- AVFoundation does not support custom properties; configuration apps must use CoreMedia IO C API.
+
+CMIOExtension does not replace DAL controls. Auto exposure, brightness, sharpening, pan/zoom, and similar capabilities should be modeled as properties. Custom properties can bridge to the legacy CoreMedia IO C property interface: names start with `4cc_`, followed by selector, scope, and element encoded with underscores ([26:46](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1606)).
+
+```text
+Conceptual example: custom property naming
+4cc_cust_glob_0000
+```
+
+Key points:
+
+- `4cc_` indicates a custom name bridging to the old C property address.
+- `cust` is a four-character selector; the session uses it as an example for custom.
+- `glob` means global scope; scope can also be input or output.
+- `0000` is the element; main element is usually 0.
+
+If a creative camera needs to access another hardware camera inside the extension, macOS Ventura is required. Add `com.apple.security.device.camera` to extension entitlements, provide `NSCameraUsageDescription` in Info.plist, and users receive an authorization prompt ([17:31](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1051)).
+
+### 4. Security boundary: daemon, registerassistantservice, and TCC
+
+Camera Extension code does not enter the app process. Apple's registerassistantservice identifies extensions via `CMIOExtensionMachServiceName` and launches them as role user `_cmiodalassistants`. sandboxd applies a camera-specific sandbox profile ([19:25](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1165)).
+
+This sandbox profile allows common hardware communication: USB, Bluetooth, Wi-Fi client mode, FireWire, and read/write to the extension's own container and tmp. It is stricter than a normal app: no fork, exec, or posix spawn child processes; no window server access; no connection to the foreground user account; no registering Mach services in the global namespace ([19:59](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1199)).
+
+```text
+Camera Extension runtime boundary:
+App process
+  -> CoreMedia IO / AVFoundation compatibility layers
+  -> registerassistantservice
+  -> sandboxed camera extension daemon
+```
+
+Key points:
+
+- Apps still see cameras through AVFoundation or CoreMedia IO.
+- `registerassistantservice` is the proxy between app and extension.
+- The extension daemon is sandbox-isolated and cannot load third-party code into apps.
+- Buffers are validated and permission-controlled before delivery to apps.
+
+`registerassistantservice` also handles transparency, consent, and control policy. When an app uses a camera for the first time, the system asks the user; consent applies to built-in and third-party cameras. If the user denies authorization, the proxy blocks buffers to that app. It also handles attribution so the system knows which app uses which camera and attributes daemon power consumption to the using app ([21:04](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1264)).
+
+### 5. Output device: CoreMedia IO can also consume video
+
+A lesser-known DAL plug-in capability is publishing output devices. Unlike cameras, they do not provide video to apps—they consume video from apps in real time. Typical scenarios are print-to-tape or sending live preview to professional decks with SDI input ([28:44](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1724)).
+
+There is no AVFoundation equivalent for output devices. Clients must use CoreMedia IO C API directly to send frames to output devices ([29:25](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1765)).
+
+```text
+Conceptual flow: sink stream consumes video
+1. Set stream direction to sink
+2. Client places sample buffers in a simple queue
+3. Extension consumes buffers via consumeSampleBuffer
+4. After consumption, call notifyScheduledOutputChanged to notify client
+```
+
+Key points:
+
+- `source` streams produce data like cameras.
+- `sink` streams consume data like output devices.
+- `consumeSampleBuffer` is the extension-side consumption call mentioned in the session.
+- `notifyScheduledOutputChanged` notifies the client of queue state changes.
+
+The session closes with a migration signal: macOS 12.3 deprecated DAL plug-ins with build warnings. Apple plans to fully disable DAL plug-ins in the major release after macOS Ventura. Teams still maintaining DAL plug-ins should begin migrating to Camera Extensions ([30:28](https://developer.apple.com/videos/play/wwdc2022/10022/?time=1828)).
+
+## Core Takeaways
+
+- **What to do**: Build a meeting-specific virtual camera.
+  **Why it is worth doing**: Camera Extensions appear in all camera apps including FaceTime; change a filter once in the configuration app and all clients see the same result.
+  **How to start**: Use the software camera template to establish Provider, Device, and Stream, process source camera buffers with Core Image; write filter names via CoreMedia IO custom properties from the configuration app.
+
+- **What to do**: Build a macOS driver for non-standard USB cameras.
+  **Why it is worth doing**: Apple's UVC extension suits standard UVC devices; non-standard protocols or features beyond UVC can use Camera Extensions to override the default UVC extension.
+  **How to start**: Read "Overriding the default USB video class extension" and declare corresponding vendor and product IDs in the minimal DEXT bundle Info.plist.
+
+- **What to do**: Build a software camera that auto-plays test patterns.
+  **Why it is worth doing**: Pure software cameras can generate fixed patterns at different frame rates and resolutions to verify video conferencing, recording, or A/V sync flows.
+  **How to start**: Start from Xcode's Camera Extension target template, keep the software camera stream, and replace sample buffer generation logic.
+
+- **What to do**: Migrate an old DAL plug-in to a Camera Extension.
+  **Why it is worth doing**: DAL plug-ins are deprecated and planned for disablement after Ventura; Camera Extensions work with Apple apps too.
+  **How to start**: Reuse the old device's unique identifier as legacy device ID and gradually map DAL controls to provider, device, or stream properties.
+
+## Related Sessions
+
+- [Capture machine-readable codes and text with VisionKit](/articles/wwdc2022-10025) — Also starts from camera input but wraps capture and recognition in VisionKit's Data Scanner.
+- [Add Live Text interaction to your app](/articles/wwdc2022-10026) — Covers text interaction in still images and paused video frames, suitable to combine with camera capture flows.
+- [What's new in the Photos picker](/articles/wwdc2022-10023) — Shows how system photo entry protects user privacy across platform UIs.
+- [Create parametric 3D room scans with RoomPlan](/articles/wwdc2022-10127) — Shows another system-wrapped camera experience, turning room scanning into an integrable app feature.

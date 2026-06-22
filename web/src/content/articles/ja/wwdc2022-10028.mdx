@@ -1,0 +1,279 @@
+---
+title: "Create custom catalogs at scale with ShazamKit"
+description: "learn how shazamkit can help you build custom catalogs and support exact matching of any audio source within your app — all on-device. find out how you can easily generate audio signatures and build catalogs at scale through the new shazamkit cli. we'll also show you how you can quickly update your app to sync with large amounts of audio content like multiple seasons of a tv show or multiple episodes of a podcast, and we'll share updates to the shazamkit api and shmediaitems to help your apps respond precisely to key moments in audio sources using time ranges."
+date: 2026-06-10
+tags: ["WWDC 2022", "ShazamKit", "Audio & Video"]
+thumbnail: "/images/sessions/2022/10028.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10028/"
+sessionId: "wwdc2022-10028"
+year: "2022"
+relatedSessions:
+  - title: "Explore ShazamKit"
+    code: "10044"
+    description: "ShazamKit の署名、カタログ、マッチングセッション、Shazam 音楽カタログの理解は、本 Session の前提コンテンツです。"
+  - title: "Create custom audio experiences with ShazamKit"
+    code: "10045"
+    description: "WWDC21 のカスタムカタログマッチング基本ワークフローを学び、本 Session が大量オーディオコンテンツへどう拡張するかを理解します。"
+  - title: "Create a great ShazamKit experience"
+    code: "10051"
+    description: "2023 年の ShazamKit マッチング体験、エラー処理、UX 推奨事項を続けて学びます。"
+  - title: "Create a more responsive media app"
+    code: "110379"
+    description: "メディア App が AVFoundation とシステム機能で再生とインタラクション応答性を高める方法を紹介します。"
+---
+
+## ハイライト
+
+> WWDC 2022 の ShazamKit は Shazam CLI、`SHSignatureGenerator.signatureFromAsset`、Timed MediaItem、frequency skew 範囲を追加し、開発者がカスタムカタログを一括生成し、マッチ結果をオーディオの特定時間帯へ正確に同期できるようにしました。
+
+## 主要内容
+
+カスタム ShazamKit カタログの基本フローは複雑ではありません。オーディオを署名に変換し、署名とメディアメタデータをカスタムカタログにまとめ、App 内でカタログに対してマッチングします。
+
+問題は規模が大きくなると現れます。Session 冒頭の具体例は、10シーズンのテレビ番組をすべてマッチ可能にしたい場合、サンプルレート、オーディオバッファ、署名生成、メディア項目の関連付けを手作業で扱うとすぐに破綻する、というものです（[02:12](https://developer.apple.com/videos/play/wwdc2022/10028/?time=132)）。コンテンツが更新されるたびに同じ作業を繰り返す必要があります。
+
+Apple はこの Session で3つの能力を補います。第一に、macOS 13 同梱の Shazam CLI でメディアファイルから署名を生成し、カタログを作成、更新、表示できます。第二に、`SHSignatureGenerator` が `AVAsset` から直接署名を生成でき、開発者が手動でオーディオバッファを取得する必要がなくなります。第三に、メディア項目に時間範囲と frequency skew 範囲を持たせ、指定セグメントや指定バリアント内でのみマッチ結果を返せます。
+
+FoodMath サンプル App は結果を示します。動画が問題、カウントダウン、解答セグメントに進むと SwiftUI UI が表示・非表示されます。App 側に複雑なタイミングロジックはほとんどなく、主な作業はカタログのメディア項目メタデータに置かれます（[04:11](https://developer.apple.com/videos/play/wwdc2022/10028/?time=251)）。
+
+## 詳細
+
+### 1. AsyncSequence でマッチ結果を受け取る（[04:26](https://developer.apple.com/videos/play/wwdc2022/10028/?time=266)）
+
+これまで ShazamKit を使うとき、マッチ結果は delegate コールバックで受け取るのが一般的でした。この Session では新しい `session.results` を紹介します。これはマッチ、非マッチ、エラーなどを返す `AsyncSequence` です。
+
+FoodMath App はマッチ成功のみを扱うため、`for await case .match` でフィルタします。マッチのたびに `SHMatch` を UI に必要な `MatchResult` へ集約します。
+
+```swift
+class Matcher: NSObject, ObservableObject, SHSessionDelegate {
+    @Published var matchResult: MatchResult?
+    
+    private var session: SHSession!
+    private let audioEngine = AVAudioEngine()
+    private var matchingTask: Task<Void, Never>? = nil
+    
+    func match(catalog: SHCustomCatalog) throws {
+        
+        session = SHSession(catalog: catalog)
+        session.delegate = self
+        
+        let audioFormat = AVAudioFormat(standardFormatWithSampleRate: audioEngine.inputNode.outputFormat(forBus: 0).sampleRate,
+                                        channels: 1)
+        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 2048, format: audioFormat) { [weak session] buffer, audioTime in
+            session?.matchStreamingBuffer(buffer, at: audioTime)
+        }
+        
+        try AVAudioSession.sharedInstance().setCategory(.record)
+        AVAudioSession.sharedInstance().requestRecordPermission { [weak self] success in
+            guard success, let self = self else { return }
+            
+            Task.detached {
+                try? self.audioEngine.start()
+            }
+        }
+        
+        Task { @MainActor in
+            for await case .match(let match) in session.results {
+                self.matchResult = match.matchResult
+            }
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `SHSession(catalog: catalog)` はカスタムカタログでマッチングセッションを作成します。
+- `installTap` はマイク入力ノードからオーディオバッファを取得します。
+- `matchStreamingBuffer(buffer, at: audioTime)` はライブオーディオを ShazamKit マッチングへ渡します。
+- `requestRecordPermission` は録音開始前にマイク権限を要求します。
+- `for await case .match(let match) in session.results` はマッチ成功イベントのみを処理します。
+- `@MainActor` で `matchResult` 更新をメインスレッドに保ち、SwiftUI を駆動しやすくします。
+
+`SHMatch` には複数のメディア項目が含まれる場合があります。FoodMath はタイトル、エピソード、式、解答範囲を取り出し、UI 向けの結果オブジェクトにまとめます。
+
+```swift
+extension SHMatch {
+
+    var matchResult: MatchResult {
+        mediaItems.reduce(into: MatchResult()) { result, mediaItem in
+            result.title = result.title ?? mediaItem.title
+            result.episode = result.episode ?? mediaItem.episode
+            result.equation = result.equation ?? mediaItem.equation
+            result.answerRange = result.answerRange ?? mediaItem.answerRange
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `mediaItems.reduce(into:)` は今回のマッチで返されたすべてのメディア項目を走査します。
+- `result.title = result.title ?? mediaItem.title` は最初に利用可能なタイトルを保持します。
+- `episode`、`equation`、`answerRange` も同様のロジックです。
+- このコードはカタログ内メディア項目メタデータに依存し、App が動画の何秒目かを自分で判定する必要はありません。
+
+### 2. Shazam CLI でカタログを一括作成・更新する（[05:24](https://developer.apple.com/videos/play/wwdc2022/10028/?time=324)）
+
+Shazam CLI は macOS 13 で提供されます。Session のフローはコンテンツライブラリ向けです。`signature` コマンドで動画やオーディオを署名に変換し、CSV でメディア項目を記述し、`create` で署名とメディア項目をカタログにまとめ、コンテンツ更新時は `update` を使います。
+
+CSV ヘッダーは `SHMediaItem` 属性にマッピングされます。FoodMath 例では CSV にタイトルを保存し、カスタム JSON フィールドに問題データを格納します（[06:33](https://developer.apple.com/videos/play/wwdc2022/10028/?time=393)）。時間帯にマッチした後、App はメディア項目フィールドから表示する問題を直接読み出せます。
+
+Session の CLI ワークフローに基づく概念フロー:
+
+```text
+# Conceptual CLI workflow from transcript, not exact command syntax
+1. Run the signature command on the media file to create a signature file.
+2. Run the custom catalog create command with the signature file and CSV metadata.
+3. Run the update command when adding a new episode or media file.
+4. Run the display command to inspect catalog contents.
+```
+
+キーポイント:
+
+- `signature` コマンドは音轨を含むメディアファイルから署名を生成します。
+- `create` コマンドは署名と CSV メディア項目をカスタムカタログに合成します。
+- `update` コマンドは既存カタログへ新しいメディアコンテンツを追加します。
+- `display` コマンドはカタログに含まれる署名とメディア項目を確認します。
+- ここは transcript レベルのワークフロー表現であり、コピペ可能な完全 CLI 構文ではありません。
+
+CLI は反復作業を解消します。テレビ番組、複数エピソードのポッドキャスト、講座動画では、スクリプトが各エピソードフォルダを走査し、署名生成、メディア項目バインド、カタログ更新、最後にカタログ内容表示を自動化できます（[08:20](https://developer.apple.com/videos/play/wwdc2022/10028/?time=500)）。
+
+### 3. AVAsset から直接署名を生成する（[11:18](https://developer.apple.com/videos/play/wwdc2022/10028/?time=678)）
+
+カタログ作成の第一歩は署名です。以前は開発者がメディアからオーディオトラックを読み、サンプルレートとバッファを処理する必要がありました。Session では `SHSignatureGenerator` に全プラットフォームで `signatureFromAsset` があると明言しています。
+
+このメソッドは音轨を含む `AVAsset` を受け取ります。asset に複数音轨がある場合、ShazamKit はそれらをミックスし、署名が完全なオーディオ内容を捉えます。
+
+Session transcript に基づく概念 API フロー:
+
+```text
+# Conceptual API flow from transcript, not exact Swift syntax
+1. Create an AVAsset for a media file that contains an audio track.
+2. Ask SHSignatureGenerator to create a signature from that asset using signatureFromAsset.
+3. Combine the generated signature with media items to form a reference signature.
+4. Store the reference signature in a custom catalog.
+```
+
+キーポイント:
+
+- `AVAsset` はローカルまたはリモートのメディアリソースを表します。
+- `signatureFromAsset` は Session で言及された新機能です。検証済みコード断片を超える Swift 呼び出し構文はここでは展開しません。
+- 返された署名はメディア項目と組み合わせて reference signature となり、カスタムカタログに保存されます。
+- 開発者はメディアファイルから手動でオーディオバッファを取得する必要がありません。
+
+App やツールチェーンでは、この API はバッチ処理ステップに適しています。「メディアをマッチ可能な署名に変換する」作業を明確な入口に集約します。
+
+### 4. Timed MediaItem でコンテンツをオーディオ時間帯にバインドする（[11:51](https://developer.apple.com/videos/play/wwdc2022/10028/?time=711)）
+
+FoodMath の精密 UI 同期の核心は Timed MediaItem API です。メディア項目は1つ以上の時間範囲を持てます。ShazamKit は範囲の開始と終了でマッチコールバックを送り、コールバックには現在範囲内のメディア項目のみが含まれます。
+
+同じオーディオセグメントに複数の表示コンテンツがあるシーンに適しています。例えば講座動画の問題、カウントダウン、解答、章タイトル。複数コーラスがある曲。異なる時刻に異なるリンクを表示するポッドキャスト。
+
+```swift
+// Restrict this media item to only describe the first 5 seconds
+
+ let mediaItem = SHMediaItem(properties: [
+            .title: "Title",
+            .timeRanges:[0.0..<5.0]
+        ])
+
+ let timeRanges: [Range<TimeInterval>] = mediaItem.timeRanges
+```
+
+キーポイント:
+
+- `.title` はメディア項目のタイトルメタデータを設定します。
+- `.timeRanges:[0.0..<5.0]` はこのメディア項目を署名の最初5秒のみに限定します。
+- `timeRanges` は Swift range の配列で、1つのメディア項目が複数セグメントにバインドできます。
+- `mediaItem.timeRanges` で時間範囲を読み戻せます。
+
+Session は3つの返却ルールも示します（[12:40](https://developer.apple.com/videos/play/wwdc2022/10028/?time=760)）。時間範囲外のメディア項目は返されません。範囲内の項目は返され、直近イベントが先頭になります。時間範囲のないメディア項目は常に最後に返され、順序は保証されません。FoodMath は時間範囲のない項目にエピソード名など全話情報を保存します。
+
+### 5. 大規模カタログは実行時に必要に応じて合成する（[15:01](https://developer.apple.com/videos/play/wwdc2022/10028/?time=901)）
+
+大きなコンテンツライブラリを1つのカタログに詰め込む必要はありません。Session はカタログを焦点を絞って保つことを推奨します。単曲、全アルバム、単エピソード、関連グループごとに分割し、アーティスト全集のような過大な内容を1カタログに入れないでください。
+
+理由は実用的です。メディア資産ごとに1カタログだと、App は現在どのカタログを読み込むべきかを知る必要があります。すべてを1カタログに入れるとマッチ範囲は広がりますが、ダウンロードサイズとメモリ使用量も増えます。実行時読み込みの柔軟性とカタログサイズのトレードオフがあります。
+
+```swift
+let parentCatalog = SHCustomCatalog()
+
+parentCatalog.add(from: URL(fileURLWithPath: "/path/to/Episode1.shazamcatalog"))
+parentCatalog.add(from: URL(fileURLWithPath: "/path/to/Episode2.shazamcatalog"))
+parentCatalog.add(from: URL(fileURLWithPath: "/path/to/Episode3.shazamcatalog"))
+```
+
+キーポイント:
+
+- `SHCustomCatalog()` は空のカタログを作成します。
+- `parentCatalog.add(from:)` はローカルカタログファイルから内容を読み込みます。
+- `add(from:)` を複数回呼ぶと複数エピソードカタログを1つの実行時カタログに合成できます。
+- ユーザーが見ている講座、アルバム、シーズンに応じて読み込み範囲を動的に決められます。
+
+Session のベストプラクティスは、メディア資産ごとに完全な署名を1つ作ることです。1つのオーディオを多数の小さな署名に分割しないでください（[14:16](https://developer.apple.com/videos/play/wwdc2022/10028/?time=856)）。長い署名はより多くのオーディオピークを提供し、マッチ精度が上がり、query signature が複数 reference signature にまたがる問題も避けられます。
+
+### 6. frequencySkew で聞こえが同じオーディオを区別する（[16:06](https://developer.apple.com/videos/play/wwdc2022/10028/?time=966)）
+
+聞こえは同じだが App では異なる体験が必要なコンテンツがあります。Session の例は、各エピソード共通のイントロ音楽、または別曲をサンプリングした曲です。この場合 frequency skew を検討します。
+
+再生オーディオの周波数をわずかに上下します。オフセットが十分小さければ人耳にはほとんど気づかれませんが、ShazamKit は `frequencySkew` を報告できます。Session は可感知リスクを下げつつ複数バリアントの余地を残すため、オフセットは5%以内に保つことを推奨します（[16:58](https://developer.apple.com/videos/play/wwdc2022/10028/?time=1018)）。
+
+```swift
+func within(range: Range<Float>, for matchedMediaItem: SHMatchedMediaItem) -> Bool {
+        
+	range.contains(matchedMediaItem.frequencySkew)
+}
+```
+
+キーポイント:
+
+- `SHMatchedMediaItem` はマッチ後に返されるメディア項目を表します。
+- `matchedMediaItem.frequencySkew` は ShazamKit が報告する周波数オフセットです。
+- `range.contains(...)` は現在のマッチが App が関心を持つ範囲内かを判定します。
+- メディア項目返却後の二次フィルタやデバッグに適しています。
+
+より直接的な方法は、frequency skew 範囲をメディア項目に書き込むことです。ShazamKit はマッチが範囲内に入ったときのみそのメディア項目を返します。
+
+```swift
+// Restrict this media item to only describe the first 5 seconds
+
+ let mediaItem = SHMediaItem(properties: [
+            .title: "Frequency Skewed Audio",
+            .frequencySkewRanges:[0.01..<0.02]
+        ])
+
+ let frequencySkewRanges: [Range<Float>] = mediaItem.frequencySkewRanges
+```
+
+キーポイント:
+
+- `.frequencySkewRanges` はメディア項目に返却可能な周波数オフセット区間を設定します。
+- `0.01..<0.02` は1%から2%のオフセット範囲を表します。
+- `frequencySkewRanges` でメディア項目上のオフセット範囲を読み戻せます。
+- オフセットなし、または範囲外のオーディオではこの制限付きメディア項目は返されません。
+
+## 重要ポイント
+
+- **何を作るか**: 講座動画に時間連動のクイズカードを表示する。  
+  **なぜ価値があるか**: Timed MediaItem で問題、カウントダウン、解答説明を動画セグメントにバインドでき、マッチコールバックが範囲開始・終了で同期トリガーされます。  
+  **始め方**: 各エピソードに完全署名を1つ作成。CSV またはコードで各クイズメディア項目に `.timeRanges` を設定。`session.results` で SwiftUI 状態を更新。
+
+- **何を作るか**: ポッドキャストプレイヤーに章メタデータとリンク提示を追加する。  
+  **なぜ価値があるか**: 1つの署名に複数メディア項目を含め、各項目がポッドキャスト内の時間帯に対応できます。時間範囲のない項目には番組全体の情報も保存できます。  
+  **始め方**: Shazam CLI でオーディオファイルから署名を生成。CSV で章タイトル、リンク、時間範囲のメディア項目を作成。マッチ後 `SHMatch.mediaItems` から現在章データを読み取る。
+
+- **何を作るか**: ユーザーがダウンロード済みのエピソードに応じてマッチカタログを読み込む。  
+  **なぜ価値があるか**: カタログをエピソード単位に分割し、実行時に `SHCustomCatalog.add(from:)` で合成すれば、一括ダウンロードとメモリ使用を減らせます。  
+  **始め方**: エピソードごとに `.shazamcatalog` を生成。ユーザーがシーズンやプレイリストに入ったとき、関連カタログを親カタログに追加してから `SHSession` を作成。
+
+- **何を作るか**: 同じイントロ音楽を共有する異なるエピソードを区別する。  
+  **なぜ価値があるか**: frequency skew は聴感変化を小さく保ちつつ、ShazamKit に検出可能な差分を与えられます。  
+  **始め方**: 元オーディオから reference signature を作成。バリアントごとに `.frequencySkewRanges` を設定。再生側で対応オーディオに小幅周波数オフセットを適用し、Session 推奨の5%以内に保つ。
+
+## 関連セッション
+
+- [Explore ShazamKit](/articles/wwdc2021-10044) — ShazamKit の署名、カタログ、マッチングセッション、Shazam 音楽カタログの理解は、本 Session の前提コンテンツです。
+- [Create custom audio experiences with ShazamKit](/articles/wwdc2021-10045) — WWDC21 のカスタムカタログマッチング基本ワークフローを学び、本 Session が大量オーディオコンテンツへどう拡張するかを理解します。
+- [Create a great ShazamKit experience](/articles/wwdc2023-10051) — 2023 年の ShazamKit マッチング体験、エラー処理、UX 推奨事項を続けて学びます。
+- [Create a more responsive media app](/articles/wwdc2022-110379) — メディア App が AVFoundation とシステム機能で再生とインタラクション応答性を高める方法を紹介します。

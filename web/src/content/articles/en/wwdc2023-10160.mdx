@@ -1,0 +1,311 @@
+---
+title: "Demystify SwiftUI performance"
+description: "Learn how you can build a mental model for performance in SwiftUI and write faster, more efficient code. We'll share some of the common causes behind performance issues and help you triage hangs and hitches in SwiftUI to create more responsive views in your app."
+date: "2023-06-06"
+tags: ["SwiftUI", "Performance"]
+thumbnail: "/images/sessions/2023/10160.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10160/"
+sessionId: "wwdc2023-10160"
+year: "2023"
+relatedSessions:
+  - title: "Demystify SwiftUI"
+    code: "10022"
+    description: "SwiftUI identity basics"
+  - title: "Discover Observation in SwiftUI"
+    code: "10149"
+    description: "The new @Observable observation mechanism"
+  - title: "Analyze Hangs in Instruments"
+    code: "10248"
+    description: "Analyze hangs with Instruments"
+  - title: "Explore UI animation hitches and the render loop"
+    code: "10201"
+    description: "Animation hitches and the render loop"
+---
+## Highlight
+
+> SwiftUI in iOS 17 and macOS Sonoma allows developers to use`Self._printChanges()`To locate redundant refreshes, use`@Observable`Reduce the scope of dependencies and use a stable ForEach content structure to avoid full reconstruction, thereby systematically improving the interface response speed.
+
+## Core Content
+
+### Too many dependencies lead to unnecessary refreshes
+
+You must have encountered this situation when writing SwiftUI: an irrelevant property is modified, and the entire view tree is recalculated. For example, on a page that displays dog details, you only want to update the dog's name, but the picture is also refreshed.
+
+（[03:59](https://developer.apple.com/videos/play/wwdc2023/10160/?time=239)）
+
+SwiftUI uses a dependency graph to determine which views need to be updated. Each view's body is calculated based on its input values ​​and dynamic properties. when`Dog`When the structure changes, all subviews that depend on it will be recalculated. The problem is, some subviews don't actually need to know`Dog`all information.
+
+（[04:05](https://developer.apple.com/videos/play/wwdc2023/10160/?time=245)）
+
+Apple's solution is to narrow the scope of dependencies. Instead of putting the whole`Dog`object passed to`ScalableDogImage`, it is better to pass only what it needs`Image`. In this way, when other attributes of the dog change, the picture view will not receive any update notification.
+
+（[08:48](https://developer.apple.com/videos/play/wwdc2023/10160/?time=528)）
+
+### Synchronous blocking makes the interface stuck
+
+Another common scenario is doing time-consuming operations during view initialization. For example, if you are`@State`Object`init()`Initiate a network request inside, this request will block the main thread, causing the interface to freeze.
+
+（[12:22](https://developer.apple.com/videos/play/wwdc2023/10160/?time=742)）
+
+The correct approach is to move time-consuming operations to asynchronous tasks and use`.task`Modifiers are executed when the view appears. This way the body can be returned immediately and the interface remains responsive.
+
+（[12:23](https://developer.apple.com/videos/play/wwdc2023/10160/?time=743)）
+
+### Identity Trap of List and Table
+
+In order to support advanced functions such as selection, sliding operations, and reordering, List and Table need to determine the identity of each row when they are created. This means that the contents of the ForEach must produce a fixed number of views.
+
+（[15:12](https://developer.apple.com/videos/play/wwdc2023/10160/?time=912)）
+
+If you use a conditional view in ForEach or`AnyView`, SwiftUI cannot know in advance how many views each row corresponds to, and can only create all views. There is no problem when the amount of data is small, but there will be obvious lags when the amount of data is large.
+
+（[16:08](https://developer.apple.com/videos/play/wwdc2023/10160/?time=968)）
+
+Moving the filtering logic to the model layer and letting ForEach only be responsible for display can greatly improve the loading and scrolling performance of large lists.
+
+（[17:35](https://developer.apple.com/videos/play/wwdc2023/10160/?time=1055)）
+
+## Detailed Content
+
+### use`_printChanges()`Locate redundant dependencies
+
+SwiftUI provides a debugging tool`Self._printChanges()`, you can print out the reason that triggered the view update.
+
+```swift
+struct ScalableDogImage: View {
+    @State private var scaleToFill = false
+    var dog: Dog
+
+    var body: some View {
+        let _ = Self._printChanges()
+        dog.image
+            .resizable()
+            .aspectRatio(
+                contentMode: scaleToFill ? .fill : .fit)
+            .frame(maxHeight: scaleToFill ? 500 : nil)
+            .padding(.vertical, 16)
+            .onTapGesture {
+                withAnimation { scaleToFill.toggle() }
+            }
+    }
+}
+```
+
+（[04:02](https://developer.apple.com/videos/play/wwdc2023/10160/?time=242)）
+
+**Key points:**
+
+- `let _ = Self._printChanges()`Place it at the beginning of body and the reason will be printed on the console every time the view is updated.
+- print`@Self`Indicates that the value of the view itself has changed (i.e. the incoming`dog`changed)
+- print`@scaleToFill`express`@State`Properties have changed
+- This method is prefixed with an underscore and is for debugging only. Do not submit it to the App Store.
+
+When you see the picture view because`dog.name`When refreshed due to changes, you know that the dependency scope is too large. Bundle`dog`Change to`dog.image`Afterwards, changing the name will not trigger the image refresh.
+
+（[08:46](https://developer.apple.com/videos/play/wwdc2023/10160/?time=526)）
+
+```swift
+struct DogView: View {
+    @Environment(\.isPlayTime) private var isPlayTime
+    var dog: Dog
+
+    var body: some View {
+        DogHeader(name: dog.name, breed: dog.breed)
+        ScalableDogImage(dog.image)
+        DogDetailView(dog)
+        LetsPlayButton()
+            .disabled(dog.isTired)
+    }
+}
+```
+
+**Key points:**
+
+- `ScalableDogImage`Now only receive`Image`, no longer relies on the entire`Dog`
+- `DogHeader`stand alone and only receive`name`and`breed`- The dependencies of each subview are clearly visible at the call site
+
+### Change synchronous blocking to asynchronous loading
+
+```swift
+// Problematic code: fetch data synchronously in init
+struct DogRootView: View {
+    @State private var model = FetchModel()
+
+    var body: some View {
+        DogList(model.dogs)
+    }
+}
+
+@Observable class FetchModel {
+    var dogs: [Dog]
+
+    init() {
+        fetchDogs() // Synchronous blocking
+    }
+
+    func fetchDogs() {
+        // Takes a long time
+    }
+}
+```
+
+（[12:22](https://developer.apple.com/videos/play/wwdc2023/10160/?time=742)）
+
+```swift
+// After the fix: fetch asynchronously
+struct DogRootView: View {
+    @State private var model = FetchModel()
+
+    var body: some View {
+        DogList(model.dogs)
+            .task { await model.fetchDogs() }
+    }
+}
+
+@Observable class FetchModel {
+    var dogs: [Dog]
+
+    init() {}
+
+    func fetchDogs() async {
+        // Takes a long time
+    }
+}
+```
+
+（[12:23](https://developer.apple.com/videos/play/wwdc2023/10160/?time=743)）
+
+**Key points:**
+
+- `.task`The modifier starts an asynchronous task when the view appears, and the view creation itself does not block
+-`fetchDogs()`marked as`async`, can be used internally`await`Make network requests
+-`@Observable`Automatically track attribute reads, only`dogs`View updates are triggered when changes occur
+
+### Avoid variable number of views in List
+
+```swift
+// Problem: conditional views force List to create all views to determine identity
+List {
+    ForEach(dogs) { dog in
+        if dog.likesTennisBalls {
+            DogCell(dog)
+        }
+    }
+}
+```
+
+（[16:08](https://developer.apple.com/videos/play/wwdc2023/10160/?time=968)）
+
+```swift
+// Fix: move filtering logic to the model layer
+List {
+    ForEach(tennisBallDogs) { dog in
+        DogCell(dog)
+    }
+}
+```
+
+（[17:35](https://developer.apple.com/videos/play/wwdc2023/10160/?time=1055)）
+
+**Key points:**
+
+- List needs to know the identity of all rows in advance
+- If the content of the ForEach contains conditional branches, SwiftUI must create all possible views of each element to determine the number of rows
+- Put filtering at the model layer. The data received by ForEach is already filtered, and only one view is generated for each row.
+- For grouped lists, nested ForEach is recommended, and SwiftUI will handle this structure specially
+
+```swift
+// Sectioned List is a valid use of nested ForEach
+struct DogsByToy: View {
+    var model: DogModel
+
+    var body: some View {
+        List {
+            ForEach(model.dogToys) { toy in
+                Section(toy.name) {
+                    ForEach(model.dogs(toy: toy)) { dog in
+                        DogCell(dog)
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+（[18:25](https://developer.apple.com/videos/play/wwdc2023/10160/?time=1105)）
+
+### Simplified initialization of Table
+
+iOS 17 and macOS Sonoma introduce a simplified Table initialization method:
+
+```swift
+// iOS 16 approach
+struct DogTable: View {
+    var dogs: [Dog]
+
+    var body: some View {
+        Table(of: Dog.self) {
+            // Columns
+        } rows: {
+            ForEach(dogs) { dog in
+                TableRow(dog)
+            }
+        }
+    }
+}
+```
+
+（[19:21](https://developer.apple.com/videos/play/wwdc2023/10160/?time=1161)）
+
+```swift
+// New iOS 17 approach, automatically creates TableRow
+struct DogTable: View {
+    var dogs: [Dog]
+
+    var body: some View {
+        Table(of: Dog.self) {
+            // Columns
+        } rows: {
+            ForEach(dogs)
+        }
+    }
+}
+```
+
+（[19:22](https://developer.apple.com/videos/play/wwdc2023/10160/?time=1162)）
+
+**Key points:**
+
+- New initialization method automatically created for each data element`TableRow`- This ensures that there is only one view per row and identity calculation is more efficient
+- This API is backward compatible to the system version first supported by Table
+- Note the semantic change: if`TableRow`Different data are used (such as`dog.bestFriend`), in iOS 17 identity will be based on`dog`rather than`dog.bestFriend`
+
+## Core Takeaways
+
+**1. Add to complex lists`_printChanges()`diagnosis**
+
+If your list scrolls stuck or the interface flickers when data is updated, add`let _ = Self._printChanges()`, observe the console output after running. If you find that modifying a property triggers the update of a large number of unrelated views, reduce the dependencies to the minimum scope one by one. The entrance is LLDB`expression Self._printChanges()`Or add it temporarily in the code.
+
+**2. Use`@Observable`replace`@ObservedObject` + `@Published`**
+
+Use it directly in new projects`@Observable class Model`Define the data model, no longer needed in the view`@ObservedObject`or`@StateObject`. SwiftUI automatically tracks which properties are actually read and only updates views that actually depend on those properties. The entrance is`import Observation`, and then put`ObservableObject`Change to`@Observable`。
+
+**3. Review the ForEach content in all List/Tables**
+
+Check your List and Table to make sure the closure of ForEach does not contain`if`condition,`AnyView`or nested mutable structures. If there is conditional filtering, move it to the ViewModel. The entrance is to find all`List { ForEach(...) }`and`Table { ForEach(...) }`, confirm that only one view is generated for each element.
+
+**4. Put`.task`As the default way to load data**
+
+if you are`onAppear`Call the synchronization method to obtain data, or in`init()`When making network requests, change it to`.task { await model.load() }`asynchronous mode. This prevents the interface from freezing and allows SwiftUI to automatically cancel tasks when the view disappears. The entrance is to change the synchronous loading method to`async`, then add`.task`modifier.
+
+**5. Use`inspectorColumnWidth`Check performance while debugging layout**
+
+Custom presentation of the Inspector and Sheet also involves view reconstruction. If you're displaying a lot of data in the Inspector, make sure the Inspector's content view follows the same dependency minimization principles.
+
+## Related Sessions
+
+- [Demystify SwiftUI](/articles/wwdc2021-10022) — Basic concepts of SwiftUI identity
+- [Discover Observation in SwiftUI](/articles/wwdc2023-10149) — @Observable Detailed explanation of the new observation mechanism
+- [Analyze Hangs in Instruments](/articles/wwdc2023-10248) — Use Instruments to locate main thread hangs
+- [Explore UI animation hitsches and the render loop](/articles/wwdc2023-10201) — Understand the underlying reasons for dropped frames

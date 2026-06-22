@@ -1,0 +1,202 @@
+---
+title: "Track model changes with SwiftData history"
+description: "reveal the history of your model"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10075.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10075/"
+sessionId: "wwdc2024-10075"
+year: "2024"
+relatedSessions:
+  - title: "What's new in SwiftData"
+    code: "10137"
+    description: "discover the latest updates to SwiftData"
+  - title: "Create a custom data store with SwiftData"
+    code: "10138"
+    description: "combine the power of SwiftData's modeling API with your own persistence backend"
+  - title: "Bring your app's core features to users with App Intents"
+    code: "10210"
+    description: "learn the principles of the app intents framework, like intents, entities, and queries"
+---
+
+## ハイライト
+
+> SwiftData History は Transaction と Token メカニズムにより、アプリがデータストア内の各 save で発生した挿入・更新・削除の変更を増分的にクエリできるようにします。
+
+---
+
+## 主要内容
+
+SwiftData のクエリには常に盲点がありました。`ModelContext.fetch()` はデータストアの現在のスナップショットしか取得できません。Widget がバックグラウンドで 1 件のデータを変更しても、メインアプリを再度開いたとき結果は以前とまったく同じで、途中で何が起きたか分かりません。開発者は手動 diff や NotificationCenter で似たロジックを組み立てざるを得ず、エレガントでも信頼性が高くもありません。
+
+SwiftData History がこの空白を埋めます。コアメカニズムは、`ModelContext.save()` のたびに SwiftData が Transaction を自動生成し、すべての Change（挿入、更新、削除）を時系列で記録することです。HistoryDescriptor でこれらの Transaction をクエリし、Token をブックマークとして使えば、変更ストリームを増分的に消費できます。SampleTrips を例に、Widget で宿泊を確認した後、メインアプリが History API で変更を検出し対応する Trip に未読マークを付ける流れを、fetch → process → update の 3 ステップで完全にデモします。
+
+---
+
+## 詳細
+
+### 1. `.preserveValueOnDeletion` で削除済みモデルの識別情報を保持
+
+モデルが削除されると、そのプロパティデータも一緒に消えます。後で History でこの削除レコードを処理する必要がある場合、「誰」だったかすら分からなくなることがあります。SwiftData は `.preserveValueOnDeletion` 属性修飾子を提供し、マークしたプロパティは tombstone として History クエリ用に保持されます。
+
+（[04:57](https://developer.apple.com/videos/play/wwdc2024/10075/?time=297)）
+
+```swift
+@Model
+class Trip {
+    #Unique<Trip>([\.name, \.startDate, \.endDate])
+
+    @Attribute(.preserveValueOnDeletion)
+    var name: String
+    var destination: String
+
+    @Attribute(.preserveValueOnDeletion)
+    var startDate: Date
+
+    @Attribute(.preserveValueOnDeletion)
+    var endDate: Date
+
+    var bucketList: [BucketListItem] = [BucketListItem]()
+    var livingAccommodation: LivingAccommodation?
+}
+```
+
+キーポイント:
+- `@Attribute(.preserveValueOnDeletion)` でマークしたプロパティはモデル削除後も tombstone に残る
+- `#Unique` マクロは一意性制約を宣言し、History クエリ時にレコード特定に使える
+- 保持すべきは通常識別フィールド（name、date）。非識別フィールド（destination）はマーク不要
+
+### 2. HistoryDescriptor で Transaction をクエリ
+
+HistoryDescriptor は History クエリの入口で、token と author によるフィルタリングをサポートします。Token はブックマーク、Author は変更元（メインアプリ vs Widget など）を区別します。
+
+（[06:26](https://developer.apple.com/videos/play/wwdc2024/10075/?time=386)）
+
+```swift
+private func findTransactions(after token: DefaultHistoryToken?, author: String) -> [DefaultHistoryTransaction] {
+    var historyDescriptor = HistoryDescriptor<DefaultHistoryTransaction>()
+    if let token {
+        historyDescriptor.predicate = #Predicate { transaction in
+            (transaction.token > token) && (transaction.author == author)
+        }
+    }
+
+    var transactions: [DefaultHistoryTransaction] = []
+    let taskContext = ModelContext(modelContainer)
+    do {
+        transactions = try taskContext.fetchHistory(historyDescriptor)
+    } catch let error {
+        print(error)
+    }
+
+    return transactions
+}
+```
+
+キーポイント:
+- `DefaultHistoryToken` と `DefaultHistoryTransaction` の「Default」は DefaultStore に対応。カスタム DataStore を使う場合は型名が異なる
+- `transaction.token > token` で前回処理以降のすべての Transaction をフィルタ
+- `transaction.author == author` でソースをフィルタ。Widget では `ModelContext.author = TransactionAuthor.widget` で設定
+- token を渡さない場合、利用可能なすべての History が返される
+- `fetchHistory()` は History クエリ専用の ModelContext 上の新メソッド
+
+### 3. Change の処理: 型ごとに挿入・更新・削除をマッチ
+
+Transaction を取得したら、その Change を走査し、`switch` で具体型をマッチします。Change はジェネリックパラメータ化されており、モデル型で直接マッチできます。
+
+（[07:34](https://developer.apple.com/videos/play/wwdc2024/10075/?time=454)）
+
+```swift
+private func findTrips(in transactions: [DefaultHistoryTransaction]) -> (Set<Trip>, DefaultHistoryToken?) {
+    let taskContext = ModelContext(modelContainer)
+    var resultTrips: Set<Trip> = []
+    for transaction in transactions {
+        for change in transaction.changes {
+            let modelID = change.changedPersistentIdentifier
+            let fetchDescriptor = FetchDescriptor<Trip>(predicate: #Predicate { trip in
+                trip.livingAccommodation?.persistentModelID == modelID
+            })
+            let fetchResults = try? taskContext.fetch(fetchDescriptor)
+            guard let matchedTrip = fetchResults?.first else {
+                continue
+            }
+            switch change {
+            case .insert(_ as DefaultHistoryInsert<LivingAccommodation>):
+                resultTrips.insert(matchedTrip)
+            case .update(_ as DefaultHistoryUpdate<LivingAccommodation>):
+                resultTrips.update(with: matchedTrip)
+            case .delete(_ as DefaultHistoryDelete<LivingAccommodation>):
+                resultTrips.remove(matchedTrip)
+            default: break
+            }
+        }
+    }
+    return (resultTrips, transactions.last?.token)
+}
+```
+
+キーポイント:
+- `change.changedPersistentIdentifier` で変更モデルの PersistentIdentifier を取得
+- FetchDescriptor で関連 Trip インスタンスを逆引き
+- `DefaultHistoryInsert<LivingAccommodation>` のジェネリックマッチで LivingAccommodation 型の挿入のみ処理
+- `default: break` で他モデル型の変更をスキップ
+- 最後の Transaction の token を返し、次回クエリの起点とする
+
+### 4. UserDefaults で Token を永続化
+
+Token は永続化が必要です。そうでなければアプリ再起動後に増分クエリできません。Session では SwiftData 自体ではなく UserDefaults への保存を推奨しています（History クリア時の循環依存を避けるため）。
+
+（[10:19](https://developer.apple.com/videos/play/wwdc2024/10075/?time=619)）
+
+```swift
+private func findUnreadTrips() -> Set<Trip> {
+    let tokenData = UserDefaults.standard.data(forKey: UserDefaultsKey.historyToken)
+
+    var historyToken: DefaultHistoryToken? = nil
+    if let tokenData {
+        historyToken = try? JSONDecoder().decode(DefaultHistoryToken.self, from: tokenData)
+    }
+    let transactions = findTransactions(after: historyToken, author: TransactionAuthor.widget)
+    let (unreadTrips, newToken) = findTrips(in: transactions)
+
+    if let newToken {
+        let newTokenData = try? JSONEncoder().encode(newToken)
+        UserDefaults.standard.set(newTokenData, forKey: UserDefaultsKey.historyToken)
+    }
+    return unreadTrips
+}
+```
+
+キーポイント:
+- Token は `Codable` をサポートし、JSONEncoder/JSONDecoder で直接シリアライズ可能
+- 初回呼び出しで token がない場合、すべての History が返される
+- クエリ完了後すぐに新 token を保存し、次回は増分のみ取得する
+- Token は関連 DataStore に対してのみ有効。History データがクリアされると token は失効し、`fetchHistory` は `historyTokenExpired` をスロー。旧 token を破棄して再クエリが必要
+
+### 5. カスタム DataStore の History サポート
+
+カスタム DataStore を使う場合、History 関連型を自分で実装する必要があります。カスタム Transaction、Change（Insert/Update/Delete）、Token。さらに DataStore は `HistoryProviding` プロトコルに準拠する必要があります。Session ではいくつかの重要な考慮点を挙げています:
+
+- Transaction の境界を明確に定義する。DefaultStore では 1 回の `save` で発生したすべての変更が 1 つの Transaction に属する
+- Change の境界は通常 1 モデルインスタンスの粒度
+- アプリですべての Change 型が必要とは限らない（時系列ログのみのシナリオでは Insert だけで十分な場合もある）
+- `.preserveValueOnDeletion` のサポート要否と、削除後のデータ保存方法を検討する
+- Token は `HistoryToken` プロトコルに準拠するカスタム型が必要で、Transaction ストリーム内の位置を一意に識別する状態を持つ。複数の関連 Store を使う場合、Token はすべての Store の状態を含むべき
+
+---
+
+## 重要ポイント
+
+1. **Widget とメインアプリのデータ変更同期**: Widget が SwiftData のデータを変更した場合、メインアプリは History API で `author` をフィルタし、Widget 由来の変更のみ処理して、未読マークなど精密な UI 更新を実現できる。**始め方**: Widget の ModelContext に `.author` を設定。メインアプリでは HistoryDescriptor の predicate で author をフィルタ。
+
+2. **オフライン変更の増分同期**: オフライン中のローカル変更は History の時系列 Transaction として記録でき、接続後 Token で増分同期してサーバーに反映し、全量比較を避けられる。**始め方**: 同期成功のたびに Token を保存。次回は Token 以降の Transaction のみ取得。同期完了後に処理済み History データをクリア。
+
+3. **モデル削除後の情報追跡**: `.preserveValueOnDeletion` で重要フィールドを保持し、History 上で削除操作を追跡可能にする。**始め方**: モデルの識別属性に `@Attribute(.preserveValueOnDeletion)` を追加。History 処理時に tombstone 値で削除レコードの身元を判定。
+
+---
+
+## 関連セッション
+
+- [What's new in SwiftData](/articles/wwdc2024-10137) — SwiftData フレームワーク 2024 年の全体更新概要
+- [Create a custom data store with SwiftData](/articles/wwdc2024-10138) — カスタム DataStore の構築方法。History カスタムサポートと密接に関連
+- [Bring your app's core features to users with App Intents](/articles/wwdc2024-10210) — App Intents フレームワークの設計原則と Widget インタラクションの基盤メカニズム

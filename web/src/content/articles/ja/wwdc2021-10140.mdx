@@ -1,0 +1,223 @@
+---
+title: "HLS 動的広告挿入の探索"
+description: "HLS タグと AVFoundation API を使用して、HLS ストリーム内で広告と長編映画の間のシームレスなトランジションを作成し、インストリーム コンテンツの再生を可能にする方法を学びます。"
+date: "2021-06-08"
+tags: ["Audio & Video"]
+thumbnail: "/images/sessions/2021/10140.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10140/"
+sessionId: "wwdc2021-10140"
+year: "2021"
+relatedSessions:
+  - title: "グループアクティビティでカスタムエクスペリエンスを構築する"
+    code: "10187"
+    description: "SharePlay でのメディア共有"
+  - title: "グループアクティビティを使用してメディアエクスペリエンスを調整する"
+    code: "10225"
+    description: "複数の人が同時に生まれ変わる"
+  - title: "Safari の Group Activities"
+    code: "10189"
+    description: "Web での SharePlay のサポート"
+  - title: "Core Image Kernel の改善"
+    code: "10159"
+    description: "ビデオ処理パフォーマンスの最適化"
+---
+#HLS 動的広告挿入の調査
+
+## ハイライト
+
+> HLS インタースティシャルは、マスター プレイリストを通じて広告を独立したリソースとして参照し、広告を結合するために DISCONTINUITY を使用しなくなりました。任意の時点での広告の挿入、クリエイティブの遅延バインディング、ライブ ブロードキャスト シーンの早期復帰、AirPlay とピクチャ イン ピクチャのネイティブ サポートをサポートしています。
+
+## 主要内容
+
+HLS ストリームに広告を挿入するのは常に面倒な作業でした。サーバー側のスプライシングでは、プレイリストを生成する前に広告セグメントとコンテンツ セグメントを結合する必要がありますが、これでは動的な意思決定を行うことができません。クライアント側のデュアル プレーヤー ソリューションでは、バッファリングとビュー階層を手動で調整する必要があり、AirPlay とピクチャー イン ピクチャーのサポートは困難です。
+
+WWDC2021 での HLS インタースティシャルの導入により、これが完全に変わります。広告はマスター プレイリストを通じて独立したリソースとして参照され、プレーヤーはメイン コンテンツと広告の間のバッファリング、切り替え、およびナビゲーション制限を自動的に調整します。広告はいつでも挿入でき、レイト バインディングと再バインドをサポートし、AirPlay およびピクチャー イン ピクチャーとネイティブ互換性があります。
+
+## 詳細
+
+### 従来のソリューションの問題点
+
+DISCONTINUITY タグを使用したサーバー側の広告挿入 (00:41):
+- 静的解決策: プレイリストが生成される前に、広告セグメントを結合する必要があります。
+- 遅延バインディングは実装できません。ユーザーは広告マークに近づくまで広告コンテンツを決定できません。
+- セグメント境界による制約: 広告タグがコンテンツ セグメントの途中にある場合、広告タグを分割する必要があります。
+- エンコーディングの一致: 広告には、長編映画と同じ品質レベルとエンコーディング パラメータが必要です。
+- ライブ ブロードキャスト シナリオ: パッケージャーは、広告期間全体にわたってセグメントごとに出力する必要があります。
+
+クライアント デュアル プレーヤー ソリューション (01:55):
+- 1 人のプレーヤーはホスト コンテンツを再生し、もう 1 人のプレーヤーは広告を再生します
+- バッファリングを手動で調整する必要があり、広告のプリフェッチは長編映画のアダプティブ ビットレートのパフォーマンスに影響します。
+- AirPlayとピクチャインピクチャは実装が難しい
+
+### HLS インタースティシャルのコア設計
+
+HLS インタースティシャルは、広告を独立してスケジュール可能なリソースとして扱います (02:37):
+- 広告は DISCONTINUITY で結合されなくなりましたが、マスター プレイリストを通じて参照されます。
+- 動的な遅延バインディングと再バインディングをサポート
+- セグメントの境界に関係なく、番組タイムラインのどこにでも広告を挿入できます
+- AVKit には tvOS ナビゲーション制限のサポートが組み込まれています
+- AirPlay とピクチャ イン ピクチャのネイティブ サポート、広告は AirPlay セッションでストリーミングされます
+- プレーヤーはメイン コンテンツと広告の間でバッファリングとシステム リソースを自動的に調整します
+
+### 再生プロセス
+
+オンデマンドシーン (03:36): メインコンテンツは広告マークが一時停止するまで再生され、広告が順番に再生され、終了後に一時停止ポイントから再開されます。
+
+ライブ ブロードキャスト シーン (04:21): 広告が再生された後、プレーヤーは広告が再生されている間前方にジャンプし、ライブ ブロードキャストの端に再び加わり、ライブ ブロードキャストとの同期を保ちます。
+
+バッファリング戦略 (04:01): プレーヤーは最初にメイン コンテンツを最初の広告の開始点にバッファリングし、次に最初の広告をプリバッファリングし、次に 2 番目の広告をプリバッファリングし、最後にメイン コンテンツのバッファリングを再開してシームレスな切り替えを保証します。
+
+### サーバー側の広告挿入: DATERANGE タグ
+
+使用`EXT-X-DATERANGE`タグ定義広告 (04:38):
+
+```
+#EXT-X-DATERANGE:CLASS="com.apple.hls.interstitial",\
+ID="ad-1",\
+START-DATE="2021-06-07T10:00:05Z",\
+DURATION=15,\
+X-ASSET-URI="https://cdn.example.com/ad1/master.m3u8",\
+X-RESUME-OFFSET=0
+```
+
+主要な属性:
+
+|プロパティ |機能 |
+|------|------|
+| `CLASS`|固定値`com.apple.hls.interstitial` |
+| `ID`|イベントを一意に識別する |
+| `START-DATE`|メイン タイムラインの広告の開始時刻 |
+| `DURATION`|広告期間 |
+| `X-ASSET-URI`|広告マスター プレイリストの URI |
+| `X-RESUME-OFFSET`| START-DATE | を基準としたメイン コンテンツのリカバリ位置のオフセット。
+
+`X-RESUME-OFFSET`価値戦略 (05:21):
+- 0に設定: オンデマンドシーン、一時停止から再開
+- 省略: 生放送シーン、広告の長さに応じて前方にジャンプし、生放送の端に再結合します
+- 広告期間に設定: インライン広告をスキップします
+
+同じ開始日 (06:00) による連続広告:
+
+```
+#EXT-X-DATERANGE:CLASS="com.apple.hls.interstitial",ID="ad-1",START-DATE="...",DURATION=15,X-ASSET-URI="ad1.m3u8"
+#EXT-X-DATERANGE:CLASS="com.apple.hls.interstitial",ID="ad-2",START-DATE="...",DURATION=15,X-ASSET-URI="ad2.m3u8"
+```
+
+### 遅延バインディング: X-ASSET-LIST
+
+使用`X-ASSET-LIST`代わりの`X-ASSET-URI`遅延バインディングの実装 (06:26): バッファリング中に JSON オブジェクトがフェッチされ、広告コンテンツの直前の決定が可能になります。
+
+```json
+{
+  "ASSETS": [
+    { "URI": "https://cdn.example.com/ad1/master.m3u8", "DURATION": 15 },
+    { "URI": "https://cdn.example.com/ad2/master.m3u8", "DURATION": 15 }
+  ]
+}
+```
+
+### ライブブロードキャストが早期に再開されます
+
+`X-PLAYOUT-LIMIT`生放送シーンの早期復帰を実装(06:55)。たとえば、ニュース速報は広告を中断する必要があります。
+
+```
+#EXT-X-DATERANGE:CLASS="com.apple.hls.interstitial",\
+ID="live-ad",\
+START-DATE="...",\
+DURATION=15,\
+X-ASSET-URI="...",\
+X-PLAYOUT-LIMIT=12
+```
+
+クリエイティブ自体の長さが 15 秒であっても、広告はライブに戻るまで最大 12 秒間再生できます。
+
+### ナビゲーションの制限
+
+`X-RESTRICT`ユーザーのナビゲーション動作の制御 (08:13):
+
+|値 |行動 |
+|----|------|
+| `jump`|ユーザーが広告の前から広告の後まで検索できないようにする |
+| `skip`|広告が標準以外のレートで再生されないようにする (早送りスキップを防ぐ) |
+
+tvOS 上の AVKit は、これらの制限を自動的に適用します。他のプラットフォームを使用する場合、またはカスタム プレーヤーを使用する場合、アプリケーションはそれを独自に実装する必要があります。
+
+### クライアント API
+
+**AVPlayerInterstitialEventMonitor**: サーバーによって挿入された広告イベントを監視します (08:56)
+
+```swift
+let player = AVPlayer(url: movieURL)  // EXT-X-DATERANGE タグが含まれています
+let observer = AVPlayerInterstitialEventMonitor(primaryPlayer: player)
+
+NotificationCenter.default.addObserver(
+    forName: AVPlayerInterstitialEventMonitor.currentEventDidChangeNotification,
+    object: observer,
+    queue: .main
+) { _ in
+    self.updateUI(observer.currentEvent, observer.interstitialPlayer)
+}
+```
+
+**AVPlayerInterstitialEvent**: 単一のインタースティシャル イベントについて説明します (09:50)
+
+```swift
+class AVPlayerInterstitialEvent {
+    var primaryItem: AVPlayerItem? { get }      // 主内容
+    var identifier: String { get }               // 事件 ID
+    var time: CMTime { get }                     // メディア時間の開始点
+    var date: Date? { get }                      // 日期起点
+    var templateItems: [AVPlayerItem] { get }    // クリエイティブテンプレート
+    var restrictions: Restrictions { get }       // 导航限制
+    var resumptionOffset: CMTime { get }         // 恢复偏移
+    var playoutLimit: CMTime { get }             // 播放上限
+    var userDefinedAttributes: [AnyHashable: Any] { get }  // 自定义属性
+}
+```
+
+**AVPlayerInterstitialEventController**: クライアント側のプログラマティック広告挿入 (11:40)
+
+```swift
+let player = AVPlayer(url: movieURL)  // 広告のない純粋なコンテンツ
+let controller = AVPlayerInterstitialEventController(primaryPlayer: player)
+
+let adPodTemplates = [AVPlayerItem(url: ad1URL), AVPlayerItem(url: ad2URL)]
+let event = AVPlayerInterstitialEvent(
+    primaryItem: player.currentItem,
+    time: CMTime(seconds: 10, preferredTimescale: 1),
+    templateItems: adPodTemplates,
+    restrictions: [],
+    resumptionOffset: .zero,
+    playoutLimit: .invalid
+)
+
+controller.events = [event]
+player.currentItem?.translatesPlayerInterstitialEvents = true
+```
+
+`translatesPlayerInterstitialEvents = true`AVKit でタイムラインにナビゲーション マーカーを配置し、tvOS でナビゲーション制限を強制します。
+
+### tvOS デモエフェクト
+
+- 無制限の広告: タイムラインには広告マーカーが表示され、再生中にカウントダウンが表示され、ユーザーはスキップすることを選択できます (13:02)
+- スキップ制限: 再生中にスキップ オプションはありません。最後まで視聴する必要があります (13:34)
+- ジャンプ制限: ユーザーが広告をスキップしようとすると、再生ヘッドが広告マークに自動的に接続され、広告が再生された後にのみシークが続行されます (13:57)
+
+## 重要ポイント
+
+1. **DISCONTINUITY を DATERANGE に置き換えます**: 新しいソリューションは、広告を独立したリソースとして参照し、プレイリストをより簡潔にし、動的な意思決定と再バインドをサポートします。
+
+2. **オンデマンド ビデオの場合は再開オフセットを 0 に設定し、ライブ ブロードキャストの場合はこの属性を省略します**: オンデマンド ビデオは一時停止ポイントから再開され、ライブ ブロードキャストは同期を維持するためにライブ ブロードキャストの端に自動的にジャンプします。
+
+3. **X-ASSET-LIST を使用して遅延バインディングを実装**: 広告決定サービスはバッファリング時にのみ呼び出され、ユーザーのポートレートに基づいて最適な広告をリアルタイムで選択できます。
+
+4. **X-PLAYOUT-LIMIT は、予期せぬライブ ブロードキャスト シナリオに対応します**: スポーツ イベント、ニュース速報、その他のシナリオの突然のエキサイティングな瞬間に、プレイアウト制限を使用して広告を事前に中断し、ライブ ブロードキャストに戻ります。
+
+5. **カスタム属性による広告メタデータの転送**: DATERANGE でビーコン URL や広告 ID などのカスタム属性を定義し、渡します`userDefinedAttributes`クライアントで取得され、広告効果の追跡に使用されます。
+
+## 関連セッション
+
+- [WWDC2021 10187 - グループ アクティビティでカスタム エクスペリエンスを構築](https://developer.apple.com/videos/play/wwdc2021/10187/) — SharePlay でのメディア共有
+- [WWDC2021 10225 - グループ アクティビティを使用してメディア エクスペリエンスを調整する](https://developer.apple.com/videos/play/wwdc2021/10225/) — 複数人による同時再生
+- [WWDC2021 10189 - Safari でのグループ アクティビティ](https://developer.apple.com/videos/play/wwdc2021/10189/) — Web での SharePlay のサポート
+- [WWDC2021 10159 - コアイメージカーネルの改善](https://developer.apple.com/videos/play/wwdc2021/10159/) — ビデオ処理パフォーマンスの最適化

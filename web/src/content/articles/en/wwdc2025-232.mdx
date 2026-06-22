@@ -1,0 +1,120 @@
+---
+title: "Verify identity documents on the web"
+description: "learn how digital credentials can enhance online identity verification flows. we"
+date: 2026-06-10
+tags: ["App Services", "Safari and Web"]
+thumbnail: "/images/sessions/2025/232.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/232/"
+sessionId: "wwdc2025-232"
+year: "2025"
+relatedSessions:
+  - title: "Discover Apple-Hosted Background Assets"
+    code: "325"
+    description: "building on background assets, this session will introduce the new capability to"
+  - title: "Dive deeper into Writing Tools"
+    code: "265"
+    description: "with writing tools, people can proofread, rewrite, and transform text directly w"
+  - title: "Dive into App Store server APIs for In-App Purchase"
+    code: "249"
+    description: "discover the latest updates for the app store server api, app store server notif"
+  - title: "Enhance child safety with PermissionKit"
+    code: "293"
+    description: "discover how permissionkit helps you enhance communication safety for children i"
+---
+
+## Highlight
+
+> This session covers two complete API implementations: the W3C Digital Credentials API on the web and the IdentityDocumentServices framework on iOS.
+
+---
+
+## Core Content
+
+Online identity verification is a mess today. The user has to dig out a physical document, find a clean background, take a sharp photo, and upload it to the website. The website then has to build an image recognition pipeline to decide whether the photo is real. The flow is bad for both sides, and easy to forge.
+
+WWDC25 gives a complete replacement. Safari and WebKit now support the W3C Digital Credentials API, so a site can call `navigator.credentials.get()` to ask for a mobile document (mdoc) based on the ISO 18013-5 standard. The user picks a source in the system UI — a driver's license in Apple Wallet, or a third-party Document Provider app like the demo's Local Driving Authority — authorizes with Face ID, and the encrypted response goes straight to the site's server. The whole path is end-to-end encrypted; even the browser and the operating system cannot read the document. Paired with this is a new iOS framework, IdentityDocumentServices, which lets any app that manages identity documents show up in the system picker through a UI App Extension.
+
+---
+
+## Detailed Content
+
+The site-side request has two halves: Device Request and Encryption Information ([10:17](https://developer.apple.com/videos/play/wwdc2025/232/?time=617)). The Device Request uses a `docType` string to declare that it wants a driver's license, then lists the specific fields (given name, family name, age over 21, portrait, driving privileges). The Encryption Information generates a nonce to prevent replay, and a recipient encryption key-pair. The public key goes into the request and is sent to the provider; the private key stays on the server to decrypt the response.
+
+Signing goes through Apple Business Connect. First generate a signing key-pair, then submit a CSR to get a certificate. At runtime, combine the site's origin URL with the Encryption Information to compute the Session Transcript, then sign with the certificate to produce a Signed Authentication Structure, which goes into the `Reader Authentication All` list ([13:16](https://developer.apple.com/videos/play/wwdc2025/232/?time=796)). This list is an array, so a single request can be signed by certificates trusted by multiple providers — for example, supporting Apple Wallet and Local Driving Authority at the same time.
+
+The front-end call is simple:
+
+```javascript
+const response = await navigator.credentials.get({
+  digital: {
+    requests: [{
+      protocol: "org-iso-mdoc",
+      data: requestData
+    }]
+  }
+});
+```
+
+Key points:
+
+- The `protocol` field must be the standardized string `org-iso-mdoc`. The browser uses it to recognize this as an mdoc request.
+- `data` is the request binary built and signed by the server. The front end does not assemble it.
+- `navigator.credentials.get()` must be called inside a user gesture (click, key press), or the browser will reject it.
+- The returned `response` is JSON-serializable. Send it back to the server with fetch or XHR for decryption.
+- The API exposes a rich set of exception types, so the catch block can fall back to the old "upload a document photo" flow ([15:08](https://developer.apple.com/videos/play/wwdc2025/232/?time=908)).
+
+Response decryption uses HPKE (RFC-9180) ([18:05](https://developer.apple.com/videos/play/wwdc2025/232/?time=1085)). The inputs are the ciphertext, the provider's sender public key, the recipient private key the server generated earlier, and the same Session Transcript used for signing. The output is the Device Response. Each document contains a Mobile Security Object — immutable, signed by the issuer, holding the hash digest of every field. Verification goes like this: first verify that the Document Signer Certificate chains back to a trusted Issuing Authority root; then compute the digest of every returned field and compare it against the digest in the MSO; finally use the Device Public Key in the MSO to verify Device Authentication, confirming that this mdoc really came from the device that was issued the credential and has not been copied ([20:32](https://developer.apple.com/videos/play/wwdc2025/232/?time=1232)).
+
+iOS-side Document Provider registration ([26:19](https://developer.apple.com/videos/play/wwdc2025/232/?time=1579)):
+
+```swift
+let store = IdentityDocumentProviderRegistrationStore.shared
+
+let registration = MobileDocumentRegistration(
+    mobileDocumentType: .mDL,
+    authorityKeyIdentifiers: trustedAuthorities,
+    documentIdentifier: localStorageID
+)
+
+try await store.addRegistration(registration)
+```
+
+Key points:
+
+- `IdentityDocumentProviderRegistrationStore` is the entry point for every registration operation.
+- `mobileDocumentType` takes a standardized string. `mDL` maps to mobile driver's license.
+- `authorityKeyIdentifiers` decides which certificate-signed requests will trigger your app's picker entry. Requests from issuers not in this list will not show your app in the system picker.
+- `documentIdentifier` is the app's own local ID, used to map the system registration to the mdoc stored inside the app.
+- When the user deletes a credential in the app, call `removeRegistration()` with the same ID to take it offline.
+- You can also read the `registrations` property to enumerate all current registrations for reconciliation.
+
+The UI side uses Xcode's `Identity Document Provider` template to generate an App Extension ([28:19](https://developer.apple.com/videos/play/wwdc2025/232/?time=1699)). The key design is the partial request: the system parses part of the request in a sandbox first, verifies the signature, and only hands the app the information it needs to build the UI (document requests, authentication certificates). The full ISO 18013 Device Request is released to the app only after the user taps "accept" inside the app, through the `rawRequest` parameter of the `sendResponse()` closure. Once the app has the full request, it must compare it against the partial request for consistency, then verify the signature, build the response, and encrypt it. This design keeps the attack surface of "OS components parsing arbitrary network data before authorization" inside the sandbox.
+
+---
+
+## Core Takeaways
+
+- **What to do**: Upgrade the "upload a document photo" flow to a Digital Credentials API entry point
+  - Why it matters: Photo capture of physical documents has a built-in conversion ceiling. Photo quality, lighting, and human review all slow down the chain. Digital Credentials hands you encrypted, signature-verified, structured data, cutting most of the work out of OCR and anti-fraud systems.
+  - How to start: Validate the full flow on a development-signed build (the development environment skips the Oblivious HTTP Relay approval), then apply for a signing certificate at Apple Business Connect, and implement server-side build and decrypt logic per ISO 18013-7 Annex C.
+
+- **What to do**: Keep the legacy upload as a fallback
+  - Why it matters: Older browsers, users without registered credentials, and cross-border users may not support the Digital Credentials API. Cutting them off hard will lose a slice of orders.
+  - How to start: Catch the standard exceptions inside the try-catch around `navigator.credentials.get()`, and decide per exception type whether to retry, prompt the user, or fall back to an HTML form upload. Do not catch and fail silently.
+
+- **What to do**: Wire identity document apps into IdentityDocumentServices
+  - Why it matters: Electronic credentials issued by governments, industry associations, and enterprises can all show up in Safari and other apps' requests through the same system picker, saving you from building deep links and negotiating integrations one by one.
+  - How to start: Use Xcode's `Identity Document Provider` template to create an App Extension. Sync local mdocs to `IdentityDocumentProviderRegistrationStore` inside `performRegistrationUpdates()`, and implement the authorization UI inside `RequestAuthorizationView`.
+
+- **What to do**: Apply the principle of minimal disclosure to request fields
+  - Why it matters: The user sees the full list of requested fields on the authorization screen. Asking for too many fields will cut authorization rates and draw compliance scrutiny.
+  - How to start: Audit the existing verification flow, list the fields the business actually needs (such as "name + age over 21"), and declare only those element identifiers in the Device Request namespace. Do not pull the whole document just because you can.
+
+---
+
+## Related Sessions
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — Apple-hosted background asset delivery, extending Background Assets.
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — Deeper Writing Tools integration, giving app text fields proofreading and rewriting.
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — App Store server API and notification updates, covering subscriptions and one-time purchases.
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — Using PermissionKit to strengthen permission requests and review for children's communication safety.

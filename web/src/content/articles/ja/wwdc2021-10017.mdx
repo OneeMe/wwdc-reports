@@ -1,0 +1,403 @@
+---
+title: "Bring Core Data concurrency to Swift and SwiftUI"
+description: "Discover how Core Data is adopting the new concurrency capabilities of Swift 5.5, leading to more concise, efficient, and safe asynchronous code. We'll show you how to update Core Data in your apps to work with concurrency, and detail the many other improvements throughout the framework that make working with Swift and SwiftUI more expressive and powerful."
+date: "2021-06-07"
+tags: ["Core Data", "Swift", "SwiftUI", "Concurrency"]
+thumbnail: "/images/sessions/2021/10017.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10017/"
+sessionId: "wwdc2021-10017"
+year: "2021"
+relatedSessions:
+  - title: "Discover concurrency in SwiftUI"
+    code: "10019"
+    description: "SwiftUI における並行処理機能の具体的な使い方"
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "Swift 構造化並行処理の詳細"
+  - title: "What's new in SwiftUI"
+    code: "10018"
+    description: "FetchRequest 強化を含む SwiftUI の新機能"
+---
+
+## ハイライト
+
+> Core Data は iOS 15 で Swift 5.5 の並行モデルを全面的に採用しました。`NSManagedObjectContext` に `perform` の async オーバーロードが追加され、`try await` での戻り値とエラー送出をサポート。SwiftUI の `@FetchRequest` には動的設定と `@SectionedFetchRequest` によるグループ化クエリが加わり、データ駆動 UI のコードがより簡潔で安全になります。
+
+## 主要内容
+
+### Core Data に並行処理が必要な理由
+
+永続化データは外部ストレージの読み書きが必要で、本質的に非同期操作です。Core Data は最初から並行実行に注目してきましたが、過去の API（`performAndWait`、`perform`）では開発者が手動でスレッド同期と結果の受け渡しを行う必要がありました。
+
+Swift 5.5 の構造化並行モデルにより、Core Data はより自然な API を提供できるようになりました。
+
+### 旧方式の課題
+
+`performAndWait` では、呼び出しスレッドがクロージャの完了までブロックされます。結果を待たない場合は `perform` を使いますが、completion handler で結果とエラーを手動で渡す必要があります。
+
+```swift
+// 過去: エラーを手動で受け渡し
+var fetchError: Error?
+context.performAndWait {
+  do {
+    // ... fetch ...
+  } catch {
+    fetchError = error
+  }
+}
+if let error = fetchError {
+  // handle error
+}
+```
+
+この書き方の問題点:
+- 結果をキャプチャするための可変変数が必要
+- エラー処理が複数箇所に分散
+- コードの可読性とテストが難しい
+
+### 新しい async perform API
+
+iOS 15 では `NSManagedObjectContext` に `perform` の async オーバーロードが追加されました。
+
+```swift
+let count = try await context.perform {
+  let request = Quake.fetchRequest()
+  let fiveHoursAgo = Calendar.current.date(byAdding: .hour, value: -5, to: Date())!
+  request.predicate = NSPredicate(format: "time >= %@", fiveHoursAgo as NSDate)
+  request.resultType = .countResultType
+  return try context.count(for: request)
+}
+```
+
+キーポイント:
+- `perform` クロージャは `throw` でき、呼び出し側は `try await` で受け取る
+- クロージャは `return` で値を呼び出し側に直接渡せる
+- コンパイラがスレッド切り替えと結果のルーティングを自動処理
+- 手動のキャプチャ変数は不要
+
+### スケジューリング戦略: immediate と enqueued
+
+新しい async `perform` は 2 つのスケジューリング戦略をサポートします。
+
+**`.immediate`（デフォルト）**:
+- 異なる実行コンテキストから呼ぶと、スケジュールを待って実行
+- 同じコンテキスト内なら楽観的に即座に実行
+
+**`.enqueued`**:
+- 常にコンテキストのワークキュー末尾に作業を追加
+- 呼び出し元のコンテキストに関係なく
+
+```swift
+// enqueued 戦略を使用
+let result = try await context.perform(schedule: .enqueued) {
+  // このコードは常に現在のキュー末尾で実行される
+  return try context.count(for: request)
+}
+```
+
+### 安全な戻り値の境界
+
+新 API で戻り値は容易になりますが、重要な制限があります。登録済みの `NSManagedObject` をコンテキスト間で返してはいけません。
+
+```swift
+// 危険: 別コンテキストに managed object を返す
+let quake = try await backgroundContext.perform {
+  let request = Quake.fetchRequest()
+  request.sortDescriptors = [NSSortDescriptor(key: "time", ascending: false)]
+  request.fetchLimit = 1
+  return try backgroundContext.fetch(request).first // これはしない！
+}
+```
+
+正しい方法:
+- `NSManagedObjectID` を使い、ターゲットコンテキストで再取得
+- fetch request の dictionary 結果型を使う
+
+```swift
+// 安全: object ID を返す
+let objectID = try await backgroundContext.perform {
+  let request = Quake.fetchRequest()
+  request.resultType = .managedObjectIDResultType
+  request.fetchLimit = 1
+  return try backgroundContext.fetch(request).first as? NSManagedObjectID
+}
+// view context で再取得
+if let objectID = objectID {
+  let quake = viewContext.object(with: objectID)
+}
+```
+
+### インポートフローのリファクタリング
+
+Earthquakes サンプルは async/await によるデータインポートのリファクタリングを示しています。
+
+```swift
+func importQuakes(from data: Data) async throws {
+  let quakes = try JSONDecoder().decode([Quake].self, from: data)
+  try await backgroundContext.perform {
+    for quake in quakes {
+      let newQuake = Quake(context: backgroundContext)
+      newQuake.magnitude = quake.magnitude
+      newQuake.place = quake.place
+      newQuake.time = quake.time
+    }
+    try backgroundContext.save()
+  }
+}
+```
+
+キーポイント:
+- インポート全体を `async throws` で宣言
+- `perform` 内で Core Data 操作をすべて処理
+- エラーは自然に上位へ伝播
+- 呼び出し側は `try await` で完了を待つ
+
+### Swift 向け API の改善
+
+iOS 15 では Core Data が Swift 開発者にとってより使いやすくなりました。
+
+**Persistent store 型**
+
+```swift
+// 新しい Swift スタイルの名前
+let storeType = NSPersistentStore.StoreType.sqlite
+// 旧文字列 "SQLite" に代わる
+```
+
+**Attribute 型**
+
+```swift
+// 新しい AttributeType 列挙型
+func assertAttribute(named name: String, on entity: NSEntityDescription, hasType type: NSAttributeDescription.AttributeType) {
+  guard let attribute = entity.attributesByName[name] else {
+    XCTFail("No attribute named \(name)")
+    return
+  }
+  XCTAssertEqual(attribute.type, type)
+}
+
+// 使用例
+assertAttribute(named: "magnitude", on: quakeEntity, hasType: .double)
+assertAttribute(named: "place", on: quakeEntity, hasType: .string)
+```
+
+### SwiftUI における FetchRequest の強化
+
+**動的ソート**
+
+```swift
+// [20:36](https://developer.apple.com/videos/play/wwdc2021/10017/?time=1236)
+private let sorts = [(
+    name: "Time",
+    descriptors: [SortDescriptor(\Quake.time, order: .reverse)]
+), (
+    name: "Time",
+    descriptors: [SortDescriptor(\Quake.time, order: .forward)]
+), (
+    name: "Magnitude",
+    descriptors: [SortDescriptor(\Quake.magnitude, order: .reverse)]
+), (
+    name: "Magnitude",
+    descriptors: [SortDescriptor(\Quake.magnitude, order: .forward)]
+)]
+
+struct ContentView: View {
+  @FetchRequest(sortDescriptors: [SortDescriptor(\Quake.time, order: .reverse)])
+  private var quakes: FetchedResults<Quake>
+
+  @State private var selectedSort = SelectedSort()
+
+  var body: some View {
+    List(quakes) { quake in
+      QuakeRow(quake: quake)
+    }
+    .toolbar {
+      ToolbarItem(placement: .primaryAction) {
+        SortMenu(selection: $selectedSort)
+        .onChange(of: selectedSort) { _ in
+          let sortBy = sorts[selectedSort.index]
+          quakes.sortDescriptors = sortBy.descriptors
+        }
+      }
+    }
+  }
+}
+```
+
+キーポイント:
+- `@FetchRequest` の `sortDescriptors` が可変になった
+- `quakes.sortDescriptors = ...` で動的にソートを切り替え
+- Swift の `SortDescriptor` 型で型安全
+
+**動的述語**
+
+```swift
+// [21:33](https://developer.apple.com/videos/play/wwdc2021/10017/?time=1293)
+struct ContentView: View {
+  @FetchRequest(sortDescriptors: [SortDescriptor(\Quake.time, order: .reverse)])
+  private var quakes: FetchedResults<Quake>
+
+  @State private var searchText = ""
+  var query: Binding<String> {
+    Binding {
+      searchText
+    } set: { newValue in
+      searchText = newValue
+      quakes.nsPredicate = newValue.isEmpty
+                             ? nil
+                             : NSPredicate(format: "place CONTAINS %@", newValue)
+    }
+  }
+
+  var body: some View {
+    List(quakes) { quake in
+      QuakeRow(quake: quake)
+    }
+    .searchable(text: query)
+  }
+}
+```
+
+キーポイント:
+- `quakes.nsPredicate` を動的に変更可能
+- `.searchable` modifier と組み合わせて検索を実装
+- 検索が空のときは述語をクリアし全データを表示
+
+**グループ化クエリ SectionedFetchRequest**
+
+```swift
+// [23:26](https://developer.apple.com/videos/play/wwdc2021/10017/?time=1406)
+extension Quake {
+  lazy var dateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "MMMM d, yyyy"
+    return formatter
+  }()
+
+  @objc var day: String {
+    return dateFormatter.string(from: time)
+  }
+}
+
+struct ContentView: View {
+  @SectionedFetchRequest(
+    sectionIdentifier: \.day,
+    sortDescriptors: [SortDescriptor(\Quake.time, order: .reverse)])
+  private var quakes: SectionedFetchResults<String, Quake>
+
+  var body: some View {
+    List {
+      ForEach(quakes) { section in
+        Section(header: Text(section.id)) {
+          ForEach(section) { quake in
+            QuakeRow(quake: quake)
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+キーポイント:
+- `@SectionedFetchRequest` で指定プロパティにより自動グループ化
+- `sectionIdentifier` はグループ化用の key path
+- `SectionedFetchResults` を返し、`ForEach` で走査可能
+- グループ化プロパティは Core Data が KVO に依存するため `@objc` が必要
+
+**動的グループ切り替え**
+
+```swift
+// [24:56](https://developer.apple.com/videos/play/wwdc2021/10017/?time=1496)
+private let sorts = [(
+    name: "Time",
+    descriptors: [SortDescriptor(\Quake.time, order: .reverse)],
+    section: \Quake.day
+), (
+    name: "Magnitude",
+    descriptors: [SortDescriptor(\Quake.magnitude, order: .reverse)],
+    section: \Quake.magnitude_str
+)]
+
+// ソートとグループを切り替え
+.onChange(of: selectedSort) { _ in
+  let sortBy = sorts[selectedSort.index]
+  let config = quakes
+  config.sectionIdentifier = sortBy.section
+  config.sortDescriptors = sortBy.descriptors
+}
+```
+
+キーポイント:
+- `sectionIdentifier` を動的に変更可能
+- グループ切り替えでリスト全体が自動的に再構成される
+- アニメーション modifier と組み合わせて滑らかな遷移を実現
+
+## 詳細
+
+### デバッグツール
+
+**Sanitizer**
+
+Xcode の Address Sanitizer と Thread Sanitizer は並行問題の検出に有用です。
+- Address Sanitizer: メモリ使用の問題
+- Thread Sanitizer: マルチスレッドのデータアクセス問題
+
+Scheme Editor の Run 設定で有効化します。
+
+**Core Data 並行デバッグ**
+
+特別なランタイムフラグを有効にすると、Core Data が内部ロックと型の正しい使用を検証します。
+
+```swift
+// 起動引数に追加
+-com.apple.CoreData.ConcurrencyDebug 1
+```
+
+### NSPersistentContainer と NSPersistentStoreCoordinator の async サポート
+
+`NSManagedObjectContext` に加え、`NSPersistentContainer` と `NSPersistentStoreCoordinator` にも同様の async API が追加されました。
+
+```swift
+// NSPersistentContainer の async 読み込み
+let container = NSPersistentContainer(name: "Earthquakes")
+try await container.loadPersistentStores()
+```
+
+## 重要ポイント
+
+**1. すべての Core Data バックグラウンド操作を async/await にリファクタリングする**
+
+- **何をするか**: 既存の `performAndWait` + 手動エラー処理を新しい async `perform` に移行
+- **なぜ価値があるか**: コード量が 50% 以上削減。コンパイラがスレッド安全性を保証。エラー処理が自然
+- **どう始めるか**: データインポート/エクスポートから始め、すべてのバックグラウンド context 操作を段階的に置き換え
+
+**2. SwiftUI でソート可能・検索可能なリストを実装する**
+
+- **何をするか**: `@FetchRequest` の動的設定でリストにソートと検索を追加
+- **なぜ価値があるか**: fetched results controller を手動管理不要。コードが簡潔でデータ変化を自動処理
+- **どう始めるか**: `quakes.sortDescriptors` と `quakes.nsPredicate` でクエリ条件を動的に変更
+
+**3. 日付でグループ化したデータ表示を構築する**
+
+- **何をするか**: `@SectionedFetchRequest` で日付やカテゴリなどでグループ化したリスト
+- **なぜ価値があるか**: 1 行で過去数十行の `NSFetchedResultsController` + section 計算ロジックに代わる
+- **どう始めるか**: エンティティに `@objc` 計算プロパティを追加し、`@SectionedFetchRequest` の `sectionIdentifier` に渡す
+
+**4. 型安全なモデル検証テストを構築する**
+
+- **何をするか**: 新しい `AttributeType` 列挙型でユニットテストを書き、ランタイムモデルと Xcode モデルエディタの一致を検証
+- **なぜ価値があるか**: 開発早期にモデル変更によるランタイム問題を捕捉
+- **どう始めるか**: 各エンティティに `assertAttribute` テストを書き、属性名と型を確認
+
+**5. 安全なコンテキスト間データ受け渡しを設計する**
+
+- **何をするか**: async perform クロージャでは `NSManagedObjectID` または辞書のみを返し、managed object は返さない
+- **なぜ価値があるか**: コンテキスト間アクセスによるクラッシュとデータ不整合を防ぐ
+- **どう始めるか**: すべての async perform の戻り値を監査し、managed object インスタンスを返していないことを確認
+
+## 関連セッション
+
+- [Discover concurrency in SwiftUI](/articles/wwdc2021-10019) — `task` と `refreshable` を含む SwiftUI の並行処理
+- [Explore structured concurrency in Swift](/articles/wwdc2021-10134) — Task、Actor など構造化並行処理の詳細
+- [What's new in SwiftUI](/articles/wwdc2021-10018) — `@FetchRequest` と `@SectionedFetchRequest` のさらなる使い方を含む SwiftUI の概要

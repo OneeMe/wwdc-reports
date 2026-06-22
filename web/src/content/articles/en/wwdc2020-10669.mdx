@@ -1,0 +1,158 @@
+---
+title: "Handling FHIR without getting burned"
+description: "learn how fhirmodels creates native data models for all fhir resources, provides data validation to enforce resource integrity, and prevents the creation of structurally invalid resources — across multiple versions of the fhir specification. whether you're working with clinical data obtained from healthkit or direct from a clinical system, fhirmodels makes fhir easy to handle."
+date: 2020-06-10
+tags: ["FHIR", "HealthKit", "Health & Fitness", "WWDC 2020"]
+thumbnail: "/images/sessions/2020/10669.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10669/"
+sessionId: "wwdc2020-10669"
+year: "2020"
+relatedSessions:
+  - title: "Getting started with HealthKit"
+    code: "10664"
+    description: "HealthKit entry path: authorization, reading and writing health data, using query to read and collect statistics on shared health data."
+  - title: "What's new in HealthKit"
+    code: "10182"
+    description: "Learn about the new ECG, symptom logging, and mobility data types new to HealthKit in 2020."
+  - title: "Synchronize health data with HealthKit"
+    code: "10184"
+    description: "Continue working on HealthKit data synchronization, change detection, and cross-device version management."
+  - title: "What's new in CareKit"
+    code: "10151"
+    description: "The recommended follow-up session at the end of the speech shows how to combine FHIR and CareKit into the care app."
+---
+## Highlight
+
+> Apple released the open source Swift package FHIRModes, which decodes FHIR clinical records in HealthKit into native Swift models such as DSTU2 and R4, and prevents resources with invalid structures during encoding and decoding.
+
+## Core Content
+
+Health app supports Fast Healthcare Interoperability Resources (FHIR) clinical records starting in 2018. The process starts in the Health app: it connects directly to the healthcare institution's API, downloads the FHIR data to the iOS device, and securely stores it in HealthKit. What developers get are clinical records exposed by the HealthKit API.
+
+The real troublesome part is on the app side. FHIR resources include strings, restricted codes, ISO-8601-style date strings, Boolean values, numbers, and multi-level nested structures. When only looking at the status, date, and medication of the prescription, write Swift yourself`Codable`It seems sufficient; once faced with complete prescription resources, the number of models and field complexity will quickly increase.
+
+The solution given by Apple is FHIRModels. It is an open source Swift package that provides native data models for all resources under the same FHIR release, and checks resource integrity when encoding and decoding. The package also includes datetime parsing, code field enumeration, value polymorphic attribute enumeration, and libraries for DSTU2, R4, and latest build release.
+
+The example of this session is very small: make a medication list app, request only medication access, and then put`HKClinicalRecord`Decode the FHIR JSON into a prescription model. This example also exposes two real boundaries: HealthKit authorization must comply with the principle of only requesting data required by the current function, FHIR release will coexist in the external world for a long time, and the App needs to select the corresponding model according to release.
+
+## Detailed Content
+
+### Decoding FHIR models from HealthKit clinical records
+
+([04:32](https://developer.apple.com/videos/play/wwdc2020/10669/?time=272)) The first path of FHIRModels is to turn the clinical records returned by HealthKit into Swift models. session uses medication prescription example: App gets`HKClinicalRecord`, read the associated`fhirResource`, then use`JSONDecoder`Decoded into DSTU2`MedicationOrder`。
+
+```
+// Use with Health Records FHIR data from HealthKit
+import HealthKit
+import ModelsDSTU2
+
+// Grab HKClinicalRecord from HealthKit API
+let clinicalRecord: HKClinicalRecord
+let resource = clinicalRecord.fhirResource!
+
+// Print the prescription note
+let decoder = JSONDecoder()
+let prescription = try decoder.decode(MedicationOrder.self, from: resource.data)
+print("\(prescription.note)")
+```
+
+Key points:
+
+- `import HealthKit`Corresponding clinical record source,`import ModelsDSTU2`Model library corresponding to the current FHIR release.
+-`HKClinicalRecord`From the HealthKit API,`clinicalRecord.fhirResource`Save raw FHIR JSON data.
+-`JSONDecoder`Instead of decoding to the structure handwritten by the developer, it is decoding to the structure provided by FHIRModels`MedicationOrder`。
+- `prescription.note`Note that the decoded object is already a Swift model, and there is no need to manually go through the JSON dictionary to read fields later.
+
+### Add a layer of business display to the nested structure
+
+([05:04](https://developer.apple.com/videos/play/wwdc2020/10669/?time=304)) FHIR resources place the actual business fields deeply nested. session uses dosage instruction. For example: the prescription instructions may contain an effective date range, and the date range is between`TimingRepeat`of`bounds`period. The example uses extension to encapsulate this nested access into a display string.
+
+```
+// Make using "TimingRepeat" period dates easier by writing an extension
+extension TimingRepeat {
+    var periodDisplayString: String? {
+        if case .period(let period) = bounds {
+            return "\(period.start) - \(period.end)"
+        }
+        return nil
+    }
+}
+
+// Collect all dosage instructions on medication prescriptions
+let instructions: [String] = prescription.dosageInstruction?.map { dosage in
+    guard let period = dosage.timing?.repeat?.periodDisplayString else {
+        return "\(dosage.text)"
+    }
+    return "\(period): \(dosage.text)"
+}
+```
+
+Key points:
+
+- `TimingRepeat`It is a type provided by FHIRModes. The extension is only responsible for adding the App's own display logic.
+-`if case .period(let period) = bounds`Handle the period branch in the value polymorphic attribute.
+-`period.start`and`period.end`From nested periods, the example spells them into date ranges.
+-`prescription.dosageInstruction?.map`Go through all medication instructions for your prescription.
+-`guard let period = ...`Keep the case without date range and return directly`dosage.text`.
+- The returned string puts the date range and medication instructions together, which is suitable for interface display such as medication list.
+
+### Support multiple FHIR releases at the same time
+
+([06:20](https://developer.apple.com/videos/play/wwdc2020/10669/?time=380)) FHIR release will not be uniformly migrated with the release of new versions. session specifically mentioned that DSTU2 will be popular for several more years, so the App needs to support multiple releases. FHIRModes' approach is to expose different modules according to release, and the App selects the corresponding model according to the release to which the resource belongs.
+
+```
+// Supporting multiple releases
+import ModelsDSTU2
+import ModelsR4
+
+let decoder = JSONDecoder()
+let release: FHIRRelease
+let data: Data
+
+let note: String? = nil
+switch release {
+case .dstu2:
+    let model = try decoder.decode(ModelsDSTU2.MedicationOrder.self, from: data)
+    note = model.note?.value?.string
+case .r4:
+    let model = try decoder.decode(ModelsR4.MedicationRequest.self, from: data)
+    note = model.note?.compactMap({ $0.text.value?.string }).joined(separator: "\n")
+default:
+    note = "Unsupported FHIR release \(release)"
+}
+```
+
+Key points:
+
+- `import ModelsDSTU2`and`import ModelsR4`Indicates that the same App can reference multiple release model libraries at the same time.
+-`release: FHIRRelease`This example assumes that there is an existing release judgment entry.
+-`switch release`Make parsing branches explicit to avoid stuffing DSTU2 data into the R4 model.
+- DSTU2 example decoded to`MedicationOrder`, R4 example decodes to`MedicationRequest`, which reflects the differences in resource models of different releases.
+- The two branches use different paths to read notes, indicating that release differences will affect field access methods.
+-`default`Give the branch unsupported release copy to avoid silent failure.
+
+### Authorization and data scope should be narrowed according to function
+
+([01:13](https://developer.apple.com/videos/play/wwdc2020/10669/?time=73)) After getting`HKClinicalRecord`Before doing so, the App must first request authorization from the user. The session's medication list app only requests medication access permissions and adheres to the "proportional to what you need" principle. The authorization interface will also display the App’s`Info.plist`The description text and privacy policy link provided here, Apple will review this privacy policy.
+
+Key points:
+
+- FHIR clinical data by default only shares data that is already on the device.
+- Authorization should be requested before each query of FHIR data, giving users an opportunity to approve new data access.
+- If there is no new content requiring authorization, the system sheet will not appear.
+- This authorization model is connected to the FHIRModels decoding process: first let the user approve the precise data range, and then parse the FHIR resource returned by HealthKit.
+
+## Core Takeaways
+
+- **Medication list**: What to do: Display the notes and dosage instructions in the user's prescription. Why it’s worth doing: The session code is directly from`HKClinicalRecord`decoding`MedicationOrder`, and demonstrate how to display prescription instructions. How to start: Request medication access only, get`fhirResource.data`for later use`ModelsDSTU2.MedicationOrder`Decode and map note and dosage instruction to lists.
+- **Dosage Instruction Timeline**: What to do: Display each dosage instruction according to the effective date range. Why it’s worth doing:`TimingRepeat`of`bounds`period can add start and end dates to the description. How to start: for`TimingRepeat`Add display extension, read`period.start`and`period.end`, fall back to the original description text when there is no period.
+- **Multi-release recipe parser**: What it does: Process DSTU2 and R4 recipe data in the same app. Why it’s worth doing: The session clearly states that existing APIs will not be automatically updated with new releases, and DSTU2 needs to continue to be supported. How to start: Save or determine resources`FHIRRelease`,use`switch`choose`ModelsDSTU2.MedicationOrder`or`ModelsR4.MedicationRequest`.
+- **FHIR Data Quality Inspection Panel**: What to do: Flag resources in the debug or import process that cannot be decoded, have unsupported releases, or have invalid structures. Why it’s worth doing: FHIRModels checks resource integrity when encoding and decoding to prevent resources with invalid structures from entering the business process. How to get started: Centralize logging of decoding errors and unsupported release branches, giving developers or testers a list of issues that can be viewed by resource.
+- **Care app’s clinical record entrance**: What to do: Convert user-authorized HealthKit clinical records into displayable care data in the care app. Why it’s worth doing: At the end of the session, I recommend continuing to see how CareKit combines FHIR to build care apps. How to start: First complete HealthKit authorization and FHIRModes decoding, then connect prescription notes, medication instructions, and date ranges to CareKit or a customized care interface.
+
+## Related Sessions
+
+- [Getting started with HealthKit](/articles/wwdc2020-10664) — First master HealthKit authorization, reading and writing, and query, and then process FHIR data in clinical records.
+- [What's new in HealthKit](/articles/wwdc2020-10182) — Learn about the new data types and health data capabilities added to HealthKit in the same year.
+- [Synchronize health data with HealthKit](/articles/wwdc2020-10184) — Supplement HealthKit data change detection, synchronization and cross-device management.
+- [What's new in CareKit](/articles/wwdc2020-10151) — The recommended follow-up content at the end of the session shows how to use FHIR and CareKit in the care app.

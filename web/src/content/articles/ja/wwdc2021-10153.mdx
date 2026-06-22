@@ -1,0 +1,225 @@
+---
+title: "Create image processing apps powered by Apple silicon"
+description: "Discover how to optimize your image processing app for Apple silicon. Explore how to take advantage of Metal render command encoders, tile shading, unified memory architecture, and memoryless attachments."
+date: "2021-06-07"
+tags: ["Metal", "Apple Silicon", "Image Processing", "GPU"]
+thumbnail: "/images/sessions/2021/10153.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10153/"
+sessionId: "wwdc2021-10153"
+year: "2021"
+relatedSessions:
+  - title: "Optimize high-end games for Apple GPUs"
+    code: "10148"
+    description: "Apple GPU の TBDR アーキテクチャを活用したゲーム最適化"
+  - title: "Explore Core Image kernel improvements"
+    code: "10159"
+    description: "Core Image Metal kernel の新しい書き方"
+  - title: "Discover Metal debugging, profiling, and asset creation tools"
+    code: "10157"
+    description: "Xcode 13 の Metal デバッグツール"
+---
+## ハイライト
+
+> Apple Silicon のユニファイドメモリアーキテクチャにより、CPU-GPU 間のゼロコピー転送が可能になる。TBDR アーキテクチャの tile shading と memoryless attachment により、画像フィルタパイプラインを完全に on-chip tile メモリ内で実行でき、メモリ帯域幅を大幅に削減できる。
+
+## 主な内容
+
+画像処理アプリはカメラから 1 フレームの画像を取得し、一連のフィルタを適用してから結果を表示する。ディスクリート GPU では、各ステップでデータを CPU メモリから GPU メモリへコピーし、フィルタ間でもテクスチャを行き来させる必要がある。こうしたコピーは多くの時間と電力を消費する。
+
+Apple Silicon はこの状況を変えた。CPU と GPU は同じ物理メモリを共有するため、データをコピーする必要がない。
+
+## 詳細
+
+### ユニファイドメモリアーキテクチャの利点
+
+（[00:52](https://developer.apple.com/videos/play/wwdc2021/10153/?time=52)）
+
+Apple Silicon のすべてのコンポーネント（CPU、GPU、Neural Engine、Media Engine）は、統一されたメモリインターフェイスを通じて同じシステムメモリへアクセスする。
+
+つまり次のことが可能になる。
+- `MTLBuffer` で作成した buffer は、CPU が直接読み書きでき、GPU も直接使用できる
+- `IOSurface` と `CVPixelBuffer` はコピーなしで CPU と GPU の間を受け渡しできる
+- 画像処理パイプラインの各ステップをインプレースで実行できる
+
+```swift
+// カメラから取得した CVPixelBuffer
+let pixelBuffer: CVPixelBuffer = ...
+
+// Metal texture を直接作成し、ゼロコピーにする
+let texture = CVMetalTextureCacheCreateTextureFromImage(
+    allocator: kCFAllocatorDefault,
+    textureCache: textureCache,
+    sourceImage: pixelBuffer,
+    textureAttributes: nil,
+    pixelFormat: .bgra8Unorm,
+    width: width,
+    height: height,
+    planeIndex: 0
+)
+```
+
+（[02:30](https://developer.apple.com/videos/play/wwdc2021/10153/?time=150)）
+
+**キーポイント:**
+- `CVMetalTextureCache` は pixel buffer とメモリを共有する texture を作成する
+- CPU-GPU 間のデータコピーがない
+- 処理パイプライン全体を GPU 上で実行する
+- リアルタイムカメラフィルタの場面に適している
+
+### Tile Shading：Tile メモリ内で処理する
+
+（[03:45](https://developer.apple.com/videos/play/wwdc2021/10153/?time=225)）
+
+Apple GPU の TBDR アーキテクチャは画面を小さなブロック（tile）に分割し、それぞれを on-chip tile メモリ内で処理する。tile メモリの帯域幅はメインメモリより 1 桁高い。
+
+画像処理では、複数のフィルタを 1 つの render pass に統合し、中間結果を tile メモリに残せることを意味する。
+
+```metal
+// 従来の方法：フィルタごとに compute pass を使い、メインメモリへ書き戻す
+kernel void blurPass1(...) { ... }  // メインメモリへ書き込む
+kernel void blurPass2(...) { ... }  // メインメモリへ書き込む
+kernel void sharpen(...) { ... }    // メインメモリへ書き込む
+
+// 最適化した方法：tile shader により、中間結果を tile メモリに残す
+[[kernel]] void imageProcessingTileShader(
+    texture2d<float> source [[texture(0)]],
+    device ImageProcessingParams* params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    // ソース画像を読み取る
+    float4 color = source.read(gid);
+
+    // 複数のフィルタを適用し、データを tile memory に残す
+    color = applyBlur(color, params->blurRadius);
+    color = applySharpen(color, params->sharpenAmount);
+    color = applyColorAdjust(color, params->brightness, params->contrast);
+
+    // 最終結果だけをメインメモリへ書き戻す
+    destination.write(color, gid);
+}
+```
+
+（[05:20](https://developer.apple.com/videos/play/wwdc2021/10153/?time=320)）
+
+**キーポイント:**
+- tile shader は tile memory 内で実行される
+- 複数のフィルタを 1 つの kernel に統合する
+- 中間結果をメインメモリへ書き出さない
+- メモリ帯域幅を大幅に削減できる
+
+### Memoryless Attachment
+
+（[10:53](https://developer.apple.com/videos/play/wwdc2021/10153/?time=653)）
+
+render pass の中間 attachment は memoryless としてマークでき、tile メモリ内だけに存在し、メインメモリへは書き込まれない。
+
+```swift
+let descriptor = MTLRenderPassDescriptor()
+
+// 中間 G-Buffer attachment、memoryless
+descriptor.colorAttachments[0].texture = intermediateTexture
+descriptor.colorAttachments[0].storeAction = .dontCare  // メインメモリへ書き戻さない
+intermediateTexture.storageMode = .memoryless
+
+// 最終出力 attachment
+descriptor.colorAttachments[1].texture = outputTexture
+descriptor.colorAttachments[1].storeAction = .store  // メインメモリへ書き戻す
+```
+
+（[10:53](https://developer.apple.com/videos/play/wwdc2021/10153/?time=653)）
+
+**キーポイント:**
+- `.memoryless` storage mode は tile メモリ内にだけ存在する
+- `.dontCare` store action はメインメモリへ書き込まない
+- G-Buffer や中間処理結果に適している
+- 最終出力は `.store` で保存する
+
+### Uber-Shader 最適化
+
+（[12:25](https://developer.apple.com/videos/play/wwdc2021/10153/?time=745)）
+
+画像処理アプリには通常、多数のフィルタ組み合わせがある。組み合わせごとに個別の shader を書くと、shader の数が爆発的に増える。uber-shader は条件分岐ですべてのフィルタを処理できるが、レジスタ圧を高める。
+
+解決策は、function constants を使って有効にするフィルタをコンパイル時に確定すること。
+
+```metal
+[[function_constant(0)]] const bool enableBlur = false;
+[[function_constant(1)]] const bool enableSharpen = false;
+[[function_constant(2)]] const bool enableVignette = false;
+
+fragment float4 imageFilterFragment(...) {
+    float4 color = source.sample(sampler, uv);
+
+    if (enableBlur) {
+        color = applyBlur(color, uv);
+    }
+    if (enableSharpen) {
+        color = applySharpen(color, uv);
+    }
+    if (enableVignette) {
+        color = applyVignette(color, uv);
+    }
+
+    return color;
+}
+```
+
+（[13:32](https://developer.apple.com/videos/play/wwdc2021/10153/?time=812)）
+
+**キーポイント:**
+- function constants はコンパイル時に確定する
+- 有効でないフィルタのコードは取り除かれる
+- レジスタ圧を下げられる
+- 組み合わせごとに pipeline state を作成する必要がある
+
+### 画像処理フィルタグラフ
+
+（[23:02](https://developer.apple.com/videos/play/wwdc2021/10153/?time=1382)）
+
+複雑な画像処理アプリでは、フィルタ間の依存関係を管理する必要がある。典型的なフィルタグラフは次のようになる。
+
+```
+Input Image → Blur → Blend with Original → Sharpen → Color Adjust → Output
+                ↑___________________________|
+```
+
+Apple Silicon では、このグラフを単一の render pass で完了できる。
+
+```swift
+// render pass を設定し、すべての中間結果に memoryless を使う
+let descriptor = MTLRenderPassDescriptor()
+descriptor.colorAttachments[0].storeAction = .dontCare
+descriptor.colorAttachments[0].texture.storageMode = .memoryless
+
+// すべてのフィルタを 1 つの render command としてエンコードする
+encoder.setRenderPipelineState(uberPipeline)
+encoder.setFragmentTexture(input, index: 0)
+encoder.setFragmentBytes(&filterParams, length: ...)
+encoder.drawPrimitives(...)
+```
+
+（[23:02](https://developer.apple.com/videos/play/wwdc2021/10153/?time=1382)）
+
+**キーポイント:**
+- フィルタの依存関係を分析し、統合できるステップを見つける
+- 中間結果には memoryless attachment を使う
+- 最終出力は `.store` を使う
+- render pass の切り替えとメモリ帯域幅を削減する
+
+## 重要ポイント
+
+1. **CVMetalTextureCache でゼロコピーのカメラフィルタを実装する**。カメラから取得した pixel buffer を直接 Metal texture に変換し、処理パイプライン全体を GPU 上で完了する。主な API：`CVMetalTextureCacheCreateTextureFromImage`。
+
+2. **複数のフィルタを単一の tile shader に統合する**。中間結果を tile メモリに残し、最終結果だけを書き込む。主な API：`[[kernel]] tileShader`。
+
+3. **中間 attachment には memoryless storage を使う**。G-Buffer と一時テクスチャをメインメモリへ永続化する必要がない。主な API：`texture.storageMode = .memoryless` + `storeAction = .dontCare`。
+
+4. **function constants で uber-shader を最適化する**。現在有効なフィルタの組み合わせに応じて専用 shader をコンパイルし、レジスタ圧を下げる。主な API：`[[function_constant(N)]]`。
+
+5. **ディスクリート GPU から移行するときはデータフローを再設計する**。Apple Silicon では CPU-GPU コピーが不要なため、コピー最小化のために作られていた複雑な設計を簡素化できる。主な API：ユニファイドメモリ + `MTLStorageMode.shared`。
+
+## 関連セッション
+
+- [Optimize high-end games for Apple GPUs](/articles/wwdc2021-10148) — Apple GPU の TBDR アーキテクチャを活用したゲーム最適化
+- [Explore Core Image kernel improvements](/articles/wwdc2021-10159) — Core Image Metal kernel の新しい書き方
+- [Discover Metal debugging, profiling, and asset creation tools](/articles/wwdc2021-10157) — Xcode 13 の Metal デバッグツール

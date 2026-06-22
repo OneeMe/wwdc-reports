@@ -1,0 +1,148 @@
+---
+title: "Go further with Metal 4 games"
+description: "dive deeper into the latest advancements in metal 4. we"
+date: 2026-06-10
+tags: ["AVFoundation", "Audio and Video", "Camera", "Media Playback", "SwiftUI"]
+thumbnail: "/images/sessions/2025/211.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/211/"
+sessionId: "wwdc2025-211"
+year: "2025"
+relatedSessions:
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+  - title: "Engage players with the Apple Games app"
+    code: "215"
+    description: "meet the games app – a new destination for players to keep up with what"
+---
+
+## Highlight
+
+> MetalFX adds frame interpolation on Apple platforms for the first time. Together with the new denoised upscaler and the ray tracing intersection function buffer, it lets Cyberpunk 2077-class path tracing run on Apple Silicon.
+
+---
+
+## Core Content
+
+The hard problem in game rendering is on the table: at the visual level of Cyberpunk 2077, every pixel is expensive, and pushing resolution and frame rate together breaks the budget. MetalFX used to ship only one tool, the temporal upscaler. Developers had to give up resolution, give up frame rate, or hand-roll their own frame interpolation — and rolling your own means handling UI rendering, pacing, and double-buffered queues. That is a lot of work.
+
+This WWDC25 session hands developers three new weapons. The MetalFX Frame Interpolator generates a frame between two already-rendered frames out of thin air, and is built into the Metal pipeline natively. The MetalFX Denoised Upscaler folds ray-traced denoising and upscaling into a single step, removing per-scene hand tuning. On the ray tracing side, the new intersection function buffer lets a DirectX shader binding table port over directly. The three features stack: use the intersection function buffer to optimize ray tracing, use the denoised upscaler to cut the ray budget, then use the frame interpolator to double the frame rate.
+
+---
+
+## Detailed Content
+
+Hooking up the frame interpolator takes only five textures: current frame color, previous frame color, depth, motion vectors, and output. If you have already wired up the MetalFX upscaler, you can reuse motion vectors and depth. Pass `temporalScaler` to `MTLFXFrameInterpolatorDescriptor.scaler` to get a combined performance bonus ([08:35](https://developer.apple.com/videos/play/wwdc2025/211/?time=515)).
+
+```objc
+// Create and configure the interpolator descriptor
+MTLFXFrameInterpolatorDescriptor* desc = [MTLFXFrameInterpolatorDescriptor new];
+desc.scaler = temporalScaler;
+
+// Create the effect and configure your effect
+id<MTLFXFrameInterpolator> interpolator = [desc newFrameInterpolatorWithDevice:device];
+interpolator.motionVectorScaleX = mvecScaleX;
+interpolator.motionVectorScaleY = mvecScaleY;
+interpolator.depthReversed = YES;
+
+// Set input textures
+interpolator.colorTexture = colorTexture;
+interpolator.prevColorTexture = prevColorTexture;
+interpolator.depthTexture = depthTexture;
+interpolator.motionTexture = motionTexture;
+interpolator.outputTexture = outputTexture;
+```
+
+Key points:
+- `desc.scaler = temporalScaler`: hand the existing MetalFX temporal upscaler object to the interpolator so the two share intermediate results. This is cheaper than calling them independently.
+- `depthReversed = YES`: declare reversed Z (far near 0, near near 1). Almost every modern engine uses reversed Z for better depth precision.
+- `motionVectorScaleX/Y`: scale motion vectors from normalized coordinates to pixel coordinates. Get this wrong and the interpolator produces ghosting.
+- Bind all five input textures at once: color, previous color, depth, motion, output. Miss one and it will not run.
+
+The migration path to the Denoised Upscaler is short — start from a working `MTLFXTemporalScalerDescriptor` and add four auxiliary textures ([13:02](https://developer.apple.com/videos/play/wwdc2025/211/?time=782)).
+
+```objc
+MTLFXTemporalScalerDescriptor* desc = [MTLFXTemporalScalerDescriptor new];
+desc.colorTextureFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+desc.outputTextureFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+desc.depthTextureFormat = DepthStencilFormat;
+desc.motionTextureFormat = MotionVectorFormat;
+
+desc.diffuseAlbedoTextureFormat = DiffuseAlbedoFormat;
+desc.specularAlbedoTextureFormat = SpecularAlbedoFormat;
+desc.normalTextureFormat = NormalVectorFormat;
+desc.roughnessTextureFormat = RoughnessFormat;
+
+desc.inputWidth = _mainViewWidth;
+desc.inputHeight = _mainViewHeight;
+desc.outputWidth = _screenWidth;
+desc.outputHeight = _screenHeight;
+temporalScaler = [desc newTemporalDenoisedScalerWithDevice:_device];
+```
+
+Key points:
+- The first four lines are what any temporal upscaler needs: color format, output format, depth format, motion format.
+- Four new noise-free auxiliary textures: diffuse albedo, specular albedo, normals, and roughness. A game's G-buffer usually has all four — reuse them directly.
+- The line `newTemporalDenoisedScalerWithDevice:` is the watershed. Switch to this factory method and you get an object that does denoising and upscaling in one shot.
+- Normals must be in world space, and the texture type must be signed. Otherwise quality drops the moment the camera turns. The session hits this point hard at [22:00](https://developer.apple.com/videos/play/wwdc2025/211/?time=1320).
+
+For ray tracing, the new intersection function buffer cuts the cost of porting a DirectX shader binding table to almost zero. The host side uses a two-level offset index across instances and geometry ([16:04](https://developer.apple.com/videos/play/wwdc2025/211/?time=964)):
+
+```objc
+MTLAccelerationStructureInstanceDescriptor *grassInstanceDesc, *treeInstanceDesc = . . .;
+grassInstanceDesc.intersectionFunctionTableOffset = 0;
+treeInstanceDesc.intersectionFunctionTableOffset  = 1;
+```
+
+On the shader side, declare the intersector with the `intersection_function_buffer` tag, then set the ray type count and base id ([13:01](https://developer.apple.com/videos/play/wwdc2025/211/?time=781)):
+
+```metal
+metal::raytracing::intersector<intersection_function_buffer, instancing, triangle> trace;
+trace.set_geometry_multiplier(2); // Number of ray types, defaults to 1
+trace.set_base_id(1);             // Set ray type index, defaults to 0
+```
+
+Key points:
+- `geometry_multiplier(2)`: declares two ray types per geometry (for example, primary rays and shadow rays). This sets the buffer stride.
+- `set_base_id(1)`: the current trace is the second ray type (base id = 1, shadow rays). For primary rays, pass 0.
+- Unlike DirectX, Metal sets the buffer address and stride in the shader. DirectX sets them on the host at dispatch time. All threads in a SIMD group must set the same value, or behavior is undefined.
+- When porting a DirectX project, instance offset, ray type index, and geometry multiplier map one-to-one. The only difference is that Metal hands geometry offset to the developer; DirectX generates it automatically.
+
+Pacing for frame interpolation is the easiest place to trip. The session ships a reference `PresentThread` helper ([12:45](https://developer.apple.com/videos/play/wwdc2025/211/?time=765)) that uses `MTLSharedEvent` plus `kqueue`'s `EVFILT_TIMER` for sub-millisecond pacing, so interpolated frames and real frames hit the screen at equal intervals. The simple way to check pacing: turn on the Metal HUD and look at the Frame Interval histogram. One or two buckets means pacing is correct; more than two means pacing is broken.
+
+Two more new tools are worth a note. The `MTLFX_EXPOSURE_TOOL_ENABLED` environment variable overlays a gray checkerboard on the image. Pass the right exposure and the checkerboard stays a steady mid-gray; pass the wrong value and it flickers ([04:25](https://developer.apple.com/videos/play/wwdc2025/211/?time=265)). The reactive mask lets developers tag transparent effects like particles and fireworks that do not write motion or depth, so the upscaler does not smear them out as if they were texture detail ([06:46](https://developer.apple.com/videos/play/wwdc2025/211/?time=406)).
+
+---
+
+## Core Takeaways
+
+- **What to do**: upgrade the existing MetalFX upscaler to a frame interpolator
+  - Why it pays off: the render pipeline only needs one extra step after tone-mapping. Motion vectors and depth are reusable. The work is small and it doubles the target frame rate. A 30 FPS input is enough — far cheaper than grinding more low-level optimization.
+  - How to start: use the Metal HUD to read current frame rate and the frame interval histogram for a baseline. Then wire up a minimal `MTLFXFrameInterpolatorDescriptor` and start with Composited UI mode for the UI (the simplest path — let the interpolator unblend it). Once that runs, move to Offscreen UI or Every-Frame UI for higher quality.
+
+- **What to do**: replace the ray tracing denoiser with the MetalFX Denoised Upscaler
+  - Why it pays off: a traditional denoiser needs hand-tuning per scene. The Denoised Upscaler is a machine learning model that ships shippable output with zero tuning, and it lets you cut the ray budget — same image quality with fewer rays.
+  - How to start: confirm your G-buffer has the four required textures: normals (world space, signed), diffuse albedo, specular albedo, and roughness. Once that runs, add three optional inputs — specular hit distance, denoiser strength mask, and transparency overlay — to refine quality. For metallic surfaces, darken the diffuse albedo; the color should live in the specular albedo.
+
+- **What to do**: when porting a ray tracing game from DirectX, reach for the intersection function buffer first
+  - Why it pays off: the DirectX shader binding table and the Metal 4 intersection function buffer map one-to-one. Instance offset, ray type, and geometry multiplier port over directly, and the shader changes are far smaller than on the older visible function table path.
+  - How to start: set `intersectionFunctionTableOffset` on the instance descriptor and the same field on the geometry descriptor. In the shader, declare `intersector<intersection_function_buffer, ...>`, set `set_geometry_multiplier` to the ray type count and `set_base_id` to the current ray type index. Finally, pass the buffer, size, and stride through `intersection_function_buffer_arguments` to `trace.intersect`.
+
+- **What to do**: use the `MTLFX_EXPOSURE_TOOL_ENABLED` environment variable to calibrate the exposure input to the upscaler
+  - Why it pays off: a wrong exposure value causes flickering and ghosting, but the eye cannot easily tell where the error is. The checkerboard debugger is Apple's litmus test — turn it on and you know.
+  - How to start: add the environment variable to the Xcode scheme and run the game. A steady mid-gray checkerboard is correct. If it is too dark, too bright, or shifts color at runtime, exposure and the tone mapper do not match, and the value passed to the upscaler needs to change.
+
+---
+
+## Related Sessions
+
+- [Discover Metal 4](/articles/wwdc2025-205) — an introduction to Metal 4; watch this first and the current session goes down easier
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — how to encode machine learning inference directly into the Metal command buffer
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — the migration path for 3D projects after SceneKit's deprecation
+- [Engage players with the Apple Games app](/articles/wwdc2025-215) — how the new Apple Games app becomes the distribution entry point for players

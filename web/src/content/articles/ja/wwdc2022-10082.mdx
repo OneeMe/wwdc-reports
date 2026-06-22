@@ -1,0 +1,259 @@
+---
+title: "Track down hangs with Xcode and on-device detection"
+description: "learn how you can increase responsiveness and eliminate hangs in your app and make even better experiences. hang out with the performance tools team as we explore how you can track down these issues —"
+date: 2026-06-10
+tags: ["Developer Tools", "Performance"]
+thumbnail: "/images/sessions/2022/10082.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10082/"
+sessionId: "wwdc2022-10082"
+year: "2022"
+relatedSessions:
+  - title: "Understand and eliminate hangs from your app"
+    code: "10258"
+    description: "ハングの原因をメインスレッド、ロック、I/O、同期待ちから解消方法を説明します。"
+  - title: "What's new in MetricKit"
+    code: "10081"
+    description: "クラッシュ診断やハング診断などの MetricKit 診断データを紹介します。"
+  - title: "Diagnose performance issues with the Xcode Organizer"
+    code: "10076"
+    description: "Xcode Organizer を使用して、実際のユーザーのデバイス上で集約されたパフォーマンス データを表示する方法を示します。"
+  - title: "Identify trends with the Power and Performance API"
+    code: "10057"
+    description: "Power and Performance API を介してパフォーマンス データを自動システムに統合する方法について説明します。"
+---
+## ハイライト
+
+> パフォーマンス ツール チームの John Crowson 氏は、ドーナツ フード トラック管理アプリケーションを例として使用し、開発のさまざまな段階でラグを追跡するためのツールを体系的に導入しました。ハングは、メイン スレッドがビジー状態であるか、他のスレッド/システム リソースを 250 ミリ秒以上待機し、ビューの更新に失敗する時間として定義されます。
+
+---
+
+## 主要内容
+
+吃音が発生する可能性が最も高いのは開発段階です。Xcode でアプリを実行し、リストをスクロールすると、インターフェイスが数百ミリ秒間フリーズします。問題は見えても、原因がわからない場合があります。
+
+出版後はさらに面倒です。ユーザーの手元にあるデバイス、ネットワーク、システムのバージョンはすべて異なります。デスクトップでは再現できない途切れは、弱いネットワーク、古い機器、または人気のないパスで発生する可能性があります。
+
+このセッションでは、行き詰まった診断を開発中、ベータ テスト中、リリース後の 3 つの段階に分けて説明します。Apple は、各ステージに対応する信号ソースがあるように、iOS 16 と Xcode 14 に数種類のツールを追加しました。
+
+最初の段階では Xcode を使用します。スレッド パフォーマンス チェッカーは、デバッグ中の優先順位の反転とメイン スレッドの非 UI 作業について警告します。Instruments の Time Profiler は、タイムライン上でハングを直接マークします。
+
+第 2 段階では、デバイス側の検出を使用します。署名付きアプリまたは TestFlight アプリを開発すると、[設定] > [開発者] > [ハング検出] で検出をオンにできます。デバイスはハングが発生すると通知し、テキストのハング ログとテールスピンを生成します。
+
+3 番目の段階では Xcode Organizer を使用します。リリース後、オーガナイザーのハング レポートは、ユーザーのデバイス上で収集されたメイン スレッド スタックをシグネチャごとにグループ化し、ユーザーの影響によって並べ替えます。
+
+このリンクの目標は明らかです。発見が早け​​れば早いほど、コストは低くなります。実際のユーザーに近いほど、データは影響の範囲をより正確に示すことができます。
+
+## 詳細
+
+### 1. まずハングとは何かを定義します。
+
+([01:20](https://developer.apple.com/videos/play/wwdc2022/10082/?time=80)) Apple のハングの定義は非常に具体的です。メインスレッドが動作しているか、他のスレッドまたはシステム リソースを待機しているため、ビューのコンテンツが少なくとも 250 ミリ秒更新できなくなります。
+
+メインスレッドは、ユーザー対話の処理も担当します。占有されている間、新しいタッチ イベントも待機する必要があります。ユーザーに表示される影響は、アプリが停止していることです。
+
+このプレゼンテーションのフード トラック アプリは、ドーナツのリストをスクロールしているときに一時停止します。この例は、メイン スレッドが優先順位の低いワーカー スレッドを待機するか、メイン スレッドが同期ネットワークおよびディスク操作を実行するという 2 つの一般的な理由に対応しています。
+
+```text
+概念示例：hang 判定
+
+Main thread is busy or waiting
+View update is delayed >= 250 ms
+New user interactions wait until the main thread is available
+Result: the app appears stuck
+```
+
+キーポイント:
+
+- `Main thread is busy or waiting`: ソースはトランスクリプトのハングの定義です。メインスレッドは独自に動作している場合もあれば、他のスレッドまたはシステム リソースを待機している場合もあります。
+- `View update is delayed >= 250 ms`: 250 ミリ秒は、このセッションによって明示的に指定されたレポートしきい値です。
+- `New user interactions wait`: メインスレッドが利用できない場合、新しいユーザーの操作を時間内に処理できません。
+- `Result`: これはクラッシュではありません。プロセスはまだ生きています。ユーザーが感じるのは、インターフェースが停止したということです。
+
+### 2. 開発段階: 最初にスレッド パフォーマンス チェッカーのアラームが発生します
+
+([04:43](https://developer.apple.com/videos/play/wwdc2022/10082/?time=283)) Xcode 14 のスレッド パフォーマンス チェッカーは、優先順位の反転とメイン スレッドでの非 UI 作業という 2 種類のハング リスクを問題ナビゲーターに表示します。
+
+プレゼンテーション中にフード トラック アプリが優先順位逆転プロンプトをトリガーしました。優先度の高いスレッドが優先度の低いスレッドを待機しています。メインスレッドがこの待機チェーン上にある場合、スクロールは停止します。
+
+開く場所も非常に具体的です。スキームの診断領域でスレッド パフォーマンス チェッカーを有効にします。
+
+```text
+概念示例：开发阶段检查
+
+Scheme > Diagnostics
+Enable Thread Performance Checker
+Run the app in Xcode
+Repeat the slow interaction
+Inspect the Issue Navigator warning
+```
+
+キーポイント:
+
+- `Scheme > Diagnostics`: 講義では、このツールがスキームの診断領域から起動されることが説明されています。
+- `Enable Thread Performance Checker`: これは、Xcode 14 の新しい開発段階の検査の入り口です。
+- `Run the app in Xcode`: デバッグのために Xcode に接続するときに使用するのに適しており、トレースを積極的に記録する必要はありません。
+- `Repeat the slow interaction`: ツールは実際のインタラクションを通じてリスクを明らかにします。フード トラックの例はドーナツのスクロール リストです。
+- `Inspect the Issue Navigator warning`: アラートは、優先順位の逆転やメインスレッドでの非 UI 作業などのリスクを示します。
+
+このツールの価値はスピードです。ワーカー スレッドが何をしているのかを完全に説明することはできませんが、調査の方向を「インターフェイスが遅い」から「スレッドの待機関係に問題がある」に絞り込むことができます。
+
+### 3. 開発段階: Time Profiler マークがタイムラインにハングする
+
+([05:56](https://developer.apple.com/videos/play/wwdc2022/10082/?time=356)) 次はインストゥルメントです。Time Profiler は、各スレッドの呼び出しスタックを経時的に表示できます。Xcode 14 では、ハングも検出し、対応するプロセス トラックにラベルを付けます。
+
+講義での調査手順は次のとおりです。Xcode の Product > Profile から Instruments に移動し、Time Profiler を選択し、問題のあるスクロール操作を記録します。ハング ラベルがタイムラインに表示されたら、ハング間隔をトリプルクリックして、この期間の下部の詳細をフィルターします。
+
+フィルタリング後、John Crowson は最初にメインスレッド CPU を調べます。メインスレッドは CPU 使用率がほとんどなく、待機状態にあることを示しています。他のトラックを見ると、ハング期間中に 1 つのワーカー スレッドの CPU 使用率が高くなっています。このワーカースレッドが次にチェックする対象となります。
+
+```text
+概念示例：Time Profiler 调查路径
+
+Product > Profile
+Choose Time Profiler
+Record the problematic interaction
+Triple-click the hang interval
+Compare main thread CPU with worker thread CPU
+Open call stacks in the filtered time range
+```
+
+キーポイント:
+
+- `Product > Profile`: この講義では、Xcode メニューから Instruments に入り、release を使用してスタートアップ アプリを構築します。
+- `Choose Time Profiler`: Time Profiler は、時間の経過とともに変化するスレッドの呼び出しスタックを提供します。
+- `Record the problematic interaction`: 記録範囲は、再現可能なユーザー操作をカバーする必要があります。
+- `Triple-click the hang interval`: ハング間隔をトリプルクリックすると、時間フィルターが作成され、ハング期間中のイベントのみが表示されます。
+- `Compare main thread CPU with worker thread CPU`: メインスレッドの CPU が非常に低い場合、焦点は待機関係に移ります。ワーカー スレッドの CPU が非常に高い場合は、ハング期間中の呼び出しスタックを確認します。
+- `Open call stacks`: 最後に、「ハングが発生した」という結論に留まるのではなく、特定の関数に戻る必要があります。
+
+([08:00](https://developer.apple.com/videos/play/wwdc2022/10082/?time=480)) Time Profiler と CPU Profiler は、デフォルトでハング検出をサポートします。Xcode 14 は、独立したハング トレース インストルメントも提供します。これは、任意のトレース ドキュメントに追加でき、ハング期間のしきい値を設定できます。
+
+### 4. ベータ段階: デバイス側のハング検出は実際の環境をカバーします
+
+([09:08](https://developer.apple.com/videos/play/wwdc2022/10082/?time=548)) デスクトップ デバッグには盲点があります。環境が理想的すぎるということです。Food Truck アプリには、Xcode と安定したネットワークの下では明らかな問題はありません。ドーナツを外で販売する際にネットワークが悪くなると、注文ページを開くときに3秒以上固まってしまいます。
+
+iOS 16 のオンデバイス ハング検出は、このギャップをカバーするために使用されます。これはデバイス側で動作し、Xcode が接続されている必要も、Instruments トレースが記録されている必要もありません。Signature App または TestFlight App の開発に適用されます。
+
+有効にするパスは、[設定] > [開発者] > [ハング検出] です。ハングしきい値では、最小検出期間を 250 ミリ秒に設定することも、500 ミリ秒以上に増やすこともできます。
+
+```text
+概念示例：设备端检测配置
+
+Settings > Developer > Hang Detection
+Turn on Hang Detection
+Set Hang Threshold to 250 ms or higher
+Install a development-signed or TestFlight build
+Use the app in real-world conditions
+Wait for hang notifications and diagnostics
+```
+
+キーポイント:
+
+- `Settings > Developer > Hang Detection`: これはスピーチで示されたシステム設定パスです。
+- `Turn on Hang Detection`: オンにすると、デバイスは Xcode 接続がない場合のハングを監視できます。
+- `Set Hang Threshold`: 最小しきい値は 250 ミリ秒です。しきい値を高くすると、ユーザーへの影響が大きい長いラグを優先的に検出するのに適しています。
+- `development-signed or TestFlight build`:session はサポートの範囲を明確に制限します。
+- `real-world conditions`: フード トラックの例は、脆弱なネットワークなどの現実世界の状況を浮き彫りにしています。
+- `notifications and diagnostics`: このツールはリアルタイムの通知を発行し、その後診断資料を提供します。
+
+([10:30](https://developer.apple.com/videos/play/wwdc2022/10082/?time=630)) これらの診断はベストエフォート型です。システムは、パフォーマンスのオーバーヘッドを削減するために、優先度の低いバックグラウンドで処理します。デバイスがビジー状態の場合、診断の生成は遅くなります。新しい診断が利用可能になると、パッシブ通知が表示されます。
+
+### 5. ベータ段階: ハング ログとテールスピンを使用して同期呼び出しを見つける
+
+([10:58](https://developer.apple.com/videos/play/wwdc2022/10082/?time=658)) デバイス側の検出では、テキスト ハング ログとテールスピンの 2 種類のマテリアルが提供されます。
+
+テキストのハング ログには情報が少ないですが、ざっと見るのに適しています。tailspin を Instruments で開くと、プロセス内スレッドの相互作用を観察したり、システム リソースの使用状況を表示したりできます。
+
+講義内のハング ログのテキストには、次のことが示されています。ハング中に、メイン スレッドはネットワークを同期的に要求するメソッドを呼び出しました。デスクトップ上の強力なネットワークは問題を隠します。ネットワークが弱いと、同期リクエストが遅くなり、メインスレッドが停止します。
+
+```text
+概念示例：从设备端诊断到修复方向
+
+Receive an on-device hang notification
+Open the generated hang log
+Symbolicate the log on a Mac
+Find the main thread stack during the hang
+Look for synchronous network or disk work
+Move that work off the main thread
+```
+
+キーポイント:
+
+- `Receive an on-device hang notification`: 検出エントリは実際のデバイス上の通知から取得されます。
+- `Open the generated hang log`: テキスト ログは、メイン スレッドがハングしているときに、そのスタックの手がかりを最初に提供します。
+- `Symbolicate the log on a Mac`：講義ではログをMacに共有し、関数名を読みやすくするためにシンボル化しました。
+- `Find the main thread stack`: このセッションの診断は、メインスレッドがビューを更新できない理由に焦点を当てています。
+- `synchronous network or disk work`: 講演では、同期ネットワーク リクエストと同期ディスク読み取りが具体的な例として挙げられています。
+- `Move that work off the main thread`: 修正の指示は推測ではなく、スタックの事実に基づいています。
+
+### 6. リリース後: 主催者は集計レポートを使用してユーザーへの影響を分類します
+
+([12:35](https://developer.apple.com/videos/play/wwdc2022/10082/?time=755)) アプリのリリース後、Xcode 14 のオーガナイザーはハング レポートをサポートします。データは App Analytics の共有に同意したユーザー デバイスから取得され、ハングの原因となったメイン スレッドのスタック トレースが含まれます。
+
+同様のスタック トレースは同じシグネチャに分類されます。リストはユーザーへの影響によって並べ替えられています。各シグネチャでは、サンプルのハング ログ、メイン スレッド スタック、ハング時間、デバイスおよび OS のバージョンを確認できます。また、このシグニチャが原因となっているハング ログの数が OS バージョンとデバイスごとに表示されます。
+
+このバージョンでは、スピーチの先頭の署名がハングタイムの 21% を占めています。App Storeに投稿する際にシンボル情報が含まれるため、Organizerではソースコード内の関数名を表示することができます。John Crowson は、メイン スレッドの呼び出しスタックから、このハングはメイン スレッドがディスク ファイルを同期的に読み取っていることが原因であると判断しました。
+
+```text
+概念示例：发布后排查顺序
+
+Open Xcode Organizer
+Select Hang Reports
+Sort signatures by user impact
+Open the top signature
+Inspect sample hang logs and main thread stack traces
+Check OS and device breakdowns
+Fix the source code path with the largest impact
+```
+
+キーポイント:
+
+- `Open Xcode Organizer`: 公開後の入口は Organizer にあります。
+- `Select Hang Reports`: Xcode 14 では、ハング レポートのサポートが追加されています。
+- `Sort signatures by user impact`：講演では、顧客に最も影響を与える上位の署名を優先することを推奨しています。
+- `Open the top signature`:signature は、類似したスタック トレースをグループ化したものです。
+- `sample hang logs and main thread stack traces`: サンプル ログは、特定のコード パスを見つけるために使用されます。
+- `OS and device breakdowns`: 情報を分割して、問題が特定のシステムまたはデバイスに焦点を当てているかどうかを判断するのに役立ちます。
+- `largest impact`: 修正の順序は、実際のユーザーへの影響によって決定されます。
+
+([15:21](https://developer.apple.com/videos/play/wwdc2022/10082/?time=921)) オーガナイザー レポートを読みやすくするために、Apple は App Store に送信するときにシンボル情報を含めることをお勧めします。レポートに関数名が表示され、スタック トレース関数から Xcode ソース コードへのワンクリック ジャンプがサポートされます。抽出される情報は関数名とメソッド名、ソース コードのパス、行番号に限定されており、安全に保存され、共有されることはありません。
+
+## 重要ポイント
+
+### 1. 各新機能に「メインスレッド物理検査」を追加します。
+
+- **対処方法**: 新しいページをマージする前に、スレッド パフォーマンス チェッカーとタイム プロファイラーを使用してコア インタラクションを実行します。
+- **実行する価値がある理由**: セッションでは、優先順位の反転とメインスレッドでの非 UI 作業が開発段階で見つかる可能性があることを強調しています。早めに修理すればするほど費用は安くなります。
+- **開始方法**: スキームの診断でスレッド パフォーマンス チェッカーを開きます。リストのスクロール、ページを開く、検索入力などの高頻度の操作を記録するタイムプロファイラー。
+
+### 2. 弱いネットワークのテストをベータ版のチェックリストに変える
+
+- **対処方法**: TestFlight テスト中に、弱いネットワークまたはネットワーク スイッチング シナリオで注文、詳細、検索、および同期のページを開きます。
+- **実行する価値がある理由**: フード トラックの例の同期ネットワーク リクエストは、強力なデスクトップ ネットワークの下では明らかではなく、実際の環境では 3 秒以上ハングするだけです。
+- **開始方法**: テスト デバイスの [設定] > [開発者] > [ハング検出] で検出を開き、しきい値を 250 ミリ秒または 500 ミリ秒に設定し、通知後にハング ログを収集します。
+
+### 3. リリース後の問題に対する最上位の署名処理リズムを確立する
+
+- **対処法**: 各リリース後に Xcode Organizer のハング レポートを確認し、ハング時間の最も高い割合を占める署名を最初に処理します。
+- **実行する価値がある理由**: オーガナイザーはユーザーへの影響に基づいて並べ替えます。スピーチの最上位の署名は、このバージョンのハングタイムの 21% を占めます。
+- **開始方法**: リリース後は定期的にハング レポートを確認してください。トップの署名を開き、サンプルのハング ログ、デバイスと OS の分割を読み、対応するソース コード パスに戻って修正します。
+
+### 4. シンボル情報をパフォーマンス診断の一部として扱う
+
+- **内容**: App Store に送信するときにシンボル情報を保持します。
+- **実行する価値がある理由**: オーガナイザーは、レポート内のスタック フレームを関数名に復元し、Xcode ソース コードへのジャンプをサポートするためにこれを必要とします。
+- **開始方法**: アーカイブとアップロードのプロセスをチェックして、シンボル情報がアプリで送信されていることを確認します。リリース後にオーガナイザーを使用して、ハング レポートに関数名が表示されることを確認します。
+
+### 5. 同期 I/O および同期ネットワーキングのコード レビュー ルールを確立する
+
+- **内容**: コード レビュー中に待機が発生する可能性がある、メイン スレッド上の同期ネットワーク リクエスト、同期ディスク読み取り、およびスレッド同期にフラグを立てます。
+- **実行する価値がある理由**: セッションの 2 つの特定のケースは、同期ネットワーク リクエストとメイン スレッドによるディスク ファイルの同期読み取りから発生します。
+- **開始方法**: 「メインスレッドがネットワーク、ディスク、または低優先度のスレッドを待機しているかどうか」をレビュー チェックリストに追加します。疑わしい場合は、Instruments のハング間隔フィルタリングを使用して確認してください。
+
+---
+
+## 関連セッション
+
+- [アプリのハングを理解して排除する](/articles/wwdc2021-10258) - まず、ハングの原因と一般的な修復手順を学び、次にこのセッションに戻って、対応する診断ツールを選択します。
+- [MetricKit の新機能](/articles/wwdc2020-10081) - MetricKit は、リリース後のパフォーマンス データ リンクの一部としてハング診断を提供します。
+- [Xcode Organizer を使用してパフォーマンスの問題を診断する](/articles/wwdc2020-10076) — オーガナイザーが実際のユーザー デバイス上で集約されたパフォーマンス メトリクスを表示する方法について説明します。
+- [Power and Performance API を使用して傾向を特定する](/articles/wwdc2020-10057) — オーガナイザーとパフォーマンスの傾向を内部システムに接続する場合は、引き続き Power and Performance API を確認できます。

@@ -1,0 +1,379 @@
+---
+title: "Beyond the basics of structured concurrency"
+description: "It's all about the task tree: Find out how structured concurrency can help your apps manage automatic task cancellation, task priority propagation, and useful task-local value patterns. Learn how to manage resources in your app with useful patterns and the latest task group APIs. We'll show you how you can leverage the power of the task tree and task-local values to gain insight into distributed systems."
+date: "2023-06-06"
+tags: ["Swift", "Developer Tools"]
+thumbnail: "/images/sessions/2023/10170.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10170/"
+sessionId: "wwdc2023-10170"
+year: "2023"
+relatedSessions:
+  - title: "Write Swift macros"
+    code: "10166"
+    description: "最初の Swift マクロの作成を始めましょう"
+  - title: "Expand on Swift macros"
+    code: "10167"
+    description: "マクロ設計原則とより多くの文字タイプについての深い理解"
+  - title: "Meet Swift OpenAPI Generator"
+    code: "10171"
+    description: "コード生成によるサーバー側の API 呼び出しの簡素化"
+---
+## ハイライト
+
+> Swift の構造化された同時実行性は、自動キャンセル伝播、優先順位の継承、タスク ツリーを介したタスク ローカル値 (Task-Local Values) の配信を実装し、新しい機能を追加します。`withThrowingDiscardingTaskGroup`そして`DiscardingTaskGroup`サブタスクの結果を収集する必要のないシナリオを最適化するため。
+
+## 主な内容
+
+同時実行コードに対処するのが最も難しいのは、ライフサイクル管理です。ネットワーク要求が送信され、ユーザーはページに切り替わります。リクエストを続行する必要がありますか?続行すると、存在しない UI が更新されることになり、良くてもリソースが無駄になり、最悪の場合クラッシュします。
+
+Swift の構造化同時実行では、タスク ツリーを使用してこの問題を解決します。構造化されたタスク (`async let`およびタスク グループ) は親タスクとツリー階層を形成し、スコープを離れると自動的にキャンセルされます。構造化されていないタスク (`Task.init`そして`Task.detached`) はこのレベルに参加していないため、手動で管理する必要があります。
+
+（[02:24](https://developer.apple.com/videos/play/wwdc2023/10170/?time=144)）
+
+### 非構造化から構造化へ
+
+スープを作るときに、同時にスープを調理し、野菜を切り、肉をマリネする必要があるとします。構造化されていない文章:
+
+```swift
+func makeSoup(order: Order) async throws -> Soup {
+    let boilingPot = Task { try await stove.boilBroth() }
+    let choppedIngredients = Task { try await chopIngredients(order.ingredients) }
+    let meat = Task { await marinate(meat: .chicken) }
+    let soup = await Soup(meat: meat.value, ingredients: choppedIngredients.value)
+    return await stove.cook(pot: boilingPot.value, soup: soup, duration: .minutes(10))
+}
+```
+
+この書き方の問題点は次の 3 つです。`Task`すべて構造化されておらず、ライフサイクルは次のようなものです。`makeSoup`関数には拘束関係がありません。もし`makeSoup`キャンセルしても、これら 3 つのタスクは自動的にはキャンセルされません。
+
+構造化された同時実行として書き直されると、次のようになります。
+
+```swift
+func makeSoup(order: Order) async throws -> Soup {
+    async let pot = stove.boilBroth()
+    async let choppedIngredients = chopIngredients(order.ingredients)
+    async let meat = marinate(meat: .chicken)
+    let soup = try await Soup(meat: meat, ingredients: choppedIngredients)
+    return try await stove.cook(pot: pot, soup: soup, duration: .minutes(10))
+}
+```
+
+`async let`作成されたタスクは構造化されており、`makeSoup`父と子の関係を築きます。`makeSoup`キャンセルされると、3 つのサブタスクは自動的にキャンセルされます。
+
+（[02:42](https://developer.apple.com/videos/play/wwdc2023/10170/?time=162)）
+
+### タスクがキャンセルされました
+
+キャンセルは協力です。設定解除のみ`isCancelled`フラグを設定すると、タスクは強制的に停止されません。コードは以下について積極的にチェックする必要があります。
+
+```swift
+func makeSoup(order: Order) async throws -> Soup {
+    async let pot = stove.boilBroth()
+
+    guard !Task.isCancelled else {
+        throw SoupCancellationError()
+    }
+
+    async let choppedIngredients = chopIngredients(order.ingredients)
+    async let meat = marinate(meat: .chicken)
+    let soup = try await Soup(meat: meat, ingredients: choppedIngredients)
+    return try await stove.cook(pot: pot, soup: soup, duration: .minutes(10))
+}
+```
+
+`Task.checkCancellation()`より簡潔な書き方で、キャンセルされた場合に直接スローされます。`CancellationError`：
+
+```swift
+func chopIngredients(_ ingredients: [any Ingredient]) async throws -> [any ChoppedIngredient] {
+    return try await withThrowingTaskGroup(of: (ChoppedIngredient?).self) { group in
+        try Task.checkCancellation()
+
+        for ingredient in ingredients {
+            group.addTask { await chop(ingredient) }
+        }
+
+        var choppedIngredients: [any ChoppedIngredient] = []
+        for try await choppedIngredient in group {
+            if let choppedIngredient {
+                choppedIngredients.append(choppedIngredient)
+            }
+        }
+        return choppedIngredients
+    }
+}
+```
+
+キーポイント: 親タスクをキャンセルすると、すべての子タスクが再帰的にキャンセルされます。タスクグループに電話をかける`group.cancelAll()`すべてのアクティブなサブタスクと今後追加されるサブタスクはキャンセルされます。
+
+（[04:32](https://developer.apple.com/videos/play/wwdc2023/10170/?time=272)）
+
+### 一時停止時のキャンセル処理
+
+タスクが保留中で待機しているとき`AsyncSequence`次の要素をポーリングしてキャンセル ステータスを確認する方法はありません。`withTaskCancellationHandler`このシナリオは次のように処理されました。
+
+```swift
+public func next() async -> Order? {
+    return await withTaskCancellationHandler {
+        let result = await kitchen.generateOrder()
+        guard state.isRunning else {
+            return nil
+        }
+        return result
+    } onCancel: {
+        state.cancel()
+    }
+}
+```
+
+プロセッサとメインロジック間の共有状態を解除するには、アトミック操作によって保護する必要があります。ここで使用されます`ManagedAtomic`：
+
+```swift
+private final class OrderState: Sendable {
+    let protectedIsRunning = ManagedAtomic<Bool>(true)
+    var isRunning: Bool {
+        get { protectedIsRunning.load(ordering: .acquiring) }
+        set { protectedIsRunning.store(newValue, ordering: .relaxed) }
+    }
+    func cancel() { isRunning = false }
+}
+```
+
+（[05:47](https://developer.apple.com/videos/play/wwdc2023/10170/?time=347)）
+
+＃＃詳細
+
+### 同時実行数を制限する
+
+タスクグループのデフォルトはそれぞれ`addTask`同時実行性が制御されていない新しいタスクを作成します。もし`ingredients`100 個ある場合は、100 個のチョッピング タスクが同時に作成されます。
+
+同時実行を制限するモード: 最初に固定数のタスクを開始し、各タスクが完了した後に新しいタスクを開始します。
+
+```swift
+func chopIngredients(_ ingredients: [any Ingredient]) async -> [any ChoppedIngredient] {
+    return await withTaskGroup(of: (ChoppedIngredient?).self) { group in
+        let maxChopTasks = min(3, ingredients.count)
+        for ingredientIndex in 0..<maxChopTasks {
+            group.addTask { await chop(ingredients[ingredientIndex]) }
+        }
+
+        var choppedIngredients: [any ChoppedIngredient] = []
+        var nextIngredientIndex = maxChopTasks
+        for await choppedIngredient in group {
+            if nextIngredientIndex < ingredients.count {
+                group.addTask { await chop(ingredients[nextIngredientIndex]) }
+                nextIngredientIndex += 1
+            }
+            if let choppedIngredient {
+                choppedIngredients.append(choppedIngredient)
+            }
+        }
+        return choppedIngredients
+    }
+}
+```
+
+このモデルの核となるロジックは次のとおりです。
+1. 一番最初に始める`maxChopTasks`タスク
+2.で`for await`ループ内ではタスクが完了するたびに、未処理のタスクがあれば新たなタスクが追加されます。
+3. 常に最大限のものを維持する`maxChopTasks`タスクが実行中です
+
+（[10:55](https://developer.apple.com/videos/play/wwdc2023/10170/?time=655)）
+
+### DiscardingTaskGroup
+
+従来のタスク グループは、すべてのサブタスクの結果を収集する必要があります。ただし、一部のシナリオでは「すべてのタスクが完了した」ことのみを考慮し、結果を必要としません。たとえば、レストラン サービスでは、複数のシェフが同時に働きます。 1つのタスクが完了する（終了時間が過ぎる）限り、サービス全体が終了します。
+
+```swift
+func run() async throws {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for cook in staff.keys {
+            group.addTask { try await cook.handleShift() }
+        }
+
+        group.addTask {
+            try await Task.sleep(for: shiftDuration)
+        }
+
+        try await group.next()
+        group.cancelAll()
+    }
+}
+```
+
+この書き方の問題は、明示的に呼び出す必要があることです。`cancelAll()`、そしてもし`group.next()`終了タスクの代わりにシェフ タスクを返すには、追加のロジックが必要です。
+
+Swift 5.9の新機能`withThrowingDiscardingTaskGroup`：
+
+```swift
+func run() async throws {
+    try await withThrowingDiscardingTaskGroup { group in
+        for cook in staff.keys {
+            group.addTask { try await cook.handleShift() }
+        }
+
+        group.addTask {
+            try await Task.sleep(for: shiftDuration)
+            throw TimeToCloseError()
+        }
+    }
+}
+```
+
+`DiscardingTaskGroup`サブタスクの結果は収集されません。 1 つのサブタスクがエラーをスローするか、すべてが完了する限り、グループ全体が終了します。マニュアルは不要です`cancelAll()`。
+
+（[11:56](https://developer.apple.com/videos/play/wwdc2023/10170/?time=716)）
+
+### Task-Local Values
+
+タスク ローカル値を使用すると、タスク ツリー内でコンテキスト情報を自動的に伝達できます。サブタスクは、親タスクのタスクローカル値を自動的に継承します。
+
+```swift
+actor Kitchen {
+    @TaskLocal static var orderID: Int?
+    @TaskLocal static var cook: String?
+
+    func logStatus() {
+        print("Current cook: \(Kitchen.cook ?? "none")")
+    }
+}
+
+let kitchen = Kitchen()
+await kitchen.logStatus()           // "Current cook: none"
+await Kitchen.$cook.withValue("Sakura") {
+    await kitchen.logStatus()       // "Current cook: Sakura"
+}
+await kitchen.logStatus()           // "Current cook: none"
+```
+
+`@TaskLocal`タグパスの静的属性`$`プレフィックスアクセス。`withValue`値はクロージャの実行中に設定され、クロージャの終了後に自動的に復元されます。
+
+（[14:10](https://developer.apple.com/videos/play/wwdc2023/10170/?time=850)）
+
+### MetadataProvider を使用してロギングを簡素化する
+
+サーバーサイド開発では、各関数は注文 ID、シェフ名などのコンテキストを記録する必要があります。タスクローカル値がない場合、これらのコンテキストはパラメーターとして渡す必要があります。
+
+```swift
+func makeSoup(order: Order) async throws -> Soup {
+    log.debug("Preparing dinner", [
+        "cook": "\(self.name)",
+        "order-id": "\(order.id)",
+        "vegetable": "\(vegetable)",
+    ])
+}
+```
+
+使用`MetadataProvider`タスクローカル値は各ログに自動的に挿入できます。
+
+```swift
+let orderMetadataProvider = Logger.MetadataProvider {
+    var metadata: Logger.Metadata = [:]
+    if let orderID = Kitchen.orderID {
+        metadata["orderID"] = "\(orderID)"
+    }
+    return metadata
+}
+
+let chefMetadataProvider = Logger.MetadataProvider {
+    var metadata: Logger.Metadata = [:]
+    if let chef = Kitchen.chef {
+        metadata["chef"] = "\(chef)"
+    }
+    return metadata
+}
+
+let metadataProvider = Logger.MetadataProvider.multiplex([
+    orderMetadataProvider,
+    chefMetadataProvider
+])
+
+LoggingSystem.bootstrap(
+    StreamLogHandler.standardOutput,
+    metadataProvider: metadataProvider
+)
+```
+
+構成後、ロギング コードは次のように簡略化されます。
+
+```swift
+func makeSoup(order: Order) async throws -> Soup {
+    logger.info("Preparing soup order")
+    async let pot = stove.boilBroth()
+    async let choppedIngredients = chopIngredients(order.ingredients)
+    async let meat = marinate(meat: .chicken)
+    let soup = try await Soup(meat: meat, ingredients: choppedIngredients)
+    return try await stove.cook(pot: pot, soup: soup, duration: .minutes(10))
+}
+```
+
+`orderID`そして`chef`これはすべてのログに自動的に表示されるため、手動で渡す必要はありません。
+
+（[16:17](https://developer.apple.com/videos/play/wwdc2023/10170/?time=977)）
+
+### 分散トレーシング
+
+Swift Distributed Tracing ライブラリと組み合わせると、次のことが可能になります。`withSpan`サーバー側コードのパフォーマンス分析:
+
+```swift
+func makeSoup(order: Order) async throws -> Soup {
+    try await withSpan("makeSoup(\(order.id)") { span in
+        async let pot = stove.boilWater()
+        async let choppedIngredients = chopIngredients(order.ingredients)
+        async let meat = marinate(meat: .chicken)
+        let soup = try await Soup(meat: meat, ingredients: choppedIngredients)
+        return try await stove.cook(pot: pot, soup: soup, duration: .minutes(10))
+    }
+}
+```
+
+カスタム プロパティも追加できます。
+
+```swift
+func makeSoup(order: Order) async throws -> Soup {
+    try await withSpan(#function) { span in
+        span.attributes["kitchen.order.id"] = order.id
+        async let pot = stove.boilWater()
+        async let choppedIngredients = chopIngredients(order.ingredients)
+        async let meat = marinate(meat: .chicken)
+        let soup = try await Soup(meat: meat, ingredients: choppedIngredients)
+        return try await stove.cook(pot: pot, soup: soup, duration: .minutes(10))
+    }
+}
+```
+
+`withSpan`作成されたスパンにはサブタスクの追跡情報が自動的に含まれ、完全なコール チェーンが形成されます。
+
+（[20:30](https://developer.apple.com/videos/play/wwdc2023/10170/?time=1230)）
+
+## 重要なポイント
+
+**ネットワークリクエストに対する統合キャンセルチェックを追加**
+
+データ層の各リクエストメソッドの先頭に追加します。`try Task.checkCancellation()`、ページに切り替えた後、ユーザーが無駄なネットワーク要求を実行し続けるのを防ぎます。
+
+入口：`URLSession.data(for:)`カプセル化層にキャンセル チェックを追加します。協力する`async let`複数のリクエストが開始されると、親タスクのキャンセルがすべての子リクエストに自動的に伝播されます。
+
+**タスクローカル値を使用してリクエスト追跡 ID を実装します**
+
+サーバーまたはクライアントのいずれかが使用できます`@TaskLocal static var requestID: String?`現在のリクエストをマークします。すべてのログにはこの ID が自動的に含まれるため、トラブルシューティング時にリクエスト ID でログをフィルタリングできます。
+
+入口：リクエスト入口にて`await RequestContext.$requestID.withValue(UUID().uuidString)`、ログ構成`MetadataProvider`自動的に読み上げます。
+
+**同時ダウンロード数を制限する**
+
+画像リスト ページに同時に多くの画像が読み込まれる場合は、タスク グループの「1 つを完了して 1 つ追加」モードを使用して同時実行数を制限し、同時に開始されるリクエストが多すぎることによって引き起こされるネットワークの混雑を回避します。
+
+入口：参考`chopIngredients`電流制限モード、置く`maxChopTasks`に変更します`maxDownloadTasks`(3 か 5 のように)。
+
+**DiscardingTaskGroup を使用してバックグラウンド タスクを管理します**
+
+ハートビート検出、ログレポート、位置更新などのバックグラウンドタスクでは、結果を収集する必要はありません。使用`withDiscardingTaskGroup`管理。メインタスクがキャンセルされると、すべてのバックグラウンドタスクが自動的に終了します。
+
+入口：置く`Task { ... }`に変更します`group.addTask { ... }`、使用`withDiscardingTaskGroup`パック。
+
+## 関連セッション
+
+- [Swift マクロを書く](/articles/wwdc2023-10166) — 初めての Swift マクロを書く
+- [Swift マクロの拡張](/articles/wwdc2023-10167) — マクロの設計原則とより多くのロール タイプを深く理解します。
+- [Swift OpenAPI Generator の紹介](/articles/wwdc2023-10171) — コード生成を使用してサーバー側 API 呼び出しを簡素化する
+- [Swift 同時実行性: 舞台裏](/articles/wwdc2023-10170) — Swift 構造化同時実行性の基礎となる原則

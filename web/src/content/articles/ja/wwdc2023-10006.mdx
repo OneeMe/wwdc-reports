@@ -1,0 +1,259 @@
+---
+title: "Build robust and resumable file transfers"
+description: "find out how urlsession can help your apps transfer large files and recover from network interruptions. learn how to pause and resume http file transfers and support resumable uploads, and explore best practices for using urlsession to transfer files even when your app is suspended in the background."
+date: 2026-06-10
+tags: ["WWDC 2023"]
+thumbnail: "/images/sessions/2023/10006.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10006/"
+sessionId: "wwdc2023-10006"
+year: "2023"
+relatedSessions:
+  - title: "Ready, set, relay: Protect app traffic with network relays"
+    code: "10002"
+    description: "learn how relays can make your app's network traffic more private and secure without the overhead of a vpn."
+  - title: "Reduce network delays with L4S"
+    code: "10004"
+    description: "learn how low latency, low loss, scalable throughput (l4s) can reduce network delays and improve your app's responsiveness."
+  - title: "What's new in Background Assets"
+    code: "10108"
+    description: "discover how background assets can help your app download content before it even launches."
+---
+
+## ハイライト
+
+> URLSession は iOS 17 でアップロードタスク（Upload Task）にダウンロードタスク（Download Task）と同等の一時停止/再開 API を追加し、IETF 標準の再開可能アップロードプロトコルを導入し、バックグラウンド転送のきめ細かい制御も追加しました。
+
+---
+
+## 主要内容
+
+大容量ファイルを転送する App を作ると、ネットワーク中断は例外ではなく日常です。ユーザーがエレベーターに入ったり、Wi-Fi を切り替えたり、圏外に入ると、進行中の数 GB のダウンロード/アップロードが中断され、最初からやり直しになることがあります。iOS 17 以前、URLSession はダウンロードタスクに `cancelByProducingResumeData` がありましたが、アップロードタスクには対応 API がありませんでした。断点再開アップロードを作るには、アプリ層でチャンク分割ロジックを自前実装する必要がありました。
+
+iOS 17 でアップロードタスクの空白が埋まりました。`URLSessionUploadTask` は `cancelByProducingResumeData()` でアップロードを一時停止し再開データを生成し、`uploadTask(withResumeData:)` で再開地点から続行できます。API の形はダウンロードタスクと完全に同じで、学習コストはゼロです。
+
+ただしクライアント API だけでは不十分です。一時停止/再開にはサーバー側の協力が必要で、サーバーはクライアントがどこから再開するか理解する必要があります。iOS 17 は最新 IETF 標準ドラフトに基づく再開可能アップロードプロトコルを導入しました。Apple は SwiftNIO のサーバー参照実装も公開し、バックエンドチームの迅速な統合を支援しています。
+
+さらに、iOS 17 の Background URLSession はより細かい制御を獲得しました。タスクの最早開始時刻の設定、転送バイト数の見積もりによるシステムスケジューリング最適化、制限付きネットワークの使用可否の宣言が可能です。
+
+---
+
+## 詳細
+
+### ダウンロードタスクの一時停止と再開（[04:53](https://developer.apple.com/videos/play/wwdc2023/10006/?time=293)）
+
+URLSession のダウンロード一時停止/再開は HTTP Range リクエストに基づきます。サーバーは `Accept-Ranges` レスポンスヘッダーで範囲リクエストを宣言し、`ETag` でリソースバージョンを識別します。中断後、クライアントは `Range` リクエストと `If-Range` ヘッダーを送り、リソースが変更されていないことを確認します。
+
+ダウンロードタスク作成後、通常の `cancel()` の代わりに `cancelByProducingResumeData()` を使います：
+
+```swift
+let downloadTask = session.downloadTask(with: request)
+downloadTask.resume()
+
+guard let resumeData = await downloadTask.cancelByProducingResumeData() else {
+    // Download cannot be resumed
+    return
+}
+```
+
+再開データ（resume data）は、ダウンロード済みバイト、元リクエスト、サーバー検証情報を含むバイナリ blob です。これで新しいダウンロードタスクを作成し、断点から続行できます：
+
+```swift
+let downloadTask = session.downloadTask(with: request)
+downloadTask.resume()
+
+guard let resumeData = await downloadTask.cancelByProducingResumeData() else {
+    // Download cannot be resumed
+    return
+}
+
+let newDownloadTask = session.downloadTask(withResumeData: resumeData)
+newDownloadTask.resume()
+```
+
+**キーポイント:**
+- `cancelByProducingResumeData()` は非同期で、システムが再開データを生成するまで待ちます
+- 再開データはローカルにシリアライズできません。一時ファイルパスを含む場合があり、App 再起動後は無効になります
+- `nil` が返る場合、サーバーが断点再開非対応で、最初からダウンロードする必要があります
+
+ネットワークエラーで予期せず中断した場合、`URLError` から再開データを取り出せます（[06:34](https://developer.apple.com/videos/play/wwdc2023/10006/?time=394)）：
+
+```swift
+do {
+    let (url, response) = try await session.download(for: request)
+} catch let error as URLError {
+    guard let resumeData = error.downloadTaskResumeData else {
+        // Download cannot be resumed
+        return
+    }
+}
+```
+
+**キーポイント:**
+- `URLError.downloadTaskResumeData` はダウンロードタスクのエラーにのみ含まれます
+- エラー処理時は、再開データの有無を確認してから最初からやり直すか判断します
+
+### アップロードタスクの一時停止と再開（[08:29](https://developer.apple.com/videos/play/wwdc2023/10006/?time=509)）
+
+iOS 17 以前、アップロードタスクは `cancel()` で完全キャンセルのみで、復旧手段がありませんでした。新 API はダウンロードタスクと完全対称です。
+
+アップロード一時停止：
+
+```swift
+let uploadTask = session.uploadTask(with: request, fromFile: fileURL)
+uploadTask.resume()
+
+guard let resumeData = await uploadTask.cancelByProducingResumeData() else {
+    // Upload cannot be resumed
+    return
+}
+```
+
+アップロード再開：
+
+```swift
+let uploadTask = session.uploadTask(with: request, fromFile: fileURL)
+uploadTask.resume()
+
+guard let resumeData = await uploadTask.cancelByProducingResumeData() else {
+    // Upload cannot be resumed
+    return
+}
+
+let newUploadTask = session.uploadTask(withResumeData: resumeData)
+newUploadTask.resume()
+```
+
+エラーからのアップロード復旧（[09:22](https://developer.apple.com/videos/play/wwdc2023/10006/?time=562)）：
+
+```swift
+do {
+    let (data, response) = try await session.upload(for: request, fromFile: fileURL)
+} catch let error as URLError {
+    guard let resumeData = error.uploadTaskResumeData else {
+        // Upload cannot be resumed
+        return
+    }
+}
+```
+
+**キーポイント:**
+- アップロード再開データとダウンロード再開データは別タイプで、混在できません
+- 短い中断でサーバー到達可能なら、URLSession が自動的にアップロード復旧を試み、手動処理不要な場合があります
+- アップロード再開には、最新 IETF 再開可能アップロードプロトコルドラフトのサーバーサポートが必要です
+
+### 再開可能アップロードプロトコルと SwiftNIO サーバー実装（[13:15](https://developer.apple.com/videos/play/wwdc2023/10006/?time=795)）
+
+クライアントがアップロードを一時停止した後、再開時に特殊な HTTP リクエストを送り「何バイトアップロード済みか、どこから続けるか」を問い合わせます。サーバーは受信済みデータに基づきオフセットを返し、クライアントはそのオフセットから送信を続けます。
+
+このプロトコルにはサーバー側実装が必要です。Apple は SwiftNIO に `NIOResumableUpload` モジュールを提供しています。
+
+再開可能アップロード非対応の SwiftNIO サーバーコード：
+
+```swift
+NIOTSListenerBootstrap(group: NIOTSEventLoopGroup())
+    .childChannelInitializer { channel in
+        channel.configureHTTP2Pipeline(mode: .server) { channel in
+            channel.pipeline.addHandlers([
+                HTTP2FramePayloadToHTTPServerCodec(),
+                ExampleChannelHandler()
+            ])
+        }.map { _ in () }
+    }
+    .tlsOptions(tlsOptions)
+```
+
+再開可能アップロード対応後（[14:06](https://developer.apple.com/videos/play/wwdc2023/10006/?time=846)）：
+
+```swift
+import NIOResumableUpload
+
+let uploadContext = HTTPResumableUploadContext(origin: "https://example.com")
+
+NIOTSListenerBootstrap(group: NIOTSEventLoopGroup())
+    .childChannelInitializer { channel in
+        channel.configureHTTP2Pipeline(mode: .server) { channel in
+            channel.pipeline.addHandlers([
+                HTTP2FramePayloadToHTTPServerCodec(),
+                HTTPResumableUploadHandler(context: uploadContext, handlers: [
+                    ExampleChannelHandler()
+                ])
+            ])
+        }.map { _ in () }
+    }
+    .tlsOptions(tlsOptions)
+```
+
+**キーポイント:**
+- `HTTPResumableUploadContext` の `origin` パラメーターで再開可能アップロードを許可するオリジンドメインを宣言
+- `HTTPResumableUploadHandler` は既存ビジネス handler の外側にラップし、プロトコルハンドシェイクを自動処理
+- このモジュールは HTTP/2 ベースで、先に HTTP/2 pipeline を設定する必要があります
+- `NIOResumableUpload` は独立 Swift package で、別途 import が必要です
+
+### 情報レスポンスデリゲートメソッド（[15:48](https://developer.apple.com/videos/play/wwdc2023/10006/?time=948)）
+
+再開可能アップロードプロトコルは HTTP 情報レスポンス（1xx ステータスコード）で再開パラメーターを交渉します。iOS 17 は `URLSessionTaskDelegate` にこれらを受け取るメソッドを追加しました：
+
+```swift
+protocol URLSessionTaskDelegate : URLSessionDelegate {
+    optional func urlSession(_ session: URLSession, task: URLSessionTask,
+                             didReceiveInformationalResponse response: HTTPURLResponse)
+}
+```
+
+**キーポイント:**
+- 情報レスポンス（`100 Continue`、`104 Upload Resumption` など）は最終レスポンスとして扱われません
+- 各情報レスポンス受信時に1回呼ばれます
+- 再開可能アップロードでは、システム内部がこの仕組みでプロトコル交渉を処理し、通常は手動介入不要です
+
+### Background URLSession のベストプラクティス（[18:19](https://developer.apple.com/videos/play/wwdc2023/10006/?time=1099)）
+
+Background URLSession は App がサスペンドされた後も転送タスクを継続できます。iOS 17 でより細かい制御オプションが追加されました：
+
+```swift
+// Configuring your background session
+let configuration = URLSessionConfiguration.background(withIdentifier: "com.example.app")
+configuration.isDiscretionary = true
+configuration.allowsConstrainedNetworkAccess = false
+let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+
+// Configuring your background task
+let backgroundTask = session.uploadTask(with: url, fromFile: fileURL)
+backgroundTask.earliestBeginDate = .now.addingTimeInterval(60 * 60)
+backgroundTask.countOfBytesClientExpectsToSend = 500 * 1024
+backgroundTask.countOfBytesClientExpectsToReceive = 200
+```
+
+**キーポイント:**
+- `isDiscretionary = true`：Wi-Fi かつ十分なバッテリー時のみ転送実行。非緊急コンテンツ向け
+- `allowsConstrainedNetworkAccess = false`：低データモードやホットスポットなど制限付きネットワークを禁止
+- `earliestBeginDate`：タスクの最早開始時刻を設定（例：深夜の低峰帯に延期）
+- `countOfBytesClientExpectsToSend/Receive`：転送バイト数を見積もり、スケジューリングと消費電力最適化を支援
+- Background URLSession の delegate は必須。設定しないと完了コールバックを受け取れません
+
+---
+
+## 重要ポイント
+
+**1. プログレスバー付き断点再開ダウンロードマネージャーを作る**
+
+URLSession のダウンロード一時停止/再開 API は十分成熟しています。`URLSessionDownloadDelegate` の進捗コールバックと組み合わせ、`ResumableDownloadManager` をラップし、複数ダウンロードタスクの状態（ダウンロード中/一時停止/完了）、進捗、再開データを管理できます。手動一時停止時は `cancelByProducingResumeData()` を呼び、再開データをローカル保存（一時ファイルパス無効化に注意）。次回起動時にタスクを再構築します。
+
+**2. ソーシャル App に大容量動画の断点アップロードを追加**
+
+新しいアップロード再開 API で、WeChat Moments 風の動画アップロード体験を実現：動画選択後すぐアップロード開始、App 終了やバックグラウンド移行時に自動一時停止して再開データ保存、次回起動で自動続行。要点は再開データのライフサイクル管理—ディスクにシリアライズし、復旧後にクリーンアップします。
+
+**3. バックエンドチーム向け SwiftNIO 再開可能アップロード統合案を提供**
+
+Swift バックエンド（Vapor や裸 SwiftNIO）を使うチームは `NIOResumableUpload` を直接 import し、Session のコードテンプレートで統合できます。重要設定は `HTTPResumableUploadContext` の `origin` と pipeline handler の順序。クライアント追加コード不要—URLSession のアップロード再開 API が標準プロトコルを自動使用します。
+
+**4. バックグラウンドコンテンツプリロードシステム**
+
+Background URLSession の `earliestBeginDate` と `isDiscretionary` を組み合わせ、ニュース/動画 App のオフラインプリロードを実装。フォアグラウンド時に各プリロード対象リソースのバックグラウンドタスクを作成し、深夜実行を設定。Wi-Fi + 充電条件下でシステムが自動ダウンロードし、朝 App を開くとコンテンツ準備完了です。
+
+---
+
+## 関連セッション
+
+- [Ready, set, relay: Protect app traffic with network relays](/articles/wwdc2023-10002) — relay で App のネットワークトラフィックプライバシーを保護する方法
+- [Reduce network delays with L4S](/articles/wwdc2023-10004) — L4S がネットワーク遅延を下げ、リアルタイム App の応答性を向上させる方法
+- [What's new in Background Assets](/articles/wwdc2023-10108) — Background Assets が App 起動前にコンテンツをプリダウンロードする方法

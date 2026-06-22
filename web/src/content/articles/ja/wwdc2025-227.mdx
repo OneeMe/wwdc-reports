@@ -1,0 +1,206 @@
+---
+title: "Finish tasks in the background"
+description: "discover background execution advancements and understand how the system schedules runtime. we"
+date: 2026-06-10
+tags: ["システムサービス"]
+thumbnail: "/images/sessions/2025/227.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/227/"
+sessionId: "wwdc2025-227"
+year: "2025"
+relatedSessions:
+  - title: "Deliver age-appropriate experiences in your app"
+    code: "299"
+    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
+  - title: "Filter and tunnel network traffic with NetworkExtension"
+    code: "234"
+    description: "learn about the apis in the networkextension framework that give your app the po"
+  - title: "Get ahead with quantum-secure cryptography"
+    code: "314"
+    description: "learn how to protect your app"
+  - title: "Optimize home electricity usage with EnergyKit"
+    code: "257"
+    description: "learn how to support energykit in your app so people can optimize electricity us"
+---
+
+## ハイライト
+
+> iOS 26 では `BGContinuedProcessingTask` が導入され、ユーザーが明示的に開始した長時間タスク（動画書き出し、SNS への投稿、アクセサリのアップデートなど）を、app がバックグラウンドへ移行したあとも継続して実行できるようになりました。進捗 UI とキャンセル導線はシステム側が提供します。
+
+## 主要内容
+
+ユーザーが app 内で「4K 動画を書き出す」をタップし、ホームボタンでホーム画面へ戻る。これまでこのシナリオでは、開発者は `beginBackgroundTask` で猶予時間を確保しても数十秒で suspend され、書き出しが失敗していました。あるいは、ユーザーをフォアグラウンドに引き戻して進捗バーを眺めさせるしかありませんでした。どちらも体験とは呼べません。
+
+iOS 26 はここに第三の道を用意しました。Apple の Ryan は session でこう説明しています。app はバックグラウンドへ移行するとデフォルトで suspend され、CPU 時間は割り当てられません。これはバッテリーを保護し、フォアグラウンドの滑らかさを維持するためです。バックグラウンド実行は権利ではなく、システムが「効率的・最小限・復元可能・行儀よく・適応的」という 5 つの原則に従って配分する有限なリソースです（[01:02](https://developer.apple.com/videos/play/wwdc2025/227/?time=62)）。この前提のうえで新たに加わった `BGContinuedProcessingTask` は、特定のシナリオに特化しています。ユーザーが明示的にトリガーし、明確な終了点があり、進捗を定量化できる長時間タスクです。システムはバックグラウンドで UI を表示し、タイトル・サブタイトル・進捗バーを見せ、ユーザーはいつでもキャンセルできます。Journal app の書き出し機能は、この API で動いています（[11:40](https://developer.apple.com/videos/play/wwdc2025/227/?time=700)）。
+
+新しい API は既存 API を置き換えるものではなく、iOS のバックグラウンド実行ツールボックスに残っていた最後のピースを埋めるものです。コンテンツのプリフェッチには `BGAppRefreshTask`、サーバー側からのプッシュ更新には Background Push、オフラインの ML 推論やデータベースのメンテナンスには `BGProcessingTask`、ファイルハンドルの後始末には `beginBackgroundTask`、そしてユーザー起点の長時間タスクには `BGContinuedProcessingTask` を使います。各 API がそれぞれ別の作業プロファイルに対応し、システムはそれを根拠にリソースを割り振ります。
+
+## 詳細
+
+**app refresh タスクを登録する**（[08:27](https://developer.apple.com/videos/play/wwdc2025/227/?time=507)）。SwiftUI app では scene modifier で宣言し、システムが利用頻度に応じてスケジュールします。よく使われる app ほどヒット率が高くなります。
+
+```swift
+import BackgroundTasks
+import SwiftUI
+
+@main
+struct ColorFeed: App {
+    var body: some Scene {
+        WindowGroup {
+            // ...
+        }
+        .backgroundTask(.appRefresh("com.colorfeed.wwdc25.appRefresh")) {
+            await self.handleAppRefreshTask()
+        }
+    }
+}
+```
+
+ポイント:
+- `.backgroundTask(.appRefresh(...))` は SwiftUI が提供する scene modifier で、逆ドメイン形式の識別子に紐づけます。
+- クロージャは `async` で、システムが app をバックグラウンドで起動した際に呼び出されます。クロージャから return すると app は再び suspend されます。
+- このルートでは `AppDelegate` で `register` する必要はありません。SwiftUI が代わりに行ってくれます。
+
+**processing タスクを登録して submit する**（[09:45](https://developer.apple.com/videos/play/wwdc2025/227/?time=585)）。ML 推論やデータベース整理など、レイテンシに敏感でないバッチ処理向けです。「充電中かつネットワーク接続あり」を必須にすることで、バッテリーへの影響を最小限に抑えられます。
+
+```swift
+import BackgroundTasks
+import UIKit
+
+class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) -> Bool {
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: "com.example.apple-samplecode.ColorFeed.db_cleaning",
+            using: nil
+        ) { task in
+            self.handleAppRefresh(task: task as! BGProcessingTask)
+        }
+    }
+
+    func submitProcessingTaskRequest() {
+        let request = BGProcessingTaskRequest(
+            identifier: "com.example.apple-samplecode.ColorFeed.db_cleaning"
+        )
+        request.requiresNetworkConnectivity = true
+        request.requiresExternalPower = true
+
+        BGTaskScheduler.shared.submit(request)! 
+    }
+}
+```
+
+ポイント:
+- `register` は app 起動の早い段階で完了させる必要があります。さもないとバックグラウンドで起こされた際にシステムがハンドラを見つけられず、タスクは即座に失敗します（[09:56](https://developer.apple.com/videos/play/wwdc2025/227/?time=596)）。
+- `using: nil` を指定するとコールバックキューはシステムが選びます。
+- `requiresExternalPower = true` で「充電中のみ実行」を宣言でき、バッテリーに優しくなります。
+- `requiresNetworkConnectivity = true` でネットワーク必須を宣言します。ネットがないときはシステムが延期します。
+- `submit` 後の実行タイミングはシステムが決定し、即座には走りません。
+
+**短時間の後始末には begin/end background task を使う**（[10:51](https://developer.apple.com/videos/play/wwdc2025/227/?time=651)）。app がバックグラウンドへ移行する直前に追加の実行時間を確保し、状態保存やファイルハンドルのクローズを行うための仕組みです。
+
+```swift
+import UIKit
+
+@main
+class AppDelegate: UIResponder, UIApplicationDelegate {
+    var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+   
+    func saveState() { /*  ... */ }
+
+    func handlePersistence() {
+        let app = UIApplication.shared
+        guard backgroundTaskID != .invalid else { return }
+        backgroundTaskID = app.beginBackgroundTask(withName: "Finish Export") {
+            app.endBackgroundTask(self.backgroundTaskID)
+            self.backgroundTaskID = .invalid
+        }
+
+        self.saveState()
+
+        app.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+}
+```
+
+ポイント:
+- `beginBackgroundTask(withName:)` は token を返すので、必ず保存しておきます。
+- クロージャは expiration handler です。システムがタイムアウトと判断したときに呼ばれるので、ここでやることは 1 つだけ、`endBackgroundTask` を呼んで抜けることだけにとどめます。
+- 作業が終わったら必ず明示的に `endBackgroundTask` を呼んでください。さもないとシステムが app を強制終了します。
+- 「数秒で終わる後始末」向きで、長時間タスクには不向きです。
+
+**continued processing タスクを登録する**（[14:00](https://developer.apple.com/videos/play/wwdc2025/227/?time=840)）。`BGProcessingTask` と異なり、ここでの `register` は動的で、ユーザーが意図を表明したあとに呼び出します。
+
+```swift
+import BackgroundTasks
+
+func handleDialogConfirmation() {
+    BGTaskScheduler.shared.register("com.colorfeed.wwdc25.userTask") { task in
+        let task = task as! BGContinuedProcessingTask
+                                                                      
+        var shouldContinue = true
+        task.expirationHandler = {
+            shouldContinue = false
+        }
+
+        task.progress.totalUnitCount = 100
+        task.progress.completedUnitCount = 0
+
+        while shouldContinue {
+            // Do some work
+            task.progress.completedUnitCount += 1
+        }
+
+        task.setTaskCompleted(success: true)
+    }
+}
+```
+
+ポイント:
+- 識別子はあらかじめ Info.plist の `BGTaskSchedulerPermittedIdentifiers` に宣言しておく必要があり、bundle ID で始める必要があります。
+- `expirationHandler` ではフラグを 1 つ反転させるだけにし、ループ側でフラグを見て優雅に抜けます。ハンドラ内で重い処理をしてはいけません。
+- `task.progress` は Foundation の `Progress` Reporting Protocol を使います。システムはこれを購読して UI を駆動します。進捗をまったく更新しないタスクはハングと判定されて expire されます（[14:44](https://developer.apple.com/videos/play/wwdc2025/227/?time=884)）。
+- 完了後は必ず `setTaskCompleted(success:)` を呼びます。これによりシステムはリソースを回収し、進捗 UI を閉じます。
+
+**continued processing リクエストを submit する**（[15:47](https://developer.apple.com/videos/play/wwdc2025/227/?time=947)）:
+
+```swift
+import BackgroundTasks
+
+func submitContinuedProcessingTaskRequest() {
+    let request = BGContinuedProcessingTaskRequest(
+        identifier: "com.colorfeed.wwdc25.userTask",
+        title: "A succinct title",
+        subtitle: "A useful and informative subtitle"
+    )
+
+    request.strategy = .fail
+
+    BGTaskScheduler.shared.submit(request)!
+}
+```
+
+ポイント:
+- `title` と `subtitle` はどちらもローカライズが必要です。システム UI にそのままユーザーへ表示されます。
+- `strategy = .fail` は「すぐに開始できないなら失敗とする」を意味します。「いま走らせなければ意味がない」タスクに向いています。デフォルトの挙動はキューに並んで待機する形です。
+- ワイルドカード識別子（`bundleID.context.*`）を使うと、登録時と submit 時に動的なサフィックスを連結できます（[13:37](https://developer.apple.com/videos/play/wwdc2025/227/?time=817)）。
+- バックグラウンドでの GPU アクセスには Xcode で capability の追加が必要で、ランタイムでは `scheduler.supportedResources` でデバイスがサポートしているか確認します（[17:11](https://developer.apple.com/videos/play/wwdc2025/227/?time=1031)）。
+
+## 重要ポイント
+
+- **「書き出し／アップロード／投稿」にバックグラウンド継続実行を加える**: なぜやる価値があるか。ユーザーがもっとも不満を言うのは「戻るを押したら中断された」というケースで、課金につながりやすい機能（動画の書き出し、一括アップロード、アクセサリのファームウェアアップデート）が中断されると最初からやり直しになります。始め方。ボタンの handler 内で `BGContinuedProcessingTask` を `register` し、`Progress` で既存の進捗ロジックを駆動し、`setTaskCompleted` を従来の完了コールバックにつなげます。
+
+- **`BGProcessingTask` で「夜中に走らせていた処理」を充電中の時間帯へ移す**: なぜやる価値があるか。embedding の再構築、ローカルインデックス、キャッシュ整理、ML モデルのウォームアップといった処理をフォアグラウンドで走らせるのはユーザーのバッテリーの無駄遣いで、充電時間帯に寄せれば、システムスケジューラのコスト平準化にも乗れます。始め方。`AppDelegate` の起動時に identifier を `register` し、リクエスト送信時に `requiresExternalPower = true` と `requiresNetworkConnectivity = true` を付け、あとはシステムのキューに任せます。
+
+- **「app を開いたら古いコンテンツ」を「開いた瞬間に新しいコンテンツ」へ変える**: なぜやる価値があるか。フィード系、リーダー系、メール系の app の体感差は、コールドスタートの 1 秒に集約されがちです。始め方。SwiftUI の `.backgroundTask(.appRefresh(...))` modifier で軽量なプリフェッチクロージャを登録し、サーバー側の Background Push と組み合わせて補完します。前者は利用頻度ベース、後者はイベントベースで、二本立てで戦います。
+
+- **タスクには常に進捗を持たせる。持たせなければ kill される**: なぜやる価値があるか。`BGContinuedProcessingTask` は「システムから見てハングしている」と「システムから見て働いている」を明確に区別します。`Progress` を更新しないと expire されてしまいます。始め方。既存の進捗コールバックを `task.progress.completedUnitCount` に接続します。推定値であっても、まったく報告しないよりは大幅にマシです。同時に、`expirationHandler` 用に即座に抜けられるチェックポイントを用意しておきます。
+
+## 関連セッション
+
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — Declared Age Range API により、app が年齢層に応じた適切なコンテンツを提供できるようになります。
+- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — NetworkExtension フレームワークによるフィルタリングとトンネリング機能。システムレベルのネットワーク介入シナリオを広くカバーします。
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — CryptoKit に耐量子アルゴリズムを取り込み、向こう 10 年のデータを守ります。
+- [Optimize home electricity usage with EnergyKit](/articles/wwdc2025-257) — EnergyKit により、app が家庭の電力網状況に合わせてエネルギー消費タスクをスケジューリングできます。

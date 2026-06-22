@@ -1,0 +1,226 @@
+---
+title: "Explore Core Image kernel improvements"
+description: "Discover how you can add Core Image kernels written in the Metal shading language into your app. We'll explore how you can use Xcode rules and naming conventions for Core Image kernels written in the Metal shading language."
+date: "2021-06-07"
+tags: ["Core Image", "Metal", "Image Processing", "Shader"]
+thumbnail: "/images/sessions/2021/10159.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10159/"
+sessionId: "wwdc2021-10159"
+year: "2021"
+relatedSessions:
+  - title: "Create image processing apps powered by Apple silicon"
+    code: "10153"
+    description: "Apple Silicon画像処理の最適化"
+  - title: "Explore HDR rendering with EDR"
+    code: "10161"
+    description: "EDR HDR レンダリング パイプライン"
+  - title: "What's new in AVFoundation"
+    code: "10146"
+    description: "新しい API をロードする AVFoundation 非同期プロパティ"
+---
+## ハイライト
+
+> Core Image は、Metal カーネルの 2 つの記述方法をサポートするようになりました。extern CIKernel (カスタム ビルド ルールが必要、すべてのデバイスと互換性あり) とステッチ可能な CIKernel (Metal Dynamic Libraries を使用、A11+/Apple Silicon/AMD Navi/Vega のみ) です。
+
+## 主な内容
+
+カスタム画像フィルターを作成したいと考えています。 Core Image の CIFilter はすでに 200 を超える組み込みフィルターを提供していますが、満たせないニーズは常に存在します。以前は、カスタム カーネルの作成には CIKL (Core Image Kernel Language) が使用されており、構文やツール チェーンが Metal とは異なっていました。
+
+Core Image が Metal Shading Language を直接サポートするようになったので、Xcode で Metal カーネルを作成し、構文の強調表示やコンパイル時のエラー チェックを楽しむことができます。
+
+＃＃詳細
+
+### Metal を使用して CIKernel を作成する理由
+
+（[00:46](https://developer.apple.com/videos/play/wwdc2021/10159/?time=46)）
+
+Metal で CIKernel を記述することには、次の 3 つの利点があります。
+
+1. **自動タイリングと連結**。 Core Image は、大きな画像を自動的に小さな部分に分割して処理し、複数のフィルターを 1 回の実行に結合します。
+2. **コンパイル時間の最適化**。カーネルは、アプリケーションの実行時ではなく、アプリケーションの構築時にコンパイルされます。パフォーマンスが向上し、起動が速くなります。
+3. **高度な機能にアクセス**。収集読み取り、グループ書き込み、半浮動小数点演算などのメタル機能はすべて使用できます。
+4. **開発経験**。 Xcode は、構文の強調表示とコンパイル時のエラー チェックを提供します。
+
+### 方法 1: 外部 CIKernel
+
+（[02:32](https://developer.apple.com/videos/play/wwdc2021/10159/?time=152)）
+
+Extern メソッドにはカスタム ビルド ルールが必要で、Core Image をサポートするすべてのデバイスと互換性があります。
+
+**ステップ 1: ビルド ルールを追加する**
+
+2 つのビルド ルールをターゲット設定に追加します。
+
+1. `.ci.metal`ファイル→使用`metal -fcikernel`としてコンパイル`.ci.air`
+2. `.ci.air`ファイル→使用`metallib -cikernel`リンクは`.ci.metallib`
+
+**ステップ 2: カーネルを作成する**
+
+```metal
+// MyFilter.ci.metal
+#include <CoreImage/CoreImage.h>
+
+// extern "C" 标记让 Core Image 识别这个函数
+extern "C" {
+    namespace coreimage {
+        float4 myKernel(sampler src, float amount) {
+            float4 color = src.sample(src.coord());
+            // 自定义处理逻辑
+            return color * amount;
+        }
+    }
+}
+```
+
+（[03:54](https://developer.apple.com/videos/play/wwdc2021/10159/?time=234)）
+
+**ステップ 3: ロードして使用する**
+
+```swift
+class MyFilter: CIFilter {
+    var inputImage: CIImage?
+    var amount: Float = 1.0
+
+    static var kernel: CIKernel = {
+        let url = Bundle.main.url(
+            forResource: "MyFilter",
+            withExtension: "ci.metallib"
+        )!
+        let data = try! Data(contentsOf: url)
+        return try! CIKernel(
+            functionName: "myKernel",
+            fromMetalLibraryData: data
+        )
+    }()
+
+    override var outputImage: CIImage? {
+        guard let input = inputImage else { return nil }
+        return MyFilter.kernel.apply(
+            extent: input.extent,
+            roiCallback: { _, rect in rect },
+            arguments: [input, amount]
+        )
+    }
+}
+```
+
+（[04:32](https://developer.apple.com/videos/play/wwdc2021/10159/?time=272)）
+
+**キーポイント:**
+- ファイルの拡張子は次のとおりです。`.ci.metal`
+- 関数は次のようにマークされています`extern "C"`
+- コンパイルされた製品のサフィックスは、`.ci.metallib`
+- カーネル用`static`プロパティの遅延読み込み
+- `roiCallback`入力画像内の目的の領域を返します。
+
+### 方法 2: ステッチ可能な CIKernel
+
+（[05:42](https://developer.apple.com/videos/play/wwdc2021/10159/?time=342)）
+
+Stitchable の方法はより簡単で、ビルド設定のみが必要ですが、サポートされるのは新しいデバイスのみです。
+
+**ステップ 1: ビルド設定を行う**
+
+ターゲットの「その他のメタルリンカーフラグ」に追加`-framework CoreImage`。
+
+**ステップ 2: カーネルを作成する**
+
+```metal
+// MyFilter.metal（普通 .metal 文件）
+#include <CoreImage/CoreImage.h>
+
+// [[stitchable]] 属性标记
+[[stitchable]] float4 myStitchableKernel(
+    sampler src,
+    float amount
+) {
+    float4 color = src.sample(src.coord());
+    return color * amount;
+}
+```
+
+（[06:18](https://developer.apple.com/videos/play/wwdc2021/10159/?time=378)）
+
+**ステップ 3: ロードして使用する**
+
+```swift
+class MyFilter: CIFilter {
+    var inputImage: CIImage?
+    var amount: Float = 1.0
+
+    static var kernel: CIKernel = {
+        let url = Bundle.main.url(
+            forResource: "default",
+            withExtension: "metallib"
+        )!
+        let data = try! Data(contentsOf: url)
+        return try! CIKernel(
+            functionName: "myStitchableKernel",
+            fromMetalLibraryData: data
+        )
+    }()
+
+    override var outputImage: CIImage? {
+        guard let input = inputImage else { return nil }
+        return MyFilter.kernel.apply(
+            extent: input.extent,
+            roiCallback: { _, rect in rect },
+            arguments: [input, amount]
+        )
+    }
+}
+```
+
+（[06:40](https://developer.apple.com/videos/play/wwdc2021/10159/?time=400)）
+
+**キーポイント:**
+- 普通`.metal`ファイル、特別な接尾辞は必要ありません
+- 関数は次のようにマークされています`[[stitchable]]`
+- にコンパイルします`default.metallib`
+- ビルドルールをカスタマイズする必要はありません
+- 他のメタルライブラリにリンク可能
+
+### デバイスの互換性
+
+（[08:08](https://developer.apple.com/videos/play/wwdc2021/10159/?time=488)）
+
+ステッチ可能なカーネルはメタル ダイナミック ライブラリに依存しているため、デバイスのサポートを確認する必要があります。
+
+```swift
+if device.supportsDynamicLibraries {
+    // 可以使用 stitchable kernel
+} else {
+    // 回退到 extern kernel 或其他方案
+}
+```
+
+サポートされているデバイス:
+- iPhone/iPad: A11 以降のチップ
+- Mac: すべての Apple シリコン
+- Intel Mac: AMD Navi および Vega GPU
+
+（[08:21](https://developer.apple.com/videos/play/wwdc2021/10159/?time=501)）
+
+**キーポイント:**
+- `supportsDynamicLibraries`デバイスの互換性を確認する
+- サポートされていない場合はフォールバック プランが必要です
+- 外部カーネルの互換性が向上
+- ステッチ可能なカーネル開発エクスペリエンスが向上
+
+## 重要なポイント
+
+1. **新しいプロジェクトにはステッチ可能カーネルの使用が優先されます**。開発エクスペリエンスが向上し、ビルド ルールをカスタマイズする必要がありません。入口API：`[[stitchable]]` + `-framework CoreImage` linker flag。
+
+2. 古いデバイスとの互換性が必要な場合は、**外部カーネルを使用**します。ステッチ可能は、A11 より前のデバイスではサポートされていません。入口API：`extern "C"` + `.ci.metal` build rule。
+
+3. **使用`supportsDynamicLibraries`ランタイム検出を実行します**。デバイスの機能に応じて、さまざまなカーネル読み込み方法を選択してください。入口API：`MTLDevice.supportsDynamicLibraries`。
+
+4. **カーネルを遅延読み込み用の静的属性にコンパイルします**。フィルターを作成するたびに metallib をリロードすることは避けてください。入口API：`static var kernel`。
+
+5. **roiCallback は最小限必要な領域を返します**。不必要なサンプリングを減らすために、わざわざイメージ全体を返す必要はありません。入口API：`roiCallback: { _, rect in rect }`。
+
+## 関連セッション
+
+- [Apple シリコンを活用した画像処理アプリを作成する](/articles/wwdc2021-10153) — Apple シリコン画像処理の最適化
+- [EDR で HDR レンダリングを探索する](/articles/wwdc2021-10161) — EDR HDR レンダリング パイプライン
+- [AVFoundation の新機能](/articles/wwdc2021-10146) — 新しい API をロードする AVFoundation の非同期プロパティ

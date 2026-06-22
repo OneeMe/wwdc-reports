@@ -1,0 +1,231 @@
+---
+title: "Explore Metal 4 games"
+description: "learn to optimize your game engine with the latest advancements in metal 4. we"
+date: 2026-06-10
+tags: ["Graphics & Games"]
+thumbnail: "/images/sessions/2025/254.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/254/"
+sessionId: "wwdc2025-254"
+year: "2025"
+relatedSessions:
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Go further with Metal 4 games"
+    code: "258"
+    description: "learn about advanced metal 4 features for high-end games"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+---
+
+## Highlight
+
+> This is the second installment of the Metal 4 quartet, presented by GPU Driver Engineers Jason and Yang. It focuses on three axes of game-engine optimization: encoding efficiency, resource management, and pipeline loading.
+
+## Core Content
+
+Where do game engines get stuck? A typical modern AAA game issues thousands of draw calls, kernel dispatches, and blits per frame. Every time the fragment shader output's attachment layout changes, the engine has to open a new render encoder. Every time a buffer depends on the result of a prior blit, a sync has to be inserted. Thousands of pipeline states compile serially during loading while the player stares at a loading screen. Ubisoft's Assassin's Creed Shadows runs gigabytes of geometry and textures on Apple Silicon, with thousands of shaders. At that scale, every redundant cost on the encoding hot path is amplified into visible stutter.
+
+Metal 4 splits these pain points into three areas. On the encoding side, render and compute encoders are made "fewer but stronger" so a single encoder can hold more work. On the resource side, argument tables, residency sets, and queue barriers extend the bindless model to thousands of resources. On the pipeline side, an unspecialized pipeline plus specialization reuses compiled output, and multithreaded plus ahead-of-time compilation drives load time close to zero. Jason covers the first two areas; Yang covers pipelines. The theme throughout is "do less useless work and hand control back to the developer."
+
+## Detailed Content
+
+**Unified compute encoding and Pass Barrier ([02:24](https://developer.apple.com/videos/play/wwdc2025/254/?time=144))**. Kernel dispatch, blit, and acceleration structure build now share the same compute encoder. They run concurrently by default; when there is a dependency, a Pass Barrier expresses it.
+
+```objc
+id<MTL4ComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+[encoder copyFromBuffer:src sourceOffset:0 toBuffer:buffer1 destinationOffset:0 size:64];
+
+[encoder barrierAfterEncoderStages:MTLStageBlit
+               beforeEncoderStages:MTLStageDispatch
+                 visibilityOptions:MTL4VisibilityOptionDevice];
+
+[encoder setComputePipelineState:pso];
+
+[argTable setAddress:buffer1.gpuAddress atIndex:0];
+[encoder setArgumentTable:argTable];
+[encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+
+[encoder endEncoding];
+```
+
+**Key points**
+
+- `computeCommandEncoder` lets one encoder handle both blit and dispatch with no switching.
+- `copyFromBuffer:...` writes to `buffer1`, the producer of the dependency.
+- `barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch` says the dispatch must wait for the blit. Without this barrier, blit and dispatch run concurrently.
+- `MTL4VisibilityOptionDevice` sets visibility to the entire device, so the later dispatch sees the blit's latest result.
+
+**Color attachment mapping ([04:29](https://developer.apple.com/videos/play/wwdc2025/254/?time=269))**. One render encoder is configured with the superset of all attachments, and each pipeline is given its own logical-to-physical map. This avoids opening a new encoder for every output layout.
+
+```objc
+MTL4RenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
+desc.supportColorAttachmentMapping = YES;
+desc.colorAttachments[0].texture = colortex0;
+desc.colorAttachments[1].texture = colortex1;
+desc.colorAttachments[2].texture = colortex2;
+desc.colorAttachments[3].texture = colortex3;
+desc.colorAttachments[4].texture = colortex4;
+```
+
+```objc
+MTLLogicalToPhysicalColorAttachmentMap* myAttachmentRemap = [MTLLogicalToPhysicalColorAttachmentMap new];
+[myAttachmentRemap setPhysicalIndex:0 forLogicalIndex:0];
+[myAttachmentRemap setPhysicalIndex:3 forLogicalIndex:1];
+[myAttachmentRemap setPhysicalIndex:4 forLogicalIndex:2];
+
+[renderEncoder setRenderPipelineState:myPipeline];
+[renderEncoder setColorAttachmentMap:myAttachmentRemap];
+```
+
+**Key points**
+
+- `supportColorAttachmentMapping = YES` turns mapping on.
+- The descriptor binds five color attachments as a superset that covers every pipeline's output needs.
+- `setPhysicalIndex:forLogicalIndex:` routes the fragment shader's logical index to a concrete attachment. Switching pipelines only requires `setColorAttachmentMap:`; no new encoder.
+
+**Suspend/Resume merges multiple encoders into one GPU pass ([08:03](https://developer.apple.com/videos/play/wwdc2025/254/?time=483))**. Encode on multiple threads, then commit once, and skip the intermediate store/load.
+
+```objc
+id<MTL4RenderCommandEncoder> enc0 = [cmdbuf0 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionSuspending];
+id<MTL4RenderCommandEncoder> enc1 = [cmdbuf1 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionResuming | MTL4RenderEncoderOptionSuspending];
+id<MTL4RenderCommandEncoder> enc2 = [cmdbuf2 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionResuming];
+
+id<MTL4CommandBuffer> cmdbufs[] = { cmdbuf0, cmdbuf1, cmdbuf2 };
+[commandQueue commit:cmdbufs count:3];
+```
+
+**Key points**
+
+- `MTL4RenderEncoderOptionSuspending` marks the encoder as not ending the GPU pass.
+- The middle encoder uses `Resuming | Suspending` to chain the head and tail.
+- The three command buffers commit together via `commit:count:`. Metal sees them as one pass; tile memory never spills to DRAM.
+
+**Drawable sync and queue barriers ([11:48](https://developer.apple.com/videos/play/wwdc2025/254/?time=708) / [13:25](https://developer.apple.com/videos/play/wwdc2025/254/?time=805))**. Drawables are no longer tracked implicitly. The developer synchronizes them with explicit wait/signal on the queue. Cross-encoder dependencies use a Queue Barrier filtered by stage.
+
+```objc
+id<MTL4ComputeCommandEncoder> compute = [commandBuffer computeCommandEncoder];
+[compute dispatchThreadgroups:threadGrid threadsPerThreadgroup:threadsPerThreadgroup];
+[compute endEncoding];
+
+id<MTL4RenderCommandEncoder> render = [commandBuffer renderCommandEncoderWithDescriptor:des];
+
+[render barrierAfterQueueStages:MTLStageDispatch
+                   beforeStages:MTLStageFragment
+              visibilityOptions:MTL4VisibilityOptionDevice];
+
+[renderCommandEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                         vertexStart:vertexStart
+                         vertexCount:vertexCount];
+[render endEncoding];
+```
+
+**Key points**
+
+- `barrierAfterQueueStages:MTLStageDispatch` waits for the dispatch stage of every prior encoder to finish.
+- `beforeStages:MTLStageFragment` blocks only the fragment stage of the current encoder. The vertex stage can overlap with compute, maximizing concurrency.
+- Filtering by stage instead of blocking the whole encoder is the heart of this sync model.
+
+**Flexible render pipeline state ([20:41](https://developer.apple.com/videos/play/wwdc2025/254/?time=1241))**. First compile a pipeline whose color-attachment fields are all unspecialized. Then specialize three variants — opaque, transparent, hologram — that reuse the vertex and fragment binary body.
+
+```objc
+pipelineDescriptor.colorAttachments[i].pixelFormat   = MTLPixelFormatUnspecialized;
+pipelineDescriptor.colorAttachments[i].writeMask     = MTLColorWriteMaskUnspecialized;
+pipelineDescriptor.colorAttachments[i].blendingState = MTL4BlendStateUnspecialized;
+```
+
+```objc
+pipelineDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+pipelineDescriptor.colorAttachments[0].writeMask =
+    MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
+pipelineDescriptor.colorAttachments[0].blendingState = MTL4BlendStateEnabled;
+pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+pipelineDescriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+
+id<MTLRenderPipelineState> transparentPipeline =
+    [compiler newRenderPipelineStateBySpecializationWithDescriptor:pipelineDescriptor
+                                                          pipeline:unspecializedPipeline
+                                                             error:&error];
+```
+
+**Key points**
+
+- First block: set pixelFormat, writeMask, and blendingState to `Unspecialized`. The compiled pipeline contains the vertex binary, the fragment binary body, and a default fragment output.
+- Second block: fill in the real attachment configuration. `newRenderPipelineStateBySpecializationWithDescriptor:pipeline:` regenerates only the fragment output. It does not redo full shader compilation, so it is very fast.
+
+**Ahead-of-time compilation ([28:24](https://developer.apple.com/videos/play/wwdc2025/254/?time=1704))**. The runtime collects pipeline descriptors and serializes them into `mtl4-json`. The dev machine builds an archive with `metal-tt`. The shipping build looks pipelines up in the archive, falling back to online compilation on a miss.
+
+```objc
+MTL4PipelineDataSetSerializerDescriptor *desc = [MTL4PipelineDataSetSerializerDescriptor new];
+desc.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureDescriptors;
+id<MTL4PipelineDataSetSerializer> serializer =
+    [device newPipelineDataSetSerializerWithDescriptor:desc];
+
+MTL4CompilerDescriptor *compilerDesc = [MTL4CompilerDescriptor new];
+[compilerDesc setPipelineDataSetSerializer:serializer];
+id<MTL4Compiler> compiler = [device newCompilerWithDescriptor:compilerDesc error:nil];
+
+NSData *data = [serializer serializeAsPipelinesScriptWithError:&err];
+NSString *path = [NSString pathWithComponents:@[folder, @"pipelines.mtl4-json"]];
+BOOL success = [data writeToFile:path options:NSDataWritingAtomic error:&err];
+```
+
+**Key points**
+
+- `CaptureDescriptors` mode records only the descriptors, not the compiled output, so memory use stays small.
+- Once the serializer is attached to a compiler, every pipeline created through it is recorded automatically.
+- `serializeAsPipelinesScriptWithError:` writes `pipelines.mtl4-json`, which `metal-tt` then turns into a GPU binary archive.
+
+```objc
+id<MTL4Archive> archive = [device newArchiveWithURL:archiveURL error:&error];
+id<MTLRenderPipelineState> pipeline =
+    [archive newRenderPipelineStateWithDescriptor:descriptor error:&error];
+
+if (pipeline == nil)
+{
+    pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor
+                                          compilerTaskOptions:nil
+                                                        error:&error];
+}
+```
+
+**Key points**
+
+- `newArchiveWithURL:` loads the archive from disk.
+- Look up a pipeline in the archive with the same descriptor. A hit is nearly free.
+- A miss (descriptor mismatch, OS incompatible, GPU architecture incompatible) must fall back to online compilation. Otherwise the game ships without that pipeline.
+
+## Key Takeaways
+
+- **What to do: fold all compute work into one encoder and express dependencies with Pass Barrier**
+  - Why it pays off: Metal 4 runs dispatch, blit, and acceleration structure build concurrently inside one compute encoder by default. Independent work fills the GPU on its own.
+  - How to start: audit existing compute paths and remove the logic that opens separate encoders for blit and dispatch. Add `barrierAfterEncoderStages:beforeEncoderStages:` only where there is a real data dependency.
+
+- **What to do: merge render passes with color attachment mapping**
+  - Why it pays off: every extra render encoder adds another tile-memory store/load. Mapping lets one encoder serve many fragment output layouts.
+  - How to start: configure the render encoder with the superset of every attachment you need, give each pipeline its own `MTLLogicalToPhysicalColorAttachmentMap`, and check in profiling that tile memory does not overflow before shipping.
+
+- **What to do: make all render pipelines unspecialized plus specialization by default**
+  - Why it pays off: in the city-builder demo, the opaque, transparent, and hologram pipelines share the vertex and fragment binary body. Specialization regenerates only the fragment output, cutting compile time sharply.
+  - How to start: set pixelFormat, writeMask, and blendingState in the pipeline descriptor to unspecialized and compile once. After shipping, use Instruments' Metal System Trace to find shaders where specialization regresses, and run a background full-state compile for that small set.
+
+- **What to do: push pipeline loading to ahead-of-time**
+  - Why it pays off: online multithreaded compilation already cuts stutter, but ahead-of-time pushes load time close to zero. The player almost never sees a loading screen.
+  - How to start: attach `MTL4PipelineDataSetSerializer` to dev builds to collect `mtl4-json`. Build the archive with `metal-tt` and ship it. At runtime, look up pipelines via `MTL4Archive`, and keep a fallback to `compiler newRenderPipelineStateWithDescriptor:`.
+
+- **What to do: keep residency sets few, sync drawables explicitly**
+  - Why it pays off: a few large residency sets let Metal prepare resources in batches. Explicit wait/signal on drawables replaces implicit tracking and gives more predictable cost.
+  - How to start: attach stable residency sets to the command queue and volatile ones to the command buffer. Add `CAMetalLayer`'s dynamic residency set to the queue once. Each frame: `[queue waitForDrawable:]` → submit → `[queue signalDrawable:]` → `present`.
+
+## Related Sessions
+
+- [Discover Metal 4](/articles/wwdc2025-205) — Part one of the Metal 4 quartet, covering the overall design of encoders, argument tables, and residency sets
+- [Go further with Metal 4 games](/articles/wwdc2025-258) — Part three, on advanced uses of MetalFX and ray tracing
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — Part four, embedding ML inference directly into the graphics pipeline
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — The migration path from SceneKit to RealityKit after SceneKit's deprecation

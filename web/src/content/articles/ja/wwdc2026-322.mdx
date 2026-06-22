@@ -1,0 +1,383 @@
+---
+title: "SwiftUI で高度なグラフィックス効果を組み立てる"
+description: "SwiftUI のレイアウト API とグラフィックス API を創造的に組み合わせ、豊かなカスタム体験を作る方法を学びます。複雑なデザインを分解し、単純な部品をつなぐクリエイティブなパイプラインとして扱う考え方を紹介します。"
+date: "2026-06-10"
+tags: ["SwiftUI", "Metal", "Shader", "TimelineView", "Alignment"]
+thumbnail: "/images/sessions/2026/322.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/322/"
+sessionId: "wwdc2026-322"
+year: "2026"
+relatedSessions:
+  - title: "SwiftUI の新機能"
+    code: "269"
+    description: "SwiftUI の基本レイアウトと新しい modifier の概要です"
+  - title: "Lazy stacks"
+    code: "321"
+    description: "大量のデータリストを効率よく扱うための遅延読み込み技術です"
+  - title: "RealityKit"
+    code: "279"
+    description: "Shader 効果を 3D 空間へ拡張したい場合、RealityKit が対応するマテリアルシステムを提供します"
+  - title: "Swift"
+    code: "262"
+    description: "Swift 言語の新機能です。`constexpr` などの低レベル概念を理解すると Shader コードを読みやすくなります"
+  - title: "Xcode 27"
+    code: "258"
+    description: "新しい Xcode における Shader 開発とプレビューの改善です"
+---
+
+## ハイライト
+
+> Apple は SwiftUI で `layerEffect` と `alignmentGuide` を組み合わせる力を広げました。開発者は Metal Shader でピクセル単位の流体的な歪みを実装し、セマンティックな整列ガイドで浮遊ビューを配置できます。しかも全体を SwiftUI の中だけで完結できます。
+
+## 主要内容
+
+### 複雑な効果は魔法ではなく、パイプラインの組み合わせ
+
+高度な UI 効果を作るとき、開発者はよく「Apple 純正 App は何か特別な裏技を使っているのでは」と考えます。この Session は、ポッドキャスト App のデザイン過程を通じて、答えは単純な API をパイプラインのようにつなぐことだと示します。
+
+発表者は簡素な文字起こしビューから始め、Apple Music のリアルタイム歌詞画面のような効果を目指します。背景には流れるようなカバーアート、前景には再生時間に同期してスクロールする歌詞、各行の横には浮遊するタイムスタンプがあります。UIKit や Core Animation は導入せず、既存データ、つまりカバー画像、再生時間、文字起こしテキストを、複数の SwiftUI API で段階的に変換していきます。
+
+この「クリエイティブパイプライン」の中心思想は、SwiftUI の各 modifier が1つの処理段階であるということです。データは片側から入り、変換され、次の段階へ流れます。単独の段階はシンプルですが、つなげることで複雑な効果が生まれます。
+
+### Shader は GPU にピクセルを描かせる
+
+([04:18](https://developer.apple.com/videos/play/wwdc2026/322/?time=258)) カバー画像はまずぼかし、前景テキストと注意を奪い合わないようにします。
+
+```swift
+Image("CoverArt")
+    .blur(radius: 30)
+```
+
+([04:42](https://developer.apple.com/videos/play/wwdc2026/322/?time=282)) ぼかした後、GPU 上で各ピクセルの色を決めるプログラムを実行します。このプログラムが Shader です。SwiftUI は3種類の Shader 効果を提供します。
+
+- `colorEffect`：ピクセルごとに色を変換します。たとえばカラー画像を白黒にします
+- `distortionEffect`：ピクセル位置を新しい位置へマッピングし、幾何学的な変形を作ります
+- `layerEffect`：ビュー全体のレイヤーを提供し、隣接ピクセルや任意領域からサンプリングできます
+
+([07:09](https://developer.apple.com/videos/play/wwdc2026/322/?time=429)) 流体的な歪みには、`layerEffect` が最も柔軟です。ビューに `.layerEffect` modifier を追加し、Metal Shader 関数を渡します。
+
+```swift
+GeometryReader { proxy in
+    CoverArtView()
+        .layerEffect(
+            ShaderLibrary.backgroundWarp(),
+            maxSampleOffset: .zero
+        )
+}
+.ignoresSafeArea()
+```
+
+対応する Metal Shader 関数は、最も単純な「そのまま返す」実装から始めます。
+
+```metal
+[[stitchable]] half4 backgroundWarp(
+    float2 position, SwiftUI::Layer layer
+) {
+    return layer.sample(position);
+}
+```
+
+([07:39](https://developer.apple.com/videos/play/wwdc2026/322/?time=459)) `layerEffect` はレイヤー内の任意位置からサンプリングできます。`float2` のオフセットを渡すと、Shader はずらした位置から色を取得できます。
+
+```metal
+[[stitchable]] half4 backgroundWarp(
+    float2 position, SwiftUI::Layer layer,
+    float2 offset
+) {
+    return layer.sample(position + offset);
+}
+```
+
+SwiftUI 側からオフセット引数を渡します。
+
+```swift
+.layerEffect(
+    ShaderLibrary.backgroundWarp(
+       .float2(.init(x: proxy.size.width, y: 0))
+    ),
+    maxSampleOffset: .zero
+)
+```
+
+ただし一定のオフセットでは固定的なピクセル移動しか起きず、有機的な感じがありません。
+
+([08:37](https://developer.apple.com/videos/play/wwdc2026/322/?time=517)) 発表者は NoiseTexture を導入します。これは滑らかなランダム値を事前計算した画像です。SwiftUI 側ではビューサイズとノイズテクスチャを渡します。
+
+```swift
+.layerEffect(
+    ShaderLibrary.backgroundWarp(
+        .float2(proxy.size),
+        .image(Image("NoiseTexture"))
+    ),
+    maxSampleOffset: .zero
+)
+```
+
+([08:55](https://developer.apple.com/videos/play/wwdc2026/322/?time=535)) Metal 側では UV 座標でノイズテクスチャをサンプリングし、赤と緑のチャンネル値をピクセルオフセットへ変換します。
+
+```metal
+[[stitchable]] half4 backgroundWarp(
+    float2 position, SwiftUI::Layer layer,
+    float2 size, texture2d<half> noiseTex
+) {
+    constexpr sampler s(address::repeat, filter::linear);
+    float2 uv = position / size;
+
+    half4 n = noiseTex.sample(s, uv);
+    float2 offset = (float2(n.r, n.g) - 0.5) * 200.0;
+
+    return layer.sample(position + offset);
+}
+```
+
+重要な点：
+- `position / size` は絶対ピクセル座標を 0〜1 の UV 座標へ変換します
+- `sampler` で `address::repeat` を指定すると、テクスチャをタイル状に繰り返せます
+- ノイズテクスチャの赤と緑のチャンネルがそれぞれランダム値を提供し、二次元オフセットになります
+- オフセットを 200 ピクセル範囲に拡大すると、はっきりした歪みが生まれます
+
+([10:22](https://developer.apple.com/videos/play/wwdc2026/322/?time=622)) 効果はさらに発展できます。Domain Warping はノイズを2回サンプリングします。1回目のサンプルで初期オフセットを得て、2回目はそのオフセット後の位置でもう一度サンプリングします。
+
+```metal
+half4 n = noiseTex.sample(s, uv);
+
+float2 q = float2(n.r, n.g);
+n = noiseTex.sample(s, uv + q);
+
+float2 offset = (float2(n.r, n.g) - 0.5) * 200.0;
+
+return layer.sample(position + offset);
+```
+
+2回のサンプリングが重なることで、液体がゆっくり動くような有機的な blob 効果が生まれます。
+
+### TimelineView で Shader に時間を注入する
+
+([11:37](https://developer.apple.com/videos/play/wwdc2026/322/?time=697)) Shader はステートレスです。前フレームの画面を覚えておらず、出力は現在の入力引数だけで決まります。動かすには、時間とともに変化する値を渡す必要があります。
+
+`TimelineView(.animation)` は毎フレーム呼び出され、現在のタイムスタンプを提供します。このタイムスタンプを Shader に渡し、ノイズのサンプリング位置に加えます。
+
+```swift
+@State private var startDate = Date.now
+
+TimelineView(.animation) { timeline in
+    let elapsed = timeline.date.timeIntervalSince(startDate)
+    CoverArtView()
+        .layerEffect(
+            ShaderLibrary.backgroundWarp(
+                .float2(proxy.size),
+                .image(Image("NoiseTexture")),
+                .float(elapsed)
+            ),
+            maxSampleOffset: .zero
+        )
+}
+```
+
+Metal 側で時間を UV 座標に足すと、ノイズパターンが流れ始めます。これは SwiftUI の transaction-based アニメーションとはまったく異なります。Shader は状態変化でトリガーされるアニメーションシステムに依存せず、外部から継続的に入力される時間引数で駆動されます。
+
+### 時間同期する文字起こしスクロール
+
+([12:15](https://developer.apple.com/videos/play/wwdc2026/322/?time=735)) 文字起こしビューは基本的な `LazyVStack` から始まります。
+
+```swift
+ScrollView {
+    LazyVStack(alignment: .leading, spacing: 12) {
+        ForEach(sampleTranscript) { line in
+            Text(line.text)
+                .font(.title)
+                .fontWeight(.bold)
+        }
+    }
+}
+```
+
+([12:33](https://developer.apple.com/videos/play/wwdc2026/322/?time=753)) 再生状態を接続すると、現在行は太字で表示され、その他の行は薄くなります。`ScrollViewReader` で現在行の変化を監視し、自動的に画面中央へスクロールします。
+
+```swift
+@State private var playback = PlaybackState()
+
+ScrollViewReader { scrollProxy in
+    ScrollView {
+        LazyVStack(alignment: .leading, spacing: 12) {
+            ForEach(sampleTranscript) { line in
+                Text(line.text)
+                    .transcriptLineStyle(isCurrent:
+                        line.id == playback.currentLineIndex
+                    )
+            }
+        }
+    }
+    .onChange(of: playback.currentLineIndex, { _, i in
+        scrollProxy.scrollTo(i, anchor: .center)
+    })
+}
+```
+
+### alignmentGuide によるセマンティックな浮遊配置
+
+([13:53](https://developer.apple.com/videos/play/wwdc2026/322/?time=833)) 各歌詞行の左下にはタイムスタンプを表示したいものの、見えるのは現在行だけにします。`overlay` で子ビューをテキスト上に重ねます。
+
+```swift
+Text(line.text)
+    .overlay {
+        Text(line.formattedTimestamp)
+    }
+```
+
+デフォルトの `overlay` は中央揃えなので、タイムスタンプが文字の中央に重なってしまいます。`.bottomLeading` に変更します。
+
+```swift
+Text(line.text)
+    .overlay(alignment: .bottomLeading) {
+        Text(line.formattedTimestamp)
+    }
+```
+
+これでタイムスタンプの左下がテキストの左下に揃います。しかし目標は、タイムスタンプの**上端**をテキストの**下端**へ接することです。
+
+([14:32](https://developer.apple.com/videos/play/wwdc2026/322/?time=872)) `alignmentGuide` はデフォルトの整列セマンティクスを上書きできます。レイアウトシステムに「bottom の位置を尋ねられたら、このビューの top を返す」と伝えます。
+
+```swift
+Text(line.text)
+    .overlay(alignment: .bottomLeading) {
+        Text(line.formattedTimestamp)
+            .alignmentGuide(.bottom) { $0[.top] }
+    }
+```
+
+重要な点：
+- `$0[.top]` は子ビューの上端を返します
+- レイアウトシステムはそれを bottom の整列点だと扱うため、子ビューの上端が親ビューの下端に固定されます
+- 具体的なサイズを知る必要はありません。完全にセマンティックで、Dynamic Type や複数行テキストにも自動対応します
+
+## 詳細
+
+### 3種類の Shader の比較
+
+| 種類 | 入力 | 出力 | 適した用途 |
+|------|------|------|------------|
+| `colorEffect` | ピクセル位置 + 元の色 | 新しい色 | 白黒フィルタ、色置換 |
+| `distortionEffect` | ピクセル位置 | 新しいサンプリング位置 | 幾何学的変形、傾き効果 |
+| `layerEffect` | ピクセル位置 + レイヤー全体 | 新しい色 | ぼかし、流体的な歪み、近傍サンプリングが必要な効果 |
+
+`layerEffect` は最も柔軟ですが、ビューをオフスクリーンテクスチャへ描画する必要があるため、他の2種類より性能コストが大きくなります。
+
+### Domain Warping の完全な Shader
+
+```metal
+[[stitchable]] half4 backgroundWarp(
+    float2 position, SwiftUI::Layer layer,
+    float2 size, texture2d<half> noiseTex
+) {
+    constexpr sampler s(address::repeat, filter::linear);
+    float2 uv = position / size;
+
+    half4 n = noiseTex.sample(s, uv);
+
+    float2 q = float2(n.r, n.g);
+    n = noiseTex.sample(s, uv + q);
+
+    float2 offset = (float2(n.r, n.g) - 0.5) * 200.0;
+
+    return layer.sample(position + offset);
+}
+```
+
+重要な点：
+- `constexpr sampler s(address::repeat, filter::linear)` はテクスチャサンプラーを作成し、`repeat` モードでノイズテクスチャを継ぎ目なくタイルできます
+- `uv + q` が Domain Warping の核心です。1回目のサンプル結果 `q` を UV 座標に足し、2回目のサンプルを歪んだ座標空間で行います
+- 赤と緑のチャンネル `(n.r, n.g)` はそれぞれ -0.5〜0.5 のランダム値を提供し、200 を掛けると -100〜100 ピクセルのオフセット範囲になります
+- `layer.sample(position + offset)` がオフセット後の位置から色を取得し、ピクセルのずれを生みます
+
+### 時間駆動 Shader アニメーションの完全形
+
+SwiftUI 側：
+
+```swift
+@State private var startDate = Date.now
+
+TimelineView(.animation) { timeline in
+    let elapsed = timeline.date.timeIntervalSince(startDate)
+    GeometryReader { proxy in
+        CoverArtView()
+            .layerEffect(
+                ShaderLibrary.backgroundWarp(
+                    .float2(proxy.size),
+                    .image(Image("NoiseTexture")),
+                    .float(elapsed)
+                ),
+                maxSampleOffset: .zero
+            )
+    }
+    .ignoresSafeArea()
+}
+```
+
+Metal 側では引数リストに `float time` を追加し、サンプリング時に時間を UV 座標へ加えます。
+
+```metal
+[[stitchable]] half4 backgroundWarp(
+    float2 position, SwiftUI::Layer layer,
+    float2 size, texture2d<half> noiseTex,
+    float time
+) {
+    constexpr sampler s(address::repeat, filter::linear);
+    float2 uv = position / size + time * 0.1;
+    // ... 残りのロジックは同じ
+}
+```
+
+重要な点：
+- `TimelineView(.animation)` は毎フレーム呼び出され、最新のタイムスタンプを提供します
+- `timeIntervalSince(startDate)` は経過秒数を計算します
+- Shader 内で時間を UV 座標に加えると、ノイズパターンが時間とともに平行移動し、流れるような感覚が生まれます
+- `maxSampleOffset` は実際の最大オフセットに合わせて設定すべきです。`.zero` のままだと、ビュー境界外からサンプリングしたピクセルが SwiftUI によって切り取られます
+
+### alignmentGuide の仕組み
+
+SwiftUI の整列システムは、親ビューと子ビューの整列点を同時に貫く1本のピンのように考えられます。デフォルトでは overlay は中央揃えなので、ピンは両方のビューの中心を通ります。
+
+`.bottomLeading` に変えると、ピンは両方のビューの左下を通ります。しかし必要なのは、子ビューの上端を親ビューの下端へ接することです。
+
+`alignmentGuide(.bottom) { $0[.top] }` はセマンティックな置き換えを行います。レイアウトシステムが「あなたの bottom はどこか」と尋ねると、子ビューは「私の top」と答えます。するとピンは子ビューの上端を通り、それを親ビューの下端位置へ引き寄せます。
+
+## 重要な示唆
+
+**1. 既存 App に動的背景を追加する**
+
+- **何を作るか**：App 内の静的なカバー画像、アバター、banner を、時間駆動の Shader 流体効果に置き換えます
+- **なぜ価値があるか**：`TimelineView` + `layerEffect` は数十行のコードで実装でき、静止画よりはるかに強い視覚的印象を作れます
+- **どう始めるか**：NoiseTexture 画像を用意し、`layerEffect` Shader を書き、`TimelineView(.animation)` で時間引数を注入します
+
+**2. 歌詞や字幕の同期リーダーを作る**
+
+- **何を作るか**：時間同期のハイライトと自動スクロールに対応したテキストリーダーを作ります。ポッドキャスト、オーディオブック、外国語学習に使えます
+- **なぜ価値があるか**：`ScrollViewReader` + `onChange` の組み合わせで、歌詞同期スクロールは非常に簡単になり、手動で `contentOffset` を計算する必要がありません
+- **どう始めるか**：各テキスト行にタイムスタンプフィールドを追加し、`PlaybackState` で現在時刻を追跡し、`onChange` 内で `scrollTo(_:anchor:)` を呼びます
+
+**3. alignmentGuide で浮遊ラベルシステムを作る**
+
+- **何を作るか**：リスト、カード、フォーム内で、レイアウトフローを壊さずに浮遊ヒント、badge、タイムスタンプを実現します
+- **なぜ価値があるか**：`alignmentGuide` は `offset` よりセマンティックで、異なるフォントサイズや画面サイズへ自動的に適応します
+- **どう始めるか**：`overlay` または `background` に子ビューを置き、`alignmentGuide` でデフォルトの整列セマンティクスを上書きします
+
+**4. センサーデータを Shader に渡す**
+
+- **何を作るか**：時間引数の代わりにジャイロスコープや加速度センサーのデータを使い、Shader 効果がデバイスの動きに反応するようにします
+- **なぜ価値があるか**：発表者は「入力はオーディオではなくジャイロデータでもよい」と述べています。このパイプラインモデルは任意のデータソースを自然に扱えます
+- **どう始めるか**：`CoreMotion` でデバイス姿勢を取得し、roll/pitch 値を Shader の `float2` 引数として渡し、歪み方向を制御します
+
+**5. Domain Warping を他の視覚効果へ再利用する**
+
+- **何を作るか**：同じ2回のノイズサンプリング技術で、水面の波紋、熱気の揺らぎ、液体表面効果を作ります
+- **なぜ価値があるか**：Domain Warping は汎用技術です。別のノイズテクスチャに差し替えたりスケール係数を調整したりするだけで、まったく異なる見た目になります
+- **どう始めるか**：Apple のサンプルプロジェクトをダウンロードし、`offset` の乗数と `uv` の時間係数を変えて効果を観察します
+
+## 関連セッション
+
+- [SwiftUI の新機能](/articles/wwdc2026-269) - SwiftUI の基本レイアウトと新しい modifier の概要です
+- [Lazy stacks](/articles/wwdc2026-321) - 大量のデータリストを効率よく扱うための遅延読み込み技術です
+- [RealityKit](/articles/wwdc2026-279) - Shader 効果を 3D 空間へ拡張したい場合、RealityKit が対応するマテリアルシステムを提供します
+- [Swift](/articles/wwdc2026-262) - Swift 言語の新機能です。`constexpr` などの低レベル概念を理解すると Shader コードを読みやすくなります
+- [Xcode 27](/articles/wwdc2026-258) - 新しい Xcode における Shader 開発とプレビューの改善です

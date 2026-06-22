@@ -1,0 +1,176 @@
+---
+title: "Enhance your app with machine-learning-based video effects"
+description: "discover how to add effects like frame rate conversion, super resolution, and noise filtering to improve video editing and live streaming experiences. we"
+date: 2026-06-10
+tags: ["Photos & Camera", "Audio & Video"]
+thumbnail: "/images/sessions/2025/300.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/300/"
+sessionId: "wwdc2025-300"
+year: "2025"
+relatedSessions:
+  - title: "Capture cinematic video in your app"
+    code: "319"
+    description: "discover how the cinematic video api enables your app to effortlessly capture ci"
+  - title: "Enhancing your camera experience with capture controls"
+    code: "253"
+    description: "learn how to customize capture controls in your camera experiences. we"
+---
+
+## Highlight
+
+> Starting in macOS 15.4 and new in iOS 26, the VTFrameProcessor API is a new capability in the Video Toolbox framework. It ships a set of machine-learning-based video processing algorithms tuned for Apple Silicon, covering two scenarios: high-quality video editing (frame rate conversion, super resolution, motion blur, temporal noise filtering) and real-time video enhancement (low-latency frame interpolation, low-latency super resolution).
+
+---
+
+## Core content
+
+Video apps that wanted slow motion, super resolution, or noise filtering used to either train their own models or pull in a third-party library. Both paths cost a lot of engineering and the results were uneven. Video Toolbox is one of the most-used frameworks in video apps, but for years it lacked a ready-to-use set of video enhancement algorithms running on Apple Silicon.
+
+This year Apple added the VTFrameProcessor API to Video Toolbox. It shipped on macOS 15.4 and joins iOS 26. Developers only need to import Video Toolbox to get frame rate conversion, super resolution, motion blur, and temporal noise filtering for high-quality video editing, plus low-latency frame interpolation and low-latency super resolution for real-time scenarios. Every algorithm is tuned for Apple Silicon. The app only has to feed in frames.
+
+The API has a fixed two-step shape. First, pick an effect: start a session with a `VTFrameProcessorConfiguration`. Then process frames one by one with a `VTFrameProcessorParameters` that describes input and output. Each effect has its own pair of Configuration / Parameters types. The framework is a frame-level interface; the app reads frames, writes frames, and manages pixel buffers itself.
+
+---
+
+## Details
+
+The VTFrameProcessor API ships six effects in total. Frame rate conversion, super resolution, motion blur, and temporal noise filtering target video editing. Low-latency frame interpolation and low-latency super resolution target real-time scenarios such as video conferencing and live streaming. Temporal noise filtering works for both ([01:11](https://developer.apple.com/videos/play/wwdc2025/300/?time=71)).
+
+Frame rate conversion is the most common entry point. It raises frames per second by synthesizing new frames between existing ones. You can use it to match the target frame rate of a display, or to produce slow motion ([06:50](https://developer.apple.com/videos/play/wwdc2025/300/?time=410)). The first step is to create a session ([08:06](https://developer.apple.com/videos/play/wwdc2025/300/?time=486)):
+
+```swift
+// Frame rate conversion configuration
+
+let processor = VTFrameProcessor()
+
+guard let configuration = VTFrameRateConversionConfiguration(frameWidth: width,
+                                                            frameHeight: height,
+                                                     usePrecomputedFlow: false,
+                                                  qualityPrioritization: .normal,
+                                                               revision: .revision1)
+else {
+     throw Fault.failedToCreateFRCConfiguration
+}
+
+try processor.startSession(configuration: configuration)
+```
+
+Key points:
+- `VTFrameProcessor()` is a stateless processor instance. The effect is decided by the configuration you pass in next.
+- `frameWidth` / `frameHeight` is the input frame resolution. It cannot be changed once the session has started.
+- `usePrecomputedFlow: false` lets the framework compute optical flow on the fly. If your app has a preprocessing stage, you can compute optical flow ahead of time with `VTOpticalFlowConfiguration` and pass it in.
+- `qualityPrioritization` controls the trade-off between quality and performance.
+- `revision: .revision1` pins the algorithm version so production results stay reproducible.
+- After `startSession`, you have a processor that can handle frames.
+
+Next is buffer allocation. The caller is responsible for allocating pixel buffers for every input and output frame. You can use the `sourcePixelBufferAttributes` and `destinationPixelBufferAttributes` properties on the configuration to create CVPixelBuffer pools ([08:56](https://developer.apple.com/videos/play/wwdc2025/300/?time=536)):
+
+```swift
+// Frame rate conversion buffer allocation
+
+//use sourcePixelBufferAttributes and destinationPixelBufferAttributes property of VTFrameRateConversionConfiguration to create source and destination CVPixelBuffer pools
+
+sourceFrame = VTFrameProcessorFrame(buffer: curPixelBuffer, presentationTimeStamp: sourcePTS)
+nextFrame = VTFrameProcessorFrame(buffer: nextPixelBuffer, presentationTimeStamp: nextPTS)
+
+// Interpolate 3 frames between reference frames for 4x slow-mo
+var interpolationPhase: [Float] = [0.25, 0.5, 0.75]
+
+//create destinationFrames
+let destinationFrames = try framesBetween(firstPTS: sourcePTS,
+                                           lastPTS: nextPTS,
+                            interpolationIntervals: intervals)
+```
+
+Key points:
+- `VTFrameProcessorFrame` binds a CVPixelBuffer to a PTS. It is the unified frame carrier in the framework.
+- Each 0–1 float in the `interpolationPhase` array tells the framework where between the two frames to insert a new frame. `[0.25, 0.5, 0.75]` inserts 3 frames between the two source frames, giving 4x slow motion.
+- The length of the array directly controls the number of output frames.
+- `destinationFrames` is an array of output frames the same length as `interpolationPhase`. The caller allocates the buffers up front.
+
+The last step of frame rate conversion is to build the parameters and run them ([09:48](https://developer.apple.com/videos/play/wwdc2025/300/?time=588)):
+
+```swift
+// Frame rate conversion parameters
+
+guard let parameters = VTFrameRateConversionParameters(sourceFrame: sourceFrame,
+                                                         nextFrame: nextFrame,
+                                                       opticalFlow: nil,
+                                                interpolationPhase: interpolationPhase,
+                                                    submissionMode: .sequential,
+                                                 destinationFrames: destinationFrames)
+else {
+     throw Fault.failedToCreateFRCParameters
+}
+
+try await processor.process(parameters: parameters)
+```
+
+Key points:
+- `sourceFrame` and `nextFrame` are the two reference frames used for interpolation.
+- `opticalFlow: nil` lets the processor compute optical flow itself. If you set `usePrecomputedFlow: true` on the session, you must pass precomputed optical flow frames here.
+- `submissionMode: .sequential` means frames are submitted in order, so the framework can exploit continuity between adjacent frames. Use `.random` for non-sequential submission.
+- `process(parameters:)` is async. When it returns, the buffers in `destinationFrames` already hold the output frames.
+
+Motion blur needs both a previous and a next reference frame. It simulates a slow shutter to produce trails, which makes time-lapse video feel more natural and adds a sense of speed to fast motion ([11:23](https://developer.apple.com/videos/play/wwdc2025/300/?time=683)). The parameters look like this ([12:35](https://developer.apple.com/videos/play/wwdc2025/300/?time=755)):
+
+```swift
+// Motion blur process parameters
+
+sourceFrame = VTFrameProcessorFrame(buffer: curPixelBuffer, presentationTimeStamp: sourcePTS)
+nextFrame = VTFrameProcessorFrame(buffer: nextPixelBuffer, presentationTimeStamp: nextPTS)
+previousFrame = VTFrameProcessorFrame(buffer: prevPixelBuffer, presentationTimeStamp: prevPTS)
+destinationFrame = VTFrameProcessorFrame(buffer: destPixelBuffer, presentationTimeStamp: sourcePTS)
+
+guard let parameters = VTMotionBlurParameters(sourceFrame: currentFrame,
+                                                nextFrame: nextFrame,
+                                            previousFrame: previousFrame,
+                                          nextOpticalFlow: nil,
+                                      previousOpticalFlow: nil,
+                                       motionBlurStrength: strength,
+                                           submissionMode: .sequential,
+                                         destinationFrame: destinationFrame) 
+else {
+    throw Fault.failedToCreateMotionBlurParameters
+}
+
+try await processor.process(parameters: parameters)
+```
+
+Key points:
+- Motion blur processes one destination frame at a time. The output is `destinationFrame` (singular), not an array.
+- For the first frame, set `previousFrame` to nil. For the last frame, set \`nextFrame\` to nil.
+- When both `nextOpticalFlow` and `previousOpticalFlow` are nil, the processor computes optical flow itself.
+- `motionBlurStrength` ranges from 1 to 100. Higher values produce longer trails.
+- `destinationFrame` shares its PTS with sourceFrame, since the output corresponds to the current moment.
+
+The real-time interfaces are lighter. Low-latency super resolution uses only `LowLatencySuperResolutionScalerConfiguration` and its matching parameters: the configuration takes width, height, and a scaling ratio; the parameters take a source frame and a destination frame ([13:53](https://developer.apple.com/videos/play/wwdc2025/300/?time=833)). It is tuned for video conferencing and can suppress encoding artifacts and sharpen edges when the network is poor.
+
+---
+
+## Key takeaways
+
+- **What to do: use frame rate conversion to give old footage high-quality slow motion**
+  - Why it is worth doing: the `interpolationPhase` array maps directly to the slow-motion ratio. `[0.25, 0.5, 0.75]` gives 4x without any third-party frame interpolation library.
+  - How to start: start a session with `VTFrameRateConversionConfiguration`, prepare the PTS of the source and next frames, and convert your target ratio into a 0–1 relative-position array.
+
+- **What to do: wire low-latency super resolution into a video conferencing or live streaming SDK**
+  - Why it is worth doing: the API surface is tiny. Width, height, and a scaling ratio are enough to cut compression artifacts and sharpen face edges on weak networks.
+  - How to start: hook `LowLatencySuperResolutionScalerConfiguration` after the receiver-side decoder. Call process for every decoded frame and feed the output straight to the renderer.
+
+- **What to do: use motion blur to fix the choppy feel of time-lapse footage**
+  - Why it is worth doing: a single `motionBlurStrength` knob from 1 to 100 can turn a sequence of stills into continuous motion, sparing you from compositing shutter trails by hand.
+  - How to start: pull previous / current / next frames in order, let the framework compute optical flow, and start with a low strength before turning it up.
+
+- **What to do: precompute optical flow inside a video editing pipeline**
+  - Why it is worth doing: optical flow is expensive. Computing it once during preprocessing lets several effects (motion blur, frame rate conversion) reuse it, which keeps the render stage stable.
+  - How to start: run optical flow on its own with `VTOpticalFlowConfiguration` and `VTOpticalFlowParameters` and save the result. Later, set `usePrecomputedFlow` to true on the effect session and pass the optical flow frames into parameters.
+
+---
+
+## Related sessions
+
+- [Capture cinematic video in your app](/articles/wwdc2025-319) — Wire the Cinematic Video API into your app to capture video with system-level depth-of-field focus transitions.
+- [Enhancing your camera experience with capture controls](/articles/wwdc2025-253) — Customize capture controls on iPhone to give shooting apps a hardware-button experience.
+- [What's new in Metal 4](/articles/wwdc2025-205) — The new pipeline and resource management in Metal 4, paired with video effects for GPU post-processing.
+- [Discover machine learning & AI frameworks on Apple platforms](/articles/wwdc2025-360) — An overview of the machine learning frameworks on Apple platforms, useful for placing VTFrameProcessor in the wider stack.

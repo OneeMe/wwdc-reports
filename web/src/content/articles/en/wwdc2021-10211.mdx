@@ -1,0 +1,285 @@
+---
+title: "Symbolication: Beyond the basics"
+description: "discover how you can achieve maximum performance and insightful debugging with your app. symbolication is at the center of tools such as instruments and lldb to help bridge the layers between your application's runtime and your source code. learn how this process works and the steps you can take to gain the most insight into your app."
+date: "2021-06-06"
+tags: ["Developer Tools", "Debugging"]
+thumbnail: "/images/sessions/2021/10211.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10211/"
+sessionId: "wwdc2021-10211"
+year: "2021"
+relatedSessions:
+  - title: "Detect and diagnose memory issues"
+    code: "10180"
+    description: "Use Xcode and command line tools to locate memory leaks, heap growth, and memory regressions."
+  - title: "Triage TestFlight crashes in Xcode Organizer"
+    code: "10203"
+    description: "View and group TestFlight crash reports in Xcode Organizer."
+  - title: "Discover breakpoint improvements"
+    code: "10209"
+    description: "Improve your debugging flow with Xcode 13’s column breakpoints and unresolved breakpoints."
+  - title: "Explore advanced project configuration in Xcode"
+    code: "10210"
+    description: "Understand Xcode build settings, build rules, and complex project configurations."
+---
+## Highlight
+
+> Apple explains how symbolization restores runtime addresses to function names, file names, and line numbers, and provides tools such as atos, otool, vmmap, nm, symbols, dwarfdump, and codesign to diagnose crash logs and Instruments sampling information.
+
+## Core Content
+
+When a crash occurs, all the device sees are memory addresses and machine instructions. The code that developers see is functions, files, and line numbers. Without a mapping between the two, the crash log can only tell you that a certain address went wrong.
+
+The MagicNumbers program in Session is this scenario. The code selects a number from 10 random numbers. After the program crashes, the original crash log can only show that MagicNumbers crashed somewhere. Registers, addresses, and disassembly all make it difficult to point out the problem directly.
+
+After Xcode Organizer downloads the dSYM, the crash log is reprocessed. The log begins to show function calls, file names, and line numbers, as well as out-of-bounds array accesses. The reason is`MAGIC_CHOICE`The 10-element array range was exceeded.
+
+Performance analysis has the same problem. Instruments can only display partial backtrace without complete symbol information. The high-CPU interval and the low-CPU interval look like the same piece of code. After adding dSYM, Instruments can point out that the high CPU comes from the legacy debug code path.
+
+Apple breaks symbolization into two steps in this session. The first step is to convert the runtime address back to the address in the binary file. The second step is to use debugging information to map the file address to the source code. The previous step relies on Mach-O, load command and ASLR slide. The latter step relies on function starts, nlist symbol table and DWARF.
+
+## Detailed Content
+
+### Use atos to manually symbolize an address
+
+（[02:51](https://developer.apple.com/videos/play/wwdc2021/10211/?time=171)）`atos`A crash address can be restored to the source code location. The premise is that you have the dSYM, architecture, load address and crash address of the corresponding build.
+
+```bash
+atos -o MagicNumbers.dSYM/Contents/Resources/DWARF/MagicNumbers -arch arm64 -l 0x10045c000 -i 0x10045fb70
+```
+
+Key points:
+- `atos`It is an address symbolization tool, used to query the symbol information corresponding to an address.
+-`-o MagicNumbers.dSYM/Contents/Resources/DWARF/MagicNumbers`Points to the DWARF binary in the dSYM package.
+-`-arch arm64`Specify the schema slice to query. Universal 2 App must be schema-specific.
+-`-l 0x10045c000`supply`__TEXT`The load address of the segment, which the tool uses to calculate the ASLR slide.
+-`-i 0x10045fb70`Require`atos`Also consider inlined functions, which will make backtrace closer to the source code call relationship.
+
+This command corresponds to the crash example at the beginning of the session. You can also use Xcode Organizer to do things automatically`atos`Done manually.
+
+### Retrieve file address from Mach-O
+
+([07:34](https://developer.apple.com/videos/play/wwdc2021/10211/?time=454)) The first step in symbolization is to "go back to the file". Runtime addresses are affected by ASLR (Address Space Layout Randomization). The address in the file is written by the linker to the load commands of the Mach-O (Apple executable file format) header.
+
+```bash
+otool -l MagicNumbers | grep LC_SEGMENT -A8
+```
+
+Key points:
+- `otool -l`Print the load commands for a Mach-O file.
+-`LC_SEGMENT_64`Describes the attributes of a segment.
+-`vmaddr`Is the file address assigned to the segment by the linker.
+-`__TEXT`The segment stores function and method code and is where crash instructions usually reside.
+-`-A8`let`grep`Output the 8 lines after the matching line to facilitate viewing the segment name, address and size.
+
+([11:32](https://developer.apple.com/videos/play/wwdc2021/10211/?time=692)) The running loading address can be used`vmmap`Check. The Binary Images area of ​​the crash log will also record these loading addresses.
+
+```bash
+vmmap MagicNumbers | grep __TEXT
+```
+
+Key points:
+- `vmmap MagicNumbers`Enumerate the MagicNumbers memory area of ​​the process.
+-`grep __TEXT`only keep`__TEXT` segment。
+- `__TEXT`The runtime loading address is recorded as`L`。
+- `otool`The found linker address is recorded as`A`.
+- ASLR slide calculation formula is`S = L - A`。
+
+After getting the slide, use `runtime address - S` to get the file address. The file address is stable and will not change because the kernel selects a different ASLR slide each time it is started.
+
+### Confirm crashing instructions with disassembly
+
+([10:31](https://developer.apple.com/videos/play/wwdc2021/10211/?time=631)) When you have converted the crash address into a file address, you can view the machine instructions at that location. In the session example,`otool`Found it`brk`Instruction, which indicates that the program triggered an exception.
+
+```bash
+otool -tV MagicNumbers -arch arm64
+```
+
+Key points:
+- `otool`Read Mach-O files.
+-`-t`Print`__TEXT`The text segment content in segment is the executable instruction.
+-`-V`Let the output use symbolic disassembly format.
+-`MagicNumbers`is the executable file to be checked.
+-`-arch arm64`Specify schema slices to avoid incorrect schema checking in Universal 2 files.
+
+This step is suitable for verifying "what exactly does this address execute?" It cannot directly give you the source code line number, but it can confirm whether the address in the crash log falls on the abnormal instruction.
+
+### Distinguish between function starts and nlist symbol tables
+
+([15:09](https://developer.apple.com/videos/play/wwdc2021/10211/?time=909)) function starts is the most basic debugging information. It only records the starting address of the function, not the function name. it is stored in`__LINKEDIT`segment, and consists of`LC_FUNCTION_STARTS`load command points to.
+
+```bash
+symbols -onlyFuncStartsData -arch arm64 MagicNumbers
+```
+
+Key points:
+- `symbols`Used to check symbols and debugging information in binary files.
+-`-onlyFuncStartsData`Only function starts data is output.
+- The output will have a set of addresses and empty bits.
+- These addresses tell the debugger "how many bytes away from the beginning of the function is an address".
+- It cannot tell you function names, file names, or line numbers.
+
+([17:06](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1026)) nlist symbol table has one more layer of information than function starts. it uses`nlist_64`The structure records name, type, section, description and value.
+
+```c
+struct nlist_64 {
+    union {
+        uint32_t  n_strx;
+    } n_un;
+    uint8_t n_type;
+    uint8_t n_sect;
+    uint16_t n_desc;
+    uint64_t n_value;
+};
+```
+
+Key points:
+- `n_un.n_strx`Pointer to a name in the string table.
+-`n_type`Describing symbol types, session focuses on direct symbols and indirect symbols.
+-`n_sect`Indicates the section where the symbol is located.
+-`n_desc`Save additional descriptive information.
+-`n_value`Save the address or related value.
+
+([17:59](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1079)) Direct symbols are functions or methods that the App or framework defines itself and participates in the link. Swift symbols are usually name mangling and require demangle to be readable.
+
+```bash
+nm -arch arm64 --defined-only --numeric-sort MagicNumbers | xcrun swift-demangle
+```
+
+Key points:
+- `nm`Check out Mach-O's symbol table.
+-`-arch arm64`Select arm64 architecture.
+-`--defined-only`Only display direct symbols defined by the current binary.
+-`--numeric-sort`Sort by address for easy comparison with the crash address.
+-`xcrun swift-demangle`Restore Swift mangled name to readable name.
+
+([23:06](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1386)) Indirect symbols represent functions from an external framework or library. For example, MagicNumbers relies on Swift functions in libswiftCore.
+
+```bash
+nm -m -arch arm64 --undefined-only --numeric-sort MagicNumbers
+```
+
+Key points:
+- `-m`Shows which framework or library the symbol comes from.
+-`--undefined-only`Only displays symbols used by the current binary but provided by external dependencies.
+-`--numeric-sort`Sort by address.
+- This information can explain the link relationship between the App and the system library or Swift runtime.
+- It does not provide source code line numbers for local static functions.
+
+Release builds often strip symbol tables.`Strip Linked Product`、`Strip Style`、`Strip Swift Symbols`Affects which symbols are retained. When a backtrace with "function name but no file name and line number" appears, DWARF is usually missing.
+
+### Use DWARF to get file names, line numbers and inline calls
+
+([27:16](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1636)) DWARF (Debug Information Format) provides the most complete source code mapping. The dSYM bundle contains a`__DWARF`segment binary. The key data flows mentioned by session are`debug_info`、`debug_abbrev`and`debug_line`。
+
+```bash
+dwarfdump -v -debug-info -arch arm64 MagicNumbers.dSYM
+```
+
+Key points:
+- `dwarfdump`Read DWARF debugging information.
+-`-v`Output details.
+-`-debug-info`Check`debug_info`data flow.
+-`-arch arm64`Specify the schema.
+-`MagicNumbers.dSYM`is the dSYM bundle to check.
+
+DWARF uses compile unit to represent a source file and subprogram to represent a function. compile unit is the root of the tree, and subprogram is the child node.`debug_line`Saves a mapping of file addresses to file names and line numbers.
+
+([29:25](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1765)) If`atos`not used`-i`, the calling details of the inline function will be lost. The output in session still has function names and line numbers, but it lacks many valuable function relationships.
+
+```bash
+atos -o MagicNumbers.dSYM/Contents/Resources/DWARF/MagicNumbers -arch arm64 -l 0x10045c000 0x10045fb70
+```
+
+Key points:
+- This command queries the same dSYM and the same address.
+- it retains`-o`、`-arch`、`-l`and destination address.
+- it doesn't`-i`parameter.
+- Compiler optimization replaces function calls with function bodies, which is called inlining.
+- DWARF uses inlined subroutines to record such relationships.
+
+Inline information explains why dSYM is important for Instruments and crash logs. Only DWARF can express where the function is inlined, which line of source code the call point is, and the parent-child relationship between inline calls.
+
+### Check dSYM, UUID, DWARF and signature
+
+([32:29](https://developer.apple.com/videos/play/wwdc2021/10211/?time=1949)) Static libraries and object files may also contain DWARF.`dsymutil`The debug map can show which files the function comes from, and tools can then scan these locations to process DWARFs.
+
+```bash
+dsymutil --dump-debug-map -arch arm64 MagicNumbers
+```
+
+Key points:
+- `dsymutil`Is a tool for generating and checking dSYMs.
+-`--dump-debug-map`Output debug map.
+-`-arch arm64`Specify the schema.
+-`MagicNumbers`is the binary being checked.
+- Output can help you identify which object file or static library the debugging information comes from.
+
+([33:59](https://developer.apple.com/videos/play/wwdc2021/10211/?time=2039)) The dSYM must match the App build. Matching is based on UUID. The Binary Images area of ​​the crash report has the App UUID, and dSYM also has its own UUID.
+
+```bash
+symbols -uuid MagicNumbers.dSYM
+```
+
+Key points:
+- `symbols`The UUID of the dSYM can be read.
+-`-uuid`Only UUID information is output.
+- UUID is the unique identifier in the load command.
+- The UUID of App and dSYM must be consistent.
+- The dSYM of Bitcode App needs to download the corresponding version from App Store Connect.
+
+([34:03](https://developer.apple.com/videos/play/wwdc2021/10211/?time=2043)) The toolchain may occasionally generate an invalid DWARF. Apple recommends using`dwarfdump`Verify and submit feedback if errors are found.
+
+```bash
+dwarfdump --verify MagicNumbers.dSYM
+```
+
+Key points:
+- `dwarfdump`Check the DWARF contents.
+-`--verify`Perform consistency verification.
+-`MagicNumbers.dSYM`Is a verified debugging symbol file.
+- If errors occur, the quality of the symbolization may be affected.
+- There is an upper limit of 4GB for a single binary DWARF data. If it is too large, the components need to be split.
+
+([35:09](https://developer.apple.com/videos/play/wwdc2021/10211/?time=2109)) If Instruments cannot find the function name and you confirm that there is a dSYM, also check the signature and entitlement. Development and build needs`get-task-allow`Only entitlement and Instruments have permission to symbolize the App.
+
+```bash
+codesign --display -v --entitlements :- MagicApp.app
+```
+
+Key points:
+- `codesign`View your app’s code signing information.
+-`--display`Display signature metadata.
+-`-v`Output more detailed information.
+-`--entitlements :-`Print the contents of entitlement to standard output.
+-`MagicApp.app`is the App bundle to check.
+
+If `get-task-allow` is missing, check Xcode's `Code Signing Inject Base Entitlements` build setting. Xcode usually sets it automatically when using the Profile action.
+
+## Core Takeaways
+
+- **What to do**: Add dSYM UUID check to CI.
+  **Why it’s worth doing**: Session emphasizes that the UUID of App and dSYM must match. Mismatching will prevent the crash log from being fully symbolized.
+  **How ​​to start**: Run the build product after it is generated`symbols -uuid YourApp.app/YourApp`and`symbols -uuid YourApp.app.dSYM`, compare the UUID before uploading the archive.
+
+- **What to do**: Make a quick query script for crash addresses.
+  **Why it’s worth doing**:`atos`A single address can be mapped to a function name, file name and line number, which is suitable for processing crash log fragments sent by users.
+  **How ​​to start**: Extract the load address from Binary Images, extract the crash address from backtrace, and then spell it out`atos -o ... -arch ... -l ... -i ...`。
+
+- **What to do**: Add Instruments dSYM check steps to the performance troubleshooting manual.
+  **Why it's worth doing**: The Instruments example of session shows that the absence of dSYM will make high-time-consuming paths and ordinary paths look the same.
+  **How ​​to start**: When the sampling result is missing the file name or line number, first locate the corresponding dSYM, and then check the UUID and`get-task-allow` entitlement。
+
+- **What**: Build a cleanup symbol stripping strategy for Release.
+  **Why it’s worth doing**:`Strip Linked Product`and`Strip Style`Can affect symbol table visibility, retention errors can increase volume, and excessive stripping can reduce diagnostic capabilities.
+  **How ​​to start**: Check the strip build settings of the target and combine`nm`、`symbols -onlyNListData`See if the direct symbols are as expected.
+
+- **What to do**: Set up dSYM size monitoring for large projects.
+  **Why it’s worth doing**: The session mentioned that a single binary DWARF data has an upper limit of 4GB, and an excessively large dSYM will affect tool processing.
+  **How ​​to start**: Count the volume of each dSYM after archiving; split modules close to the upper limit into frameworks or independent components, allowing each component to generate smaller dSYMs.
+
+## Related Sessions
+
+- [Detect and diagnose memory issues](/articles/wwdc2021-10180) — Learn to use Xcode, XCTest, and command line tools to locate memory issues.
+- [Triage TestFlight crashes in Xcode Organizer](/articles/wwdc2021-10203) — Learn how Xcode Organizer receives, clusters, and symbolizes TestFlight crash reports.
+- [Discover breakpoint improvements](/articles/wwdc2021-10209) — Master Xcode 13’s column breakpoints and unresolved breakpoints to complete the interactive debugging process.
+- [Explore advanced project configuration in Xcode](/articles/wwdc2021-10210) — Understand build settings and file dependency configuration in complex Xcode projects.

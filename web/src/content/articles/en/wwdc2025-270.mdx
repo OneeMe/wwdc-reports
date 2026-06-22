@@ -1,0 +1,246 @@
+---
+title: "Code-along: Elevate an app with Swift concurrency"
+description: "learn how to optimize your app"
+date: 2026-06-10
+tags: ["Developer Tools", "Swift"]
+thumbnail: "/images/sessions/2025/270.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/270/"
+sessionId: "wwdc2025-270"
+year: "2025"
+relatedSessions:
+  - title: "What’s new in Swift"
+    code: "245"
+    description: "join us for an update on swift. we"
+  - title: "Code-along: Explore localization with Xcode"
+    code: "225"
+    description: "learn how to localize your app into additional languages using xcode. we"
+  - title: "Meet Containerization"
+    code: "346"
+    description: "meet containerization, an open source project written in swift to create and run"
+  - title: "Get started with Game Center"
+    code: "214"
+    description: "explore the features of game center and learn how to get started. we"
+---
+
+## Highlight
+
+> Move image processing off the main thread with a `nonisolated` type and a `@concurrent` method, then run sticker extraction and color analysis in parallel using `async let` to wipe out a Severe Hang of more than 10 seconds.
+
+---
+
+## Core content
+
+Sima is building an app that turns photos into a sticker album. Everything ran fine until she added the "sticker cutout + dominant color" step. The Time Profiler in Instruments delivered a clear verdict: Severe Hang, with the heaviest stack frame sitting on PhotoProcessor and the main thread blocked for more than 10 seconds ([11:23](https://developer.apple.com/videos/play/wwdc2025/270/?time=683)). Scrolling froze and taps stopped working. The problem was not the algorithm; it was that this work had no business running on the main thread.
+
+Xcode 26 turns on main actor by default, which hides the issue further: every type is bound to `@MainActor` unless you say otherwise, so it gets queued onto the main thread. The session walks down a clear path. First use `async/await` so the UI can wait for asynchronous loading. Then use `nonisolated` + `@concurrent` to push expensive work to the background. Then use `async let` to run two independent tasks in parallel. Finally use `withTaskGroup` for a variable number of concurrent jobs. Each step starts with Instruments showing a real performance problem, and reaches for just enough concurrency to fix it, without piling on extra complexity ahead of time.
+
+---
+
+## Details
+
+**Step 1: Trigger asynchronous loading with `task` ([06:29](https://developer.apple.com/videos/play/wwdc2025/270/?time=389))**
+
+PhotosPickerItem provides `loadTransferable`, which is already asynchronous. Mark `loadPhoto` as `async` and add `await` at the call site:
+
+```swift
+func loadPhoto(_ item: SelectedPhoto) async {
+    var data: Data? = try? await item.loadTransferable(type: Data.self)
+
+    if let cachedData = getCachedData(for: item.id) { data = cachedData }
+
+    guard let data else { return }
+    processedPhotos[item.id] = Image(data: data)
+
+    cacheData(item.id, data)
+}
+```
+
+Key points:
+
+- An `async` function may contain suspension points; `await` marks one specific suspension point.
+- While `loadTransferable` is suspended, the main thread is free to handle UI events while the framework runs the load in the background.
+- When `loadPhoto` resumes, it is back on the main thread, so updating the `processedPhotos` dictionary is safe.
+
+In SwiftUI, kick off this async function with the `task` modifier:
+
+```
+StickerPlaceholder()
+    .task {
+        await viewModel.loadPhoto(selectedPhoto)
+    }
+```
+
+Key points:
+
+- `task` starts when the view appears and is cancelled automatically when the view disappears.
+- Combined with LazyHStack, only the placeholders visible on screen trigger a load, so no work is wasted.
+
+**Step 2: Move PhotoProcessor off the main thread ([14:13](https://developer.apple.com/videos/play/wwdc2025/270/?time=853))**
+
+After adding sticker cutout, the app stutters badly. Instruments shows the main thread blocked for more than 10 seconds. The cause: under main actor by default, PhotoProcessor is bound to the main thread:
+
+```swift
+nonisolated struct PhotoProcessor {
+
+    let colorExtractor = ColorExtractor()
+
+    @concurrent
+    func process(data: Data) async -> ProcessedPhoto? {
+        let sticker = extractSticker(from: data)
+        let colors = extractColors(from: data)
+
+        guard let sticker = sticker, let colors = colors else { return nil }
+
+        return ProcessedPhoto(sticker: sticker, colorScheme: colors)
+    }
+
+    private func extractColors(from data: Data) -> PhotoColorScheme? {
+        // ...
+    }
+
+    private func extractSticker(from data: Data) -> Image? {
+        // ...
+    }
+}
+```
+
+Key points:
+
+- `nonisolated` on the struct lifts the whole type off MainActor; every method and property becomes nonisolated automatically (a Swift 6.1 feature).
+- `@concurrent` is a new attribute that tells Swift this method **always** runs on a background thread and never inherits the caller's actor.
+- `async` forces the caller to use `await` — that "thread switch" becomes visible at the type level.
+- The call site becomes `await PhotoProcessor().process(data: data)`, and the main thread keeps handling scroll gestures while it waits.
+
+**Step 3: Run sticker extraction and color analysis in parallel ([20:55](https://developer.apple.com/videos/play/wwdc2025/270/?time=1255))**
+
+Cutout and color analysis are independent, so they can run at the same time with `async let`:
+
+```swift
+nonisolated struct PhotoProcessor {
+
+    @concurrent
+    func process(data: Data) async -> ProcessedPhoto? {
+        async let sticker = extractSticker(from: data)
+        async let colors = extractColors(from: data)
+
+        guard let sticker = await sticker, let colors = await colors else { return nil }
+
+        return ProcessedPhoto(sticker: sticker, colorScheme: colors)
+    }
+
+    private func extractColors(from data: Data) -> PhotoColorScheme? {
+        let colorExtractor = ColorExtractor()
+        return colorExtractor.extractColors(from: data)
+    }
+
+    private func extractSticker(from data: Data) -> Image? {
+        // ...
+    }
+}
+```
+
+Key points:
+
+- `async let` starts a child task immediately, sending the sticker and colors computations to different threads to run concurrently.
+- `await sticker` and `await colors` are where the code actually waits for results; both tasks finish around the same time, so the total time is close to the longer of the two.
+- ColorExtractor moves from a stored property to a local variable inside `extractColors` — each concurrent task creates its own instance, avoiding a data race on the shared mutable pixel buffer.
+
+**Step 4: Handle data races in SwiftUI closures ([24:20](https://developer.apple.com/videos/play/wwdc2025/270/?time=1460))**
+
+The `visualEffect` closure is `@Sendable`, and SwiftUI calls it on a background thread. Reading `viewModel.selection` (a @MainActor state) directly fails to compile. The fix is to copy the value into the capture list:
+
+```swift
+.visualEffect { [selection = viewModel.selection] content, proxy in
+    let frame = proxy.frame(in: .scrollView(axis: .horizontal))
+    let distance = min(0, frame.minX)
+    let isLast = selectedPhoto.id == selection.last?.id
+
+    return content
+        .hueRotation(.degrees(frame.origin.x / 10))
+        .scaleEffect(1 + distance / 700)
+        .offset(x: isLast ? 0 : -distance / 1.25)
+        .brightness(-distance / 400)
+        .blur(radius: isLast ? 0 : -distance / 50)
+        .opacity(isLast ? 1.0 : min(1.0, 1.0 - (-distance / 400)))
+}
+```
+
+Key points:
+
+- `[selection = viewModel.selection]` takes the snapshot on the main thread; the closure body uses the copied `selection` and never touches `self` again.
+- Value types (arrays, IDs) are cheap to copy and Sendable by nature, so reading them across threads is safe.
+
+**Step 5: Process the whole album with TaskGroup ([29:00](https://developer.apple.com/videos/play/wwdc2025/270/?time=1740))**
+
+When the grid view appears, every photo has to be processed at once, and the count is only known at runtime. Use TaskGroup:
+
+```swift
+func processAllPhotos() async {
+    await withTaskGroup { group in
+        for item in selection {
+            guard processedPhotos[item.id] == nil else { continue }
+            group.addTask {
+                let data = await self.getData(for: item)
+                let photo = await PhotoProcessor().process(data: data)
+                return photo.map { ProcessedPhotoResult(id: item.id, processedPhoto: $0) }
+            }
+        }
+
+        for await result in group {
+            if let result {
+                processedPhotos[result.id] = result.processedPhoto
+            }
+        }
+    }
+}
+```
+
+Key points:
+
+- `withTaskGroup` fits cases where the task count is not fixed at compile time; `async let` cannot.
+- `group.addTask` adds child tasks dynamically inside the loop; TaskGroup conforms to AsyncSequence.
+- `for await result in group` returns results in **completion order**, not submission order — whichever finishes first writes into the dictionary first.
+- The whole group waits for every child task to finish when `await withTaskGroup` returns — structured concurrency keeps tasks from leaking.
+
+---
+
+## Takeaways
+
+**1. Profile first, then add concurrency**
+
+Why it matters: optimizing without measurements is guesswork. Throughout the session, Sima keeps using the Time Profiler in Instruments to confirm the main thread is blocked before deciding to switch threads.
+
+How to start: in Xcode, choose Product → Profile, run Time Profiler, and look for your own code in the heaviest stack trace stuck on the main thread. Act when you see Severe Hang.
+
+**2. Use `nonisolated` + `@concurrent` to say "this type is not part of the main thread"**
+
+Why it matters: main actor by default makes things run on the main thread by default, which is sensible for UI code and fatal for compute code. Putting `nonisolated` on a type lifts the whole type off MainActor; `@concurrent` on an async method forces it to a background thread. This reads more clearly than wrapping every call site in `Task { @concurrent in ... }`.
+
+How to start: pick out the pure-compute types in your project (image processing, decoding, signing, and so on), mark them as `nonisolated struct` or `nonisolated class`, and mark their entry methods `@concurrent async`.
+
+**3. Solve data races by not sharing**
+
+Why it matters: ColorExtractor started as a stored property on PhotoProcessor, so concurrent calls collided. Moving it to a local variable in the function gives each task its own instance, and the problem is gone. That is cheaper than adding a lock or an actor.
+
+How to start: when you hit a Sendable error, ask first — does this mutable state really need to be shared? If you can build a fresh one on every call, do not make it a property.
+
+**4. Copy values through capture lists in SwiftUI's `@Sendable` closures**
+
+Why it matters: closures like `visualEffect` and `onGeometryChange` get called on background threads. Reading `self.someMainActorProperty` inside them fails to compile; taking a value-type snapshot in the capture list fixes it.
+
+How to start: when you see "Sending main actor-isolated value to nonisolated context", check whether the closure is `@Sendable`, then copy with `[x = self.x]`.
+
+**5. Use TaskGroup for dynamic counts, `async let` for fixed counts**
+
+Why it matters: `async let` is the simplest form of structured concurrency, but it only opens a fixed number of branches. For "every photo in the album" cases where the count is known at runtime, you need `withTaskGroup` plus `for await` to consume results in completion order.
+
+How to start: when you write a concurrent batch job, count the tasks first — fixed 2–3 branches, use `async let`; addTask in a loop, use TaskGroup; once everything is queued, do not forget `for await result in group` to collect the results.
+
+---
+
+## Related sessions
+
+- [What’s new in Swift](/articles/wwdc2025-245) — Swift 6.2 language updates, including the `@concurrent` and nonisolated type modifiers used in this session.
+- [Code-along: Explore localization with Xcode](/articles/wwdc2025-225) — a sibling code-along that walks through Xcode's localization flow with a sample app.
+- [Meet Containerization](/articles/wwdc2025-346) — an open-source container project written in Swift, showing Swift in system-level concurrent engineering.
+- [Get started with Game Center](/articles/wwdc2025-214) — a Game Center primer that highlights the async API patterns common when a SwiftUI app talks to system services.

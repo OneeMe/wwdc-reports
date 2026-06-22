@@ -1,0 +1,351 @@
+---
+title: "Build apps that share data through CloudKit and Core Data"
+description: "Learn how to easily build apps that share data between multiple iCloud users with NSPersistentCloudKitContainer. Discover how to create informative experiences around shared data and learn about the CloudKit technologies that support these features in Core Data."
+date: "2021-06-07"
+tags: ["Core Data", "CloudKit", "Data Sharing"]
+thumbnail: "/images/sessions/2021/10015.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10015/"
+sessionId: "wwdc2021-10015"
+year: "2021"
+relatedSessions:
+  - title: "What's new in CloudKit"
+    code: "10093"
+    description: "CloudKit updates including Record Zone Sharing"
+  - title: "Bring Core Data concurrency to Swift and SwiftUI"
+    code: "10017"
+    description: "Core Data Swift Concurrency support"
+  - title: "Synchronizing a local store to the cloud"
+    code: "101"
+    description: "Core Data and CloudKit sync fundamentals"
+---
+
+## Highlight
+
+> iOS 15 adds full CloudKit Record Zone Sharing support to `NSPersistentCloudKitContainer`. Add a shared store description, call `share(_:to:completion:)`, and handle `UICloudSharingController` callbacks—Core Data objects sync across iCloud users in real time, with UI tailored to each participant's permissions.
+
+## Core Content
+
+### Starting from Photos Shared Albums
+
+Imagine implementing Photos-style shared albums in your app. A user creates a content collection, invites friends, everyone can view, some can edit.
+
+Previously this required heavy custom code: backend, real-time sync, permissions, conflict resolution. CloudKit provided infrastructure, but integrating into Core Data was still a lot of work.
+
+iOS 15's `NSPersistentCloudKitContainer` packages it all.
+
+### Two Databases, One Context
+
+The core architecture change: the app now connects to two CloudKit databases:
+
+- **Private Database**: Data the user owns
+- **Shared Database**: Data others have shared with the user
+
+Each mirrors to a local persistent store. Key point: one `NSManagedObjectContext` can access both stores. Querying shared data uses the same code as private data.
+
+### Enabling Shared Storage
+
+First step: add a shared store description to the Core Data stack.
+
+```swift
+// [5:20](https://developer.apple.com/videos/play/wwdc2021/10015/?time=320)
+let privateStoreDescription = container.persistentStoreDescriptions.first!
+let storesURL = privateStoreDescription.url!.deletingLastPathComponent()
+privateStoreDescription.url = storesURL.appendingPathComponent("private.sqlite")
+privateStoreDescription.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
+privateStoreDescription.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+
+let sharedStoreURL = storesURL.appendingPathComponent("shared.sqlite")
+let sharedStoreDescription = privateStoreDescription.copy()
+sharedStoreDescription.url = sharedStoreURL
+
+let containerIdentifier = privateStoreDescription.cloudKitContainerOptions!.containerIdentifier
+let sharedStoreOptions = NSPersistentCloudKitContainerOptions(containerIdentifier: containerIdentifier)
+sharedStoreOptions.databaseScope = .shared
+sharedStoreDescription.cloudKitContainerOptions = sharedStoreOptions
+container.persistentStoreDescriptions.append(sharedStoreDescription)
+```
+
+Key points:
+- Copy private store description; change URL to shared.sqlite
+- Create `NSPersistentCloudKitContainerOptions` with `databaseScope = .shared`
+- Both stores share the same CloudKit container identifier
+- Enable persistent history tracking and remote change notification
+
+### Initiating a Share
+
+Sharing an object takes just a few lines. `share(_:to:completion:)` is designed to work with `UICloudSharingController`.
+
+```swift
+// [6:00](https://developer.apple.com/videos/play/wwdc2021/10015/?time=360)
+@IBAction func shareNoteAction(_ sender: Any) {
+  guard let barButtonItem = sender as? UIBarButtonItem else {
+    fatalError("Not a UI Bar Button item??")
+  }
+
+  guard let post = self.post else {
+    fatalError("Can't share without a post")
+  }
+
+  let container = AppDelegate.sharedAppDelegate.coreDataStack.persistentContainer
+  let cloudSharingController = UICloudSharingController {
+    (controller, completion: @escaping (CKShare?, CKContainer?, Error?) -> Void) in
+    container.share([post], to: nil) { objectIDs, share, container, error in
+      if let actualShare = share {
+        post.managedObjectContext?.performAndWait {
+          actualShare[CKShare.SystemFieldKey.title] = post.title
+        }
+      }
+      completion(share, container, error)
+    }
+  }
+  cloudSharingController.delegate = self
+
+  if let popover = cloudSharingController.popoverPresentationController {
+    popover.barButtonItem = barButtonItem
+  }
+  present(cloudSharingController, animated: true) {}
+}
+```
+
+Key points:
+- `container.share([post], to: nil)` creates a new share containing the post
+- `to: nil` creates a new share; pass an existing share to add objects to it
+- Set share metadata like title in the completion block
+- `UICloudSharingController` handles the invitation flow
+
+### Accepting Share Invitations
+
+When a user taps a share link in email, the app must accept the invitation.
+
+```swift
+// In AppDelegate
+func application(_ application: UIApplication, userDidAcceptCloudKitShareWith cloudKitShareMetadata: CKShare.Metadata) {
+  let container = coreDataStack.persistentContainer
+  container.acceptShareInvitations(from: [cloudKitShareMetadata], into: sharedPersistentStore) { shares, error in
+    // NSPersistentCloudKitContainer automatically syncs shared objects to local store
+  }
+}
+```
+
+Key points:
+- `acceptShareInvitations(from:into:completion:)` accepts the invitation
+- Pass the shared store; the container syncs shared objects locally
+- After sync, the app's UI reflects the new data automatically
+
+### How Record Zone Sharing Works
+
+NSPersistentCloudKitContainer uses CloudKit Record Zone Sharing, not traditional hierarchical sharing.
+
+In hierarchical sharing, records link to a root record (share). In Record Zone Sharing:
+
+- Shared `CKRecord`s live in a shared `CKRecordZone`
+- Each shared zone is identified by a `CKShare` record
+- `CKShare` contains owner, participants, permissions, etc.
+- NSPersistentCloudKitContainer automatically manages zone and record assignment
+
+Each participant has data in both databases:
+- **Private Database**: Zones they own (shared or not)
+- **Shared Database**: Zones others shared with them
+
+### Building Share-Aware UI
+
+Sharing isn't just data sync—the UI must communicate share state. Key scenarios:
+
+**Marking shared objects**
+
+```swift
+// [17:58](https://developer.apple.com/videos/play/wwdc2021/10015/?time=1078)
+override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+  // ... dequeue cell ...
+  let post = dataProvider.fetchedResultsController.object(at: indexPath)
+  cell.title.text = post.title
+
+  if sharingProvider.isShared(object: post) {
+    let attachment = NSTextAttachment(image: UIImage(systemName: "person.circle")!)
+    let attributedString = NSMutableAttributedString(attachment: attachment)
+    attributedString.append(NSAttributedString(string: " " + (post.title ?? "")))
+    cell.title.text = nil
+    cell.title.attributedText = attributedString
+  }
+  return cell
+}
+```
+
+Key points:
+- Use `person.circle` SF Symbol to mark shared content
+- `sharingProvider.isShared(object:)` checks if object is shared
+
+**SharingProvider protocol**
+
+For testing and modularity, the presenter designed a `SharingProvider` protocol:
+
+```swift
+// [17:06](https://developer.apple.com/videos/play/wwdc2021/10015/?time=1026)
+protocol SharingProvider {
+  func isShared(object: NSManagedObject) -> Bool
+  func isShared(objectID: NSManagedObjectID) -> Bool
+  func participants(for object: NSManagedObject) -> [RenderableShareParticipant]
+  func shares(matching objectIDs: [NSManagedObjectID]) throws -> [NSManagedObjectID: RenderableShare]
+  func canEdit(object: NSManagedObject) -> Bool
+  func canDelete(object: NSManagedObject) -> Bool
+}
+```
+
+Benefits:
+- Each method maps to a specific UI decision
+- Easy to inject mock implementations for unit tests
+- Decouples CloudKit details from UI code
+
+**Implementing SharingProvider**
+
+```swift
+// [20:01](https://developer.apple.com/videos/play/wwdc2021/10015/?time=1201)
+extension CoreDataStack: SharingProvider {
+  func isShared(object: NSManagedObject) -> Bool {
+    return isShared(objectID: object.objectID)
+  }
+
+  func isShared(objectID: NSManagedObjectID) -> Bool {
+    var isShared = false
+    if let persistentStore = objectID.persistentStore {
+      if persistentStore == sharedPersistentStore {
+        isShared = true
+      } else {
+        let container = persistentContainer
+        do {
+          let shares = try container.fetchShares(matching: [objectID])
+          if nil != shares.first {
+            isShared = true
+          }
+        } catch let error {
+          print("Failed to fetch share for \(objectID): \(error)")
+        }
+      }
+    }
+    return isShared
+  }
+
+  func canEdit(object: NSManagedObject) -> Bool {
+    return persistentContainer.canUpdateRecord(forManagedObjectWith: object.objectID)
+  }
+
+  func canDelete(object: NSManagedObject) -> Bool {
+    return persistentContainer.canDeleteRecord(forManagedObjectWith: object.objectID)
+  }
+}
+```
+
+Key points:
+- Check if object's persistent store is the shared store
+- Use `fetchShares(matching:)` for share info
+- `canUpdateRecord(forManagedObjectWith:)` checks edit permission
+- `canDeleteRecord(forManagedObjectWith:)` checks delete permission
+
+### Permission Control
+
+Share creators set participant permissions:
+
+- **Read-Only**: View only; no edit or delete
+- **Read-Write**: View, edit, add content
+
+UI must adapt dynamically:
+- Read-only participants don't see Edit
+- Can't swipe-delete read-only shared content
+- Can't delete read-only content in edit mode
+
+## Detailed Content
+
+### Testing Share UI
+
+The presenter stressed testing share-related UI. The `SharingProvider` protocol makes mock injection easy:
+
+```swift
+// [18:44](https://developer.apple.com/videos/play/wwdc2021/10015/?time=1124)
+func testSharedPostsGetDisclosure() {
+  var sharedObjectIDs: Set<NSManagedObjectID> = Set()
+  let context = coreDataStack.persistentContainer.viewContext
+  self.generatePosts(in: context, postSaveBlock: { posts in
+    for (index, post) in posts.enumerated where (index % 4) == 0 {
+      sharedObjectIDs.insert(post.objectID)
+    }
+  })
+
+  let provider = BlockBasedShareProvider(stack: coreDataStack)
+  provider.isSharedBlock = sharedObjectIDs.contains
+  mainViewController.sharingProvider = provider
+
+  // ... perform fetch and verify cells ...
+  for index in 0..<rowCount {
+    let indexPath = IndexPath(row: index, section: 0)
+    let post = mainViewController.dataProvider.fetchedResultsController.object(at: indexPath)
+    guard let cell = mainViewController.tableView(
+      mainViewController.tableView,
+      cellForRowAt: indexPath
+    ) as? PostCell else {
+      XCTFail("Encountered an unexpected cell type")
+      return
+    }
+
+    if sharedObjectIDs.contains(post.objectID) {
+      guard let attachment = cell.title.attributedText?
+        .attributes(at: 0, effectiveRange: nil)[.attachment] as? NSTextAttachment else {
+        XCTFail("Expected an image attachment at the first character")
+        return
+      }
+      XCTAssertEqual(expectedSharedImage, attachment.image)
+    } else {
+      XCTAssertEqual(cell.title.text, title)
+    }
+  }
+}
+```
+
+Key points:
+- Create `BlockBasedShareProvider` with custom behavior
+- `isSharedBlock` controls which objects count as shared
+- Verify shared cells show person.circle icon
+- Verify non-shared cells show normal text title
+
+### Share Boundaries
+
+NSPersistentCloudKitContainer infers which related records to include when sharing. If object A relates to B, sharing A includes B.
+
+You can also pass an explicit `CKShare` parameter to control which share zone objects belong to.
+
+## Core Takeaways
+
+**1. Build a family-shared todo app**
+
+- **What**: Family shopping list or task app with real-time collaboration
+- **Why**: `NSPersistentCloudKitContainer` handles sync, conflict resolution, and permissions—you focus on UI
+- **How**: Add shared store description to Core Data stack; use `UICloudSharingController` to share
+
+**2. Add collaboration to a notes app**
+
+- **What**: Let users share specific notes with colleagues for co-editing
+- **Why**: Share granularity down to a single `NSManagedObject`—other private notes stay private
+- **How**: Add share button on notes; call `container.share([note], to: nil)`
+
+**3. Implement permission-aware UI**
+
+- **What**: Adapt UI by role (owner/read-only/read-write)
+- **Why**: `canEdit` and `canDelete` simplify permission checks
+- **How**: Implement `SharingProvider`; call in `cellForRowAt` and edit button logic
+
+**4. Design a testable sharing module**
+
+- **What**: Decouple sharing logic from UI with `SharingProvider`
+- **Why**: Unit test share/non-share and read-only/read-write without real CloudKit
+- **How**: Define `SharingProvider`; create `BlockBasedShareProvider` mock
+
+**5. Build cross-device shared experiences**
+
+- **What**: Shared content available on all devices via automatic sync
+- **Why**: After accepting on one device, other devices on the same Apple ID get access automatically
+- **How**: Handle `acceptShareInvitations` correctly; use the same Core Data stack config on all devices
+
+## Related Sessions
+
+- [What's new in CloudKit](/articles/wwdc2021-10093) — CloudKit Record Zone Sharing internals
+- [Bring Core Data concurrency to Swift and SwiftUI](/articles/wwdc2021-10017) — Core Data Swift Concurrency; combine with shared data
+- [Synchronizing a local store to the cloud](/articles/wwdc2021-101) — Core Data and CloudKit sync fundamentals

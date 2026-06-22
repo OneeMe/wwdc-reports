@@ -1,0 +1,229 @@
+---
+title: "Meet Background Assets"
+description: "Discover how you can use the Background Assets framework to download large files directly from your CDN and improve the initial launch experience of your apps and games. We'll show you how to schedule background downloads during initial app install, app updates, and periodically as someone uses the app. We'll also explore how you can manage scheduled downloads to make sure people have the content they want, when they want it."
+date: "2022-06-06"
+tags: ["App Services", "Background Assets", "Download"]
+thumbnail: "/images/sessions/2022/110403.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110403/"
+sessionId: "wwdc2022-110403"
+year: "2022"
+relatedSessions:
+  - title: "Accelerating networking with HTTP/3"
+    code: "10084"
+    description: "Improve network transmission efficiency and work with Background Assets to optimize large file downloads"
+  - title: "What's new in SwiftUI"
+    code: "102"
+    description: "Use SwiftUI to build application interfaces that require preloaded resources"
+  - title: "Meet SwiftData"
+    code: "10187"
+    description: "Manage application data models and work with resource downloads"
+---
+## Highlight
+
+> Apple introduced the Background Assets framework in iOS 16, iPadOS 16 and macOS 13, allowing developers to use the Background Download Extension to automatically download large file resources from the CDN after the application is installed and before the first launch, solving the pain point of users still having to wait for resource downloads after opening the application.
+
+## Core Content
+
+### Pain points for users waiting
+
+You spend half a day finding a favorite game in the App Store, click to download, wait a few minutes or even longer, and finally the installation is completed. I opened the app with great expectations, but saw a big progress bar - the app still needs to download several more GB resource packages.
+
+This experience is especially bad for users on slower networks. Many people will choose to close and uninstall the app directly. Developers don’t want this, but existing solutions have limitations: On-Demand Resources need to host resources to Apple; URLSession background download can only be used after the application is launched.
+
+### Solution ideas for Background Assets
+
+Apple's solution is a completely new framework: Background Assets. It introduces a new application extension - Background Download Extension, which runs outside the application life cycle.
+
+The extension will be awakened by the system at three times:
+
+1. **After first installation**: The extension starts downloading resources before the user opens the app.
+2. **After application update**: After the App Store automatically updates the application, the extension is awakened to download new resources.
+3. **Periodic operation**: Based on the user's frequency of use, the system will periodically wake up the extension to check for updates.
+
+Developers only need to schedule the download task in the extension, and the system will choose the appropriate time to execute it. After the download is completed, the file is stored in the App Group shared container and is directly available when the application is started.
+
+### Relationship to existing solutions
+
+Background Assets are designed to be flexible. If you already have a complex resource management system, it can be seamlessly integrated. It is suitable for scenarios where resources need to be downloaded from your own CDN, complementing Apple-hosted On-Demand Resources.
+
+## Detailed Content
+
+### BADownloadManager: core scheduling interface
+
+（[05:28](https://developer.apple.com/videos/play/wwdc2022/110403/?time=328)）
+
+`BADownloadManager`It is the core class of the framework, a singleton object, which runs through applications and extensions:
+
+```swift
+import BackgroundAssets
+
+let url = URL(string: "https://cdn.example.com/large-asset.bin")!
+let appGroupIdentifier = "group.WWDC.AssetContainer"
+let download = BAURLDownload(
+    identifier: "Large-Asset",
+    request: URLRequest(url: url),
+    applicationGroupIdentifier: appGroupIdentifier
+)
+
+let manager = BADownloadManager.shared
+manager.delegate = self
+
+// Let the system choose the best time to run
+do {
+    try manager.schedule(download)
+} catch {
+    print("Failed to schedule download. \(error)")
+}
+
+// Or run immediately in the foreground
+do {
+    try manager.startForegroundDownload(download)
+} catch {
+    print("Failed to start foreground download. \(error)")
+}
+```
+
+Key points:
+- `BAURLDownload`of`identifier`Must be unique, the system does not allow repeated scheduling of downloads with the same identifier
+-`applicationGroupIdentifier`Specify the App Group. Apps and extensions must join the same group to share downloaded files.
+-`schedule(_:)`Let the system choose the best time to execute, suitable for use in expansion
+-`startForegroundDownload(_:)`Starts immediately and has higher priority, can only be called from the application main program
+
+### Promote background downloads to the foreground
+
+（[07:58](https://developer.apple.com/videos/play/wwdc2022/110403/?time=478)）
+
+If the user opens your app while background downloads scheduled by extensions are still in progress, you should immediately bring them to the foreground:
+
+```swift
+do {
+    for download in try await manager.fetchCurrentDownloads() {
+        try manager.startForegroundDownload(download)
+    }
+} catch {
+    print("Failed to promote downloads to foreground \(error)")
+}
+```
+
+Key points:
+- `fetchCurrentDownloads()`Returns all scheduled, in progress, or queued downloads
+- After being promoted to the foreground, the downloaded part will not be re-downloaded and will continue from the breakpoint.
+- The extension itself cannot call the foreground download API because it has no UI and cannot be perceived by users.
+
+### Delegate Agreement: Monitor download status
+
+（[10:28](https://developer.apple.com/videos/play/wwdc2022/110403/?time=628)）
+
+`BADownloadManagerDelegate`The protocol receives download status callback:
+
+```swift
+public protocol BADownloadManagerDelegate : NSObjectProtocol {
+    optional func downloadDidBegin(_ download: BADownload)
+    optional func downloadDidPause(_ download: BADownload)
+    optional func download(_ download: BADownload,
+                           bytesWritten: Int64,
+                           totalBytesWritten: Int64,
+                           totalExpectedBytes: Int64)
+    optional func download(_ download: BADownload,
+                           didReceive challenge: URLAuthenticationChallenge) async -> (URLSession.AuthChallengeDisposition, URLCredential?)
+    optional func download(_ download: BADownload, failedWithError error: Error)
+    optional func download(_ download: BADownload, finishedWithFileURL fileURL: URL)
+}
+```
+
+Key points:
+- All delegate methods are optional and implemented on demand
+-`downloadDidPause`Triggered when the background download is promoted to the foreground, there will be a brief pause in the middle
+- Files downloaded successfully are managed by the system, and the system will automatically clean them up when the storage space is insufficient.
+- It is recommended to keep the file in the location provided by the system. If you need to move it, delete the original file after moving to avoid repeated space occupation.
+
+### Background download extension: run when the application is not started
+
+（[15:37](https://developer.apple.com/videos/play/wwdc2022/110403/?time=937)）
+
+Extensions need to be implemented`BADownloaderExtension`protocol:
+
+```swift
+public protocol BADownloaderExtension : NSObjectProtocol {
+    optional func applicationDidInstall(metadata: BAApplicationExtensionInfo)
+    optional func applicationDidUpdate(metadata: BAApplicationExtensionInfo)
+    optional func checkForUpdates(metadata: BAApplicationExtensionInfo)
+    optional func download(_ download: BADownload,
+                           didReceive challenge: URLAuthenticationChallenge) async -> (URLSession.AuthChallengeDisposition, URLCredential?)
+    optional func backgroundDownloadDidFail(failedDownload: BADownload)
+    optional func backgroundDownloadDidFinish(finishedDownload: BADownload, fileURL: URL)
+    optional func extensionWillTerminate()
+}
+```
+
+Key points:
+- `applicationDidInstall`: Called after the application is installed for the first time, suitable for downloading the initial resource package
+-`applicationDidUpdate`: Called after the App Store updates the app
+-`checkForUpdates`: The system wakes up periodically, the frequency depends on the user's frequency of use
+- The extension life cycle is very short. It can only quickly schedule downloads and cannot perform time-consuming operations such as decompression.
+- The extension running frequency will be dynamically adjusted based on application usage: commonly used application extensions run more frequently
+
+### Info.plist configuration requirements
+
+（[12:56](https://developer.apple.com/videos/play/wwdc2022/110403/?time=776)）
+
+The application's main Info.plist needs to add two keys:
+
+1. `BAInitialDownloadRestrictions`(dictionary):
+   -`DownloadAllowance`: Maximum total number of bytes allowed to be downloaded on first installation (sum of all files)
+   -`AllowList`: Array of domain names that are allowed to be downloaded, supporting prefix wildcards
+   - These restrictions only take effect during first installation and will no longer be restricted after the app is launched.
+
+2. `BADownloadSize`(root level):
+   - The total size of the resource after decompression
+   - This value will be displayed in the App Store to let users know how much additional content needs to be downloaded
+
+### Synchronization mechanism between applications and extensions
+
+（[19:40](https://developer.apple.com/videos/play/wwdc2022/110403/?time=1180)）
+
+Extensions and applications may be running at the same time, creating a race condition. For example, if an extension downloads a directory file, both the application and the extension want to read and delete it:
+
+```swift
+func download(_ download: BADownload, finishedWithFileURL fileURL: URL) {
+    let manager = BADownloadManager.shared
+    manager.withExclusiveControl { error in
+        guard error == nil else {
+            print("Unable to acquire exclusive control \(String(describing: error))")
+            return
+        }
+        // Code in this scope is mutually exclusive with the extension
+        do {
+            let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+            // Process the data
+            try FileManager.default.removeItem(at: fileURL)
+        } catch {
+            print("Unable to read/cleanup file data. \(error)")
+        }
+    }
+}
+```
+
+Key points:
+- `withExclusiveControl`Ensure apps and extensions don't execute critical code at the same time
+- If one party has acquired exclusive control, the other party will wait
+- Obtaining exclusive control may fail and error situations need to be handled.
+- Exclusive control will be automatically released when the extension terminates
+
+## Core Takeaways
+
+- **Game resource preloading**: Automatically download high-definition texture packs and level data after the application is installed. Users enter the main interface directly when opening the game for the first time without waiting. Entrance API:`applicationDidInstall`mid-schedule`BAURLDownload`。
+
+- **Offline content caching**: News or reading apps regularly download the latest articles, pictures and videos in the background. The content is ready when the user opens the app. Entrance API:`checkForUpdates`Check the server version number and schedule incremental downloads.
+
+- **AI model dynamic update**: Machine learning applications download updated Core ML model files in the background. Users are always on the latest model, eliminating the need to manually update apps. Entrance API: download in extension`.mlmodelc`file, loaded into`MLModel`。
+
+- **Map Data Package Management**: Navigation application downloads offline map packages by city or region. When installing for the first time, the basic package of the city where the user is located is downloaded, and then the maps of the cities passing through are automatically downloaded according to the itinerary. Entrance API:`applicationDidInstall` + `checkForUpdates`Use in combination.
+
+- **Video course pre-caching**: Educational applications automatically download video files for the next class subscribed by the user at night. Users can watch offline when they open the app the next day. Entrance API: Combined with user learning progress data, determine the course ID that needs to be downloaded in the extension.
+
+## Related Sessions
+
+- [Accelerating networking with HTTP/3](/articles/wwdc2022-10084) — Improve network transmission efficiency and work with Background Assets to optimize large file downloads
+- [What's new in SwiftUI](/articles/wwdc2022-102) — Use SwiftUI to build application interfaces that require preloaded resources
+- [Meet SwiftData](/articles/wwdc2022-10187) — Manage application data models and work with resource downloads

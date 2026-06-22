@@ -1,0 +1,131 @@
+---
+title: "What’s new in passkeys"
+description: "discover how ios, ipados, macos, and visionos 26 enhance passkeys. we"
+date: 2026-06-10
+tags: ["Privacy & Security"]
+thumbnail: "/images/sessions/2025/279.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/279/"
+sessionId: "wwdc2025-279"
+year: "2025"
+relatedSessions:
+  - title: "Integrate privacy into your development process"
+    code: "246"
+    description: "learn how to build privacy into your apps from the planning stages through deplo"
+  - title: "Supercharge device connectivity with Wi-Fi Aware"
+    code: "228"
+    description: "learn how to create peer-to-peer network connections with wi-fi aware. we"
+  - title: "What’s new in UIKit"
+    code: "243"
+    description: "modernize your app with the latest apis in uikit, including enhanced menu bar su"
+---
+
+## Highlight
+
+> iOS, iPadOS, macOS, and visionOS 26 each ship a set of APIs covering the five stages of the passkey lifecycle: enrollment, maintenance, upgrade, discovery, and migration.
+
+---
+
+## Core Content
+
+The old sign-up flow hurts. The user taps "Sign up with email", types in the email, then the first name, then the last name, then generates a strong password, then taps Continue — at least four steps. In the FIDO Alliance's 2025 survey, 69% of people already have at least one passkey. Google has reported that password users sign in successfully at one quarter the rate of passkey users. TikTok's passkey sign-in success rate hits 97%. Even so, sign-up still walks through a password form. Passkeys come later, not at the start.
+
+The Account Creation API rebuilds enrollment. After the user taps sign up, the system shows a sheet with the name, the email, and the new passkey already filled in. One Face ID scan and you're done ([03:43](https://developer.apple.com/videos/play/wwdc2025/279/?time=223)). The pre-filled fields are editable; tapping a field opens a picker with system-suggested values, or the user can type. The whole interaction goes through the system Passwords app or a third-party credential manager. The account has a passkey from the very first second — no password account that has to be "upgraded" later.
+
+The other four updates cover what happens after enrollment. The Signal API lets the app notify the credential manager when the user changes a username, revokes a passkey, or deletes a password, so the credential manager doesn't show stale info. Automatic Passkey Upgrade silently creates a passkey after a successful password sign-in, with no prompt. Passkey Management Endpoints is a well-known URL standard the credential manager can read for enroll and manage URLs, and proactively prompt the user to upgrade. Import/Export moves credentials directly between credential managers without an intermediate file on disk.
+
+## Detailed Content
+
+The core sign-up code is one block ([06:33](https://developer.apple.com/videos/play/wwdc2025/279/?time=393)). Create an `ASAuthorizationAccountCreationProvider`, call `createPlatformPublicKeyCredentialRegistrationRequest` to build a request, and hand it to `ASAuthorizationController`.
+
+```swift
+@Environment(\.authorizationController) var authorizationController
+
+func performPasskeySignUp() async throws {
+    let provider = ASAuthorizationAccountCreationProvider()
+    let request = provider.createPlatformPublicKeyCredentialRegistrationRequest(
+        acceptedContactIdentifiers: [.email, .phoneNumber],
+        shouldRequestName: true,
+        relyingPartyIdentifier: "example.com",
+        challenge: try await fetchChallenge(),
+        userID: try await fetchUserID()
+    )
+
+    do {
+        let result = try await authorizationController.performRequest(request)
+        if case .passkeyAccountCreation(let account) = result {
+            // Register new account on backend
+        }
+    } catch ASAuthorizationError.deviceNotConfiguredForPasskeyCreation {
+        showPasswordSignUpForm = true
+    } catch ASAuthorizationError.canceled {
+        showPasswordSignUpForm = true
+    } catch ASAuthorizationError.preferSignInWithApple {
+        await performSignInWithApple()
+    } catch { ... }
+}
+```
+
+Key points:
+
+- `acceptedContactIdentifiers` declares which contact identifiers the app accepts. Pass both `.email` and `.phoneNumber`. The user only sends one back, and that value also becomes the passkey's user name label.
+- `shouldRequestName` controls whether to ask for a name. Don't turn it on unless you need it — every dropped field is a win.
+- `relyingPartyIdentifier`, `challenge`, and `userID` are the same as standard passkey registration: the domain, a one-shot challenge from the server, and a stable unique account ID.
+- Three specific errors must each be handled. `deviceNotConfiguredForPasskeyCreation` means the device has no passcode set and can't create a passkey — fall back to the traditional form. `canceled` means the user dismissed the system sheet — fall back too. `preferSignInWithApple` is only thrown when the app supports Sign in with Apple, and means the user already has a Sign in with Apple account; at that point fire off a Sign in with Apple request and let the user land on the existing account.
+- From the `ASAuthorizationResult` returned by `performRequest`, unwrap `.passkeyAccountCreation(let account)` to get the contact identifier, the name (if requested), and the passkey object.
+
+The second block is the Signal API ([12:30](https://developer.apple.com/videos/play/wwdc2025/279/?time=750) and [13:07](https://developer.apple.com/videos/play/wwdc2025/279/?time=787)). When the user changes their email in the app, call `ASCredentialUpdater().reportPublicKeyCredentialUpdate` to push the new name to the credential manager. When revoking a passkey, call `reportAllAcceptedPublicKeyCredentials` with the set of credential IDs that are still valid; the credential manager deletes any passkey not in the set. The web has matching `PublicKeyCredential.signalCurrentUserDetails` and `signalAllAcceptedCredentials`.
+
+The third block is Automatic Passkey Upgrade ([15:36](https://developer.apple.com/videos/play/wwdc2025/279/?time=936)).
+
+```swift
+func signIn() async throws {
+    let accountDetails = try await signInWithPassword()
+    guard !accountDetails.hasPasskey else { return }
+
+    let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(
+        relyingPartyIdentifier: "example.com")
+
+    let request = provider.createCredentialRegistrationRequest(
+        challenge: try await fetchChallenge(),
+        name: accountDetails.userName,
+        userID: accountDetails.userID,
+        requestStyle: .conditional
+    )
+
+    do {
+        let passkey = try await authorizationController.performRequest(request)
+        // Save new passkey to the backend
+    } catch { ... }
+}
+```
+
+Key points:
+
+- The entry point is right after a successful password sign-in. Confirm the account has no passkey first, then fire the registration request — avoid duplicates.
+- `requestStyle: .conditional` is the switch. With it set, the system takes the silent path. If the conditions don't hold (say the device doesn't support passkeys), the call fails silently — no UI, no interruption.
+- On success the system posts a notification telling the user a passkey was added. On failure nothing shows, and the next sign-in can try again at zero cost.
+
+## Core Takeaways
+
+- **What to do**: switch every new sign-up path to the Account Creation API and keep the traditional form as a fallback.
+  - Why it's worth doing: sign-up shrinks from four steps to one Face ID, and the user ends up with a passkey-backed account instead of a password account, so sign-in success rates jump.
+  - How to start: implement the `ASAuthorizationAccountCreationProvider` flow, fall back to the form on `deviceNotConfiguredForPasskeyCreation` and `canceled`, and if the app supports Sign in with Apple, also handle `preferSignInWithApple` to route to the existing account.
+
+- **What to do**: wire the Signal API into every place that changes a username, deletes an account, or revokes a passkey, so the credential manager always shows the latest state.
+  - Why it's worth doing: a credential manager that shows a stale username or a revoked passkey leaves the user stuck at sign-in — the most common silent failure in the passkey experience.
+  - How to start: after the user changes their email in account settings, call `reportPublicKeyCredentialUpdate`; after the revocation list updates, call `reportAllAcceptedPublicKeyCredentials` with the current valid ID set; once the user has gone all-passkey, call `reportUnusedPasswordCredential` so the old password disappears from the credential manager.
+
+- **What to do**: add Automatic Passkey Upgrade for existing password users and try once on every password sign-in.
+  - Why it's worth doing: legacy password accounts are the biggest drag on passkey adoption. A silent upgrade migrates the user to a passkey without them noticing, and the next sign-in is Face ID.
+  - How to start: in the password sign-in success callback, check `hasPasskey`, and if there isn't one, fire a `requestStyle: .conditional` registration request. Do nothing on failure.
+
+- **What to do**: serve `/.well-known/passkey-endpoints` and publish enroll and manage URLs.
+  - Why it's worth doing: the credential manager can read this endpoint and proactively guide the user to upgrade to a passkey while they are still on a password — a free acquisition channel for the service.
+  - How to start: return JSON at the well-known path with the enroll and manage URLs, and accept those deep links from the sign-in page so they land in the matching enroll or manage flow.
+
+## Related Sessions
+
+- [Integrate privacy into your development process](/articles/wwdc2025-246) — push privacy design up into product planning, the same source as passkeys' privacy defaults.
+- [Supercharge device connectivity with Wi-Fi Aware](/articles/wwdc2025-228) — Wi-Fi Aware device discovery pairs with passkey cross-device sync.
+- [What’s new in UIKit](/articles/wwdc2025-243) — UIKit 26's new menu bar and text controls work with the system passkey sheet to improve sign-in pages.
+- [Meet Passkeys (WWDC22)](/articles/wwdc2022-10092) — required reading before this session, covering the basic passkey APIs and prefer immediately available credentials.

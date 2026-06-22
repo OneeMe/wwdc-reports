@@ -1,0 +1,162 @@
+---
+title: "Read documents using the Vision framework"
+description: "learn about the latest advancements in the vision framework. we"
+date: 2026-06-10
+tags: ["機械学習"]
+thumbnail: "/images/sessions/2025/272.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/272/"
+sessionId: "wwdc2025-272"
+year: "2025"
+relatedSessions:
+  - title: "Bring advanced speech-to-text to your app with SpeechAnalyzer"
+    code: "277"
+    description: "discover the new speechanalyzer api for speech to text. we"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+---
+
+## Highlight
+
+> Vision フレームワークに新しく `RecognizeDocumentsRequest` が追加されました。階層構造を持つ `DocumentObservation` によって、ドキュメント中の表・リスト・段落・バーコード・主要データを直接取得でき、座標から行列を推測する必要がなくなります。
+
+---
+
+## 主要内容
+
+実店舗で来店客に登記用紙へ氏名・メールアドレス・電話番号を手書きしてもらい、それをスキャンして画像として保存する。これまでこの用紙を連絡先リストに変換するには、`RecognizeTextRequest` を呼び出してバラバラのテキストボックス群を取得し、各ボックスの座標から「どのセルが同じ行に属するのか」を逆算するしかありませんでした。座標が少しでもずれれば、表全体が崩れてしまいます。Megan Williams さんがセッション冒頭で示したのは、まさにこの痛点でした（[01:23](https://developer.apple.com/videos/play/wwdc2025/272/?time=83)）。テキストを認識できても、構造が失われていてはやり直しになるのです。
+
+WWDC25 が出した答えが `RecognizeDocumentsRequest` です。返ってくる `DocumentObservation` はツリー構造になっており、`Document` コンテナの中に `Text`、`Table`、`List`、`Barcode` が入ります。`Table` は `Cell` の二次元配列で構成され、各 `Cell` は row/column の範囲情報を持ち、`Cell` の中身もコンテナとなっていて入れ子で展開できます（[05:15](https://developer.apple.com/videos/play/wwdc2025/272/?time=315)）。同じ登記用紙でも、旧 API では大量のテキストボックスが返ってくるだけだったのに対し、新 API では行単位で直接取得できます。`table.rows` をループし、最初のセルを氏名として取り出し、残りのセルを DataDetection に渡してメールアドレスと電話番号を抽出する。これだけで数十行のコードで完結します（[10:14](https://developer.apple.com/videos/play/wwdc2025/272/?time=614)）。Vision には同時に `DetectLensSmudgeRequest`（レンズの汚れ検知）と新しい手のポーズモデルも追加されており、ドキュメントスキャンのパイプライン全体で品質面の課題も補強されています。
+
+---
+
+## 詳細内容
+
+`RecognizeDocumentsRequest` は 26 言語に対応し、すべてオンデバイスで動作します。リクエストを実行したあと、`document.tables.first` で最初のテーブルを直接取得できます（[06:39](https://developer.apple.com/videos/play/wwdc2025/272/?time=399)）。
+
+```swift
+/// Process an image and return the first table detected
+func extractTable(from image: Data) async throws -> DocumentObservation.Container.Table {
+    
+    // The Vision request.
+    let request = RecognizeDocumentsRequest()
+    
+    // Perform the request on the image data and return the results.
+    let observations = try await request.perform(on: image)
+
+    // Get the first observation from the array.
+    guard let document = observations.first?.document else {
+        throw AppError.noDocument
+    }
+    
+    // Extract the first table detected.
+    guard let table = document.tables.first else {
+        throw AppError.noTable
+    }
+    
+    return table
+}
+```
+
+ポイントは以下のとおりです。
+
+- `RecognizeDocumentsRequest()` は引数なしで構築でき、デフォルトでテキスト・テーブル・リスト・バーコード・DataDetection が有効になります。
+- `request.perform(on:)` は async メソッドで、`Data` のほか `CGImage` や `URL` も受け取れます。戻り値は observation の配列です。
+- `observations.first?.document` で `DocumentObservation` を取り出します。1 枚の画像からは 1 つの document しか生成されません。
+- `document.tables.first` でテーブルを直接取得できます。同様に `document.lists`、`document.barcodes`、`document.paragraphs` も利用できます。
+
+`Table` を取得したら、行単位でループするだけで各行を 1 件の連絡先レコードに変換できます。テキストアクセスには 4 つのビューがあります。`transcript`（全体を 1 つの文字列にしたもの）、`lines`（行の配列）、`paragraphs`（自然な読み順でグルーピングされたもの）、そして `words`（中国語・日本語・韓国語・タイ語では返されません）です（[08:30](https://developer.apple.com/videos/play/wwdc2025/272/?time=510)）。`detectedData` は DataDetection フレームワークが提供するもので、メールアドレス、電話番号、住所、URL、日付（カレンダーイベントとして認識）、計量単位、金額、追跡番号、決済識別子、フライト番号などをカバーします（[09:13](https://developer.apple.com/videos/play/wwdc2025/272/?time=553)）。
+
+```swift
+/// Extract name, email addresses, and phone number from a table into a list of contacts.
+private func parseTable(_ table: DocumentObservation.Container.Table) -> [Contact] {
+    var contacts = [Contact]()
+    
+    // Iterate over each row in the table.
+    for row in table.rows {
+        // The contact name will be taken from the first column.
+        guard let firstCell = row.first else {
+            continue
+        }
+        // Extract the text content from the transcript.
+        let name = firstCell.content.text.transcript
+        
+        // Look for emails and phone numbers in the remaining cells.
+        var detectedPhone: String? = nil
+        var detectedEmail: String? = nil
+        
+        for cell in row.dropFirst() {
+            // Get all detected data in the cell, then match emails and phone numbers.
+            let allDetectedData = cell.content.text.detectedData
+            for data in allDetectedData {
+                switch data.match.details {
+                case .emailAddress(let email):
+                    detectedEmail = email.emailAddress
+                case .phoneNumber(let phoneNumber):
+                    detectedPhone = phoneNumber.phoneNumber
+                default:
+                    break
+                }
+            }
+        }
+        // Create a contact if an email was detected.
+        if let email = detectedEmail {
+            let contact = Contact(name: name, email: email, phoneNumber: detectedPhone)
+            contacts.append(contact)
+        }
+    }
+    return contacts
+}
+```
+
+ポイントは以下のとおりです。
+
+- `for row in table.rows`：`rows` は `[[Cell]]` の論理ビューで、視覚的な行の順序で並んでいます。
+- `firstCell.content.text.transcript`：`content` がコンテナ、`text` がテキストビューで、`transcript` はすべての文字列を 1 本に連結したものです。
+- `cell.content.text.detectedData`：DataDetection が見つけたすべてのマッチを返します。各要素は `match.details` という型安全な列挙型を持ちます。
+- `case .emailAddress(let email)` / `case .phoneNumber(let phoneNumber)`：Swift の switch のパターンマッチで関連値を取り出し、`email.emailAddress`、`phoneNumber.phoneNumber` といった文字列を取得しています。
+- `row.dropFirst()`：氏名カラムをスキップして、残りのカラムからのみ連絡先情報を探します。
+
+`DetectLensSmudgeRequest` も新しく追加されたリクエストです（[13:35](https://developer.apple.com/videos/play/wwdc2025/272/?time=815)）。`SmudgeObservation` を返し、`confidence` は 0 から 1 の値で、1 に近いほど汚れたレンズで撮影された可能性が高いことを示します。Megan さんは 0.9 をしきい値としてフィルタしています（[15:34](https://developer.apple.com/videos/play/wwdc2025/272/?time=934)）。しきい値を低くするほど厳しく弾けますが、良い画像まで弾いてしまうため、自分のデータセットで調整する必要があります。さらに、モーションブラー、長時間露光、もや・霧などのシーンでは偽陽性が出やすい点にも注意が必要だと述べています。`DetectFaceCaptureQualityRequest`（顔の品質）や `CalculateImageAestheticScoresRequest`（美的スコア＋実用画像認識）と組み合わせて、多次元の品質フィルタを構成できます。
+
+手のポーズモデルも、ひっそりと世代交代しています。21 関節という定義は変わらないものの、モデルサイズは小さくなり、精度は向上、メモリ消費とレイテンシも下がっています。ただし関節点の位置は旧モデルとは異なるため、すでに学習済みのジェスチャー分類器は新しいデータで再学習する必要があります。
+
+---
+
+## 核心となる学び
+
+- **何をすべきか**：登記用紙・領収書・フォーム系アプリで使っている `RecognizeTextRequest` ＋座標推測のロジックを、`RecognizeDocumentsRequest` に置き換えましょう。
+  - なぜやる価値があるのか：旧方式はセルの傾き・行の結合・空白に対する許容度が低く、行と列のミスマッチ率が高くなりがちです。新 API は行列構造を直接返してくれるため、コード量はおよそ 1/3 に縮みます。
+  - どう始めるか：まずは最もシンプルな 2 列の表（氏名 / メールアドレス）を対象に、`table.rows` と `transcript` で最小ループを完成させ、その後で複数列やセル結合に拡張していきましょう。
+
+- **何をすべきか**：テキストからメールアドレス・電話番号・住所・追跡番号などを抽出する処理は、すべて `cell.content.text.detectedData` に任せましょう。
+  - なぜやる価値があるのか：国際的なフォーマット（括弧付きの電話番号、`+` 付き国コード、サブドメイン付きメールアドレス）を自前の正規表現で扱うのは保守コストが非常に高いです。DataDetection はすでにこれらをカバーしており、システム更新とともに改善されていきます。
+  - どう始めるか：既存の正規表現を `data.match.details` に対する switch の型安全な分岐に置き換えます。最初は両方を並行稼働させてカバレッジを比較し、問題なければ旧ロジックを停止しましょう。
+
+- **何をすべきか**：スキャンの入口に `DetectLensSmudgeRequest` の品質ゲートを追加しましょう。
+  - なぜやる価値があるのか：汚れた画像はその後の OCR、表認識、バーコード認識をすべて劣化させます。早めに弾いておけば、連鎖的なリトライを節約できます。
+  - どう始めるか：まずは緩めのしきい値（たとえば 0.9）でヒット率を記録し、precision/recall を見ながら自分のシーンに合うしきい値に調整します。境界事例には美的スコアを重ねてフォールバックさせましょう。
+
+- **何をすべきか**：品質チェックを多段パイプラインにしましょう。汚れ検知 → 美的スコア → 実用画像認識、という流れです。
+  - なぜやる価値があるのか：各 API は 1 つの軸しかカバーしないため、単体では取りこぼしが発生します。カスケードさせれば、失敗モードごとに補完し合えます。
+  - どう始めるか：まず過去画像のバッチに対してオフラインで分析を走らせ、各段階の拒否率を集計してから、本番での適用順序を決めましょう。
+
+- **何をすべきか**：アプリ内の ML ジェスチャー分類器を棚卸しし、新しい hand pose モデルに合わせて再学習が必要かを判断しましょう。
+  - なぜやる価値があるのか：関節座標の分布が変わったため、旧分類器は新モデル上で恒常的なバイアスを持つことになります。ユーザーが気付かないうちにジェスチャーが効かなくなる可能性があります。
+  - どう始めるか：新モデルで小規模なサンプルを再収集し、旧分類器の出力と比較します。バイアスがしきい値を超える場合は、同じラベリング基準で再学習しましょう。
+
+---
+
+## 関連 Session
+
+- [Discover Swift Enhancements in the Vision Framework](/articles/wwdc2024-10163) — Vision フレームワークの基礎、リクエスト/オブザベーションのモデルについて。本セッションの前提として視聴をおすすめします。
+- [Bring advanced speech-to-text to your app with SpeechAnalyzer](/articles/wwdc2025-277) — オンデバイスの音声認識新 API。ドキュメント認識と同じく知覚系のワークフローに属します。
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — オンデバイスの大規模モデルを土台に AI 機能を組み立てる内容で、ドキュメント解析の結果と組み合わせて使えます。
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — guided generation などの仕組みを解説しており、認識結果を構造化して書き換える用途に向いています。
+- [Design interactive snippets](/articles/wwdc2025-281) — App Intents のコンパクトビュー。認識した連絡先や表をそのまま snippet として表示できます。

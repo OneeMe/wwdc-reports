@@ -1,0 +1,193 @@
+---
+title: "SwiftData: Dive into inheritance and schema migration"
+description: "discover how to use class inheritance to model your data. learn how to optimize queries and seamlessly migrate your app"
+date: 2026-06-10
+tags: ["アプリサービス", "Swift"]
+thumbnail: "/images/sessions/2025/291.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/291/"
+sessionId: "wwdc2025-291"
+year: "2025"
+relatedSessions:
+  - title: "Discover Apple-Hosted Background Assets"
+    code: "325"
+    description: "building on background assets, this session will introduce the new capability to"
+  - title: "Dive deeper into Writing Tools"
+    code: "265"
+    description: "with writing tools, people can proofread, rewrite, and transform text directly w"
+  - title: "Dive into App Store server APIs for In-App Purchase"
+    code: "249"
+    description: "discover the latest updates for the app store server api, app store server notif"
+  - title: "Enhance child safety with PermissionKit"
+    code: "293"
+    description: "discover how permissionkit helps you enhance communication safety for children i"
+---
+
+## Highlight
+
+> iOS 26 から SwiftData は `@Model` class 間の継承をサポートし、lightweight migration stage と組み合わせることで、既存の schema をサブクラス入りの V4 へとスムーズに移行できます。
+
+## 主な内容
+
+サンプル app である SampleTrips は、iOS 17 から iOS 26 まで一貫して進化してきました。最初のモデルは `Trip` クラスひとつだけで、家族旅行・出張・療養など、あらゆる旅行を同じテーブルに詰め込んでいました。時間が経つにつれ、問題が浮き彫りになってきます。出張には `perdiem`（日当）フィールドが必要で、個人旅行には `Reason` enum（family/reunion/wellness）が必要ですが、それらすべてを `Trip` に追加すると基底クラスはどんどん肥大化し、しかも大半のフィールドはもう一方の用途では完全に無意味になってしまいます。一方で、フラットな複数テーブル構成（`PersonalTrip`、`BusinessTrip` をそれぞれ独立させる形）に変えると、「自分のすべての trip を一覧する」という、基底クラス視点での統一的なクエリ能力が失われてしまいます。
+
+iOS 26 では SwiftData に class inheritance が追加されました。`@Model` クラス同士で継承できるようになります。`Trip` を基底クラスとして共通フィールドを提供し、`PersonalTrip`、`BusinessTrip` をサブクラスとしてそれぞれ固有のプロパティを追加できます。`@Query` で基底クラス型を指定すれば、結果にはすべてのサブクラスのインスタンスが含まれます（deep search）。一方で `is` キーワードを使って predicate を書けば、特定のサブクラスだけを絞り込めます（shallow search）。Rishi Verma 氏のセッションでは、V1 から V4 までの完全な移行チェーンも示されました。V1→V2 ではカスタムの重複排除、V2→V3 では unique/index の追加、V3→V4 では lightweight migration を使ってサブクラスをそのまま接続します。
+
+## 詳細
+
+**サブクラスの書き方。** サブクラスには `@available(iOS 26, *)` を付ける必要があります。そうしないと低バージョンではコンパイルが通りません。
+
+```swift
+@Model
+class Trip {
+  var name: String
+  var destination: String
+  var startDate: Date
+  var endDate: Date
+
+  var bucketList: [BucketListItem] = [BucketListItem]()
+  var livingAccommodation: LivingAccommodation?
+}
+
+@available(iOS 26, *)
+@Model
+class BusinessTrip: Trip {
+  var perdiem: Double = 0.0
+}
+
+@available(iOS 26, *)
+@Model
+class PersonalTrip: Trip {
+  enum Reason: String, CaseIterable, Codable {
+    case family
+    case reunion
+    case wellness
+  }
+  var reason: Reason
+}
+```
+
+ポイント（[03:28](https://developer.apple.com/videos/play/wwdc2025/291/?time=208)）:
+- `BusinessTrip: Trip` は基底クラスのプロパティをすべて継承するため、再宣言は不要です。
+- サブクラスの新しいプロパティには必ずデフォルト値を与える必要があります（`perdiem = 0.0`）。そうしないと migration 時、既存データに値を埋められません。
+- `Reason` は `Codable` を実装していないと SwiftData で永続化できません。
+
+**サブクラスの登録。** schema 登録時には `modelContainer` にサブクラスも列挙します:
+
+```swift
+.modelContainer(for: [Trip.self, BusinessTrip.self, PersonalTrip.self])
+```
+
+ポイント（[04:03](https://developer.apple.com/videos/play/wwdc2025/291/?time=243)）: 基底クラスだけを登録すると、サブクラスは fetch で取得できません。
+
+**`is` を使った shallow search。** Segmented control で種類別に絞り込むときは、predicate に `$0 is PersonalTrip` を書きます:
+
+```swift
+let classPredicate: Predicate<Trip>? = {
+  switch segment.wrappedValue {
+  case .personal:
+    return #Predicate { $0 is PersonalTrip }
+  case .business:
+    return #Predicate { $0 is BusinessTrip }
+  default:
+    return nil
+  }
+}()
+_trips = Query(filter: classPredicate, sort: \.startDate, order: .forward)
+```
+
+ポイント（[07:06](https://developer.apple.com/videos/play/wwdc2025/291/?time=426)）:
+- `Predicate<Trip>` の型パラメータが基底クラスなので、同じ `@Query` で全 Trip を取得することも、ランタイムで型ごとに絞り込むこともできます。
+- `default` 分岐では `nil` を返し、クエリに型フィルタを付けないことで、結果的に deep search と等価になります。
+
+**Migration plan の全チェーン。** V1 から V4 までは `SchemaMigrationPlan` でつなぎます:
+
+```swift
+enum SampleTripsMigrationPlan: SchemaMigrationPlan {
+  static var schemas: [any VersionedSchema.Type] {
+    var currentSchemas: [any VersionedSchema.Type] =
+      [SampleTripsSchemaV1.self, SampleTripsSchemaV2.self, SampleTripsSchemaV3.self]
+    if #available(iOS 26, *) {
+      currentSchemas.append(SampleTripsSchemaV4.self)
+    }
+    return currentSchemas
+  }
+
+  static var stages: [MigrationStage] {
+    var currentStages = [migrateV1toV2, migrateV2toV3]
+    if #available(iOS 26, *) {
+      currentStages.append(migrateV3toV4)
+    }
+    return currentStages
+  }
+}
+```
+
+ポイント（[10:24](https://developer.apple.com/videos/play/wwdc2025/291/?time=624)）:
+- `schemas` 配列にはリリース順に各バージョンの schema を列挙します。SwiftData はこれを手がかりにユーザーが現在どのバージョンにいるかを判定します。
+- `stages` は移行ロジックの集合で、V1→V2 と V2→V3 はそれぞれ重複排除、V3→V4 は lightweight です。
+- `#available` で V4 をくくっておくことで、古い OS に古い app を入れた場合に未対応のサブクラス型に触れずに済みます。
+
+**lightweight stage は一行で十分。** サブクラスの追加は schema 互換変更にあたるため、willMigrate を書く必要はありません:
+
+```swift
+@available(iOS 26, *)
+static let migrateV3toV4 = MigrationStage.lightweight(
+  fromVersion: SampleTripsSchemaV3.self,
+  toVersion: SampleTripsSchemaV4.self
+)
+```
+
+ポイント（[10:03](https://developer.apple.com/videos/play/wwdc2025/291/?time=603)）: lightweight migration は開始バージョンと終了バージョンを宣言するだけで、ストレージエンジンが自動的に schema を変更し、既存データはすべて維持されます。
+
+**fetch 高速化の三点セット。** カスタムの migration stage でも widget でも、同じ `FetchDescriptor` のチューニングが効きます:
+
+```swift
+var fetchDesc = FetchDescriptor<SampleTripsSchemaV1.Trip>()
+fetchDesc.propertiesToFetch = [\.name]
+fetchDesc.relationshipKeyPathsForPrefetching = [\.livingAccommodation]
+```
+
+ポイント（[13:11](https://developer.apple.com/videos/play/wwdc2025/291/?time=791)）:
+- `propertiesToFetch` を指定すると、本当に使うカラムだけを読み込めます。重複排除で `name` しか必要ないケースでは IO を大きく削減できます。
+- `relationshipKeyPathsForPrefetching` を使うと、関連オブジェクトを一括で取得し、後続の N+1 クエリを防げます。
+- `fetchLimit = 1`（[13:28](https://developer.apple.com/videos/play/wwdc2025/291/?time=808)）と組み合わせれば、widget で直近の trip 1件だけを取得できます。
+
+**History token の効率的な取得。** プロセスをまたいだ変更検知は SwiftData History に頼ります。新しく追加された `sortBy` と `fetchLimit` により、最新 token の特定で全件スキャンが不要になりました:
+
+```swift
+var historyDesc = HistoryDescriptor<DefaultHistoryTransaction>()
+historyDesc.sortBy = [.init(\.transactionIdentifier, order: .reverse)]
+historyDesc.fetchLimit = 1
+
+let transactions = try context.fetchHistory(historyDesc)
+if let transaction = transactions.last {
+  historyToken = transaction.token
+}
+```
+
+ポイント（[16:24](https://developer.apple.com/videos/play/wwdc2025/291/?time=984)）: `transactionIdentifier` の降順、limit 1 という指定は SQL の `ORDER BY ... DESC LIMIT 1` と等価で、O(log n) で最新 token を取得できます。これにより、起動のたびに履歴を全スキャンする無駄がなくなります。
+
+## 重要なヒント
+
+- **やること**: 既存の SwiftData app の中から「is-a」関係にあるモデル群を見つけ出し、サブクラスを導入する。
+  - なぜ価値があるか: 業務フィールドが増えていくほど、optional フィールドよりサブクラスのほうがドメインのセマンティクスを表現できますし、`if let perdiem` のような散在する nil チェックも不要になります。
+  - 始め方: 現在のモデルで optional かつ一部のインスタンスにしか意味を持たないフィールドを洗い出し、利用シーンごとにクラスタリングしてみましょう。それらがサブクラスの候補です。
+
+- **やること**: 「deep search vs shallow search」を継承導入の判断基準にする。
+  - なぜ価値があるか: 何でも継承にしてクエリ性能を悪化させるのを避けるためです。基底クラスからしかクエリしないなら、サブクラスではなくプロパティに格上げするべきですし、サブクラスからしかクエリしないなら、モデルをフラットに保つべきです。
+  - 始め方: コード中のすべての `@Query` と `FetchDescriptor` を見直し、基底クラスでのクエリとサブクラスでのクエリの比率を集計します。両方ともゼロでない場合に初めて、継承を検討する価値があります。
+
+- **やること**: V1 から最新版までを網羅した完全な `SchemaMigrationPlan` を整備する。
+  - なぜ価値があるか: ユーザーは必ずしもバージョン順にアップデートするとは限らず、2年前のバージョンから一気に最新版へジャンプする可能性もあります。stage が一段でも欠けると、データ消失やクラッシュにつながります。
+  - 始め方: `VersionedSchema` でリリースごとに `Schema.Version` を打ち、対応する `MigrationStage` を plan の `stages` 配列にきっちりつなげましょう。
+
+- **やること**: widget や share extension のような読み取り専用・低メモリのシーンでは `propertiesToFetch` + `fetchLimit` を使う。
+  - なぜ価値があるか: widget のメモリ予算は数十 MB しかないため、Trip を全件ロードすると OOM になりかねません。必要なカラムと直近の 1件だけを取得すれば、カードのレンダリングには十分です。
+  - 始め方: すべての `FetchDescriptor` を確認し、UI で表示するフィールドが限られているなら `propertiesToFetch` に書きます。件数の表示が必要な場合は `fetchLimit` も合わせて指定しましょう。
+
+## 関連セッション
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — Apple がホストする background assets を活用し、app のアイドル時間に大きなリソースを事前ダウンロードする
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — システムの Writing Tools に校正・書き換え・テキスト変換を統合する
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — App Store Server API でサブスクリプション、返金、サーバー通知を管理する
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — PermissionKit でコミュニケーション場面における子どもの安全性を強化する

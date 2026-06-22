@@ -1,0 +1,303 @@
+---
+title: "Explore Verifiable Health Records"
+description: "find out how you can securely request access to someone's verifiable health records and incorporate that data safely into your app. the health app helps people download, view, and share their health records, including their covid-19 immunization and test results — and ios 15 brings support for the smart health card, a verifiable health record that incorporates the fhir health data standard. we'll show you how your app can go about requesting access to this record and how you can verify the signature of the file using cryptokit and the issuer's public key."
+date: "2021-06-08"
+tags: ["Health & Fitness", "Privacy & Security"]
+thumbnail: "/images/sessions/2021/10089.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10089/"
+sessionId: "wwdc2021-10089"
+year: "2021"
+relatedSessions:
+  - title: "What's new in HealthKit"
+    code: "10001"
+    description: "discover the latest updates to healthkit, including new data types and features for ios 15."
+  - title: "Build a research and care app, part 1"
+    code: "10068"
+    description: "learn how researchkit and carekit can work together to build clinical research apps."
+  - title: "Handling FHIR without getting burned"
+    code: "10060"
+    description: "learn how to handle FHIR data in your app without running into common pitfalls."
+  - title: "Apple's privacy pillars in focus"
+    code: "10085"
+    description: "understand apple's approach to privacy and how to build privacy into your app."
+---
+## Highlight
+
+> iOS 15 allows Health Apps to store and share verifiable health records (Verifiable Health Records), based on the SMART Health Cards specification.Users can import vaccination records, test results and other credentials by scanning QR Codes or downloading files. These records are cryptographically signed and any third party can use CryptoKit to verify their authenticity.Developers can use`HKVerifiableClinicalRecordQuery`Ask users to share these records.
+
+## Core Content
+
+### What is a verifiable health record?
+
+（[00:23](https://developer.apple.com/videos/play/wwdc2021/10089/?time=23)）
+
+Verifiable health records are digital credentials issued by a medical issuer (e.g., hospital, laboratory) that contain:
+- Multiple FHIR resources (Patient resources + Clinical resources)
+- SMART Health Card format packaging
+- JSON Web Signature (JWS) cryptographic signature
+
+Differences from ordinary Health Records:
+- Signed by the issuer, anyone can verify authenticity
+- Only necessary information is included, data is minimized
+- Can be verified offline, no need to query the issuer server
+
+### Import method
+
+（[03:55](https://developer.apple.com/videos/play/wwdc2021/10089/?time=235)）
+
+Users can import in three ways:
+
+1. **Health Records Connect** (US, UK, Canada only)
+- Connect with health records-enabled medical institutions in the Health App
+- Automatically download verifiable records
+
+2. **Download file**
+- Open`.smart-health-cards`file extension
+- Health App automatically recognizes and imports
+
+3. **Scan QR Code**
+- Scan the SMART Health Card QR Code with your camera
+- Jump directly to the Health App import interface
+
+### HealthKit Access
+
+（[04:42](https://developer.apple.com/videos/play/wwdc2021/10089/?time=282)）
+
+Access to verifiable health records requires:
+1. `com.apple.developer.healthkit` entitlement
+2. **Verifiable Health Records** special entitlement
+3. Each query requires explicit authorization from the user
+
+The licensing model is different from traditional Health Records:
+- No need to apply for type permission in advance
+- An authorization sheet pops up every time a query is executed
+- Users choose which records to share specifically
+- Authorization is one-time and does not establish long-term access
+
+## Detailed Content
+
+### HKVerifiableClinicalRecordQuery
+
+（[04:47](https://developer.apple.com/videos/play/wwdc2021/10089/?time=287)）
+
+```swift
+import HealthKit
+
+// Create the query
+let recordTypes = ["https://smarthealth.cards#health-card",
+                   "https://smarthealth.cards#immunization"]
+let predicate = HKQuery.predicateForClinicalRecords(
+    with RelevantDateWithin: DateInterval(start: Date().addingTimeInterval(-7*86400),
+                                          end: Date())
+)
+
+let query = HKVerifiableClinicalRecordQuery(
+    recordTypes: recordTypes,
+    predicate: predicate
+) { query, records, error in
+
+    guard let records = records, !records.isEmpty else {
+        print("No records shared or error: \(error?.localizedDescription ?? "")")
+        return
+    }
+
+    // Handle records shared by the user
+    for record in records {
+        print("Issuer: \(record.issuer)")
+        print("JWS: \(record.jws)")
+    }
+}
+
+// Run the query (an authorization sheet appears)
+healthStore.execute(query)
+```
+
+Key points:
+- `recordTypes`Is a string array, specifying the record type to be queried
+- Only records containing all specified types will be displayed in the authorization sheet
+- `predicate`You can further filter the time range
+- An authorization sheet will pop up every time it is executed.
+
+### Parsing and validating JWS
+
+（[10:54](https://developer.apple.com/videos/play/wwdc2021/10089/?time=654)）
+
+```swift
+import CryptoKit
+import Combine
+
+// Define the JWS data structure
+struct SmartHealthCardJWS: Codable {
+    let header: JWSHeader
+    let payload: JWSPayload
+    let signature: Data
+
+    struct JWSHeader: Codable {
+        let alg: String       // signature algorithm
+        let kid: String       // public key ID
+        let zip: String?      // compression algorithm
+    }
+
+    struct JWSPayload: Codable {
+        let iss: String       // issuer URL
+        let nbf: Date         // not-before time
+        let exp: Date?        // expiration time
+        let vc: VerifiableCredential
+
+        struct VerifiableCredential: Codable {
+            let type: [String]
+            let credentialSubject: CredentialSubject
+
+            struct CredentialSubject: Codable {
+                let fhirVersion: String
+                let fhirBundle: FHIRBundle
+            }
+        }
+
+        struct FHIRBundle: Codable {
+            let resourceType: String
+            let entry: [Entry]
+
+            struct Entry: Codable {
+                let resource: FHIRResource
+            }
+        }
+    }
+
+    // Parse from compact serialization format
+    init(fromCompactSerialization string: String) throws {
+        let parts = string.split(separator: ".").map(String.init)
+        guard parts.count == 3 else {
+            throw NSError(domain: "JWSParsing", code: -1, userInfo: nil)
+        }
+
+        // Decode the Header
+        let headerData = Data(base64URLEncoded: parts[0]) ?? Data()
+        let headerDecoder = JSONDecoder()
+        header = try headerDecoder.decode(JWSHeader.self, from: headerData)
+
+        // Decode the Payload (possibly compressed)
+        let payloadData = Data(base64URLEncoded: parts[1]) ?? Data()
+        let decoderPayload: Data
+        if header.zip == "DEF" {
+            decoderPayload = try payloadData.decompressed(using: .deflate)
+        } else {
+            decoderPayload = payloadData
+        }
+
+        let payloadDecoder = JSONDecoder()
+        payload = try payloadDecoder.decode(JWSPayload.self, from: decoderPayload)
+
+        // Save the signature
+        signature = Data(base64URLEncoded: parts[2]) ?? Data()
+    }
+}
+
+// Verify the signature
+extension SmartHealthCardJWS {
+    func verifySignature() -> AnyPublisher<Bool, Error> {
+        // Get the issuer public key
+        let issuerURL = URL(string: payload.iss)!
+        let jwksURL = issuerURL.appendingPathComponent(".well-known/jwks.json")
+
+        return URLSession.shared.dataTaskPublisher(for: jwksURL)
+            .map(\.data)
+            .decode(type: JWKSResponse.self, decoder: JSONDecoder())
+            .map { jwks in
+                // Find the corresponding public key by kid
+                guard let jwk = jwks.keys.first(where: { $0.kid == self.header.kid }) else {
+                    throw NSError(domain: "JWSVerification", code: -2, userInfo: nil)
+                }
+
+                // Convert to a CryptoKit public key
+                let publicKey = try P256.Signing.PublicKey(x963Representation: jwk.toX963())
+
+                // Verify the signature
+                let signedData = (parts[0] + "." + parts[1]).data(using: .utf8)!
+                return publicKey.isValidSignature(self.signature, for: signedData)
+            }
+            .eraseToAnyPublisher()
+    }
+}
+
+// Usage example
+let jwsString = "..." // Get from HKVerifiableClinicalRecord.jws
+let jws = try SmartHealthCardJWS(fromCompactSerialization: jwsString)
+
+jws.verifySignature()
+    .sink { isValid in
+        print("Signature is valid: \(isValid)")
+    }
+    .store(in: &cancellables)
+```
+
+Key points:
+- JWS uses compact serialization format: header.payload.signature
+- Header specifies algorithm (ES256) and public key ID
+- Payload is compressed with DEFLATE and needs to be decompressed first
+- Public key from the issuer`.well-known/jwks.json`get
+- Using CryptoKit`P256.Signing.PublicKey`Verify signature
+
+### Data extraction
+
+（[13:36](https://developer.apple.com/videos/play/wwdc2021/10089/?time=816)）
+
+```swift
+// Extract vaccination information
+func extractImmunizations(from record: HKVerifiableClinicalRecord) -> [Immunization] {
+    guard let jwsData = record.jws.data(using: .utf8),
+          let jws = try? SmartHealthCardJWS(fromCompactSerialization: jwsData) else {
+        return []
+    }
+
+    var immunizations: [Immunization] = []
+
+    for entry in jws.payload.vc.fhirBundle.entry {
+        if let resource = entry.resource as? ImmunizationResource {
+            immunizations.append(Immunization(
+                vaccine: resource.vaccineCode,
+                date: resource.occurrenceDateTime,
+                manufacturer: resource.manufacturer
+            ))
+        }
+    }
+
+    return immunizations
+}
+```
+
+Key points:
+- FHIR Bundle contains multiple resources
+- Each resource has a corresponding resourceType field
+- See Handling FHIR without getting burned session to learn more
+
+## Core Takeaways
+
+### 1. Integrate health credential verification in medical and health apps
+
+If your app involves vaccinations or test result verification, you can use verifiable health records instead of paper certificates or simple photo uploads.Users share verified credentials directly from the Health App, no additional photos are required.
+
+How to get started: Integration`HKVerifiableClinicalRecordQuery`, triggering queries on pages that require verification of health credentials.After user authorization, extract the specific information you need (such as vaccine type, vaccination date).
+
+### 2. Build a health certificate issuance system
+
+If your organization is a healthcare organization, you can become an issuer of SMART Health Cards.The issuance process includes:
+1. Build FHIR resources
+2. Package into SMART Health Card
+3. Sign with the organization’s private key
+4. Generate QR Code or file for users to download
+
+How to get started: Refer to the SMART Health Cards specification and use CryptoKit to implement the signature logic.Ensure private keys are stored securely in the HSM and public keys are published to`.well-known/jwks.json`。
+
+### 3. Protect user privacy in non-medical apps
+
+Even if your app is not medical, it may still be exposed to users’ health information.Using verifiable health records is more privacy-friendly than collecting sensitive data directly—users control what information is shared, and each share is a one-time use.
+
+How to start: If the app involves health-related scenarios (e.g. gym, insurance), don’t directly collect users’ medical records.Guide users to share verifiable records from the Health App, with the App reading only the necessary fields.
+
+## Related Sessions
+
+- [What's new in HealthKit](/articles/wwdc2021-10001) — All updates to HealthKit in iOS 15
+- [Build a research and care app, part 1](/articles/wwdc2021-10068) — Build a clinical research app using ResearchKit and CareKit
+- [Handling FHIR without getting burned](/articles/wwdc2021-10060) — Best practices for correct handling of FHIR data
+- [Apple's privacy pillars in focus](/articles/wwdc2021-10085) — Technical implementation of Apple’s four privacy pillars

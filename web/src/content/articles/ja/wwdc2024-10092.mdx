@@ -1,0 +1,211 @@
+---
+title: "Render Metal with passthrough in visionOS"
+description: "get ready to extend your metal experiences for visionos. learn best practices for integrating your rendered content with people"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10092.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10092/"
+sessionId: "wwdc2024-10092"
+year: "2024"
+relatedSessions:
+  - title: "Bring your iOS or iPadOS game to visionOS"
+    code: "10093"
+    description: "discover how to transform your ios or ipados game into a uniquely visionos exper"
+  - title: "Create custom environments for your immersive apps in visionOS"
+    code: "10087"
+    description: "discover how to create visually rich and performant customized app environments "
+  - title: "Create enhanced spatial computing experiences with ARKit"
+    code: "10100"
+    description: "learn how to create captivating immersive experiences with arkit"
+  - title: "Design interactive experiences for visionOS"
+    code: "10096"
+    description: "learn how you can design a compelling interactive narrative experience for apple"
+---
+
+## ハイライト
+
+> 昨年の visionOS 1 では Metal レンダリングは Full Immersion モード（現実環境を完全に遮る）のみサポートしていました。今年は Mixed Immersion モードが追加され、ユーザーは現実環境と仮想コンテンツを同時に見られます。この Session は Pooya によるもので、3 つのコア技術ポイントに焦点を当てます。
+
+---
+
+## 主要内容
+
+visionOS 1 では、Compositor Services + Metal + ARKit で独自レンダリングパイプラインを構築する開発者は Full Immersion のみ実行可能でした。現実環境は完全に遮られ、ユーザーは仮想世界しか見えません。ゲームや映像体験では問題ありませんが、仮想オブジェクトと現実環境の共存が必要な場面は多数あります。デスク上に 3D モデルを置く、仮想ボールを現実のテーブルと衝突させる、指で仮想オブジェクトを直接掴む。Full Immersion ではこれらはすべて不可能です。
+
+visionOS 2 で Mixed Immersion モードが追加されました。`.immersionStyle(selection: $style, in: .mixed, .full)` に `.mixed` を追加すると、Metal レンダリングコンテンツが passthrough 映像と合成されます。Compositor Services が color/depth texture をカメラ映像とブレンドし、ARKit が scene understanding データを提供して仮想オブジェクトを現実世界に固定します。開発者はレンダリングパイプラインの出力色と深度値がシステム規約に合致することを確認するだけです。
+
+Session は 3 つの技術ポイントを展開します。レンダリングブレンド（clear color、pre-multiplied alpha、reverse Z）、空間配置（scene-aware projection matrix）、trackable anchor prediction（デバイスアンカーと手のアンカーを異なるタイムスタンプでクエリし、遅延誤差を低減）。
+
+---
+
+## 詳細
+
+### 1. Mixed Immersion のレンダリング規約
+
+Mixed Immersion を有効にするには SwiftUI の ImmersiveSpace でスタイルを宣言します（[03:07](https://developer.apple.com/videos/play/wwdc2024/10092/?time=187)）:
+
+```swift
+@main
+struct MyApp: App {
+    var body: some Scene {
+        ImmersiveSpace {
+            CompositorLayer(configuration: MyConfiguration()) { layerRenderer in
+                 let engine = my_engine_create(layerRenderer)
+                 let renderThread = Thread {
+                     my_engine_render_loop(engine)
+                 }
+                 renderThread.name = "Render Thread"
+                 renderThread.start()
+            }
+            .immersionStyle(selection: $style, in: .mixed, .full)
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `.immersionStyle(selection:in:)` で `.mixed` と `.full` を同時宣言し、実行時に切り替え可能
+- `CompositorLayer` は Metal レンダリングのエントリポイント。ここで `layerRenderer` を取得し、独自レンダースレッドを起動
+- アプリ起動時から Mixed Immersion に入る場合、Info.plist で `InitialImmersionStyle` を `UIImmersionStyleMixed`、`PreferredDefaultSceneSessionRole` を `CPSceneSessionRoleImmersiveApplication` に設定
+
+Mixed Immersion では clear color は全ゼロである必要があります（[04:43](https://developer.apple.com/videos/play/wwdc2024/10092/?time=283)）:
+
+```swift
+let renderPassDescriptor = MTLRenderPassDescriptor()
+
+renderPassDescriptor.colorAttachments[0].texture = drawable.colorTextures[0]
+renderPassDescriptor.colorAttachments[0].loadAction = .clear
+renderPassDescriptor.colorAttachments[0].storeAction = .store
+renderPassDescriptor.colorAttachments[0].clearColor = .init(red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0)
+
+renderPassDescriptor.depthAttachment.texture = drawable.depthTextures[0]
+renderPassDescriptor.depthAttachment.loadAction = .clear
+renderPassDescriptor.depthAttachment.storeAction = .store
+renderPassDescriptor.depthAttachment.clearDepth = 0.0
+```
+
+キーポイント:
+
+- Full Immersion の clear color は `(0, 0, 0, 1)`（不透明黒）、Mixed Immersion は `(0, 0, 0, 0)`（完全透明）
+- alpha が 0 のピクセルは画面に表示されない。Compositor Services の合成ルールは alpha > 0 かつ depth が有効な場合のみ描画
+- depth は reverse Z 規約を使用し、clearDepth は 0.0（最遠）
+- alpha が 0 のピクセルの depth も 0.0 にすべき。システム合成パフォーマンスが向上
+
+色について、visionOS の合成パイプラインは pre-multiplied alpha と Display P3 カラースペースを使用。shader 出力前に RGB に alpha を乗算。アセットも Display P3 空間で制作し、仮想コンテンツと passthrough 映像の色を一致させる。
+
+### 2. Upper Limb Visibility（上肢の可視性）
+
+Mixed Immersion ではユーザーの手と仮想コンテンツが同時に視野に現れます。`.upperLimbVisibility()` 修飾子で手の可視性戦略を制御（[09:08](https://developer.apple.com/videos/play/wwdc2024/10092/?time=548)）:
+
+```swift
+@main
+struct MyApp: App {
+    var body: some Scene {
+        ImmersiveSpace {
+            CompositorLayer(configuration: MyConfiguration()) { layerRenderer in
+                 let engine = my_engine_create(layerRenderer)
+                 let renderThread = Thread {
+                     my_engine_render_loop(engine)
+                 }
+                 renderThread.name = "Render Thread"
+                 renderThread.start()
+            }
+            .immersionStyle(selection: $style, in: .mixed, .full)
+            .upperLimbVisiblity(.automatic)
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `.visible`：手は常に仮想コンテンツの前面にレンダリングされ、depth を無視
+- `.hidden`：手は常に仮想コンテンツに遮られる
+- `.automatic`：Compositor Services が提出した depth texture に基づき自動判断。物体の前方なら手が見え、後方ならフェードアウト
+
+### 3. Scene-aware Projection Matrix
+
+今年 `computeProjection()` API が追加され、カメラ内部パラメータとリアルタイム scene understanding 要素を組み合わせた投影行列を返します。Mixed Immersion を使用するアプリはこの新 API を使う必要があります（[13:37](https://developer.apple.com/videos/play/wwdc2024/10092/?time=817)）:
+
+```swift
+func renderLoop {
+    //...
+
+    let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: presentationTime)
+    drawable.deviceAnchor = deviceAnchor
+
+    for viewIndex in 0...drawable.views.count {
+        let view = drawable.views[viewIndex]
+        let originFromDevice = deviceAnchor?.originFromAnchorTransform
+        let deviceFromView = view.transform
+        let viewMatrix = (originFromDevice * deviceFromView).inverse
+        let projection = drawable.computeProjection(normalizedDeviceCoordinatesConvention:
+                                                    .rightUpBack,
+                                                    viewIndex: viewIndex)
+
+        let projectionViewMatrix = projection * viewMatrix;
+
+        //...
+    }
+}
+```
+
+キーポイント:
+
+- `originFromDevice` は ARKit の `queryDeviceAnchor` から取得。原点座標系でのデバイス変換
+- `deviceFromView` は Compositor Services の `view.transform` から
+- viewMatrix = `(originFromDevice * deviceFromView).inverse`、原点からの観察行列
+- `computeProjection` の NDC 規約は `.rightUpBack`（X 右、Y 上、Z 後）を渡す必要がある。Compositor Services が期待する規約
+- 毎フレーム再クエリが必要。旧フレームの変換行列をキャッシュしない
+
+### 4. Trackable Anchor Prediction
+
+trackable anchor（手のトラッキングなど）で仮想コンテンツを配置する場合、デバイスアンカーと trackable アンカーを異なるタイムスタンプでクエリし、予測誤差を低減します（[18:27](https://developer.apple.com/videos/play/wwdc2024/10092/?time=1107)）:
+
+```swift
+func renderFrame() {
+    //...
+
+    // Get the trackable anchor and presentation time.
+    let presentationTime = drawable.frameTiming.presentationTime
+    let trackableAnchorTime = drawable.frameTiming.trackableAnchorTime
+
+    // Convert the timestamps into units of seconds
+    let devicePredictionTime = LayerRenderer.Clock.Instant.epoch.duration(to:    presentationTime).timeInterval
+    let anchorPredictionTime = LayerRenderer.Clock.Instant.epoch.duration(to:    trackableAnchorTime).timeInterval
+
+    let deviceAnchor = worldTracking.queryDeviceAnchor(atTimestamp: devicePredictionTime)
+    let leftAnchor = handTracking.handAnchors(at: anchorPredictionTime)
+
+    if (leftAnchor.isTracked) {
+        //...
+    }
+```
+
+キーポイント:
+
+- `presentationTime`：フレームが画面に表示される時刻。デバイスアンカーのクエリに使用
+- `trackableAnchorTime`：カメラが環境を捉えた時刻。trackable アンカー（手など）のクエリに使用
+- 2 つの時刻は異なる。カメラサンプリングと画面表示の間に遅延があり、trackable anchor には `trackableAnchorTime` を使うと約 1 フレームの予測誤差を低減
+- 非クリティカルな計算（物理シミュレーションなど）を先に完了し、optimal input time 以降にアンカーをクエリすると予測精度が向上
+- trackable anchor に依存しない静的物体（テーブル上のブロックなど）は `presentationTime` でデバイスアンカーをクエリするだけで十分
+
+---
+
+## 重要ポイント
+
+1. **Mixed Immersion の 3D ツール系アプリを作る**：passthrough でユーザーが現実のデスク上に 3D モデルを配置・操作。手のインタラクションは `.automatic` 可視性モード。価値がある理由：Mixed Immersion は Full Immersion よりハードルが低く、ユーザーは現実から完全に遮断されずに使用できる。始め方：Compositor Layer テンプレートから出発し、`.mixed` immersionStyle を設定、ARKit の plane anchor でモデルをデスクに固定。
+
+2. **trackable anchor prediction で手の掴みインタラクションを実装**：仮想オブジェクトが手の位置に追従する場合、`presentationTime` ではなく `trackableAnchorTime` で手のアンカーをクエリし、約 1 フレームの遅延を低減。価値がある理由：手で物体を掴むシーンは遅延に極めて敏感。1 フレーム分の誤差を減らすだけで体験が「使える」から「使いやすい」に変わる。始め方：レンダーループの update 段階で `frameTiming.trackableAnchorTime` と `frameTiming.presentationTime` を使い、手とデバイスのアンカーを別々にクエリ。
+
+3. **既存の Full Immersion Metal プロジェクトを Mixed Immersion に移行**：チェックリスト——clear color を全ゼロに、shader 出力を pre-multiplied alpha に、depth を reverse Z にし alpha=0 ピクセルの depth=0、upper limb visibility 戦略を選択。価値がある理由：Mixed Immersion の制約を満たせば、同じレンダリングパイプラインで両モードをサポートし、ユーザーが必要に応じて切り替え可能。始め方：まず clear color を変更、次に各 shader の alpha 出力を確認、最後に SwiftUI で `.mixed` スタイルと `.upperLimbVisibility(.automatic)` を宣言。
+
+---
+
+## 関連セッション
+
+- [Bring your iOS or iPadOS game to visionOS](/articles/wwdc2024-10093) — iOS/iPadOS ゲームを visionOS に移行する完全ガイド
+- [Create custom environments for your immersive apps in visionOS](/articles/wwdc2024-10087) — イマーシブ App 用カスタム環境の作成
+- [Create enhanced spatial computing experiences with ARKit](/articles/wwdc2024-10100) — 空間コンピューティングにおける ARKit の深い応用
+- [Design interactive experiences for visionOS](/articles/wwdc2024-10096) — visionOS 上のインタラクティブナラティブ体験の設計

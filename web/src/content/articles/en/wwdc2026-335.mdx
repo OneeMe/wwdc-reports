@@ -1,0 +1,529 @@
+---
+title: "Improve your prompts by hill-climbing with Evaluations"
+description: "Learning"
+date: "2026-06-10"
+tags: []
+thumbnail: "/images/sessions/2026/335.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/335/"
+sessionId: "wwdc2026-335"
+year: "2026"
+relatedSessions:
+  - title: "298. Evaluations overview"
+    code: "298"
+    description: "An introduction to the Evaluations framework and building evaluation pipelines"
+  - title: "299. Create robust evaluations"
+    code: "299"
+    description: "Create robust evaluations that cover more use cases"
+  - title: "241. Foundation Models"
+    code: "241"
+    description: "Apple Foundation Models capabilities and model selection"
+  - title: "324. Core AI"
+    code: "324"
+    description: "The Core AI framework and model integration"
+  - title: "242. Agentic apps"
+    code: "242"
+    description: "Tool-calling design for agentic apps"
+---
+
+## Highlight
+
+> Optimizing AI features starts by using Cohen's kappa to calibrate agreement between the model judge and human experts. Once the evaluation ruler is accurate, you can iterate on the business prompt with confidence.
+
+## Core Content
+
+When integrating AI features into an app, one common problem is that the generated result looks acceptable, but something feels wrong and it is hard to say exactly why.
+
+Apple's Book Tracker app faced this issue. The app lets readers record book reviews and automatically generates tags for books so they can be searched and browsed later. But generated tags often had two problems: either they turned a reader's personal reaction, such as "poignant", into a book tag, or they extracted phrases directly from the review, such as "quiet-steadiness", which are useless for retrieval.
+
+A developer's first instinct may be to modify the tag-generation prompt directly. That creates two problems. First, after changing the prompt, how do you objectively know whether the result improved? Second, even if the tag-generation prompt improves, the "model judge" evaluating those tags may itself be a crooked ruler: its scoring criteria may not match human experts.
+
+Apple's solution is hill-climbing: build an evaluation pipeline, change one variable at a time, and let evaluation results guide the next improvement. But effective hill-climbing depends on a reliable evaluation tool.
+
+This introduces the problem of judge alignment. When the dataset is small, scoring differences between human experts and the model judge may not be obvious. As the dataset grows, that drift can become larger and eventually make evaluation results untrustworthy.
+
+The tricky part is that the traditional accuracy metric fails here. If 80% of samples in the dataset are high-quality outputs, both human experts and the model judge tend to give high scores. Even if the model is guessing, accuracy can look high. That hides disagreement between their scoring standards.
+
+Apple introduces Cohen's kappa to solve this. This statistic subtracts the probability of agreement by random chance from raw accuracy, giving a truer view of agreement between two raters. Only when kappa reaches 0.6 or above can the model judge be considered meaningfully aligned with human experts.
+
+Judge calibration is itself a hill-climbing process: modify the judge prompt, add detailed descriptions of scoring dimensions, provide few-shot examples, and change one variable at a time while using kappa to judge the result. Once the judge is calibrated, it can evaluate improvements to the product feature, such as adding tool calling so the model can retrieve more context.
+
+This methodology turns AI feature optimization from "prompt alchemy by feel" into a measurable scientific experiment.
+
+## Details
+
+### Basic components of the Evaluations framework
+
+[03:54](https://developer.apple.com/videos/play/wwdc2026/335/?time=234)
+
+The core of the Evaluations framework is the `Evaluation` protocol. A complete evaluation consists of four components:
+
+**Dataset**: provides test samples. Each sample includes input and expected output.
+
+**Subject**: calls the feature being evaluated through `subject(from:)` and obtains model output.
+
+**Evaluators**: define how output quality is judged, including heuristic evaluators and model-judge evaluators.
+
+**Aggregation**: computes metrics such as means and standard deviations through `aggregateMetrics`.
+
+```swift
+struct BookTaggingEvaluation: Evaluation {
+    func subject(from sample: ModelSample<BookTags>) async throws -> ModelSubject<BookTags> {
+        let result = try await BookTaggingService.generateTags(for: sample.promptDescription)
+        return ModelSubject(value: result)
+    }
+
+    var dataset = ArrayLoader(samples:
+        Book.sampleBooks.map { book in
+            ModelSample(prompt: book.review, expected: BookTags(tags: book.tags))
+        }
+    )
+
+    var evaluators: Evaluators {
+        // Heuristic evaluator
+        Evaluator { _, subject in
+            let count = subject.value.tags.count
+            if (count >= 3 && count <= 8) {
+                return tagCount.passing(rationale: "\(count) tags")
+            }
+            return tagCount.failing(rationale: "Got \(count) tags, expected 3-8")
+        }
+        // ... More evaluators
+    }
+
+    func aggregateMetrics(using aggregator: inout MetricsAggregator) {
+        aggregator.group("Heuristics") { group in
+            group.computeMean(of: tagCount)
+        }
+    }
+}
+```
+
+**Key points**:
+- `dataset` is a `Loader` type. It can be an array, a JSON file, or another data source.
+- The `subject` method is async and can call APIs or local models.
+- `evaluators` can include multiple evaluators, each returning different metrics.
+- `aggregateMetrics` can group metrics for reporting.
+
+### Precise design of scoring dimensions
+
+[04:05](https://developer.apple.com/videos/play/wwdc2026/335/?time=245)
+
+`ScoreDimension` defines standards for qualitative evaluation. Avoid vague descriptions and state what each score level means.
+
+```swift
+let relevance = ScoreDimension(
+    "Relevance",
+    description: """
+        Whether each tag describes the book itself: genre, subject, tone, or setting,
+        rather than the reader's reaction, metacommentary on the review, or facts about the author.
+        A book can be "suspenseful" (a textual property),
+        while a reader can be "exhausted" (a reader reaction).
+        The wrong type of tag is a serious failure.
+        """,
+    scale: .numeric([
+        4: "Every tag describes the book itself",
+        3: "Most tags describe the book, with one picking up a reader reaction or minor detail",
+        2: "Most tags are surface details or personal reactions, not book descriptors",
+        1: "The tags do not meaningfully describe the book"
+    ])
+)
+
+let usefulness = ScoreDimension(
+    "Usefulness",
+    description: """
+        Whether the tags can work as category labels on a bookshelf:
+        broad enough for multiple books to share,
+        yet specific enough to narrow search.
+        Standard genre and theme tags are valid; invented phrases, character names,
+        overly specific descriptors, and generic words such as "interesting" are not.
+        """,
+    scale: .numeric([
+        4: "Every tag can group multiple books while still narrowing search",
+        3: "Most tags are at the right level, with one too broad or too narrow",
+        2: "Most tags are too broad to filter or too narrow to group",
+        1: "The tags are not useful for browsing"
+    ])
+)
+```
+
+**Key points**:
+- `description` should clearly define what is good and what is bad.
+- `scale` is a numeric scale from 1 to 4, with a concrete description for each score.
+- Dimension names are in English, while descriptions can be localized.
+- Avoid subjective words such as "interesting" or "powerful".
+
+### Cohen's kappa judge-alignment evaluation
+
+[12:31](https://developer.apple.com/videos/play/wwdc2026/335/?time=751)
+
+To verify whether the model judge agrees with human experts, create a dedicated evaluation. Its dataset comes from outputs of a previous evaluation run and includes model-generated tags plus manually assigned expert scores.
+
+```swift
+struct BookTagJudgmentCalibration: Evaluation {
+    static let samples: [ModelSample<BookTagJudgmentValue>] = {
+        guard let url = Bundle(for: BundleToken.self).url(
+                forResource: "BookTaggingEvaluation-extracted", withExtension: "json"),
+              let data = try? Data(contentsOf: url) else { return [] }
+        // Build the ModelSample array from JSON, including expert scores
+        // ...
+    }()
+
+    var dataset: some Loader { ArrayLoader(samples: Self.samples) }
+
+    func subject(from sample: ModelSample<BookTagJudgmentValue>) async throws -> ModelSubject<BookTagJudgmentValue> {
+        // Tags have already been generated, so return them directly
+        ModelSubject(value: sample.expected ?? BookTagJudgmentValue(
+            tags: [], expertRelevanceScore: 0, expertUsefulnessScore: 0))
+    }
+
+    var evaluators: Evaluators {
+        ModelJudgeEvaluator(
+            judge: .default,
+            dimensions: [relevance, usefulness],
+            prompt: ModelJudgePrompt(
+                instructions: "You are evaluating tags automatically generated for Book Tracker...",
+                evaluationTarget: { output in output.tags.joined(separator: ", ") },
+                reference: { input, _ in
+                    ["Expected Tags": input.expected?.tags.joined(separator: ", ") ?? ""]
+                }
+            )
+        )
+    }
+}
+```
+
+**Key points**:
+- The dataset comes from JSON attachments of a previous evaluation and includes expert scores.
+- The `subject` method does not need to regenerate tags; it returns the already generated results.
+- Use the same `relevance` and `usefulness` dimensions.
+- The target of evaluation is whether the model judge's scores agree with expert scores.
+
+### Custom aggregation for Cohen's kappa
+
+[13:00](https://developer.apple.com/videos/play/wwdc2026/335/?time=780)
+
+During aggregation, calculate Cohen's kappa to quantify alignment:
+
+```swift
+func aggregateMetrics(using aggregator: inout MetricsAggregator) {
+    let expertRelevance = Self.samples.map { Double($0.expected?.expertRelevanceScore ?? 0) }
+    let expertUsefulness = Self.samples.map { Double($0.expected?.expertUsefulnessScore ?? 0) }
+
+    aggregator.group("Relevance") { group in
+        group.computeMean(of: relevance.metric)
+        group.computeStandardDeviation(of: relevance.metric)
+        group.custom(of: relevance.metric, label: "Relevance Alignment Score") { judge in
+            cohensKappa(ratings1: expertRelevance, ratings2: judge) ?? 0
+        }
+    }
+    aggregator.group("Usefulness") { group in
+        group.computeMean(of: usefulness.metric)
+        group.computeStandardDeviation(of: usefulness.metric)
+        group.custom(of: usefulness.metric, label: "Usefulness Alignment Score") { judge in
+            cohensKappa(ratings1: expertUsefulness, ratings2: judge) ?? 0
+        }
+    }
+}
+```
+
+**Key points**:
+- Extract expert scores from the samples as the baseline.
+- Use the `custom` method to add a custom aggregate metric.
+- Cohen's kappa ranges from -1 to 1; values above 0.6 indicate meaningful agreement.
+- Use `?? 0` to handle a possible nil return value.
+
+### Judge calibration tests
+
+[13:24](https://developer.apple.com/videos/play/wwdc2026/335/?time=804)
+
+Use Swift Testing to write a test that verifies the alignment score meets the threshold:
+
+```swift
+@Suite("Book Tag Judge Calibration")
+struct BookTagJudgmentCalibrationTests {
+    static let evaluation = BookTagJudgmentCalibration()
+
+    @Test("Judge Calibration", .evaluates(evaluation))
+    func evaluateJudgeCalibration() async throws {
+        let result = EvaluationContext.current.result
+
+        let usefulnessMetric = BookTagJudgmentCalibrationTests.evaluation.usefulness.metric
+        let relevanceMetric = BookTagJudgmentCalibrationTests.evaluation.relevance.metric
+
+        #expect(result.aggregateValue(.custom(label: "Relevance: Judge vs Expert")) > 0.6)
+        #expect(result.aggregateValue(.custom(label: "Usefulness: Judge vs Expert")) > 0.6)
+    }
+}
+```
+
+**Key points**:
+- Use the `.evaluates(evaluation)` annotation to attach the evaluation configuration.
+- Access evaluation results through `EvaluationContext.current.result`.
+- Use `#expect` to assert that alignment scores exceed 0.6.
+- A failing test means the judge needs further calibration.
+
+### Iteratively improving the judge prompt
+
+[16:33](https://developer.apple.com/videos/play/wwdc2026/335/?time=993)
+
+Calibrating the judge is also hill-climbing: create a control group and an experimental group, then change one variable at a time.
+
+The control group uses the original prompt; the experimental group uses a more detailed prompt:
+
+```swift
+struct BookTagJudgmentCalibrationExperimental: Evaluation {
+    var evaluators: Evaluators {
+        ModelJudgeEvaluator(
+            judge: .default,
+            dimensions: [relevance, usefulness],
+            prompt: ModelJudgePrompt(
+                instructions: """
+                    You are an experienced reader and librarian,
+                    evaluating tags automatically generated for Book Tracker...
+                    Score the tag set on two independent dimensions: relevance and usefulness.
+
+                    ## What good tags look like
+                    - Genre/form, subject/theme, tone/mood, setting/period
+
+                    ## Common failure modes
+                    - Reader reactions, metacommentary, author facts, genre contradictions
+                    """,
+                evaluationTarget: { output in output.tags.joined(separator: ", ") },
+                reference: { input, _ in
+                    ["Book Review": input.promptDescription,
+                     "Tags Generated for the Review": input.expected?.tags.joined(separator: ", ") ?? ""]
+                }
+            )
+        )
+    }
+}
+```
+
+**Key points**:
+- Provide more context and tell the judge its role and task.
+- Explicitly list the traits of "good tags" and "bad tags".
+- Keep the evaluation target and reference information format consistent.
+- Run the control and experimental groups together in the test suite.
+
+### Few-shot example calibration
+
+[20:12](https://developer.apple.com/videos/play/wwdc2026/335/?time=1212)
+
+When descriptive prompts are still not enough, provide a few worked examples so the model can learn the scoring pattern:
+
+```swift
+struct ExperimentalBookTagJudgmentCalibration: Evaluation {
+    var evaluators: Evaluators {
+        ModelJudgeEvaluator(
+            judge: SystemLanguageModel(),
+            dimensions: [relevance, usefulness],
+            prompt: ModelJudgePrompt(
+                instructions: """
+                    You are calibrating with an expert librarian who scored tags
+                    automatically generated for Book Tracker...
+                    Your goal is to match the librarian's scoring style. Use the worked examples for calibration.
+
+                    ## Worked examples
+                    ### Example A - Perfect match (Pride and Prejudice)
+                    Tags: romance, historical-fiction, love, redemption, passion
+                    Librarian score: Relevance 4, Usefulness 4
+
+                    ### Example E - Clear genre contradiction (Frankenstein)
+                    Tags: horror, science-fiction, ... self-help, self-improvement
+                    Librarian score: Relevance 2, Usefulness 3
+                    """,
+                evaluationTarget: { output in output.tags.joined(separator: ", ") },
+                reference: { input, _ in
+                    ["Book Review": input.promptDescription,
+                     "Tags Generated for the Review": input.expected?.tags.joined(separator: ", ") ?? ""]
+                }
+            )
+        )
+    }
+}
+```
+
+**Key points**:
+- Examples should cover different cases, including perfect matches, obvious failures, and edge cases.
+- Keep the number of examples small to avoid overfitting.
+- Each example should include input, output, and expert score.
+- Keep example formatting consistent so the model can understand the pattern.
+
+### Tool calling and comparative evaluation
+
+[22:03](https://developer.apple.com/videos/play/wwdc2026/335/?time=1323)
+
+After the judge is calibrated, use it to evaluate improvements to the product feature, such as adding tool calling:
+
+```swift
+struct BookLookupTool: Tool {
+    let name = "lookupBook"
+    let description = "Look up the book title and author from distinguishing details extracted from the reader's review, such as character names, setting, quoted lines, or key plot points."
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Distinguishing details extracted from the review, used to identify the book, such as character names, setting, quoted lines, or key plot points.")
+        var details: String
+    }
+
+    @Generable
+    struct Output {
+        @Guide(description: "The identified book title, or an empty string if there is no match.")
+        var title: String
+
+        @Guide(description: "The identified book author, or an empty string if there is no match.")
+        var author: String
+    }
+
+    func call(arguments: Arguments) async throws -> Output {
+        let needles = arguments.details
+            .lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { $0.count >= 4 }
+
+        let best = Book.sampleBooks
+            .map { book -> (book: Book, score: Int) in
+                let review = book.review.lowercased()
+                let score = needles.reduce(0) { partial, needle in
+                    partial + (review.contains(needle) ? 1 : 0)
+                }
+                return (book, score)
+            }
+            .max(by: { $0.score < $1.score })
+
+        guard let match = best, match.score > 0 else {
+            return Output(title: "", author: "")
+        }
+        return Output(title: match.book.title, author: match.book.author)
+    }
+}
+```
+
+**Key points**:
+- The tool name should be descriptive so the model knows when to call it.
+- `description` should clearly explain the tool's purpose and the source of its input.
+- `Arguments` and `Output` use `@Generable` and `@Guide` to help the model understand the schema.
+- The `call` method is async and can execute arbitrary logic.
+
+[22:36](https://developer.apple.com/videos/play/wwdc2026/335/?time=1356)
+
+Modify the business service to support tools:
+
+```swift
+struct BookTaggingService {
+    static func generateTags(for review: String, tools: [any Tool] = []) async throws -> BookTags {
+        let prompt = tagsPrompt(review: review)
+        let session = LanguageModelSession(
+            model: SystemLanguageModel(guardrails: .permissiveContentTransformations),
+            tools: tools,
+            instructions: instructions
+        )
+        let response = try await session.respond(to: prompt, generating: BookTags.self)
+        return response.content
+    }
+}
+```
+
+[22:57](https://developer.apple.com/videos/play/wwdc2026/335/?time=1377)
+
+Create an evaluation with the tool and compare it with the original evaluation:
+
+```swift
+struct BookTaggingWithLookupEvaluation: Evaluation {
+    func subject(from sample: ModelSample<BookTags>) async throws -> ModelSubject<BookTags> {
+        let result = try await BookTaggingService.generateTags(
+            for: sample.promptDescription,
+            tools: [BookLookupTool()]
+        )
+        return ModelSubject(value: result)
+    }
+    // ... Dataset, evaluators, and aggregation are the same as BookTaggingEvaluation
+}
+```
+
+[23:09](https://developer.apple.com/videos/play/wwdc2026/335/?time=1389)
+
+Compare the two evaluations in the test suite:
+
+```swift
+@Suite("Book Tag Evaluations")
+struct BookTagEvaluationTests {
+    static let evaluation = BookTaggingEvaluation()
+    static let lookupEvaluation = BookTaggingWithLookupEvaluation()
+
+    @Test("Book Tag Evaluations", .evaluates(evaluation, info: evaluationInfo))
+    func evaluateBookTagging() async throws {
+        let result = EvaluationContext.current.result
+        let rangeMetric = BookTagEvaluationTests.evaluation.tagCount
+        let dupeMetric = BookTagEvaluationTests.evaluation.noDuplicates
+        #expect(result.aggregateValue(.mean(of: rangeMetric)) >= 0.8)
+        #expect(result.aggregateValue(.mean(of: dupeMetric)) == 1)
+    }
+
+    @Test("Book Tag Evaluations (with BookLookupTool)", .evaluates(lookupEvaluation, info: lookupEvaluationInfo))
+    func evaluateBookTaggingWithLookup() async throws {
+        let result = EvaluationContext.current.result
+        let rangeMetric = BookTagEvaluationTests.lookupEvaluation.tagCount
+        let dupeMetric = BookTagEvaluationTests.lookupEvaluation.noDuplicates
+        #expect(result.aggregateValue(.mean(of: rangeMetric)) >= 0.8)
+        #expect(result.aggregateValue(.mean(of: dupeMetric)) == 1)
+    }
+}
+```
+
+**Key points**:
+- The two evaluations share the same dataset and evaluators.
+- Only the `subject` method differs: one passes no tools, the other passes a tool.
+- Xcode's evaluation report can show both evaluation results side by side.
+- Score differences reveal the impact of tool calling.
+
+## Core Takeaways
+
+**1. Add evaluation pipelines for generative AI features**
+
+What to build: any feature that uses an LLM to generate content should have an evaluation pipeline. First define metrics such as tag count, relevance, and usefulness. Then collect 50 to 100 real samples and manually annotate expected outputs.
+
+Why it is worth doing: without an evaluation pipeline, every prompt or model change can only be judged by feel. Evaluation makes iteration quantitative and helps pinpoint whether the problem is "output format is wrong" or "content quality declined".
+
+How to start: implement the `Evaluation` protocol, wrap sample data with `ModelSample`, write `Evaluator` checks for key metrics, and register them with Swift Testing through `@Test(.evaluates)`. Entry point: `Evaluation` protocol plus `ModelSample` plus `Evaluator`.
+
+**2. Calibrate the model judge before optimizing the business prompt**
+
+What to build: before modifying the product prompt, verify that the model judge is reliable. Have human experts score a subset of samples and compute Cohen's kappa.
+
+Why it is worth doing: if the judge itself is a crooked ruler, its scores cannot guide improvement. Accuracy hides disagreement in scoring standards, while Cohen's kappa subtracts the probability of agreement by chance and gives a truer alignment measure.
+
+How to start: extract samples and expert scores from existing evaluation run results, build a `BookTagJudgmentCalibration` evaluation, compute kappa in aggregation with the `custom` method, and assert that the score exceeds 0.6. Entry point: `custom` aggregation plus `cohensKappa(ratings1:expert, ratings2:judge)`.
+
+**3. Iterate with controlled variables**
+
+What to build: change one variable at a time, such as the prompt, scoring dimension, or tool calling, and use evaluation comparison to determine the effect.
+
+Why it is worth doing: if multiple variables change at once, you cannot know which change caused the effect. Controlled-variable iteration makes causality clear, and Xcode's comparison view can show control and experimental scores side by side.
+
+How to start: create control and experimental `Evaluation` structs that share the dataset and evaluators, with only the `subject` method different. Run both in the test suite and compare aggregate metrics. Entry point: paired control/experimental `Evaluation` plus Xcode comparison view.
+
+**4. Monitor evaluation drift**
+
+What to build: as the dataset grows, regularly recompute Cohen's kappa and include judge-calibration tests in CI/CD.
+
+Why it is worth doing: as datasets expand, scoring differences between the model judge and human experts can become more obvious. Automated monitoring catches drift early and avoids making product decisions from a failed evaluation.
+
+How to start: use `#expect` in Swift Testing to assert that kappa stays above the threshold, and add the test to CI. Run calibration automatically whenever the dataset changes. Entry point: `#expect(result.aggregateValue(.custom(label: "Relevance: Judge vs Expert")) > 0.6)`.
+
+**5. Improve judge alignment with few-shot examples**
+
+What to build: when descriptive prompts are still insufficient, give the judge model a small number of worked examples so it can learn the expert's scoring pattern.
+
+Why it is worth doing: some scoring standards are hard to express precisely in words, but a few concrete examples can help the model understand quickly. Examples covering perfect matches, obvious failures, and edge cases can be more effective than a long description.
+
+How to start: add a "Worked examples" section to the `ModelJudgePrompt` instructions. Each example should include input, output, and expert score. Keep the example count small, around 3 to 5, to avoid overfitting. Entry point: `ModelJudgePrompt(instructions: "## Worked examples\n...")`.
+
+## Related Sessions
+
+- [298. Evaluations overview](/articles/wwdc2026-298) - An introduction to the Evaluations framework and building evaluation pipelines
+- [299. Create robust evaluations](/articles/wwdc2026-299) - Create robust evaluations that cover more use cases
+- [241. Foundation Models](/articles/wwdc2026-241) - Apple Foundation Models capabilities and model selection
+- [324. Core AI](/articles/wwdc2026-324) - The Core AI framework and model integration
+- [242. Agentic apps](/articles/wwdc2026-242) - Tool-calling design for agentic apps

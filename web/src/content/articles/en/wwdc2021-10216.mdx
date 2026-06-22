@@ -1,0 +1,535 @@
+---
+title: "ARC in Swift: Basics and beyond"
+description: "learn about the basics of object lifetimes and arc in swift. dive deep into what language features make object lifetimes observable, consequences of relying on observed object lifetimes and some safe techniques to fix them."
+date: "2021-06-06"
+tags: ["Swift", "ARC", "Memory Management"]
+thumbnail: "/images/sessions/2021/10216.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10216/"
+sessionId: "wwdc2021-10216"
+year: "2021"
+relatedSessions:
+  - title: "What‘s new in Swift"
+    code: "10192"
+    description: "Introducing Swift 5.5's language updates, Swift packages, async/await, structured concurrency, and actors."
+  - title: "Detect and diagnose memory issues"
+    code: "10180"
+    description: "Diagnose memory performance issues and regressions using Xcode, MetricKit, and XCTest."
+  - title: "Swift concurrency: Behind the scenes"
+    code: "10254"
+    description: "Explains the Swift concurrency runtime, task model, cooperative thread pools, and performance considerations."
+  - title: "Protect mutable state with Swift actors"
+    code: "10133"
+    description: "Isolate mutable state and reduce concurrent data races with Swift actors."
+---
+## Highlight
+
+> Apple explains how Swift Automatic Reference Counting (ARC) manages object lifetimes based on last use, and gives safe ways to write weak/unowned references, withExtendedLifetime(), API redesign, and remove deinit side effects to avoid hidden memory errors.
+
+## Core Content
+
+Swift classes are reference types. one`Traveler`Objects can be`traveler1`and`traveler2`Point at the same time. The developer writes a normal assignment, and the compiler inserts it behind the scenes.`retain`and`release`。
+
+The trouble starts with "when will the object be released?" Swift's object lifecycle is based on usage. The minimum guaranteed life cycle starts from initialization and ends with the last use. It is not guaranteed to live until the closing curly brace.
+
+Most code doesn't care about this detail. The result is the same if the object is released earlier or later.
+
+The problem arises in two places. First,`weak`and`unowned`References make the lifecycle observable. Once the object is released,`weak`It is read as`nil`，`unowned`Access will trap. second,`deinit`Can have side effects, such as printing logs, publishing metrics, and writing global state. The timing of side effects can affect the outcome of the procedure.
+
+What Apple did in this session was very straightforward: first explain the minimum guarantee of ARC, then show which language features will expose the life cycle, and finally give three types of repair methods. The lightweight way is`withExtendedLifetime()`. A more stable way is to change the API so that external objects can only be accessed through strong references. The most radical way is to avoid reference rings, or put`deinit`Side effects are moved to explicit methods.
+
+## Detailed Content
+
+### Minimum guarantee of ARC: the object lives until the last use
+
+([01:49](https://developer.apple.com/videos/play/wwdc2021/10216/?time=109)) ARC (Automatic Reference Counting) is driven by the Swift compiler. compiler insertion`retain`and`release`. After the runtime reference count reaches zero, the object can be released.
+
+```swift
+final class Traveler {
+    var name: String
+    var destination: String?
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+func test() {
+    let traveler1 = Traveler(name: "Lily")
+    let traveler2 = traveler1
+    traveler2.destination = "Big Sur"
+    print("Done traveling")
+}
+
+test()
+```
+
+Key points:
+- `final class Traveler`Define a reference type and the instance will be placed on the heap.
+-`name`It is a common storage attribute used to identify travelers.
+-`destination`Is an optional string that demonstrates object state changes.
+-`init(name:)`Set when creating the object`name`, the object's initial reference count is 1.
+-`traveler1`is the first strong reference.
+-`traveler2 = traveler1`Copy reference, two constants point to the same object.
+-`traveler2.destination = "Big Sur"`yes`traveler2`of last use.
+-`print("Done traveling")`Not used again`Traveler`Object, ARC allows the object to be released before or near it, depending on the release inserted by the compiler.
+
+The key fact about this code is that Swift guarantees that the object lives at least until its last use. The observed release point may be later because ARC optimizations change retain/release locations.
+
+### Reference cycle: two strong references will prevent the object from being released forever.
+
+([06:37](https://developer.apple.com/videos/play/wwdc2021/10216/?time=397)) After adding a points account in the travel app,`Traveler`point to`Account`，`Account`Point back again`Traveler`. If there are strong references on both sides and the reference counts of the two objects are still not 0 after the function ends, a memory leak occurs.
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func printSummary() {
+        if let account = account {
+            print("\(name) has \(account.points) points")
+        }
+    }
+}
+
+final class Account {
+    var traveler: Traveler
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+    traveler.printSummary()
+}
+
+test()
+```
+
+Key points:
+- `Traveler.account`It is a strong reference, because ordinary class attributes have a strong reference to the object by default.
+-`Account.traveler`Also a strong quote.
+-`Account(traveler: traveler, points: 1000)`Let the account hold travelers.
+-`traveler.account = account`Let travelers hold accounts.
+-`test()`After it ends, the local constant disappears, but the two objects still hold each other.
+- ARC only looks at the reference count and will not automatically identify and break this cycle.
+
+### weak reference: breaks the cycle and also exposes the life cycle
+
+([09:05](https://developer.apple.com/videos/play/wwdc2021/10216/?time=545)) A common fix is ​​to use it on one side of the ring`weak`。`weak`Does not participate in reference counting. After the referenced object is released, the Swift runtime will read the weak reference into`nil`。
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func printSummary() {
+        if let account = account {
+            print("\(name) has \(account.points) points")
+        }
+    }
+}
+
+final class Account {
+    weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+    traveler.printSummary()
+}
+
+test()
+```
+
+Key points:
+- `weak var traveler: Traveler?`No increase`Traveler`reference count.
+-`weak`The property must be able to indicate that the object no longer exists, so it is an optional type here.
+-`Traveler`Still a strong hold`Account`。
+- `Account`No longer forced to hold`Traveler`, the reference loop is broken.
+-`traveler.printSummary()`Traveler is accessed through strong reference, and the object lifetime is guaranteed during the call.
+
+This code shows the correct use of weak: to break reference loops. It does not treat weak references as the primary access path.
+
+### Access objects through weak: optional binding can only hide problems
+
+([10:05](https://developer.apple.com/videos/play/wwdc2021/10216/?time=605)) If`printSummary()`move to`Account`on, it will be accessed through weak reference`Traveler`. The speech pointed out that this code may print successfully today, but that is only the observed lifetime (observed lifetime) is just long enough. After compiler optimization,`Traveler`May be calling`account.printSummary()`Has been released before.
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+final class Account {
+    weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+
+    func printSummary() {
+        print("\(traveler!.name) has \(points) points")
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+    account.printSummary()
+}
+
+test()
+```
+
+Key points:
+- `Account.printSummary()`pass`traveler!`Access weak references.
+-`traveler.account = account`yes`traveler`of last use.
+-`account.printSummary()`When called,`Traveler`The minimum guaranteed life cycle has ended.
+- if`Traveler`released,`traveler`It is read as`nil`。
+- `traveler!`right`nil`Force unpacking will cause a crash.
+
+([11:14](https://developer.apple.com/videos/play/wwdc2021/10216/?time=674)) Changing forced unpacking to optional binding will turn the crash into a silent skip.
+
+```swift
+final class Account {
+    weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+
+    func printSummary() {
+        if let traveler = traveler {
+            print("\(traveler.name) has \(points) points")
+        }
+    }
+}
+```
+
+Key points:
+- `if let traveler = traveler`will be referenced in weak as`nil`Skip printing.
+- Code doesn't break, and tests may have a harder time finding problems.
+- The business results are still wrong because the summary is not output.
+- session classifies this situation as a silent bug.
+
+### withExtendedLifetime(): Explicitly extend the object life cycle
+
+([11:45](https://developer.apple.com/videos/play/wwdc2021/10216/?time=705)) Provided by Swift`withExtendedLifetime()`. It can extend the object life cycle until the end of the closure and prevent weak references from becoming`nil`。
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+final class Account {
+    weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+
+    func printSummary() {
+        if let traveler = traveler {
+            print("\(traveler.name) has \(points) points")
+        }
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+
+    withExtendedLifetime(traveler) {
+        account.printSummary()
+    }
+}
+
+test()
+```
+
+Key points:
+- `withExtendedLifetime(traveler)`Tell the compiler to extend`traveler`life cycle.
+- Called within a closure`account.printSummary()`。
+- `Account.printSummary()`When reading a weak reference,`Traveler`Still alive.
+- This approach requires the developer to remember all dangerous call points.
+- The talk calls it a brittle solution and maintenance costs will grow with the code base.
+
+### More stable design: only allow access to objects through strong references
+
+([12:55](https://developer.apple.com/videos/play/wwdc2021/10216/?time=775)) A better fix is ​​to reclass the API. Bundle`printSummary()`put back`Traveler`,Bundle`Account`Internal weak references are hidden. The caller can only access Traveler via a strong reference.
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func printSummary() {
+        if let account = account {
+            print("\(name) has \(account.points) points")
+        }
+    }
+}
+
+final class Account {
+    private weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+    traveler.printSummary()
+}
+
+test()
+```
+
+Key points:
+- `private weak var traveler`Prevent external code from using weak references as access points.
+-`Traveler.printSummary()`pass`self`read`name`, the current method call holds a strong reference.
+-`account.points`Only account data is read, there is no need to read travelers in reverse.
+- API forces callers to use`traveler.printSummary()`.
+- Lifecycle correctness is guaranteed by type design, reducing artificial memory.
+
+### Avoid reference loops: extract shared information
+
+([14:20](https://developer.apple.com/videos/play/wwdc2021/10216/?time=860)) The more thorough way given in the speech is to re-model.`Account`All that is needed is the traveler’s personal information, and it is not necessary to hold the entire`Traveler`. Take a cut of personal information`PersonalInfo`Finally, the relationship changes from a ring to a tree.
+
+```swift
+final class PersonalInfo {
+    var name: String
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+final class Traveler {
+    var info: PersonalInfo
+    var account: Account?
+
+    init(info: PersonalInfo) {
+        self.info = info
+    }
+}
+
+final class Account {
+    var info: PersonalInfo
+    var points: Int
+
+    init(info: PersonalInfo, points: Int) {
+        self.info = info
+        self.points = points
+    }
+}
+
+func test() {
+    let info = PersonalInfo(name: "Lily")
+    let traveler = Traveler(info: info)
+    let account = Account(info: info, points: 1000)
+    traveler.account = account
+    print("\(account.info.name) has \(account.points) points")
+}
+
+test()
+```
+
+Key points:
+- `PersonalInfo`save`name`, becomes a small shareable object.
+-`Traveler`hold`PersonalInfo`and optional`Account`。
+- `Account`hold the same`PersonalInfo`, no need to hold`Traveler`。
+- `traveler.account = account`Only one-way relationships are formed.
+- There are no weak references, and the entry point for life cycle errors disappears.
+
+### deinit side effects: release time affects external results
+
+（[15:23](https://developer.apple.com/videos/play/wwdc2021/10216/?time=923)）`deinit`Will run before the object is released. It can print, publish indicators, and write global status. These side effects make object release time observable.
+
+```swift
+final class Traveler {
+    var name: String
+    var destination: String?
+
+    init(name: String) {
+        self.name = name
+    }
+
+    deinit {
+        print("\(name) is deinitializing")
+    }
+}
+
+func test() {
+    let traveler1 = Traveler(name: "Lily")
+    let traveler2 = traveler1
+    traveler2.destination = "Big Sur"
+    print("Done traveling")
+}
+
+test()
+```
+
+Key points:
+- `deinit`Executed before the object is released.
+-`print("\(name) is deinitializing")`are externally visible side effects.
+-`traveler2.destination = "Big Sur"`is the last time the object was used.
+-`print("Done traveling")`Objects are not used.
+-`deinit`may be in`Done traveling`Run before and after, the code cannot rely on this order.
+
+([19:08](https://developer.apple.com/videos/play/wwdc2021/10216/?time=1148)) A more stable approach is to change the publishing behavior from`deinit`Move it to an explicit method and use`defer`Guaranteed to be called when leaving scope.`deinit`Just do verification.
+
+```swift
+final class TravelMetrics {
+    let id: UInt
+    var destinations = [String]()
+    var category: String?
+    var published = false
+
+    init(id: UInt) {
+        self.id = id
+    }
+
+    func computeTravelInterest() {
+        category = destinations.contains("Big Sur") ? "Nature" : nil
+    }
+
+    func publish() {
+        published = true
+        print("id: \(id), count: \(destinations.count), category: \(category ?? "nil")")
+    }
+}
+
+final class Traveler {
+    var name: String
+    var destination: String?
+    private var travelMetrics: TravelMetrics
+
+    init(name: String, id: UInt) {
+        self.name = name
+        self.travelMetrics = TravelMetrics(id: id)
+    }
+
+    func updateDestination(_ destination: String) {
+        self.destination = destination
+        travelMetrics.destinations.append(destination)
+    }
+
+    func publishAllMetrics() {
+        travelMetrics.computeTravelInterest()
+        travelMetrics.publish()
+    }
+
+    deinit {
+        assert(travelMetrics.published)
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily", id: 1)
+    defer { traveler.publishAllMetrics() }
+    traveler.updateDestination("Big Sur")
+    traveler.updateDestination("Catalina")
+}
+
+test()
+```
+
+Key points:
+- `TravelMetrics`Save destination, category and whether it has been published.
+-`computeTravelInterest()`Calculate classification based on recorded destinations.
+-`publish()`Publish the indicator explicitly and put`published`set to`true`。
+- `Traveler.updateDestination(_:)`Update the destination while recording the metrics.
+-`publishAllMetrics()`Put calculation and publishing in normal methods.
+-`defer { traveler.publishAllMetrics() }`ensure`test()`Publish indicators before exiting.
+-`deinit`It only checks whether the indicator has been released and does not assume the responsibility for business release.
+
+([19:50](https://developer.apple.com/videos/play/wwdc2021/10216/?time=1190)) Xcode 13 adds experimental build settings`Optimize Object Lifetimes`. When turned on, the Swift compiler shortens object lifetimes more aggressively, bringing the observed lifetime closer to the minimum guaranteed lifetime. This may expose previously hidden weak/unowned or deinit ordering errors.
+
+```swift
+// Xcode 13 Build Settings
+// Optimize Object Lifetimes: Yes
+```
+
+Key points:
+- This is the build setting for the Swift compiler.
+- Once opened, objects are more often released immediately after their last use.
+- Code that relies on observed lifetime is more likely to expose problems.
+- The repair directions are still the above three categories: extending the life cycle, changing the API, and removing deinit side effects.
+
+## Core Takeaways
+
+- **What to do**: Perform a weak/unowned access audit on existing projects.
+  - **Why it's worth doing**: Session points out that weak/unowned makes the life cycle observable, and optional binding may turn errors into silent skips.
+  - **How ​​to get started**: Search`weak var`、`unowned`、`!`and`if let`, focus on checking the code that initiates business behavior through weak references, change the entry to a strong reference method or use`withExtendedLifetime()`Wrap critical calls.
+
+- **What to do**: Change the logic of publishing indicators when the object is destroyed to explicit submission.
+  - **Why it's worth doing**: The order of deinit side effects is unstable, and the compiler may release uncalculated data in advance after optimization.
+  - **How ​​to start**: Put`deinit { publish() }`Change to`publishAllMetrics()`, used on the caller`defer { object.publishAllMetrics() }`Guaranteed to be executed before exiting,`deinit`only keep`assert(published)`。
+
+- **What**: Refactor model objects that hold each other.
+  - **Why is it worth doing**: The reference loop needs to be broken by weak, and weak brings life cycle observation problems. The speech suggested first thinking about whether the loop can be avoided.
+  - **How ​​to start**: Draw the holding relationship between classes, find the data that both parties need, and extract it`PersonalInfo`This type of shared value or small object makes the relationship a one-way structure.
+
+- **What**: Open in CI or local debug configuration`Optimize Object Lifetimes`.
+  - **Why it's worth doing**: This setting will shorten the object lifetime more stably and help expose hidden errors that depend on observed lifetime in advance.
+  - **How ​​to get started**: Enable Experimental in Build Settings in Xcode 13`Optimize Object Lifetimes`, focusing on running tests covering weak/unowned and deinit release logic.
+
+- **What to do**: Write minimal regression tests for memory leaks.
+  - **Why it's worth it**: Reference cycles allow objects to survive after local references disappear. The problem is often ignored when functionality is normal.
+  - **How ​​to start**: Create and release objects for models that are prone to loops, and use the Xcode memory tool or XCTest memory to check whether the recorded objects are released as expected; after discovering loops, change the data structure first, and then consider`weak`。
+
+## Related Sessions
+
+- [What’s new in Swift](/articles/wwdc2021-10192) — Learn about language updates in Swift 5.5, as well as entry points to async/await, structured concurrency, and actors.
+- [Detect and diagnose memory issues](/articles/wwdc2021-10180) — Learn to find memory issues and performance regressions with Xcode, MetricKit, and XCTest.
+- [Swift concurrency: Behind the scenes](/articles/wwdc2021-10254) — Understand how the Swift compiler and runtime affect program behavior through tasks, thread pools, and optimizations.
+- [Protect mutable state with Swift actors](/articles/wwdc2021-10133) — Continue to learn Swift’s safe design from the perspective of shared mutable state.

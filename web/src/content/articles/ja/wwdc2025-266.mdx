@@ -1,0 +1,129 @@
+---
+title: "Explore concurrency in SwiftUI"
+description: "discover how swiftui leverages swift concurrency to build safe and responsive apps. explore how swiftui uses the main actor by default and offloads work to other actors. learn how to interpret concurr"
+date: 2026-06-10
+tags: ["SwiftUI", "Swift"]
+thumbnail: "/images/sessions/2025/266.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/266/"
+sessionId: "wwdc2025-266"
+year: "2025"
+relatedSessions:
+  - title: "Bring Swift Charts to the third dimension"
+    code: "313"
+    description: "learn how to bring your 2d swift charts to the third dimension with chart3d and "
+  - title: "Build an AppKit app with the new design"
+    code: "310"
+    description: "update your appkit app to take full advantage of the new design system. we"
+  - title: "Create icons with Icon Composer"
+    code: "361"
+    description: "learn how to use icon composer to make updated app icons for ios, ipados, macos,"
+  - title: "Elevate the design of your iPad app"
+    code: "208"
+    description: "make your app look and feel great on ipados. learn best practices for designing "
+---
+
+## Highlight
+
+> SwiftUI の `View` プロトコルは標準で `@MainActor` 隔離が付与されており、`Shape.path(in:)`、`visualEffect`、`Layout`、`onGeometryChange` などの API のクロージャは `@Sendable` としてマークされ、SwiftUI がバックグラウンドスレッドにスケジューリングして実行します。
+
+## 核心となる内容
+
+Data race は SwiftUI の長年のユーザーにとって最もなじみ深いトラブルの種です。アニメーションのカクつき、状態の不整合、さらにはデータの欠損まで引き起こします。Swift 6 以前は、開発者が経験と注意深さを頼りに、どのコードがメインスレッドで動くのか、どれがそうでないのかを自分で判断するしかありませんでした。一度書き間違えると、バグはほぼランタイムでしか再現できないという厄介さがありました。
+
+Daniel は「カラー抽出 app」を題材に、SwiftUI が Swift concurrency 体系のなかでどう位置づけられているかを 3 つのステーションに分けて解説していきます。第 1 ステーションは Main Actor Meadows です。`View` プロトコル自体に `@MainActor` が付いているため、開発者が書く struct、`body`、`@State` はすべて標準でメインスレッド上にあり、`@Observable` の model にも手動でアノテーションを付ける必要はありません。第 2 ステーションは Concurrency Cliffs です。`Shape.path(in:)`、`visualEffect`、`Layout` プロトコルのメソッド、`onGeometryChange` といった API について、SwiftUI は能動的にクロージャをバックグラウンドスレッドへ送って計算します。これらの引数が `@Sendable` としてマークされているのはそのためで、コンパイラが代わりに data race を検出してくれます。第 3 ステーションは Camp です。なぜ Button の action が同期クロージャなのか、その理由が説明されます。長時間処理の前後で UI 状態を切り替える（たとえばローディングアニメーションの表示）には同期で発火する必要があり、async 関数内の `await` は suspension を導入してしまうため、次フレームの描画タイミングを逃しかねないからです。
+
+## 詳細な内容
+
+このセッションは全体を通して `ColorExtractorView` という view を中心に展開されます（[02:45](https://developer.apple.com/videos/play/wwdc2025/266/?time=165)）。
+
+```swift
+struct ColorExtractorView: View {
+    @State private var model = ColorExtractor()
+
+    var body: some View {
+        ImageView(
+            imageName: model.imageName,
+            isLoading: model.isExtracting
+        )
+        EqualWidthVStack {
+            ColorSchemeView(
+                isLoading: model.isExtracting,
+                colorScheme: model.scheme,
+                extractCount: Int(model.colorCount)
+            )
+            .onTapGesture {
+                guard !model.isExtracting else { return }
+                withAnimation { model.isExtracting = true }
+                Task {
+                    await model.extractColorScheme()
+                    withAnimation { model.isExtracting = false }
+                }
+            }
+            Slider(value: $model.colorCount, in: 3...10, step: 1)
+                .disabled(model.isExtracting)
+        }
+    }
+}
+```
+
+ポイントは以下の通りです。
+
+- `View` プロトコルが `@MainActor` を宣言しているため、`ColorExtractorView` は conformance によって `@MainActor` 隔離が推論され、`body` も `@State` もメインスレッド上で動きます。
+- `model` のインスタンスは view 宣言内の `@State` で生成されており、Swift が自動的に `@MainActor` 隔離に取り込んでくれます。そのため `@Observable` class である `ColorExtractor` に個別のアノテーションは不要です。
+- タップジェスチャ内では `withAnimation` で同期的にローディング状態へ切り替え、`Task` で async コンテキストに入って `extractColorScheme()` を呼び出し、結果が返ってきたら同期的に元の状態に戻します。このクロージャも同様に `@MainActor` を継承します。
+
+バックグラウンドスレッドの入口は次のような形です（[08:26](https://developer.apple.com/videos/play/wwdc2025/266/?time=506)）。
+
+```swift
+struct SchemeContentView: View {
+    let isLoading: Bool
+    @State private var pulse: Bool = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .scaleEffect(isLoading ? 1.5 : 1)
+
+            VStack {
+                Text(isLoading ? "Please wait" : "Extract")
+            }
+            .visualEffect { [pulse] content, _ in
+                content
+                    .blur(radius: pulse ? 2 : 0)
+            }
+            .onChange(of: isLoading) { _, newValue in
+                withAnimation(newValue ? kPulseAnimation : nil) {
+                    pulse = newValue
+                }
+            }
+        }
+    }
+}
+```
+
+ポイントは以下の通りです。
+
+- `visualEffect` のクロージャには `@Sendable` が付いており、SwiftUI はバックグラウンドスレッドからこれを呼び出す可能性があります。狙いは、頻度の高いビジュアル計算をメインスレッドから引き剥がすことです（[11:12](https://developer.apple.com/videos/play/wwdc2025/266/?time=672)）。
+- クロージャ内で `pulse` を読みたい場合、直接 `pulse` と書くと `self.pulse` と等価になり、コンパイラがエラーを出します。`self` は `@MainActor` の `View` であり、それを非隔離なクロージャに渡したうえで `@MainActor` プロパティへアクセスすると data race のチェックに引っかかるためです。
+- 解決策はキャプチャリスト `[pulse]` を使ってコピーを取ることです。`Bool` は値型かつ sendable なので、クロージャ内ではそのローカルコピーだけを読めば、もう `self` には依存しません。これでアクター越しのアクセスを回避できます（[15:52](https://developer.apple.com/videos/play/wwdc2025/266/?time=952)）。
+
+第 3 ステーションでは、なぜ非同期な状態変更を view 内に直接書くべきではないのかが解説されます（[19:15](https://developer.apple.com/videos/play/wwdc2025/266/?time=1155)）。`await` は suspension point を挿入するため、ランタイムは任意の長さで処理を中断したのち再開できます。再開のタイミングではすでにそのフレームの deadline を過ぎているかもしれず、結果としてアニメーションがジェスチャに追従しません。Daniel が推奨するのは、state を橋渡しに使う方法です。state が `Task` を発火し、async の処理が終わったら同期代入で state を更新し、UI は `@Observable` を介して自動で反応するという形です。view 側のコードはあくまで同期のままになります。副次的なメリットとして、async ロジックを view から切り離せるため、ユニットテストで SwiftUI を import しなくても動かせるようになります（[23:48](https://developer.apple.com/videos/play/wwdc2025/266/?time=1428)）。
+
+## 核となる気づき
+
+1. **`@MainActor` のデフォルトを信じる**。Swift 6.2 の新しい language mode では、module 全体に暗黙的に `@MainActor` が付与されます。既存 app をアップグレードする際はまずこれを有効化し、view 層に手書きされている `@MainActor` を削除してみるとよいでしょう。冗長なアノテーションが大量に消える可能性が高いです。
+
+2. **クロージャに外部の値が必要なら、まずキャプチャリストでコピーを取る**。`@Sendable` クロージャ内で `self.someState` にアクセスしてコンパイルエラーが出たときの第一の選択肢は `[someState]` であって、プロパティを `nonisolated` に変えることではありません。前者は必要なデータだけを複製しますが、後者はデータ安全性の責任を自分で背負い込むことになります。
+
+3. **async ロジックを view の外に追い出し、state でブリッジする**。view には同期的な state の読み書きだけを置き、長時間処理は model や manager に任せ、結果は `@Observable` 経由の同期的な mutation として返ってきます。view 内の `Task` の役割は「model に UI イベントを通知すること」だけにとどめ、`Task` 内でタイミングに敏感な UI 変更を行うのは避けましょう。
+
+4. **アニメーションに関わる state 変更は必ず同期で発火する**。`withAnimation { isLoading = true }` は `onTapGesture` のような同期 callback に書くべきで、`await` の後ろに置いてはいけません。`await` の後ろの再開タイミングは制御できず、フレーム deadline を逃す可能性があります。
+
+5. **`Mutex` でカスタム class を sendable にする**。並行タスク間で参照型を共有せざるを得ない場合は、`Synchronization.Mutex` が Apple 公式ドキュメントで推奨されている手段で、自前で lock を書くより堅実です。
+
+## 関連 Session
+
+- [Embracing Swift concurrency](/articles/wwdc2025-268) — Swift concurrency モデルの入門ガイドで、本 session でも前提として何度も参照されています。
+- [Elevate an app with Swift concurrency](/articles/wwdc2025-270) — 重い処理をメインスレッドからどう降ろすかを扱った内容で、本 session の Concurrency Cliffs と合わせて読むのがおすすめです。
+- [What's new in SwiftUI](/articles/wwdc2025-256) — SwiftUI 2025 の新機能の総覧で、本 session で取り上げられた `onScrollVisibilityChange` などの API も含まれます。
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — 同じく `@Observable` の model と `@State` で async 処理をブリッジする実践例です。

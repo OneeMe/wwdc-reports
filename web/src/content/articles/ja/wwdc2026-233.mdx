@@ -1,0 +1,306 @@
+---
+title: "MLX による分散推論と分散トレーニングを探る"
+description: "MLX による分散推論と分散トレーニングを探る"
+date: "2026-06-10"
+tags: ["MLX", "分散推論", "分散トレーニング", "Apple Silicon", "RDMA", "JACCL"]
+thumbnail: "/images/sessions/2026/233.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/233/"
+sessionId: "wwdc2026-233"
+year: "2026"
+relatedSessions:
+  - title: "セッション 232：MLX を使って Mac 上でローカルのエージェント AI を動かす"
+    code: "232"
+    description: "単一マシンでローカル AI Agent を動かす入門であり、このセッションの分散機能と合わせて全体像が完成する"
+  - title: "セッション 328：MLX Swift"
+    code: "328"
+    description: "Swift で MLX を使うための詳細ガイド。分散推論を App に組み込みたい開発者に適している"
+  - title: "セッション 324：Core AI"
+    code: "324"
+    description: "Apple プラットフォームの AI 中核フレームワークの概観。MLX がエコシステム全体のどこに位置するかを理解する"
+  - title: "セッション 241：Foundation Models"
+    code: "241"
+    description: "Apple の基盤モデルの設計思想。大規模モデルをローカルで動かす重要性が増している理由を理解する"
+---
+
+## ハイライト
+
+> Apple は macOS 26.2 で Thunderbolt 5 経由の RDMA をサポートしました。オープンソース通信ライブラリ JACCL と MLX を組み合わせることで、数台の Mac をクラスタ化し、兆パラメータ級の大規模モデルをローカルで実行できます。推論と微調整は約 3 倍高速になり、クラウドサーバーは不要です。
+
+## 主要内容
+
+### 1 台の Mac では大規模モデルを動かしきれなくなった
+
+ローカル大規模モデルの進化は速く、モデルはより大きく、より高性能になっています。開発者はそれらを使い、より長いコンテキストや複雑なタスクを処理するようになりました。しかし、メモリ、計算能力、帯域幅はいずれ上限にぶつかります。M3 Ultra 1 台で動かせるモデルにも限界があり、さらに大きいモデルはそもそも載りません。
+
+WWDC26 の session 232 では、MLX を使って 1 台の Mac 上でローカル AI Agent を動かす方法が示されました。では、机の上に複数台の Mac がある場合、それらを接続して負荷を分散できるのでしょうか。
+
+この講演は、そのための完全な道筋を示しています。
+
+### ハードウェアからソフトウェアまでのフルスタック解
+
+Apple はフレームワーク層の高レベル抽象だけを作ったわけではありません。最下層の通信プロトコルから構築しています。
+
+（[02:29](https://developer.apple.com/videos/play/wwdc2026/233/?time=149)）macOS 26.2 から、Thunderbolt 5 経由の RDMA、つまり Remote Direct Memory Access がサポートされます。RDMA はデータを 1 台のマシンのメモリから別のマシンのメモリへ直接移動し、CPU と OS の多くのオーバーヘッドを迂回します。その結果、マシン間通信は高帯域かつ低遅延になります。
+
+（[03:17](https://developer.apple.com/videos/play/wwdc2026/233/?time=197)）RDMA だけでは不十分です。分散プログラムには、より高レベルの通信プリミティブが必要です。Apple は JACCL、Just Another Collective Communication Library をオープンソース化しました。これは RDMA over Thunderbolt を基盤に、マシン間のデータ送信や結果集約などの集合通信操作を提供します。JACCL は機械学習に限定されず、Apple Silicon 上のあらゆる分散負荷で使えます。
+
+（[03:57](https://developer.apple.com/videos/play/wwdc2026/233/?time=237)）最上位層が MLX です。MLX は JACCL を使って低遅延の分散通信を行い、クラスタ上の分散タスクを編成するツールを提供します。
+
+### 4 台の M3 Ultra をクラスタにする
+
+（[04:22](https://developer.apple.com/videos/play/wwdc2026/233/?time=262)）講演では 4 台の M3 Ultra を使って、完全な手順が実演されました。
+
+最初のステップはトポロジーの選択です。JACCL は 2 種類をサポートします。
+
+- **Mesh（フル接続）**：各マシンが他のすべてのマシンに直接つながります。遅延が最も低く、頻繁な通信が必要な場面に適しています。
+- **Ring（リング）**：各マシンは 2 つの隣接ノードだけに接続します。ポートとケーブルを節約でき、複数のケーブルで単一リンクの帯域を増やせるため、大きなメッセージ転送に適しています。
+
+（[06:46](https://developer.apple.com/videos/play/wwdc2026/233/?time=406)）JACCL はメッセージサイズと操作種別に応じて最適なトポロジーを自動選択します。小さなメッセージは mesh で遅延を下げ、大きなメッセージは ring で帯域を高めます。
+
+次のステップは RDMA の有効化です。システム設定で "RDMA" を検索し、"Enable RDMA over Thunderbolt" をオンにして再起動します。
+
+（[07:59](https://developer.apple.com/videos/play/wwdc2026/233/?time=479)）3 つ目のステップは、`mlx.launch` で分散タスクを起動することです。これは SSH で各マシンに接続して実行ファイルを起動し、その後はすべてのマシンが Thunderbolt リンクを通じて直接通信します。
+
+`mlx.launch` にはクラスタを記述する hostfile が必要です。MLX はそれを自動生成する `mlx.distributed_config` ツールを提供します。
+
+```bash
+mlx.distributed_config \
+    --hosts m3-ultra-0,m3-ultra-1,m3-ultra-2,m3-ultra-3 \
+    --output "m3-ultra-jaccl.json" \
+    --env MLX_METAL_FAST_SYNCH=1 \
+    --auto-setup \
+    --backend jaccl
+```
+
+要点：
+- `--hosts`：クラスタ内のすべてのマシンのホスト名。
+- `--output`：生成される hostfile のパス。
+- `--env MLX_METAL_FAST_SYNCH=1`：より高速な GPU-CPU 同期を有効にする。分散タスクでは計算が GPU、通信が CPU で行われるため、同期速度が重要になる。
+- `--auto-setup`：Thunderbolt Bridge を自動で無効化し、RDMA を設定する。
+- `--backend jaccl`：mesh トポロジーを使う。`jaccl-ring` を指定すると ring トポロジーになる。
+
+スクリプトはまず SSH 接続性を確認し、次に Thunderbolt ポートを調べて物理接続関係を検出し、最後に JSON hostfile を出力します。
+
+### 分散推論：1 つのコマンドでクラスタを動かす
+
+（[10:39](https://developer.apple.com/videos/play/wwdc2026/233/?time=639)）クラスタが準備できると、MLX LM で分散推論を動かす操作はほぼ単一マシンと同じくらい簡単です。
+
+単一マシン推論：
+
+```bash
+mlx_lm.chat --model "Qwen/Qwen3.6-27B" --max-tokens 2048
+```
+
+分散推論：
+
+```bash
+mlx.launch --hostfile "m3-ultra-jaccl.json" -- \
+    /remote/path/to/mlx_lm.chat --model "Qwen/Qwen3.6-27B" --max-tokens 2048
+```
+
+（[12:21](https://developer.apple.com/videos/play/wwdc2026/233/?time=741)）講演では、Qwen 3.6、270 億パラメータのモデルを単一マシンと 4 台クラスタで比較しました。クラスタの token 生成速度は単一マシンの約 3 倍に近づきました。
+
+（[13:18](https://developer.apple.com/videos/play/wwdc2026/233/?time=798)）理由は速度だけではありません。一部のモデルは大きすぎて 1 台には入りません。Kimi 2.6 は 1 兆パラメータで、8-bit 量子化後の重みは約 1TB です。1 台の M3 Ultra には入りませんが、4 台なら収まります。
+
+### Pipeline 並列と Tensor 並列
+
+MLX は 2 種類のモデル分割戦略をサポートします。
+
+（[13:47](https://developer.apple.com/videos/play/wwdc2026/233/?time=827)）**Pipeline 並列**は深さ方向に分割します。各マシンは一群の層を保持し、データはマシンを順番に流れます。各 token は依然としてすべての層群を直列に通るため推論を高速化しませんが、通信は層群の境界でアクティベーションを交換するだけなので単純です。
+
+（[14:13](https://developer.apple.com/videos/play/wwdc2026/233/?time=853)）**Tensor 並列**は幅方向に分割します。各マシンは各層の一部を保持し、すべてのマシンが同じ token を同時に処理します。推論は速くなりますが、各層、各 token ごとに通信が必要であり、遅延への要求が高くなります。これが mesh トポロジーが重要な理由です。任意の 2 台のマシンが 1 hop で到達できます。
+
+Tensor 並列は MLX LM のデフォルト戦略です。Pipeline 並列に切り替えるには、`--pipeline` フラグを追加するだけです。
+
+```bash
+mlx.launch --hostfile "m3-ultra-jaccl.json" -- \
+    /remote/path/to/mlx_lm.chat --model "moonshotai/Kimi-K2.6" \
+                                 --max-tokens 2048 \
+                                 --pipeline
+```
+
+（[15:03](https://developer.apple.com/videos/play/wwdc2026/233/?time=903)）講演では、4 台の M3 Ultra で tensor 並列を使って Kimi 2.6 を動かしました。兆パラメータモデルを、1 つのコマンドで、ローカル実行しています。
+
+### 分散微調整：データ並列
+
+（[16:11](https://developer.apple.com/videos/play/wwdc2026/233/?time=971)）微調整では、単一マシンはトレーニングデータを batch に分け、順番に勾配を計算して重みを更新します。複数マシンで高速化する考え方が **データ並列** です。各マシンがモデルのコピーを持ち、それぞれ異なる batch を処理し、最後に勾配を平均して、すべての batch の情報を更新に反映します。
+
+理論上、N 台のマシンはデータ処理速度を N 倍にできます。
+
+分散微調整のコマンドは単一マシンとほぼ同じです。
+
+```bash
+# 単一マシンでの微調整
+mlx_lm.lora --model "Qwen/Qwen3.5-9B" \
+             --data "mlx-community/wikisql" \
+             --train --batch-size 4
+
+# 分散微調整（batch-size をデバイス数に合わせて拡大）
+mlx.launch --hostfile "hostfile.json" -- \
+    /remote/path/to/mlx_lm.lora --model "Qwen/Qwen3.5-9B" \
+                                  --data "mlx-community/wikisql" \
+                                  --train --batch-size 16
+```
+
+（[17:55](https://developer.apple.com/videos/play/wwdc2026/233/?time=1075)）現場比較では、単一の M3 Ultra が約 180 tokens/秒、4 台クラスタが約 600 tokens/秒で、微調整速度は 3 倍以上になりました。
+
+## 詳細
+
+### Python API で分散推論を制御する
+
+（[19:01](https://developer.apple.com/videos/play/wwdc2026/233/?time=1141)）CLI 以外に、MLX は細かな制御が可能な Python API も提供します。
+
+```python
+import mlx.core as mx
+from mlx_lm import stream_generate
+from mlx_lm.utils import sharded_load
+
+# 分散バックエンドを初期化
+group = mx.distributed.init(strict=True, backend="jaccl")
+# 並列戦略を定義
+tensor_group, pipeline_group = group, None
+
+# モデルを読み込み、分割
+model, tokenizer = sharded_load("moonshotai/Kimi-K2.6", pipeline_group, tensor_group)
+for response in stream_generate(model, tokenizer, prompt, max_tokens=1024):
+    if group.rank() == 0:
+        print(response.text, end="", flush=True)
+```
+
+要点：
+- `mx.distributed.init(backend="jaccl")`：JACCL 分散グループを初期化する。
+- `tensor_group = group, pipeline_group = None`：tensor 並列を有効にし、pipeline 並列は使わない。
+- `sharded_load()`：指定した並列戦略に従ってモデルを自動で分割し、読み込む。
+- `group.rank() == 0`：rank 0 のノードだけが結果を出力し、重複表示を避ける。
+- 読み込み後のモデルの使い方は単一マシンと同じで、分散通信は MLX 内部で処理される。
+
+### 層を手動で分割する
+
+（[19:31](https://developer.apple.com/videos/play/wwdc2026/233/?time=1171)）より低レベルの制御が必要な場合は、MLX の `shard_linear` を直接使えます。
+
+```python
+import mlx.core as mx
+import mlx.nn as nn
+
+# 分散バックエンドを初期化
+group = mx.distributed.init(strict=True, backend="jaccl")
+
+# 層を定義し、列方向に分割
+layer = nn.Linear(1024, 1024)
+sharded_layer = nn.layers.distributed.shard_linear(
+    layer, strategy="all-to-sharded", group=group
+)
+data = mx.random.normal((1, 1, 1024))
+output = sharded_layer(data)
+mx.eval(output)
+```
+
+要点：
+- `strategy="all-to-sharded"`：完全な層を列方向に分割して各デバイスへ配置する。
+- `shard_linear` が返す層は、呼び出し時にデバイス間通信を自動処理する。
+- `mx.eval(output)`：実際の計算と同期をトリガーする。
+
+### 言語をまたぐプリミティブ：All-reduce
+
+（[19:47](https://developer.apple.com/videos/play/wwdc2026/233/?time=1187)）MLX は Python、Swift、C++ で同じ分散プリミティブを公開しています。all-reduce、つまりデバイス間の総和を例にします。
+
+Python：
+
+```python
+import mlx.core as mx
+world = mx.distributed.init(strict=True, backend="jaccl")
+data = mx.full((4,), float(world.rank()), dtype=mx.float32)
+result = mx.distributed.all_sum(data, group=world)
+mx.eval(result)
+```
+
+Swift：
+
+```swift
+let group = try DistributedGroup(strict: .ring)
+let data = rank == 0
+    ? MLXArray(converting: [1.0, 2.0, 3.0])
+    : MLXArray(converting: [5.0, 6.0, 7.0])
+let result = try group.allSum(data)
+```
+
+C++：
+
+```cpp
+namespace mx = mlx::core;
+auto world = mx::distributed::init(/* 厳格 */ true, "jaccl");
+mx::array data = mx::full({4}, static_cast<float>(world.rank()), mx::float32);
+mx::array result = mx::distributed::all_sum(data, world);
+mx::eval(result);
+```
+
+要点：
+- 3 つの言語で API 構造は一致している。group を初期化し、データを準備し、all_sum を実行し、eval で同期する。
+- `world.rank()` は現在のノード番号を取得し、差異のあるテストデータを作るために使える。
+- `all_sum` は各デバイス上の配列を要素ごとに合計し、結果をすべてのデバイスへブロードキャストする。
+
+### MLX から離れて JACCL を直接使う
+
+（[20:14](https://developer.apple.com/videos/play/wwdc2026/233/?time=1214)）JACCL は MLX に依存せず、単独でも使えます。C++ API を提供しています。
+
+```cpp
+#include <jaccl/jaccl.h>
+#include <iostream>
+
+int main() {
+    // JACCL グループを初期化
+    auto group = jaccl::init();
+    std::cout << "ランク " << group->rank() << " / " << group->size() << std::endl;
+    // all-reduce の総和を実行
+    float data[10] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f};
+    float output[10];
+    group->all_sum(data, output, sizeof(data), jaccl::Float32);
+    std::cout << "結果: " << output[0] << std::endl;
+    return 0;
+}
+```
+
+要点：
+- `jaccl::init()`：クラスタ設定を自動検出し、通信グループを初期化する。
+- `group->rank()` / `group->size()`：現在のノード番号と総ノード数を取得する。
+- `all_sum` の引数は、入力配列、出力配列、バイト数、データ型。
+- マシン間でデータ同期が必要なプログラムは、JACCL を基盤に構築できる。
+
+## 主な示唆
+
+**1. ローカルで企業向け知識ベースを展開する**
+
+- **何をするか**：2-4 台の Mac Studio をクラスタにし、Qwen 3.6 またはより大きなモデルをローカルに展開して、社内知識ベース Q&A システムとして使う。
+- **なぜ価値があるか**：データは社内ネットワークから出ず、コンプライアンス要件を満たせる。分散推論の速度はクラウド A100 インスタンスに近づき、コストは一度きりのハードウェア投資になる。
+- **始め方**：まず 1 台の Mac で `mlx_lm.chat` を使いモデルの効果を検証する。確認できたら 2 台目の Mac を用意し、`mlx.distributed_config` で設定を生成し、`mlx.launch` で分散サービスを起動する。
+
+**2. プライベートなドメインモデルを微調整する**
+
+- **何をするか**：社内文書、カスタマーサポート会話、製品マニュアルを収集し、MLX の LoRA で基盤モデルを微調整して専用アシスタントを作る。
+- **なぜ価値があるか**：この session では 4 台クラスタの微調整が 3 倍以上高速になることが示されました。ローカル微調整なら、機密性の高い学習データを第三者へアップロードしません。
+- **始め方**：`mlx_lm.lora` を使って単一マシンと小さなデータセットで微調整フローを検証する。効果を確認したら `--batch-size` をデバイス数に合わせて増やし、`mlx.launch` でクラスタへ拡張する。
+
+**3. マルチ Agent 協調システムの推論バックエンド**
+
+- **何をするか**：ローカルのマルチ Agent システムを構築し、コードレビュー、ドキュメント生成、テストケース作成などを異なる Agent が担当し、同じ大規模モデルバックエンドを共有する。
+- **なぜ価値があるか**：session 232 はローカル Agentic AI を扱い、session 233 は「モデルが足りない、推論が遅い」というボトルネックを解決します。両方を組み合わせることで、実用的なローカル Agent ワークフローを作れます。
+- **始め方**：まず session 232 の方法で単一 Agent のプロトタイプを作り、その後、本 session の `sharded_load` と `stream_generate` を使って推論層を分散化し、複数 Agent の並行リクエストを支えます。
+
+**4. JACCL を非 ML の分散計算に使う**
+
+- **何をするか**：JACCL の C++ API を使い、画像の一括処理、音声分析、科学計算などの分散タスクを実装する。
+- **なぜ価値があるか**：JACCL は MLX に縛られていません。マシン間でデータを同期する必要があるプログラムなら使えます。Thunderbolt 5 の帯域と遅延は Wi-Fi や Ethernet より一桁優れています。
+- **始め方**：`<jaccl/jaccl.h>` を含む簡単な C++ プログラムを書き、`jaccl::init()` と `all_sum` を呼んで通信を検証し、その後に業務ロジックを接続します。
+
+**5. Swift App に分散推論を組み込む**
+
+- **何をするか**：macOS App に大規模モデル推論機能を統合し、ユーザーの複数台の Mac が自動でクラスタを形成して応答を高速化する。
+- **なぜ価値があるか**：MLX の Swift API は Python API と構造が一致しているため、Python で実験したモデルを App に直接移植できます。
+- **始め方**：まず Python API でモデルと分割戦略を検証し、その後 MLX Swift の `DistributedGroup` と対応 API で中核の推論ロジックを書き直し、App に組み込みます。
+
+## 関連セッション
+
+- [セッション 232：MLX を使って Mac 上でローカルのエージェント AI を動かす](/articles/wwdc2026-232) — 単一マシンでローカル AI Agent を動かす入門であり、このセッションの分散機能と合わせて全体像が完成する
+- [セッション 328：MLX Swift](/articles/wwdc2026-328) — Swift で MLX を使うための詳細ガイド。分散推論を App に組み込みたい開発者に適している
+- [セッション 324：Core AI](/articles/wwdc2026-324) — Apple プラットフォームの AI 中核フレームワークの概観。MLX がエコシステム全体のどこに位置するかを理解する
+- [セッション 241：Foundation Models](/articles/wwdc2026-241) — Apple の基盤モデルの設計思想。大規模モデルをローカルで動かす重要性が増している理由を理解する

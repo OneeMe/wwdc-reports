@@ -1,0 +1,246 @@
+---
+title: "Swift の async/await"
+description: "Swift 5.5 で導入された async/await 構文について学び、より読みやすい非同期コードを記述する方法と、既存の完了ハンドラーを非同期関数に移行する方法を学びます。"
+date: "2021-06-08"
+tags: ["Swift"]
+thumbnail: "/images/sessions/2021/10132.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10132/"
+sessionId: "wwdc2021-10132"
+year: "2021"
+relatedSessions:
+  - title: "Swift の構造化された同時実行性を探る"
+    code: "10134"
+    description: "タスク、タスクグループ、および構造化された同時実行性の詳細な説明"
+  - title: "SwiftUI の同時実行性"
+    code: "10019"
+    description: "SwiftUI での async/await の具体的なアプリケーション"
+  - title: "Core Data の並行処理と Swift"
+    code: "10017"
+    description: "Core Data が新しい同時実行モデルにどのように適応するか"
+  - title: "Swift の ARC"
+    code: "10216"
+    description: "オブジェクトのライフサイクルと同時実行の安全性"
+---
+# Swift での非同期/待機
+
+## ハイライト
+
+> async/await を使用すると、同期コードと同じくらい直感的に非同期コードを作成できます。もともと 20 行のネストされたクロージャを必要としたサムネイル取得関数は、async/await を使用した 6 行の線形コードのみを必要とし、エラー処理は渡されます。`throws`自然なコミュニケーション、あらゆるレベルで判断する必要がなくなりました`error != nil`。
+
+## 主な内容
+
+非同期プログラミングは日常的な開発で避けられないテーマですが、完了ハンドラーに基づくメソッドには共通の問題があります。非同期ステップが増えるほど、コードは指数関数的に膨らみます。ネットワークリクエスト、画像デコード、サムネイル生成という 3 段階の処理が入れ子になり、インデントは深くなり、エラー処理も各所に散らばります。少し注意を怠ると制御フローは発散します。
+
+Swift 5.5 の async/await によって、この状況は根本から変わります。中心となる考え方はシンプルです。非同期関数には `async` を付け、`await` で現在の実行フローを一時停止して結果を待ちます。コンパイラがスレッド切り替えと状態保存を管理するため、コードは同期ロジックのように読めますが、実行はノンブロッキングです。
+
+## 詳細
+
+### 完了ハンドラーから async/await へ
+
+サムネイルを取得する関数を例に挙げます。従来の完了ハンドラーの作成 (03:43):
+
+```swift
+func fetchThumbnail(for id: String, completion: @escaping (UIImage?, Error?) -> Void) {
+    let request = thumbnailURLRequest(for: id)
+    let task = URLSession.shared.dataTask(with: request) { data, response, error in
+        if let error = error {
+            completion(nil, error)
+        } else if (response as? HTTPURLResponse)?.statusCode != 200 {
+            completion(nil, FetchError.badID)
+        } else {
+            guard let image = UIImage(data: data!) else {
+                completion(nil, FetchError.badImage)
+                return
+            }
+            image.prepareThumbnail(of: CGSize(width: 40, height: 40)) { thumbnail in
+                guard let thumbnail = thumbnail else {
+                    completion(nil, FetchError.badImage)
+                    return
+                }
+                completion(thumbnail, nil)
+            }
+        }
+    }
+    task.resume()
+}
+```
+
+このコードは 20 行あり、エラー処理は 3 か所に分散されており、各分岐は手動で呼び出す必要があります。`completion`。代わりに使用してください`Result`型 (08:00) によりエラー処理がより標準化されますが、コードの量は減っていません。
+
+```swift
+func fetchThumbnail(for id: String, completion: @escaping (Result<UIImage, Error>) -> Void) {
+    // ...同じネストされた構造ですが、completion(.failure(error)) が completed(nil, error) に置き換わります。
+}
+```
+
+async/await バージョン (08:30) では、同じロジックが 6 行に凝縮されています。
+
+```swift
+func fetchThumbnail(for id: String) async throws -> UIImage {
+    let request = thumbnailURLRequest(for: id)
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw FetchError.badID }
+    let maybeImage = UIImage(data: data)
+    guard let thumbnail = await maybeImage?.thumbnail else { throw FetchError.badImage }
+    return thumbnail
+}
+```
+
+主な変更点:
+- `async`関数を非同期としてマークし、`throws`そして`async`自然な組み合わせ
+- `await`現在の実行を一時停止し、スレッドは他の作業を行うために解放されます。
+- エラーが渡されました`throws`上向きに伝播すると、各ブランチを手動で処理する必要がなくなります。
+- コードの実行順序は、左から右、上から下の読み取り順です。
+
+### 非同期プロパティ
+
+UIキット`prepareThumbnail`同期と非同期の 2 つのバージョンがあります。できる`UIImage`非同期の計算プロパティを定義します (13:15):
+
+```swift
+extension UIImage {
+    var thumbnail: UIImage? {
+        get async {
+            let size = CGSize(width: 40, height: 40)
+            return await self.byPreparingThumbnail(ofSize: size)
+        }
+    }
+}
+```
+
+直接使用する`await image.thumbnail`、通常のプロパティにアクセスするのと同じくらい自然です。
+
+### 非同期シーケンス
+
+バッチデータを処理する場合、async/await および`for`ループを結合して非同期シーケンスを形成します (14:17):
+
+```swift
+for await id in staticImageIDsURL.lines {
+    let thumbnail = await fetchThumbnail(for: id)
+    collage.add(thumbnail)
+}
+let result = await collage.draw()
+```
+
+`staticImageIDsURL.lines`です`AsyncSequence`、各反復`await`次の行を読んでください。ループ全体が順番に実行されますが、毎回`await`スレッドが解放されます。
+
+### 非同期コードをテストする
+
+テスト完了ハンドラー スタイル コードには次のものが必要です`XCTestExpectation`（21:22）：
+
+```swift
+func testFetchThumbnails() throws {
+    let expectation = XCTestExpectation(description: "mock thumbnails completion")
+    self.mockViewModel.fetchThumbnail(for: mockID) { result, error in
+        XCTAssertNil(error)
+        expectation.fulfill()
+    }
+    wait(for: [expectation], timeout: 5.0)
+}
+```
+
+async/await バージョン (21:56) は直接呼び出すことができます。
+
+```swift
+func testFetchThumbnails() async throws {
+    XCTAssertNoThrow(try await self.mockViewModel.fetchThumbnail(for: mockID))
+}
+```
+
+### 同期コードからの非同期関数の呼び出し
+
+SwiftUI`onAppear`同期コンテキストであり、作成する必要があります`Task`非同期関数を呼び出すには (22:30):
+
+```swift
+struct ThumbnailView: View {
+    @ObservedObject var viewModel: ViewModel
+    var post: Post
+    @State private var image: UIImage?
+
+    var body: some View {
+        Image(uiImage: self.image ?? placeholder)
+            .onAppear {
+                Task {
+                    self.image = try? await self.viewModel.fetchThumbnail(for: post.id)
+                }
+            }
+    }
+}
+```
+
+### 既存の API のブリッジ: CheckedContinuation
+
+非同期バージョンをまだ提供していないサードパーティ API の場合は、次を使用します。`withCheckedThrowingContinuation`パッケージ化 (26:59):
+
+```swift
+// 既存の完了ハンドラー API
+func getPersistentPosts(completion: @escaping ([Post], Error?) -> Void) { ... }
+
+// 非同期バージョンとしてラップされる
+func persistentPosts() async throws -> [Post] {
+    return try await withCheckedThrowingContinuation { continuation in
+        self.getPersistentPosts { posts, error in
+            if let error = error {
+                continuation.resume(throwing: error)
+            } else {
+                continuation.resume(returning: posts)
+            }
+        }
+    }
+}
+```
+
+デリゲート コールバック モードの場合、継続をインスタンス変数として保存します (31:44)。
+
+```swift
+class ViewController: UIViewController {
+    private var activeContinuation: CheckedContinuation<[Post], Error>?
+
+    func sharedPostsFromPeer() async throws -> [Post] {
+        try await withCheckedThrowingContinuation { continuation in
+            self.activeContinuation = continuation
+            self.peerManager.syncSharedPosts()
+        }
+    }
+}
+
+extension ViewController: PeerSyncDelegate {
+    func peerManager(_ manager: PeerManager, received posts: [Post]) {
+        self.activeContinuation?.resume(returning: posts)
+        self.activeContinuation = nil  // 防止多次调用 resume
+    }
+}
+```
+
+### SDK の非同期 API
+
+iOS 15 SDK は、多くの既存 API に async 版の代替手段を提供します (25:56)。たとえば ClockKit のコンプリケーションデータソースは次のようになります。
+
+```swift
+extension ComplicationController: CLKComplicationDataSource {
+    func currentTimelineEntry(for complication: CLKComplication) async -> CLKComplicationTimelineEntry? {
+        let date = Date()
+        let thumbnail = try? await self.viewModel.fetchThumbnail(for: post.id)
+        guard let thumbnail = thumbnail else { return nil }
+        return self.createTimelineEntry(for: thumbnail, date: date)
+    }
+}
+```
+
+## 重要なポイント
+
+1. **「アセンブリ ロジック」の移行を優先する**: まず、複数の非同期操作を呼び出す最上位関数を async/await に変更します。その後、基礎となるツール関数が徐々に従うことができます。こうすることで、変更の範囲は最小限に抑えられ、メリットは最大になります。
+
+2. **使用`withCheckedContinuation`レガシー API のラッピング**:まだ更新されていないサードパーティ ライブラリまたは内部 API この場合、それらをブリッジします。`resume`、途中で残りのポイントを「しないでください」に挿入します。
+
+3. **テスト コードに直接的な利点**: async/await により、非同期テスト コードと同期テスト コードが同じ方法で記述され、不要になります。`XCTestExpectation`そして`wait(for:timeout:)`。
+
+4. **SD​​K の非同期代替バージョンに注意してください**: iOS 15 以降、URLSession、Core Data、ClockKit などはすべて非同期 API を提供します。移行するときは、自分でパッケージ化するのではなく、ネイティブの非同期バージョンを使用することを優先してください。
+
+5. **`Task`これは同期から非同期への架け橋です**:`onAppear`、`IBAction`他の同期コンテキストでは、次を使用します。`Task { }`非同期実行環境を作成します。`Task.init`ほとんどの場合、現在のアクター コンテキストを継承することが正しい選択です。
+
+## 関連セッション
+
+- [WWDC2021 10134 - Exploring Structured Concurrency in Swift](https://developer.apple.com/videos/play/wwdc2021/10134/) — タスク、タスクグループ、および構造化同時実行の詳細な説明
+- [WWDC2021 10019 - SwiftUI の同時実行](https://developer.apple.com/videos/play/wwdc2021/10019/) — SwiftUI での async/await の特定のアプリケーション
+- [WWDC2021 10017 - Core Data Concurrency and Swift](https://developer.apple.com/videos/play/wwdc2021/10017/) — Core Data が新しい同時実行モデルにどのように適応するか
+- [WWDC2021 10216 - Swift の ARC](https://developer.apple.com/videos/play/wwdc2021/10216/) — オブジェクトのライフサイクルと同時実行の安全性

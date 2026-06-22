@@ -1,0 +1,288 @@
+---
+title: "Track workouts with HealthKit on iOS and iPadOS"
+description: "learn best practices for building a great workout experience for ios. review the life cycle of a workout session, explore the differences between workouts on apple watch and iphone, and find out how t"
+date: 2026-06-10
+tags: ["アプリサービス", "Health & Fitness"]
+thumbnail: "/images/sessions/2025/322.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/322/"
+sessionId: "wwdc2025-322"
+year: "2025"
+relatedSessions:
+  - title: "Discover Apple-Hosted Background Assets"
+    code: "325"
+    description: "building on background assets, this session will introduce the new capability to"
+  - title: "Dive deeper into Writing Tools"
+    code: "265"
+    description: "with writing tools, people can proofread, rewrite, and transform text directly w"
+  - title: "Dive into App Store server APIs for In-App Purchase"
+    code: "249"
+    description: "discover the latest updates for the app store server api, app store server notif"
+  - title: "Enhance child safety with PermissionKit"
+    code: "293"
+    description: "discover how permissionkit helps you enhance communication safety for children i"
+---
+
+## ハイライト
+
+> 以前、Apple Watch でのみワークアウトトラッキングを実装していた場合、同じコードを iPhone/iPad に移植できるようになりました。コアとなるフローは完全に一致しています。
+
+---
+
+## 主要内容
+
+以前、フィットネス系アプリの開発には一つ課題がありました。強力な workout API はすべて Apple Watch にしか存在しなかったのです。ユーザーが Watch を持っていない場合、開発者はワークアウトトラッキングを諦めるか、センサーからの読み取りとデータベースへの書き込みロジックを独自に組み立てる必要がありました。その結果、Activity Rings は更新されず、ワークアウト記録は HealthKit に保存されず、デバイス間の状態同期も不正確になるという状態でした。Health & Fitness カテゴリにおいて、Watch を持たないユーザーは長らく二流の体験しか得られませんでした。
+
+WWDC25 で、Workout Builder API が iPhone と iPad に導入されました。Watch で動作していた session、builder、data source、live metrics、crash recovery が、iOS および iPadOS でも動作するようになり、コードの変更は最小限で済みます（[00:55](https://developer.apple.com/videos/play/wwdc2025/322/?time=55)）。主な違いは、センサー（iPhone には心拍センサーがないため、外部の BLE 心率帯や Powerbeats Pro 2 が必要）、ロック画面（iPhone はワークアウト中にロックされる可能性が高く、Live Activity と Siri Intent の組み合わせが必要）、クラッシュリカバリー（新しく scene delegate エントリーポイントが追加）の 3 点にあります。フロー自体は変わっていません：設定 → session → builder → カウントダウン → 計測開始 → delegate でリアルタイムデータを受信 → 停止 → 保存。
+
+---
+
+## 詳細
+
+ワークアウトセッションのライフサイクルは、設定から終了まで 4 つの段階に分かれます。最初に設定と session を作成し、builder と data source を連携させます（[01:30](https://developer.apple.com/videos/play/wwdc2025/322/?time=90)）：
+
+```swift
+// Set up workout session
+
+// Create workout configuration
+let configuration = HKWorkoutConfiguration()
+configuration.activityType = .running
+configuration.locationType = .outdoor
+
+// Create workout session
+let session = try HKWorkoutSession(healthStore: healthStore, configuration: configuration)
+session.delegate = self
+
+// Get associated workout builder and add data source
+let builder = session.associatedWorkoutBuilder()
+builder.delegate = self
+builder.dataSource = HKLiveWorkoutDataSource(healthStore: healthStore,
+                                             workoutConfiguration: configuration)
+```
+
+重要なポイント：
+
+- `HKWorkoutConfiguration` は今回のワークアウトのアクティビティタイプと場所を記述し、センサースタックはこの設定に基づいてデータを収集します。
+- `HKWorkoutSession` は `healthStore` と configuration で初期化され、session の delegate は状態変化の通知を受け取ります。
+- `associatedWorkoutBuilder()` はこの session に紐づいた builder を返し、最終的にこれを使ってワークアウトを HealthKit に書き込みます。
+- `HKLiveWorkoutDataSource` は builder の入力ソースであり、センサーまたは外部サンプルを builder に供給する役割を担います。
+
+開始時はまず `prepare()` でセンサーを準備させ、UI に 3 秒のカウントダウンを表示し、カウントダウン終了後に正式に開始します（[01:54](https://developer.apple.com/videos/play/wwdc2025/322/?time=114)）：
+
+```swift
+// Prepare and start session
+
+session.prepare()
+
+// Start and display count down
+
+// Start session and builder collection once count down finishes
+session.startActivity(with: startDate)
+try await builder.beginCollection(at: startDate)
+```
+
+重要なポイント：
+
+- `prepare()` はオンボードセンサーを起動し、外部心心率帯に接続して、正式開始時に最初のサンプルが有効であることを保証します。
+- `startActivity(with:)` は session を running 状態に切り替え、渡された時間がワークアウトの開始時点となります。
+- `beginCollection(at:)` は builder がこの時点からサンプルの受信を開始します。
+
+ワークアウト中、すべてのリアルタイム指標は builder の delegate を通じてプッシュされ、anchored object query は不要です（[02:14](https://developer.apple.com/videos/play/wwdc2025/322/?time=134)）：
+
+```swift
+// Handling collected metrics
+
+func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder, 
+                    didCollectDataOf collectedTypes: Set<HKSampleType>) {
+    for type in collectedTypes {
+        guard let quantityType = type as? HKQuantityType else { return }
+
+        let statistics = workoutBuilder.statistics(for: quantityType)
+
+        // Update the published values
+        updateForStatistics(statistics)
+    }
+}
+```
+
+重要なポイント：
+
+- builder が新しいサンプルを受け取るたびにコールバックが呼ばれ、パラメータは変化した sample type の集合です。
+- `statistics(for:)` でそのタイプの現在の累積統計（平均、累積、最大値など）を取得でき、そのまま UI に反映できます。
+- builder はワークアウト保存時に自動的に指標を同期するため、UI データと最終的なサンプルは自然に一致します。
+
+終了フローは厳密な順序で行う必要があります：まず session を stop、delegate が stopped 状態に戻るのを待ってから、endCollection、finishWorkout、end を実行します（[02:28](https://developer.apple.com/videos/play/wwdc2025/322/?time=148)）：
+
+```swift
+// Stopping the workout session
+
+session.stopActivity(with: .now)
+
+// Session transitions to stopped then call end
+func workoutSession(_ workoutSession: HKWorkoutSession,
+                    didChangeTo toState: HKWorkoutSessionState,
+                    from fromState: HKWorkoutSessionState,
+                    date: Date) {
+    guard change.newState == .stopped, let builder else { return }
+     
+    try await builder.endCollection(at: change.date)
+    let finishedWorkout = try await builder.finishWorkout()
+    session.end()
+}
+```
+
+重要なポイント：
+
+- `stopActivity` はまず builder に最後のサンプルの収集を完了させ、データの末落ちを防ぎます。
+- session の状態が `.stopped` になるのを待ってから `endCollection` を呼びます。さもないと builder はまだ収集中です。
+- `finishWorkout()` は HealthKit に保存された `HKWorkout` オブジェクトを返し、これを使ってサマリーページを表示します。
+- 最後に `session.end()` で初めて session リソースが解放されます。
+
+iPhone と Watch の主な違いは**センサー**と**ロック画面**にあります（[03:00](https://developer.apple.com/videos/play/wwdc2025/322/?time=180)）。iPhone/iPad には心拍センサーがありませんが、GATT プロファイルに対応したデバイス（例：Powerbeats Pro 2）を接続すれば、HealthKit は自動的に心拍データを Health Store に書き込みます。システムは 2 種類のサンプルを区別します：**Generated types** はシステムがワークアウト中に自動的に生成するもの（カロリー、距離）；**Collected types** はアプリが観察し、ワークアウトサンプルとして書き込みたい指標（例：ワークアウト中の水分摂取量）。`enableCollection(for:)` / `disableCollection(for:)` で追加・削除できます（[04:43](https://developer.apple.com/videos/play/wwdc2025/322/?time=283)）。
+
+ロック画面への対応は iPhone 特有の課題です。初めてワークアウトを開始すると、システムはプライバシープロンプトを表示し、「ワークアウトデータはロック中でもアクセス可能である」ことをユーザーに伝えます（[06:15](https://developer.apple.com/videos/play/wwdc2025/322/?time=375)）。アプリは Live Activity を使ってロック画面に重要な指標を表示すべきです。ユーザーがロック中のアクセス権限を拒否した場合、UI はワークアウト時間のみを表示し、具体的な数値は表示しないようダウングレードする必要があります。
+
+さらに進んで、Siri のロック画面制御も実装できます（[06:54](https://developer.apple.com/videos/play/wwdc2025/322/?time=414)）。Intent Handler を登録すると、ユーザーはロック画面から Siri でワークアウトの開始、一時停止、再開、終了ができ、電話のロック解除が不要になります（[07:17](https://developer.apple.com/videos/play/wwdc2025/322/?time=437)）：
+
+```swift
+// Create an INExtension within your main app
+
+// Define an intent handler
+public class IntentHandler: INExtension {
+
+}
+
+// Define the intents to support
+extension IntentHandler: INStartWorkoutIntentHandling
+
+extension IntentHandler: INPauseWorkoutIntentHandling
+
+extension IntentHandler: INResumeWorkoutIntentHandling
+
+extension IntentHandler: INEndWorkoutIntentHandling
+```
+
+重要なポイント：
+
+- Intent Handler はメインアプリ内に配置する必要があり、extension 形式ではロック画面からトリガーできません。
+- 4 種類の workout intent を宣言します：開始、一時停止、再開、終了。
+- これは後続の handle 実装のエントリーポイントシグネチャとなります。
+
+`INStartWorkoutIntent` を受け取ったときは、すでに進行中のワークアウトがないか確認し、重複起動を防ぎます（[07:32](https://developer.apple.com/videos/play/wwdc2025/322/?time=452)）：
+
+```swift
+// Handle the intent
+
+public func handle(intent: INStartWorkoutIntent) async -> INStartWorkoutIntentResponse {
+    let state = await WorkoutManager.shared.state
+        
+    switch state {
+    case .running, .paused, .prepared, .stopped:
+        return INStartWorkoutIntentResponse(code: .failureOngoingWorkout, 
+                                            userActivity: nil)
+    default:
+        break;
+    }
+    Task {
+        await MainActor.run {
+            // Handle the intents activity type and location
+            WorkoutManager.shared.setWorkoutConfiguration(activityType: .running,   
+                                                          location: .outdoor)
+        }
+    }
+    return INStartWorkoutIntentResponse(code: .success, userActivity: nil)
+ }
+```
+
+重要なポイント：
+
+- `WorkoutManager` の状態を確認し、running/paused/prepared/stopped 状態の場合は `.failureOngoingWorkout` を返します。
+- 設定作業は `MainActor` に切り替え、スレッド問題を回避します。
+- `setWorkoutConfiguration` を通じて後続の起動フローをトリガーし、handle は直ちに success を返します。
+
+クラッシュリカバリー（[08:37](https://developer.apple.com/videos/play/wwdc2025/322/?time=517)）：システムは自動的にアプリを再起動し、session と builder の状態を復元しますが、data source はアプリ側で再構築する必要があります。iOS は scene delegate エントリーポイントを使用します（[09:09](https://developer.apple.com/videos/play/wwdc2025/322/?time=549)）：
+
+```swift
+// App Delegate
+
+func application(_ application: UIApplication,
+                 configurationForConnecting connectingSceneSession: UISceneSession,
+                 options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+    if options.shouldHandleActiveWorkoutRecovery {
+        let store = HKHealthStore()
+        store.recoverActiveWorkoutSession(completion: { (workoutSession, error) in
+            // Handle error
+            Task {
+                await WorkoutManager.shared.recoverWorkout(recoveredSession: workoutSession)
+            }
+        })
+    }
+    let configuration = UISceneConfiguration(name: "Default Configuration", 
+                                             sessionRole: connectingSceneSession.role)
+    configuration.delegateClass = WorkoutsOniOSSampleAppSceneDelegate.self
+    return configuration
+}
+```
+
+重要なポイント：
+
+- `options.shouldHandleActiveWorkoutRecovery` は新しく追加されたフラグで、今回の起動がクラッシュからの復元であることを示します。
+- `recoverActiveWorkoutSession` は HealthStore によって提供され、コールバック内で復元された session を取得します。
+- 復元された session を `WorkoutManager` に渡して、ビジネス側での再接続を完了します。
+
+`recoverWorkout` は delegate と data source を再構築します（[09:25](https://developer.apple.com/videos/play/wwdc2025/322/?time=565)）：
+
+```swift
+// Recover the workout for the session
+
+
+func recoverWorkout(recoveredSession: HKWorkoutSession) {
+    session = recoveredSession
+    builder = recoveredSession.associatedWorkoutBuilder()
+    session?.delegate = self
+    builder?.delegate = self
+    workoutConfiguration = recoveredSession.workoutConfiguration
+
+    let dataSource = HKLiveWorkoutDataSource(healthStore: healthStore,                                                                  
+                                             workoutConfiguration: workoutConfiguration)
+    builder?.dataSource = dataSource
+}
+```
+
+重要なポイント：
+
+- `associatedWorkoutBuilder()` は復元された session 上でも使用可能で、状態はシステムによって保持されています。
+- delegate は現在の manager インスタンスに再設定する必要があります。さもないとコールバックが受け取れません。
+- data source だけが再構築が必要な部分であり、復元された `workoutConfiguration` と組み合わせて再接続します。
+
+---
+
+## 重要ポイント
+
+**1. 優先的に Apple Watch からワークアウトを開始し、iPhone にミラーする**
+
+なぜやる価値があるか：Watch には心拍、慣性センサー、皮膚接触があり、最も完全な generated types を生成できる；iPhone では外部 BLE デバイスに頼らないと心拍を補完できない。どう始めるか：ユーザーが Watch をペアリングしていることを検出したら、`healthStore.startWatchApp()` を呼び出して Watch 側の session を起動し、マルチデバイス mirror（参考：WWDC23 "Build a multi-device workout app"）を使って状態を iPhone に同期する（[09:34](https://developer.apple.com/videos/play/wwdc2025/322/?time=574)）。
+
+**2. ワークアウトに Live Activity + Siri Intent の組み合わせを用意する**
+
+なぜやる価値があるか：iPhone でワークアウト中は画面がロックされている可能性が高く、Live Activity でユーザーはロック解除なしで重要な指標を確認でき、Siri Intent で音声による開始/一時停止/終了操作が可能になる。この 2 つを組み合わせてこそ、アウトドアランニングやサイクリングのようなシーンに対応できる。どう始めるか：Live Activity は ActivityKit + builder delegate でリアルタイムデータをプッシュ；Siri 側は [07:17](https://developer.apple.com/videos/play/wwdc2025/322/?time=437) の INExtension テンプレートに従って 4 つの workout intent を登録し、handler はメインアプリ内に配置する。
+
+**3. クラッシュリカバリーを必須項目として扱う**
+
+なぜやる価値があるか：アウトドアワークアウトは一度に 30〜60 分も続くことが多く、途中でアプリがクラッシュして復元できない場合、ユーザーの全記録が失われ、Activity Rings も更新されない。どう始めるか：`application(_:configurationForConnecting:options:)` で `shouldHandleActiveWorkoutRecovery` を確認し、`store.recoverActiveWorkoutSession` を呼び出し、その後 `WorkoutManager` で delegate と data source を再接続し、設定は復元された session から読み込む。
+
+**4. Generated types と Collected types を厳密に区別し、必要に応じて enable/disable する**
+
+なぜやる価値があるか：デフォルトの data source は現在のアクティビティタイプのすべての可能なサンプルを観察し、アプリが関心のないものも含まれます。余計なサンプルはバッテリー消費を増やし、UI データを混乱させる。どう始めるか：builder 作成後すぐに `enableCollection(for:)` / `disableCollection(for:)` を呼び出して収集対象を絞り込む。例えば、サイクリングアプリは心拍、カロリー、距離のみに関心；カスタムサンプル（水分摂取量など）を書き込む場合は、enableCollection で明示的に有効化する。
+
+**5. ロック画面権限が拒否された場合は UI をダウングレードする**
+
+なぜやる価値があるか：ユーザーが「ロック中のヘルスデータアクセス」を拒否した後、HealthKit はロック中に数値をプッシュせず、UI に無理に表示しようとすると 0 または前回の古い値が表示され、直接非表示にするよりも悪い結果になる。どう始めるか：現在サンプルが読み取れるかどうかを検出し、読めない場合は数値フィールドを「ワークアウト中…」+ 時間に置き換え、ロック解除後に完全な UI に戻す。
+
+---
+
+## 関連セッション
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — Apple がホストするバックグラウンドアセット、大型リソース配信の簡素化
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — Writing Tools の詳細な統合、リライトと校正のカスタマイズ
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — App Store Server API の最新アップデートとベストプラクティス
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — PermissionKit を使った児童通信安全の強化

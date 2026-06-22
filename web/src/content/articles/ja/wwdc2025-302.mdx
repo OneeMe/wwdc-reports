@@ -1,0 +1,145 @@
+---
+title: "Create a seamless multiview playback experience"
+description: "learn how to build advanced multiview playback experiences in your app. we"
+date: 2026-06-10
+tags: ["Audio & Video"]
+thumbnail: "/images/sessions/2025/302.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/302/"
+sessionId: "wwdc2025-302"
+year: "2025"
+relatedSessions:
+  - title: "Enhance your app’s audio recording capabilities"
+    code: "251"
+    description: "learn how to improve your app"
+  - title: "Explore video experiences for visionOS"
+    code: "304"
+    description: "learn about the different ways you can create and present immersive video experi"
+  - title: "Learn about Apple Immersive Video technologies"
+    code: "403"
+    description: "explore the capabilities of apple immersive video and apple spatial audio format"
+  - title: "Learn about the Apple Projected Media Profile"
+    code: "297"
+    description: "dive into the apple projected media profile (apmp) and see how apmp enables 180º"
+---
+
+## ハイライト
+
+> 本セッションでは 3 つの課題に焦点を当てます。複数プレイヤー間の再生同期、AirPlay におけるマルチストリーム時のルーティング管理、そしてマルチストリームの画質優先度制御です。
+
+---
+
+## 主要内容
+
+シーンを想像してみましょう。ユーザーがスポーツ中継を視聴しており、App は同時に 4 つのアングル（俯瞰、クローズアップ、サイドラインの 2 カメラ）を再生しています。ユーザーが一時停止を押すと 4 つの映像は同じフレームで止まり、10 秒早送りすれば 4 つとも同じ時刻にジャンプし、ネットワークが急に悪化したときは最も重要な俯瞰映像は HD のまま、他は SD に落としたい。iOS 26 以前は、こうした挙動をすべて自前で実装する必要がありました。seek 時刻の精度、stall からの復帰、開始時のウェイトなど、どれもバグの温床になりやすい領域です。
+
+WWDC25 のこのセッションでは、AVFoundation と AVRouting に iOS 26 から追加された 3 つの API を紹介します。これらの複雑な振る舞いをシステム側に取り込むものです。`AVPlaybackCoordinationMedium` は複数の `AVPlayer` 間の状態同期を担当し、`AVRoutingPlaybackArbiter` は AirPlay のような「1 ストリームしか扱えない」外部出力デバイスでどのストリームを大画面に送るかを仲裁し、`AVPlayer.networkResourcePriority` は帯域が逼迫した際に重要なストリームの画質を優先的に守れるようにします。この 3 つを組み合わせれば、アプリ側はわずか数行のコードで完成度の高いマルチビュー再生体験を構築できます。
+
+---
+
+## 詳細
+
+### マルチストリーム同期：AVPlaybackCoordinationMedium
+
+`AVPlaybackCoordinationMedium` は既存の `AVPlaybackCoordination` アーキテクチャ（SharePlay で使われているもの）を土台にしています。各 `AVPlayer` には `AVPlaybackCoordinator` が組み込まれており、自プレイヤーと接続済みの他プレイヤーとの状態を調整します。Medium はそれらの間でメッセージを中継し、rate の変化、time のジャンプ、stall、中断、開始同期といったすべてのイベントをメッセージ機構経由でやり取りします（[06:17](https://developer.apple.com/videos/play/wwdc2025/302/?time=377)）。
+
+導入はとてもシンプルで、各 player の `playbackCoordinator` を `coordinate(using:)` で同じ medium に接続するだけです（[07:55](https://developer.apple.com/videos/play/wwdc2025/302/?time=475)）。
+
+```swift
+import AVFoundation
+
+var closeUpVideo = AVPlayer()
+var birdsEyeVideo = AVPlayer()
+
+let coordinationMedium = AVPlaybackCoordinationMedium()
+
+do {
+  try closeUpVideo.playbackCoordinator.coordinate(using: coordinationMedium)
+} catch let error {
+  // Handle error
+}
+
+do {
+  try birdsEyeVideo.playbackCoordinator.coordinate(using: coordinationMedium)
+} catch let error {
+  // Handle error
+}
+```
+
+ポイント:
+
+- `closeUpVideo` と `birdsEyeVideo` は独立した 2 つの `AVPlayer` で、それぞれ別の asset を読み込み、互いに結合していません。
+- `AVPlaybackCoordinationMedium()` は共有の調整メディアを生成し、同期したいすべての player を同一インスタンスに接続します。
+- `playbackCoordinator.coordinate(using:)` は現在の player のコーディネーターを medium に登録します。このメソッドは throw する可能性があるため、`try` で呼び出してエラーをハンドリングする必要があります。
+- 接続が完了すれば、いずれかの player に対して `play()` / `pause()` / `seek(to:)` を呼び出すだけで、medium が他の player に状態をブロードキャストします。同期ロジックを自前で書く必要はありません。
+- このメカニズムは Picture-in-Picture や Now Playing といったシステム UI 上でも同期を維持します（[05:19](https://developer.apple.com/videos/play/wwdc2025/302/?time=319)）。
+
+### AirPlay ルーティング：AVRoutingPlaybackArbiter
+
+AirPlay レシーバーは 1 ストリームしか受け取れないため、App はマルチストリームのうちどれを大画面に送り、どれを HomePod に送るかをシステムに伝える必要があります。`AVRoutingPlaybackArbiter` は `AVRouting` フレームワークに含まれるこの仲裁を担う API で、対象は 2 種類のルートに分かれます。non-mixable audio routes（HomePod など 1 系統の音声しか出せないデバイス）と、constrained external playback video routes（AirPlay video や Lightning Digital AV Adapter など 1 系統の映像しか出せないデバイス）です（[11:31](https://developer.apple.com/videos/play/wwdc2025/302/?time=691)）。
+
+```swift
+import AVFoundation
+import AVRouting
+
+var closeUpVideo = AVPlayer()
+var birdsEyeVideo = AVPlayer()
+
+let routingPlaybackArbiter = AVRoutingPlaybackArbiter.shared()
+
+routingPlaybackArbiter.preferredParticipantForExternalPlayback = birdsEyeVideo
+
+routingPlaybackArbiter.preferredParticipantForNonMixableAudioRoutes = birdsEyeVideo
+```
+
+ポイント（[13:17](https://developer.apple.com/videos/play/wwdc2025/302/?time=797)）:
+
+- `AVRoutingPlaybackArbiter.shared()` はシングルトンを返し、App 全体で 1 つの仲裁者しか存在しません。
+- `preferredParticipantForExternalPlayback` は Apple TV への AirPlay 時にどの映像を大画面に出すかを指定します。他の player はローカルでそのまま再生を続けます。
+- `preferredParticipantForNonMixableAudioRoutes` は HomePod などへルーティングされる際にどの音声を採用するかを指定します。
+- これら 2 つのプロパティは同じ player を指すこともできますし、異なる player を指すこともできます（映像と音声を別々のストリームから供給することも可能です）。
+- 優先設定を切り替えるときは、プロパティに新しい値を代入するだけです（デモでは star ボタンを押すと `closeUpVideo` が preferred になり、大画面とローカルの映像が自動的に入れ替わります）（[10:17](https://developer.apple.com/videos/play/wwdc2025/302/?time=617)）。
+
+### 画質の優先度：networkResourcePriority
+
+ストリームはそれぞれ帯域を消費します。システムはデフォルトで複数のストリームを同等に扱い、帯域を均等に割り振ります。しかし実際のシナリオでは、俯瞰のメインアングルは HD で維持したい一方で、観客席のカメラは 1 段階解像度が落ちても問題ないことがほとんどです。`AVPlayer.networkResourcePriority` には 3 つのレベルがあります。デフォルト、`.high`、`.low` です（[14:59](https://developer.apple.com/videos/play/wwdc2025/302/?time=899)）。
+
+```swift
+birdsEyeVideo.networkResourcePriority = .high
+closeUpVideo.networkResourcePriority = .low
+```
+
+ポイント（[16:15](https://developer.apple.com/videos/play/wwdc2025/302/?time=975)）:
+
+- `.high` はネットワークリソースへの要求が高いストリームであることを示し、システムはできるだけ高解像度のビットレートを維持しようとします。
+- `.low` は画質への感度が低いストリームであることを示し、帯域が逼迫したときには真っ先に解像度が下げられます。
+- これはあくまでシステムへのヒントであり、固定の帯域配分ではありません。実際の帯域割り当てはプレイヤー数、ビデオレイヤーのサイズ、ハードウェア制約などを総合的に考慮して決定されます（[16:35](https://developer.apple.com/videos/play/wwdc2025/302/?time=995)）。
+- デモではネットワークが悪化したときに `.low` でマークされた close-up が先に低解像度に落ち、`.high` でマークされた bird's-eye は HD を維持しました（[17:52](https://developer.apple.com/videos/play/wwdc2025/302/?time=1072)）。
+
+---
+
+## 重要ポイント
+
+- **何をやるか**: スポーツ・ライブ・教育系の App に「マルチカメラ生中継」機能を組み込む。
+  - なぜ価値があるか: これまでは同期ロジックを自作するコストが高く、フレーム落ち、seek のずれ、起動時のウェイトが落とし穴でした。Medium がこれらを一気に塞いでくれます。
+  - どう始めるか: 最小デモから着手します。2 つの `AVPlayer` で異なるアングルの HLS ストリームをロードし、`AVPlaybackCoordinationMedium` でつないで、play / pause / seek / 起動同期が貧弱なネットワーク下でどう振る舞うかを検証しましょう。
+
+- **何をやるか**: 既存の動画 App に手話ストリーム（ASL/CSL）チャネルを追加する。
+  - なぜ価値があるか: 手話ストリームは「厳密な同期が必須かつ AirPlay 時はメイン映像を優先したい」という典型的なマルチビューシナリオです。Medium + Arbiter ならほぼゼロコストで導入でき、アクセシビリティ体験の向上効果が大きい領域です。
+  - どう始めるか: メイン動画と手話動画の 2 つの player を同じ medium に接続し、メイン動画を `preferredParticipantForExternalPlayback` に設定して、AirPlay で大画面に送る際に手話ストリームをローカルに残します。
+
+- **何をやるか**: マルチビュー再生画面に「メイン/サブ」切り替えボタンを追加する。
+  - なぜ価値があるか: ユーザーが長押しやダブルタップでメインアングルを切り替えたとき、AirPlay の大画面に映るストリームも追従して切り替えたい。`AVRoutingPlaybackArbiter` なら 1 行の代入で映像が入れ替わり、自前で player を作り直すよりも体験が滑らかになります。
+  - どう始めるか: ユーザーの「スター/ピン留め」操作を監視して `preferredParticipantForExternalPlayback` を更新し、同時に `networkResourcePriority` を `.high` / `.low` で切り替えて、帯域もメインアングルに追従させます。
+
+- **何をやるか**: ビューサイズに応じて `networkResourcePriority` を動的に調整する。
+  - なぜ価値があるか: iPad のマルチビューレイアウトでは、拡大表示中の映像こそ多めの帯域を割り当てたいものです。優先度をビューサイズに連動させれば、貧弱なネットワーク下でもユーザーが最も注視している映像が真っ先に守られます。
+  - どう始めるか: ビューサイズが変化したタイミング（分割表示の切り替え、PiP の切り替えなど）で対応する `AVPlayer` の `networkResourcePriority` を更新し、貧弱なネットワーク下での画質変化を A/B テストで確認します。
+
+---
+
+## 関連セッション
+
+- [Enhance your app's audio recording capabilities](/articles/wwdc2025-251) — AVAudioRecorder と複数マイクによる録音機能の強化。アフレコや配信系 App に向いています。
+- [Explore video experiences for visionOS](/articles/wwdc2025-304) — visionOS における没入型映像の見せ方。マルチビューの考え方は空間コンテンツへも応用できます。
+- [Learn about Apple Immersive Video technologies](/articles/wwdc2025-403) — Apple Immersive Video と Spatial Audio フォーマット。マルチビューと組み合わせて新しい体験を作れます。
+- [Learn about the Apple Projected Media Profile](/articles/wwdc2025-297) — APMP によって 180°/360° のプロジェクテッドメディアが扱えるようになります。マルチビューと APMP を重ねれば、ディレクター卓レベルの体験も実現可能です。

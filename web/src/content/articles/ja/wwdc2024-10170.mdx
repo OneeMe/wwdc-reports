@@ -1,0 +1,418 @@
+---
+title: "Consume noncopyable types in Swift"
+description: "get started with noncopyable types in swift. discover what copying means in swift, when you might want to use a noncopyable type, and how value ownership lets you state your intentions clearly."
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10170.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10170/"
+sessionId: "wwdc2024-10170"
+year: "2024"
+relatedSessions:
+  - title: "Analyze heap memory"
+    code: "10173"
+    description: "dive into the basis for your app"
+  - title: "Explore Swift performance"
+    code: "10217"
+    description: "discover how swift balances abstraction and performance. learn what elements of "
+  - title: "Explore the Swift on Server ecosystem"
+    code: "10216"
+    description: "swift is a great language for writing your server applications, and powers criti"
+  - title: "Go further with Swift Testing"
+    code: "10195"
+    description: "learn how to write a sweet set of (test) suites using swift testing"
+---
+
+## ハイライト
+
+> Swift は昨年 noncopyable 型（`~Copyable` でマーク）を導入し、「コピーできない型」を定義できるようにしました。今年のセッションの焦点は「実際のプロジェクトで noncopyable 型を消費（consume）する方法」——汎型パラメータ、プロトコル、extension が noncopyable 型に遭遇したときどう扱うかです。
+
+---
+
+## 主要内容
+
+Swift はデフォルトですべての型がコピー可能と仮定します。値型はコードを理解しやすくする合理的なデフォルト——値を自由に渡せ、どこかの変更が別の場所に影響しない。しかし特定のシーンでは、コピーが問題を引き起こします。
+
+セッションは銀行振込（`BankTransfer`）の例でコピーのリスクを示します。class 型の `BankTransfer` に `run()` メソッドがあり振込を実行すると仮定。schedule 関数で delay が 1 秒未満なら即実行しますが、開発者が return を忘れ、振込が 2 回実行されます。さらに悪いことに、sleep の task がキャンセルされると、投げられたエラーが無視され、振込がキャンセルされない。deinit に cancel ロジックを追加しても、呼び出し元がコピーを保持しているため実行されません。
+
+昨年の Swift 5.9 が `~Copyable` を導入してこれを解決。`BankTransfer` を noncopyable struct に変更すると、コンパイラがコピーを阻止。`run()` を `consuming` とマークすると、呼び出し後この値は存在しなくなります。コンパイラは schedule 関数のバグを直接発見——return 忘れで transfer が 2 回消費される。
+
+今年の焦点は noncopyable 型を汎型コードで動作させること。以前の制限: 汎型パラメータはデフォルトで `Copyable` 型を要求し、プロトコルもデフォルトで `Copyable` を継承——noncopyable 型が汎型プログラミングに参加できなかった。Swift 6 で 3 つの重要な変更: 汎型パラメータを `~Copyable` と宣言可能、noncopyable 型に extension 可能、noncopyable 型がプロトコルに準拠可能。`~Copyable` が実験的機能から本番コードで使えるツールに変わりました。
+
+セッションは条件付き Copyable（conditional copyable）もデモ——汎型型がパラメータ型が Copyable かどうかに基づいて自身が Copyable かを決定。例えば `Job<Action>` は Action が Copyable なら Copyable にできます。
+
+---
+
+## 詳細
+
+### コピー機構の復習
+
+Swift には 2 種類のコピー: 値コピー（value copy）と参照コピー（reference copy）。Player 例で説明（[0:52](https://developer.apple.com/videos/play/wwdc2024-10170/?time=52)）:
+
+```swift
+struct Player {
+  var icon: String
+}
+
+func test() {
+  let player1 = Player(icon: "🐸")
+  var player2 = player1
+  player2.icon = "🚚"
+  assert(player1.icon == "🐸")
+}
+```
+
+**キーポイント**:
+- struct は値型。`player2 = player1` で全データをコピー
+- `player2.icon` の変更は `player1` に影響しない。独立したコピー
+
+class の場合（[1:55](https://developer.apple.com/videos/play/wwdc2024-10170/?time=115)）:
+
+```swift
+class PlayerClass {
+  var icon: String
+  init(_ icon: String) { self.icon = icon }
+}
+
+func test() {
+  let player1 = PlayerClass("🐸")
+  let player2 = player1
+  player2.icon = "🚚"
+  assert(player1.icon == "🐸")
+}
+```
+
+**キーポイント**:
+- class は参照型。`player2 = player1` は参照のみコピー（浅いコピー）
+- 2 変数は同じオブジェクトを指し、`player2.icon` の変更は `player1` に影響
+
+### Noncopyable が必要な理由
+
+コピーは時に危険。セッションは銀行振込例（[5:10](https://developer.apple.com/videos/play/wwdc2024-10170/?time=310)）:
+
+```swift
+class BankTransfer {
+  var complete = false
+
+  func run() {
+    assert(!complete)
+    // .. do it ..
+    complete = true
+  }
+
+  deinit {
+    if !complete { cancel() }
+  }
+
+  func cancel() { /* ... */ }
+}
+
+func schedule(_ transfer: BankTransfer,
+              _ delay: Duration) async throws {
+
+  if delay < .seconds(1) {
+    transfer.run()
+  }
+
+  try await Task.sleep(for: delay)
+  transfer.run()
+}
+
+func startPayment() async {
+  let payment = BankTransfer()
+  log.append(payment)
+  try? await schedule(payment, .seconds(3))
+}
+
+let log = Log()
+
+final class Log: Sendable {
+  func append(_ transfer: BankTransfer) { /* ... */ }
+}
+```
+
+**キーポイント**:
+- `schedule` は delay < 1 秒で即実行するが return を忘れ、振込が 2 回実行
+- `complete` フラグとアサーションがあっても、ランタイムで発動しない可能性
+- `log.append(payment)` が transfer のコピーを保持し、deinit が実行されない
+- sleep がキャンセルされると transfer がキャンセルされない
+
+### Noncopyable 型の基礎
+
+`~Copyable` でコピー不可型を宣言（[7:46](https://developer.apple.com/videos/play/wwdc2024-10170/?time=466)）:
+
+```swift
+struct FloppyDisk: ~Copyable {}
+
+func copyFloppy() {
+  let system = FloppyDisk()
+  let backup = consume system
+  load(system)
+  // ...
+}
+
+func load(_ disk: borrowing FloppyDisk) {}
+```
+
+**キーポイント**:
+- `~Copyable` はデフォルトの Copyable conformance を抑制
+- `consume` キーワードは変数の値を消費し、未初期化状態を残す
+- 消費された変数を読み取ろうとするとコンパイルエラー
+
+noncopyable 型のパラメータは所有権を宣言必須（[8:18](https://developer.apple.com/videos/play/wwdc2024-10170/?time=498)）:
+
+```swift
+struct FloppyDisk: ~Copyable { }
+
+func newDisk() -> FloppyDisk {
+  let result = FloppyDisk()
+  format(result)
+  return result
+}
+
+func format(_ disk: consuming FloppyDisk) {
+  // ...
+}
+```
+
+**キーポイント**:
+- `consuming` は関数がパラメータの所有権を取る
+- format は何も返さないため、`newDisk` はコンパイル失敗
+
+3 つの所有権修飾子（[9:00](https://developer.apple.com/videos/play/wwdc2024-10170/?time=540)）:
+
+```swift
+// consuming: 所有権を受け取る
+func format(_ disk: consuming FloppyDisk) {
+  // ...
+}
+
+// borrowing: 読み取り専用で借用
+func format(_ disk: borrowing FloppyDisk) {
+  var tempDisk = disk
+  // ...
+}
+
+// inout: 変更可能な借用
+func format(_ disk: inout FloppyDisk) {
+  var tempDisk = disk
+  // ...
+  disk = tempDisk
+}
+```
+
+**キーポイント**:
+- `consuming` は所有権を取る。呼び出し元はこの値を使えなくなる
+- `borrowing` は読み取り専用アクセス。let バインドに類似
+- `inout` は書き込み可能アクセス。返却前にパラメータを再初期化必須
+
+### Noncopyable BankTransfer
+
+BankTransfer を noncopyable で書き直し（[10:28](https://developer.apple.com/videos/play/wwdc2024-10170/?time=628)）:
+
+```swift
+struct BankTransfer: ~Copyable {
+  consuming func run() {
+    // .. do it ..
+    discard self
+  }
+
+  deinit {
+    cancel()
+  }
+
+  consuming func cancel() {
+    // .. do the cancellation ..
+    discard self
+  }
+}
+```
+
+**キーポイント**:
+- `consuming func run()` は run 呼び出しでこの値を消費
+- `discard self` は deinit を呼ばず self を破棄
+- コンパイラは run が 2 回呼ばれないことを保証
+
+schedule 関数（[11:10](https://developer.apple.com/videos/play/wwdc2024-10170/?time=670)）:
+
+```swift
+func schedule(_ transfer: consuming BankTransfer,
+              _ delay: Duration) async throws {
+
+  if delay < .seconds(1) {
+    transfer.run()
+    return
+  }
+
+  try await Task.sleep(for: delay)
+  transfer.run()
+}
+```
+
+**キーポイント**:
+- `consuming BankTransfer` は schedule が transfer の所有権を取る
+- return 忘れはコンパイルエラー——transfer が 2 回消費される
+- sleep がキャンセルされると transfer が破棄され、deinit が cancel を実行
+
+### Noncopyable 汎型
+
+Swift 6 以前、汎型パラメータはデフォルトで Copyable を要求。今は `~Copyable` でこの制約を除去可能（[15:50](https://developer.apple.com/videos/play/wwdc2024/10170/?time=950)）:
+
+```swift
+protocol Runnable: ~Copyable {
+  consuming func run()
+}
+
+struct Command: Runnable {
+  func run() { /* ... */ }
+}
+
+struct BankTransfer: ~Copyable, Runnable {
+  consuming func run() { /* ... */ }
+}
+
+func execute2<T>(_ t: T)
+  where T: Runnable {
+  t.run()
+}
+
+func execute3<T>(_ t: consuming T)
+  where T: Runnable,
+        T: ~Copyable {
+  t.run()
+}
+
+func test() {
+  execute2(Command())
+  execute2(BankTransfer()) // expected error: 'execute2' requires that 'BankTransfer' conform to 'Copyable'
+
+  execute3(Command())
+  execute3(BankTransfer())
+}
+```
+
+**キーポイント**:
+- `execute2` の汎型パラメータ T はデフォルトで Copyable を要求。BankTransfer を受け入れられない
+- `execute3` は `T: ~Copyable` で制約を除去。両タイプを受け入れ可能
+- `~Copyable` 制約は型空間を「広げる」のであり、狭めるのではない
+
+### 条件付き Copyable
+
+型は汎型パラメータが Copyable かどうかに基づいて自身が Copyable かを決定可能（[18:05](https://developer.apple.com/videos/play/wwdc2024-10170/?time=1085)）:
+
+```swift
+struct Job<Action: Runnable & ~Copyable>: ~Copyable {
+  var action: Action?
+}
+
+func runEndlessly(_ job: consuming Job<Command>) {
+  while true {
+    let current = copy job
+    current.action?.run()
+  }
+}
+
+extension Job: Copyable where Action: Copyable {}
+
+protocol Runnable: ~Copyable {
+  consuming func run()
+}
+
+struct Command: Runnable {
+  func run() { /* ... */ }
+}
+```
+
+**キーポイント**:
+- `Job` 自体は `~Copyable`。noncopyable な Action を格納する必要があるため
+- `extension Job: Copyable where Action: Copyable` で Action が Copyable のとき Job も Copyable に
+- `Job<Command>` は Copyable、`Job<BankTransfer>` はそうでない
+
+### Extension のデフォルト制約
+
+noncopyable 型の extension はデフォルトで汎型パラメータが Copyable の場合のみ適用（[19:27](https://developer.apple.com/videos/play/wwdc2024-10170/?time=1167)）:
+
+```swift
+extension Job {
+  func getAction() -> Action? {
+    return action
+  }
+}
+
+func inspectCmd(_ cmdJob: Job<Command>) {
+  let _ = cmdJob.getAction()
+  let _ = cmdJob.getAction()
+}
+
+func inspectXfer(_ transferJob: borrowing Job<BankTransfer>) {
+  let _ = transferJob.getAction() // expected error: method 'getAction' requires that 'BankTransfer' conform to 'Copyable'
+}
+```
+
+**キーポイント**:
+- 通常の extension はデフォルトで汎型パラメータが Copyable と仮定
+- `getAction()` が action を返すにはコピーが必要。Copyable な Action にのみ使用可能
+- `Job<BankTransfer>` で `getAction()` を呼ぶとエラー
+
+すべての場合に extension を適用するには明示的に宣言（[20:14](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1214)）:
+
+```swift
+protocol Cancellable {
+  mutating func cancel()
+}
+
+extension Job: Cancellable {
+  mutating func cancel() {
+    action = nil
+  }
+}
+```
+
+**キーポイント**:
+- この extension はデフォルトで Action が Copyable の場合のみ適用
+- Cancellable をすべての Job に適用するには、プロトコル自体も `~Copyable` である必要
+
+すべての場合に extension を適用（[21:00](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1260)）:
+
+```swift
+protocol Cancellable: ~Copyable {
+  mutating func cancel()
+}
+
+extension Job: Cancellable where Action: ~Copyable {
+  mutating func cancel() {
+    action = nil
+  }
+}
+```
+
+**キーポイント**:
+- プロトコルを `~Copyable` と宣言後、conformance は型が Copyable であることを要求しない
+- `where Action: ~Copyable` でこの extension は Copyable かどうかに関わらずすべての Action に適用
+
+---
+
+## 重要ポイント
+
+1. **`~Copyable` で独占リソースをラップ**
+   - ファイルハンドル、ネットワーク接続、データベーストランザクション、暗号鍵——これらのリソースは noncopyable 型でラップするのに自然に適している
+   - コンパイラはリソースが誤ってコピーされないことを保証し、deinit は「最後のユーザー」が去るとき必ず実行
+   - リソース管理型（`FileHandle` など）を選び、`~Copyable struct` に変更し、deinit でクリーンアップ
+
+2. **汎型サポートを段階的に導入**
+   - すべての汎型コードを一度に noncopyable 対応に変更する必要はない
+   - 新規汎型関数から: `<T>` ではなく `<T: ~Copyable>` を直接使用。両タイプが使える
+   - 既存汎型コードはそのまま。noncopyable 型のサポートが本当に必要になったときに変更
+
+3. **条件付き Copyable で柔軟性を維持**
+   - 汎型型が単なる「コンテナ」なら、条件付き Copyable を検討
+   - `extension MyType: Copyable where T: Copyable` で T が Copyable のとき型もコピー可能に
+   - Copyable コードのみ書く呼び出し元は変更不要。noncopyable 型も使える
+
+---
+
+## 関連セッション
+
+- [Analyze heap memory](/articles/wwdc2024-10173) — ヒープメモリの深掘り。値型と参照型のメモリレイアウトを理解
+- [Explore Swift performance](/articles/wwdc2024-10217) — Swift が抽象化と性能をどうバランスするか。コピーセマンティクスの性能影響を含む
+- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Swift サーバーアプリケーションのシーン。noncopyable 型はサーバーリソース管理に有用
+- [Go further with Swift Testing](/articles/wwdc2024-10195) — Swift Testing フレームワーク。noncopyable 型のテストでは consuming セマンティクスを活用可能

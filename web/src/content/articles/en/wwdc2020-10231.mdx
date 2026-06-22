@@ -1,0 +1,196 @@
+---
+title: "Reduce latency with HLS Blocking Playlist Reload"
+description: "blocking playlist reload is a required component of low-latency hls that improves segment discovery time in live streams and addresses the common problem of stale playlists when delivering through an http cache. learn how to use blocking playlist reload to reduce streaming latency and improve cdn performance for both low-latency and regular live hls streams."
+date: 2020-06-10
+tags: ["WWDC 2020", "HLS", "Low-Latency HLS"]
+thumbnail: "/images/sessions/2020/10231.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10231/"
+sessionId: "wwdc2020-10231"
+year: "2020"
+relatedSessions:
+  - title: "What's new in Low-Latency HLS"
+    code: "10228"
+    description: "Low-Latency HLS overview, explaining partial segments, playlist updates, and two-second live broadcast latency targets."
+  - title: "Discover HLS Blocking Preload Hints"
+    code: "10229"
+    description: "Explain how the player can request the upcoming partial segment in advance to reduce the time waiting for media data."
+  - title: "Optimize live streams with HLS Playlist Delta Updates"
+    code: "10230"
+    description: "Introducing the use of incremental playlist updates to reduce transmission costs caused by large live broadcast windows and metadata."
+  - title: "Adapt ad insertion to Low-Latency HLS"
+    code: "10232"
+    description: "Describes slicing, boundary and playback continuity processing for server-side ad insertion in low-latency live broadcast."
+  - title: "Improve stream authoring with HLS Tools"
+    code: "10225"
+    description: "Demonstrates how the HLS toolchain can validate, package, and improve live and on-demand streams."
+---
+## Highlight
+
+> Apple adds HLS playlist reload`_HLS_msn`and`_HLS_part`The delivery directive allows the server to wait until the target segment or partial segment appears before returning to the playlist, thereby reducing the waiting time for the live broadcast player to discover new content.
+
+---
+
+## Core Content
+
+Live broadcast players are most afraid of missing a playlist update. The approach of traditional HLS is simple: the client periodically re-requests the same playlist URL. If it is requested just before the update, it will still get the old playlist and can only wait for the next one.`target duration`Try again. For ordinary live broadcasts, this is just a few more seconds of waiting; for Low-Latency HLS (low-latency HLS), these few seconds will directly eat up the low-latency benefits.
+
+Blocking Playlist Reload changes polling to conditional waiting. Instead of asking "What's there now?" the client tells the server "Wait until the playlist contains the next thing I haven't seen before replying." If the server does not have the target content yet, it keeps the request open; once the new segment or partial segment is written into the playlist, it immediately returns the new playlist.
+
+This change also solves the old problem of HTTP cache. The traditional live playlist always has the same URL, the cache needs to expire frequently, and the player may still get old responses. Blocking Playlist Reload uses a unique URL with query parameters, e.g.`_HLS_msn=24`, each playlist update can be cached as a separate object. New update requests will penetrate the cache to origin, and the generated responses can be retained at the CDN edge for longer.
+
+---
+
+## Detailed Content
+
+### Declare that the server supports blocking reload
+
+([01:27](https://developer.apple.com/videos/play/wwdc2020/10231/?time=87)) Blocking Playlist Reload is an optional capability. The server must be in the playlist`#EXT-X-SERVER-CONTROL`Statement in tag`CAN-BLOCK-RELOAD=YES`, the client will use this request method.
+
+```m3u8
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES
+#EXT-X-MEDIA-SEQUENCE:19
+#EXTINF:6.0,
+segmentA.ts
+#EXTINF:6.0,
+segmentB.ts
+#EXTINF:6.0,
+segmentC.ts
+#EXTINF:6.0,
+segmentD.ts
+#EXTINF:6.0,
+segmentE.ts
+```
+
+Key points:
+
+- `#EXT-X-SERVER-CONTROL`Place it in the playlist to tell the client that the server supports additional playback control capabilities.
+- `CAN-BLOCK-RELOAD=YES`Is a switch for blocking reload; without it, clients should continue to use normal reload.
+- `#EXT-X-MEDIA-SEQUENCE:19`The Media Sequence Number indicating the first segment is 19.
+- the last one in the playlist`segmentE.ts`Corresponds to Media Sequence Number 23, so the next new segment should be 24.
+
+### use`_HLS_msn`Request the next complete segment
+
+([02:44](https://developer.apple.com/videos/play/wwdc2020/10231/?time=164)) Ordinary live playlist does not have partial segment. The client only needs to use`_HLS_msn`Specify the next Media Sequence Number you want to see. After the server receives the request, if MSN 24 has not written to the playlist, it will block the HTTP request; after the update is completed, it will return the new version of the playlist.
+
+```txt
+_HLS_msn=24
+```
+
+```m3u8
+#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES
+#EXT-X-MEDIA-SEQUENCE:20
+#EXTINF:6.0,
+segmentB.ts
+#EXTINF:6.0,
+segmentC.ts
+#EXTINF:6.0,
+segmentD.ts
+#EXTINF:6.0,
+segmentE.ts
+#EXTINF:6.0,
+segmentF.ts
+```
+
+Key points:
+
+- `_HLS_msn=24`Indicates that the client is waiting for a playlist containing Media Sequence Number 24.
+- The request URL is different from the ordinary playlist URL. CDN can treat this version of the playlist as an independent cache object.
+- Returning results`#EXT-X-MEDIA-SEQUENCE`Moving forward to 20, the window is removed`segmentA.ts`。
+- The newly added segmentF corresponds to MSN 24, which is the next segment the client is waiting for.
+
+### use`_HLS_part`Request the next partial segment
+
+([03:57](https://developer.apple.com/videos/play/wwdc2020/10231/?time=237)) Low-Latency HLS will split a segment into multiple partial segments. client except`_HLS_msn`, still need to use`_HLS_part`Specifies the number of the target partial segment. The example in the lecture is that segment 7 already has part 0 and part 1, so the next request target is segment 7 part 2.
+
+```txt
+_HLS_msn=7
+_HLS_part=2
+```
+
+```txt
+Current playlist end: segment 7 part 0, segment 7 part 1
+Next blocking reload target: segment 7 part 2
+```
+
+Key points:
+
+- The target duration of the partial segment is 2 seconds, which is the part target duration in the speech example.
+- `_HLS_msn=7`Lock the Media Sequence Number of the parent segment.
+- `_HLS_part=2`Requests the third partial segment of this segment.
+- The server waits until segment 7 part 2 appears in the playlist before returning, and the player does not need to repeatedly detect it at fixed intervals.
+
+### Processing when the request crosses the end of the segment
+
+([04:47](https://developer.apple.com/videos/play/wwdc2020/10231/?time=287)) The client may request a part beyond the end of the current segment, such as segment 7 part 3. The server will convert this request into part 0 of the next segment. In this way, the client only needs to increment the part number in order, and does not need to know in advance how many parts each segment will eventually contain.
+
+```txt
+Client request: segment 7 part 3
+Server interpretation: segment 8 part 0
+```
+
+```txt
+If the requested part crosses the end of the parent segment,
+the server converts it to part 0 of the next segment.
+```
+
+Key points:
+
+- `_HLS_part=3`It exceeds the combined range of 6 seconds segment and 2 seconds part.
+- The server interprets it as part 0 of the next segment.
+- After part 0 of the next segment appears in the playlist, the request can return.
+- Client logic remains linear: whichever MSN and part you see, request the next MSN and part.
+
+### Cache and timeout rules
+
+([05:22](https://developer.apple.com/videos/play/wwdc2020/10231/?time=322)) The delivery directive only applies to live playlists. bring`#EXT-X-ENDLIST`The playlist ignores these parameters. When the server already has the version requested by the client, it must return the current playlist immediately; if the requested segment has rolled out of the window, it must also return the current playlist immediately. Only wait for more than three`target duration`, the server returns an error.
+
+```txt
+_HLS_msn=23  -> independent cache object for playlist update 23
+_HLS_msn=24  -> independent cache object for playlist update 24
+_HLS_msn=7 + _HLS_part=2 -> independent cache object for segment 7 part 2
+```
+
+Key points:
+
+- Each set of delivery directives corresponds to a different playlist update, and the cache does not need to overwrite each other with the same live playlist object.
+- New requests with parameter combinations that CDN has not seen will continue to be sent to origin.
+- Successful playlist responses can be cached six times per talk suggestion`target duration`。
+- CDN should configure duplicate edge request coalescing to merge the same edge requests into one origin request to reduce the pressure on the origin site.
+
+---
+
+## Core Takeaways
+
+- **Reload diagnostic panel of live broadcast player**
+- **What to do**: Display the current MSN, part, and next time in the internal player`_HLS_msn` / `_HLS_part`Requesting and waiting are time consuming.
+- **Why is it worth doing**: The core issue of this session is the time it takes for the player to discover new content; only by visualizing the waiting time can we determine whether the delay comes from encoding, origin, CDN, or client request strategy.
+- **How ​​to start**: Record each playlist request URL, response time, the last MSN and part returned to the playlist, and draw a timeline by playback session.
+
+- **Low-Latency HLS origin blocking request monitoring**
+- **What to do**: Increase the number of blocking reload concurrencies, average blocking duration, and triple the number of blocking reloads for origin.`target duration`Indicators such as the number of timeouts.
+- **Why it's worth doing**: The server will keep HTTP requests until the playlist is updated, and the capacity bottleneck changes from short request throughput to concurrent waiting for connections.
+- **How ​​to start**: Processing`_HLS_msn`and`_HLS_part`Ingress management, aggregate latency and error rate by playlist path and CDN POP.
+
+- **CDN cache hit experiment**
+- **What to do**: Compare the cache hits, origins and response reuse of normal live playlist URLs and URLs with delivery directives.
+- **Why it's worth doing**: The talk emphasizes that by having a unique URL for each playlist update, successful responses can be retained in the cache longer.
+- **How ​​to start**: for`_HLS_msn`、`_HLS_part`Combine the output cache flags, enable duplicate edge request coalescing, and observe whether the number of origin requests drops.
+
+- **Live broadcast window exception recovery tester**
+- **What to do**: Simulate boundary conditions such as client requesting an old MSN, requesting an advanced part, and requesting a playlist that has ended.
+- **Why it's worth doing**: session gives these exception rules; testing in advance can avoid the player getting stuck in the waiting state.
+- **How ​​to start**: Use a script to generate different query parameters, request the staging playlist, and verify whether the server returns the current playlist immediately according to the rules, or returns an error after timeout.
+
+---
+
+## Related Sessions
+
+- [What's new in Low-Latency HLS](/articles/wwdc2020-10228) — Overview of Low-Latency HLS, first understand the partial segment and the two-second live broadcast delay target.
+- [Discover HLS Blocking Preload Hints](/articles/wwdc2020-10229) — Continue to see how the media data itself is requested in advance through the blocking preload hint.
+- [Optimize live streams with HLS Playlist Delta Updates](/articles/wwdc2020-10230) — Learn how large live playlists can transmit only the changed parts, reducing reload costs.
+- [Adapt ad insertion to Low-Latency HLS](/articles/wwdc2020-10232) — Learn how ad insertion in low-latency links maintains switching and playback continuity.
+- [Improve stream authoring with HLS Tools](/articles/wwdc2020-10225) — Use HLS tools to check the packaging results and verify that the playlist and media slices are as expected.

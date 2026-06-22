@@ -1,0 +1,146 @@
+---
+title: "Filter and tunnel network traffic with NetworkExtension"
+description: "learn about the apis in the networkextension framework that give your app the power and flexibility to extend the system"
+date: 2026-06-10
+tags: ["System Services"]
+thumbnail: "/images/sessions/2025/234.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/234/"
+sessionId: "wwdc2025-234"
+year: "2025"
+relatedSessions:
+  - title: "Deliver age-appropriate experiences in your app"
+    code: "299"
+    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
+  - title: "Finish tasks in the background"
+    code: "227"
+    description: "discover background execution advancements and understand how the system schedul"
+  - title: "Get ahead with quantum-secure cryptography"
+    code: "314"
+    description: "learn how to protect your app"
+  - title: "Optimize home electricity usage with EnergyKit"
+    code: "257"
+    description: "learn how to support energykit in your app so people can optimize electricity us"
+---
+
+## ハイライト
+
+> iOS 26 では NetworkExtension に URL Filter API が追加され、完全な URL に基づくコンテンツフィルタリングが可能になりました。Bloom filter、PIR、Privacy Pass、そして Apple がホストする OHTTP Relay を組み合わせ、URL やデバイスの身元を露出することなくクエリを完了できます。
+
+## 主要内容
+
+ペアレンタルコントロール App や学校向けのネットアクセス管理 App を開発している方は、長らく次の問題に悩まされてきました。HTTPS によってトラフィックが暗号化されているため、従来の NEFilterDataProvider からは host と port しか見えません。あるサイトの特定パス、たとえば共有リンクやゲームのページだけを遮断したくても実現できず、結果としてサイト全体をブロックして大量の正常なコンテンツまで巻き添えにするか、そのまま通過させるかの二択でした。これを回避して URL 単位でフィルタリングしようとすれば、自前で VPN を構築し、独自の中間者 CA を仕込み、すべての URL を自社サーバーへ送って確認することになります。しかしそれは、App がユーザーの閲覧履歴を完全に握ることを意味し、プライバシー上のリスクが極めて大きくなります。
+
+iOS 26 が示した解は URL Filter です。「完全な URL に基づくフィルタリング判定」をシステムの機能として提供し、App はフィルタリング経路の中に存在せず、トラフィックデータも一切見えません。App が用意するのは、ローカルの Bloom filter とリモートの PIR サーバーの 2 つだけです。システムはまずデバイス側で Bloom filter による高速判定を行い、ヒットしなければそのまま通過させます。ヒットした場合（ブラックリストにあるか、誤検知の可能性もある）にのみ PIR クエリを発行します。PIR は同型暗号 (homomorphic encryption) を用い、サーバー側が暗号文のままテーブルルックアップを実行するため、最後まで URL の平文を取得しません。さらに、すべてのクエリは Apple がホストする Oblivious HTTP Relay を経由して転送され、デバイスの IP アドレスは剥がされます。開発者は URL 単位のフィルタリング能力を手に入れる一方で、ユーザーの URL や身元情報は Apple、開発者、PIR サーバーの誰にも漏れません。この仕組みは、ペアレンタルコントロール、校内向け App、企業のアクセス禁止リストなど、「完全な URL を見たいが、閲覧履歴は残してはいけない」あらゆるシナリオに適しています。
+
+## 詳細
+
+URL Filter は 4 つの技術を重ねて成り立っています。デバイス側の事前フィルタリングを担う Bloom filter、サーバーが暗号文のままテーブルを引ける PIR (Private Information Retrieval)、匿名認証のための Privacy Pass、そして送信元 IP を隠蔽する OHTTP Relay です。これら一連の処理はすべてシステムが代行し、App と App Extension はデータ経路に介在しません ([19:01](https://developer.apple.com/videos/play/wwdc2025/234/?time=1141))。
+
+WebKit や URLSession から発行されるリクエストはシステムが自動的にチェックしますが、独自のネットワークスタックを実装したブラウザや App はこの経路を通りません。その場合は、participation API を能動的に呼び出してシステムに判定を求める必要があります ([22:15](https://developer.apple.com/videos/play/wwdc2025/234/?time=1335))。
+
+```swift
+// Use participation API to check URLs before sending requests
+
+import NetworkExtension
+
+func checkURL(url: URL) async throws -> Bool {
+  var passRequest : Bool = true
+
+  let verdict = await NEURLFilter.verdict(for: url)
+
+  if verdict == .deny {
+    passRequest = false
+  }
+  return passRequest
+}
+```
+
+ポイント:
+
+- `import NetworkExtension`: URL Filter 関連の API はすべてこのフレームワークに含まれています。
+- `NEURLFilter.verdict(for:)` は async 呼び出しです。発行するとシステム側で Bloom filter の事前検査と、必要に応じた PIR クエリが行われ、最終判定が返されます。
+- 戻り値は enum で、`.deny` がブラックリスト一致を意味します。`.allow` または deny 以外であればリクエストを通過させます。
+- App 側は、URL がデータセットに含まれているかどうかを直接知ることはできません。得られるのは「通過/拒否」というブール値レベルの結果だけです。
+
+続いて、App から URL Filter を構成する手順です ([25:01](https://developer.apple.com/videos/play/wwdc2025/234/?time=1501))。
+
+```swift
+// Configure and manage URL Filter
+
+import NetworkExtension
+
+let manager = NEURLFilterManager.shared
+
+try await manager.loadFromPreferences()
+
+try manager.setConfiguration(
+    pirServerURL: URL(string:"https://pir.example.com")!,
+    pirPrivacyPassIssuerURL: URL(string:"https://privacypass.example.com")!,
+    pirAuthenticationToken: "1234",
+    controlProviderBundleIdentifier: "com.example.myURLFilter.extension")
+
+manager.prefilterFetchInterval = 86400 // fetch every 1 day
+manager.shouldFailClosed = false
+manager.localizedDescription = "Alice's URL Filter"
+manager.isEnabled = true
+
+try await manager.saveToPreferences()
+```
+
+ポイント:
+
+- `NEURLFilterManager.shared`: シングルトンです。URL Filter のすべての設定はここから読み書きします。
+- `loadFromPreferences()`: 既存の設定をディスクから読み込みます。変更前にまず load してから set する流れは、NetworkExtension フレームワークの定型パターンです。
+- `setConfiguration` の 3 つの URL/Token パラメータは、それぞれ自前の PIR サーバー、Privacy Pass Issuer、認証トークンを指します。これらのコンポーネントを Apple はホストしないため、開発者自身でデプロイします。
+- `controlProviderBundleIdentifier`: 自分の App Extension の bundle id です。システムはこれを手がかりに extension を起動して Bloom filter を取得します。
+- `prefilterFetchInterval = 86400`: 単位は秒で、システムが extension の `fetchPrefilter` を呼び出す間隔を決めます。ここでは 1 日 1 回に設定しています。
+- `shouldFailClosed = false`: PIR が失敗した際に通過させる (false) か拒否する (true) かを指定します。ペアレンタルコントロールのようなシナリオでは true が望ましい場合もあります。
+- `isEnabled = true` と `saveToPreferences()`: ここまで完了して書き込まれて初めてフィルタリングが実際に有効化されます。
+
+App Extension 側では `NEURLFilterControlProvider` プロトコルを実装し、Bloom filter のデータをシステムへ受け渡す責任を持ちます ([26:41](https://developer.apple.com/videos/play/wwdc2025/234/?time=1601))。
+
+```swift
+// Implement NEURLFilterControlProvider protocol
+
+import NetworkExtension
+
+class URLFilterControlProvider: NEURLFilterControlProvider {
+
+  func fetchPrefilter() async throws -> NEURLFilterPrefilter? {
+        
+    // Fetch your Bloom filters data from your app bundle or from your server
+    let data = NEURLFilterPrefilter.PrefilterData.temporaryFilepath(fileURL)
+    let result = NEURLFilterPrefilter(data: data,
+                                      bitCount: numberOfBits,
+                                      hashCount: numberOfHashes,
+                                      murmurSeed: murmurSeed)
+    return result
+  }
+}
+```
+
+ポイント:
+
+- `NEURLFilterControlProvider` を継承します。Xcode の URL Filter app extension テンプレートから雛形が生成されます。
+- `fetchPrefilter()` はシステムが `prefilterFetchInterval` のスケジュールに従って呼び出します。Extension は app bundle や自社サーバーからデータを取得できます。
+- `NEURLFilterPrefilter.PrefilterData.temporaryFilepath(fileURL)`: メモリバッファではなく一時ファイルのパス経由でデータをシステムに渡す方式で、大規模データセットに向いています。
+- `NEURLFilterPrefilter` を構築する際は `bitCount`、`hashCount`、`murmurSeed` の 3 つを必ず渡します。これらは Bloom filter のサイズ、ハッシュ関数の個数、murmur ハッシュの seed を決めるパラメータで、サーバー側で Bloom filter を構築したときの値と完全に一致していなければマッチングが成立しません。
+
+デプロイに関しても 2 つの注意点があります。URL Filter は OHTTP Relay 経由で外部に出るため、事前に Apple へ Relay の利用申請が必要です。開発ビルドは免除されますが、App Store / TestFlight / Ad-hoc / 企業署名による配布ではすべて承認フローを通す必要があります ([19:38](https://developer.apple.com/videos/play/wwdc2025/234/?time=1178))。PIR サーバー側の use case 名は、App の bundle id で始まり `url.filtering` 文字列が続く形式でなければならず、レコードの形式は URL 文字列を key、整数 1 を value として登録します ([23:22](https://developer.apple.com/videos/play/wwdc2025/234/?time=1402))。
+
+## 重要ポイント
+
+- **ペアレンタルコントロールや校内ネットアクセス管理 App は URL Filter へ移行する**: なぜ取り組む価値があるか — 従来の NEFilterDataProvider では HTTPS の完全な URL が見えず、サイト全体を遮断するしかなく体験が粗かったのに対し、URL Filter はリソース単位で精緻に制御でき、しかもコンシューマー向けデバイスにも開放されており、もはや supervised device に限定されません。何から始めるか — まず Apple が提供する [PIRService サンプルコード](https://swiftpackageindex.com/apple/pir-service-example/main/documentation/pirservice)でサーバー側を動かし、App では `url-filter-provider` entitlement を申請し、上記 3 種のコード骨格に沿って Manager の構成、Extension での Bloom filter 取得、participation API による独自ネットワークスタックの補完を組み立てていきます。
+
+- **企業内ネットワークへのアクセスは従来の VPN から Network Relay へ切り替える**: なぜ取り組む価値があるか — MASQUE プロトコルは TCP/UDP のアプリケーションフロー向けに最適化されておりプラットフォームがネイティブにサポートし、NEPacketTunnelProvider を書く必要もありません。企業向けメールやコラボレーション系のクラウドアプリケーションにはこの経路が最適です ([03:53](https://developer.apple.com/videos/play/wwdc2025/234/?time=233))。フルトンネルの IP VPN は、コンプライアンス要件が厳しい一部のシナリオでのみ必要になります。何から始めるか — NERelayManager API で relay と認証を構成するか、MDM 構成プロファイルで配布します。ユーザー側では追加の extension をインストールする必要はありません。
+
+- **既存の VPN App が Packet Filter を使ったり、ルーティングテーブルを直接書き換えたりしていないかを確認する**: なぜ取り組む価値があるか — Apple は Session 内で、これがサポート対象外であり、システムや他 App のフィルタリング/ルーティングルールと衝突し、AirDrop、Mac Virtual Display、Sidecar などの機能を破壊しうると明言しています ([07:34](https://developer.apple.com/videos/play/wwdc2025/234/?time=454))。何から始めるか — TN3165 と TN3120 の 2 つの Technote を読み、独自トンネルロジックを NEPacketTunnelProvider に移植します。シナリオに応じて `enforceRoutes` (split tunnel) や `includeAllNetworks` (full tunnel) を有効化し、`excludeLocalNetworks` を併用して AirDrop のようなローカルサービスがトンネルを迂回できるようにします。
+
+- **NEPacketTunnelProvider をコンテンツフィルタリングに流用しない**: なぜ取り組む価値があるか — IP 層で動作するため、フローレベルやアプリケーションレベルのメタデータが取れず、host や URL に基づく判定はできません ([08:26](https://developer.apple.com/videos/play/wwdc2025/234/?time=506))。何から始めるか — 目的に応じて API を選び直します。トラフィックを遮るなら NEFilterDataProvider/NEFilterPacketProvider、URL を遮るなら新しい NEURLFilter、DNS のセキュリティであれば DNS Configuration & Proxy API です。
+
+## 関連セッション
+
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — URL Filter と組み合わせて未成年向けの年齢別体験を構築する
+- [Finish tasks in the background](/articles/wwdc2025-227) — Bloom filter の定期取得に必要な Extension のバックグラウンドスケジューリングを理解する
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — Network Extension も最新の暗号技術によって通信路を保護している
+- [Optimize home electricity usage with EnergyKit](/articles/wwdc2025-257) — システムが代行して実行し、App が機微データに触れないというプライバシーモデルのもう一つの好例

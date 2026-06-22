@@ -39,6 +39,21 @@ function isAslSession(title) {
   return /\(ASL\)\s*$/i.test(title ?? '');
 }
 
+function isDubDubDaily(title) {
+  return /^Dub Dub Daily:/i.test(title ?? '');
+}
+
+function shouldSkipWebSession(year, contentId, title) {
+  const numericId = Number.parseInt(contentId, 10);
+  return (
+    isAslSession(title) ||
+    (year === '2026' && (
+      isDubDubDaily(title) ||
+      (Number.isFinite(numericId) && numericId >= 8000)
+    ))
+  );
+}
+
 const years = ['2020', '2021', '2022', '2023', '2024', '2025', '2026'];
 const allSessions = [];
 const allTopics = {};
@@ -65,7 +80,7 @@ for (const year of years) {
 
   yearCounts[year] = 0;
   for (const video of videos) {
-    if (isAslSession(video.title)) continue;
+    if (shouldSkipWebSession(year, video.eventContentId, video.title)) continue;
 
     // Compact format: [contentId, title, description, primaryTopic, topics, permalink, resources, snippets]
     allSessions.push([

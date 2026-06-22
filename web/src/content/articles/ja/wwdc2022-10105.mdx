@@ -1,0 +1,367 @@
+---
+title: "Maximize your Metal ray tracing performance"
+description: "learn how to simplify your ray tracing code and increase performance with the power of metal 3. we'll explore the gpu debugging and profiling tools that can help you tune your ray tracing applications. we'll also show you how you can speed up intersection tests and reduce shader code memory accesses and indirections with per-primitive data in an acceleration structure. and we'll help you implement faster acceleration structure builds and refits to reduce load times and per-frame overhead."
+date: "2022-06-08"
+tags: ["Graphics & Games", "Metal", "Ray Tracing"]
+thumbnail: "/images/sessions/2022/10105.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10105/"
+sessionId: "wwdc2022-10105"
+year: "2022"
+relatedSessions:
+  - title: "Discover Metal 3"
+    code: "10066"
+    description: "アセットのロード、オフライン コンパイル、MetalFX、メッシュ シェーダー、レイ トレーシング、ツールのアップデートをカバーする Metal 3 の概要。"
+  - title: "Go bindless with Metal 3"
+    code: "10101"
+    description: "Metal 3 のバインドレス レンダリング、引数バッファ、ヒープ内のアクセラレーション構造、およびデバッグの改善について説明します。"
+  - title: "Target and optimize GPU binaries with Metal 3"
+    code: "10102"
+    description: "GPU バイナリ生成をプロジェクトのビルド フェーズに進めて、起動、レベルの読み込み、実行時のコンパイルのオーバーヘッドを削減します。"
+  - title: "Boost performance with MetalFX Upscaling"
+    code: "10103"
+    description: "MetalFX アップスケーリングを使用して、低解像度でレンダリングし、高解像度の出力を生成して、Metal アプリケーションのパフォーマンスを向上させます。"
+  - title: "Load resources faster with Metal 3"
+    code: "10104"
+    description: "Metal 3 の高速リソース読み込みを使用して、大規模なリソースとレベル データの読み込みプロセスを最適化します。"
+---
+## ハイライト
+
+> このセッションでは、Metal 3 のレイ トレーシングに関連するパフォーマンスの最適化方法について詳しく説明します。昨年既に Metal レイ トレーシングを使用していた場合、今年のこれらの改善により、レンダリング パイプラインの実行が高速になり、より大きなシーンがサポートされるようになります。
+
+## 主要内容
+レイ トレーシングのコストは主に 2 つのことから発生します。1 つは大量のレイの発射、もう 1 つはレイが当たるシーンでのジオメトリの繰り返しの検出です。 Metal のレイ トレーシング API は、このパスをシェーダー関数に組み込みました。開発者は通常、コンピューティング関数またはフラグメント関数でレイを生成し、インターセクターを使用してアクセラレーション構造をクエリします。
+
+([00:57](https://developer.apple.com/videos/play/wwdc2022/10105/?time=57)) このプロセスでは、反射、シャドウ、グローバル イルミネーションを実行できますが、フレームごとに多数の交差テストが実行されます。シーンが大きくなるほど、交差点機能やアクセラレーション構造の構築がホット パスになりやすくなります。
+
+Metal 3 の変更は、これらの熱経路に焦点を当てています。最初のタイプの変更では、シェーダーのメモリ アクセスが減少します。 2 番目のタイプの変更は、アクセラレーション構造の構築、再調整、および並列スケジューリングを高速化します。 3 番目のカテゴリの変更により、Xcode 14 はすべてのプリミティブ、シェーダー コードのすべての行、およびシェーダー スタック オーバーフローをチェックできるようになります。
+
+このセッションのメインスレッドは明確です。光が近づくたびに読み取る必要があるデータを移動し、フレームごとに構築する必要があるデータを GPU 実行により適した形式に分割し、ツールを使用してボトルネックが本当に解消されたかどうかを確認します。
+
+## 詳細
+### プリミティブごとのデータを使用して、交差する関数への間接アクセスを減らす
+
+([04:04](https://developer.apple.com/videos/play/wwdc2022/10105/?time=244)) 話はアルファ テストから始まります。透明マップは、葉、フェンス、髪などのモデルでよく使用されます。交差関数は、テクスチャ アルファに基づいて三角形のヒットが確立されたかどうかを判断する必要があります。
+
+最小限のロジックはシンプルです。
+
+```metal
+float alpha = texture.sample(sampler, UV).w;
+return alpha >= 0.5f;
+```
+
+キーポイント:
+
+- `texture.sample(sampler, UV)`現在の UV を使用してマップをサンプリングします。
+-`.w`アルファチャンネルを取得します。
+-`alpha >= 0.5f`このヒットがアルファ テストに合格するかどうかを判断します。
+
+([05:46](https://developer.apple.com/videos/play/wwdc2022/10105/?time=346)) 問題は、真の交差関数が最初にテクスチャと UV を見つける必要があることです。古い書き方では、インスタンス データとマテリアル バッファーからいくつかのレイヤーを取得します。
+
+```metal
+[[intersection(triangle, raytracing::triangle_data, raytracing::instancing)]]
+bool alphaTestIntersection(float2               coordinates    [[barycentric_coord]],
+                           unsigned int         primitiveIndex [[primitive_id]],
+                           unsigned int         instanceIndex  [[instance_id]],
+                           device GlobalData   *globalData     [[buffer(1)]],
+                           device InstanceData *instanceData   [[buffer(0)]])
+{
+    device Material *materials = globalData->materials;
+    InstanceData instance = instanceData[instanceIndex];
+    float2 UV = calculateSamplingCoords(coordinates,
+                                        instance.uvs[primitiveIndex * 3 + 0],
+                                        instance.uvs[primitiveIndex * 3 + 1],
+                                        instance.uvs[primitiveIndex * 3 + 2]);
+    int materialIndex = instance.materialIndices[primitiveIndex];
+    float alpha = materials[materialIndex].texture.sample(sam, UV).w;
+    return alpha >= 0.5f;
+}
+```
+
+キーポイント:
+
+- `[[intersection(... )]]`これを三角形レイ トレーシングで使用する交差関数として宣言します。
+-`coordinates`三角形の頂点属性を補間するための重心座標を提供します。
+-`primitiveIndex`そして`instanceIndex`現在のプリミティブとインスタンスを見つけるために使用されます。
+-`globalData->materials`まずグローバルマテリアル配列を取得します。
+-`instanceData[instanceIndex]`次に、現在のインスタンスの UV とマテリアル インデックスを取得します。
+-`calculateSamplingCoords`プリミティブの 3 つの UV 補間を使用して、サンプリング座標を取得します。
+-`instance.materialIndices[primitiveIndex]`マテリアルインデックスを見つけます。
+-`materials[materialIndex].texture.sample(...)`マテリアルに進み、テクスチャ アルファについて読んでください。
+
+([06:48](https://developer.apple.com/videos/play/wwdc2022/10105/?time=408)) Metal 3 はプリミティブごとのデータを追加します。開発者は、交差関数が実際に必要とするデータをアクセラレーション構造に直接保存できます。講義の例では、3 つの頂点のテクスチャと UV のみを保存します。
+
+```metal
+struct PrimitiveData
+{
+    texture2d<float> texture;
+    float2 uvs[3];
+};
+```
+
+キーポイント:
+
+- `PrimitiveData`これは、各プリミティブに関連付けられた小さなデータです。
+-`texture2d<float> texture`アルファテストで必要なテクスチャハンドルをプリミティブに配置します。
+-`float2 uvs[3]`三角形の 3 つの頂点の UV を保存します。
+- 講義リマインダー。ここには任意のデータを保存できますが、サイズを小さくしておくとパフォーマンスが向上します。
+
+([07:08](https://developer.apple.com/videos/play/wwdc2022/10105/?time=428)) したがって、交差関数は短くなります。グローバル データ、インスタンス データ、プリミティブ ID、およびインスタンス ID は受信されなくなり、プリミティブ データ ポインターのみが読み取られます。
+
+```metal
+// Alpha testing intersection function
+[[intersection(triangle, raytracing::triangle_data, raytracing::instancing)]]
+bool alphaTestIntersection(float2               coordinates    [[barycentric_coord]],
+                     const device PrimitiveData *primitiveData [[primitive_data]])
+{
+    PrimitiveData ppd = *primitiveData;
+    float2 UV = calculateSamplingCoords(coordinates,
+                                        ppd.uvs[0],
+                                        ppd.uvs[1],
+                                        ppd.uvs[2]);
+    float alpha = ppd.texture.sample(sam, UV).w;
+    return alpha >= 0.5f;
+}
+```
+
+キーポイント:
+
+- `[[primitive_data]]`交差関数が現在のプリミティブのデータ ポインタを直接受け取るようにします。
+-`PrimitiveData ppd = *primitiveData`この関数で必要なデバイスのメモリ負荷はこれだけです。
+-`ppd.uvs[0...2]`インスタンス データからのさらなる逆参照を避けるために、三角形 UV を直接提供します。
+-`ppd.texture.sample(sam, UV).w`プリミティブ バインド テクスチャを使用してアルファを直接サンプリングします。
+- 戻り値は依然として 1 つのことのみを表します。それは、このヒットがアルファ テストに合格したかどうかです。
+
+([08:54](https://developer.apple.com/videos/play/wwdc2022/10105/?time=534)) このデータをアクセラレーション構造に入れるには、ジオメトリ記述子にバッファー、要素サイズ、ストライド、オフセットを設定する必要があります。
+
+```swift
+geometryDescriptor.primitiveDataBuffer = primitiveDataBuffer
+geometryDescriptor.primitiveDataElementSize = MemoryLayout<PrimitiveData>.size
+geometryDescriptor.primitiveDataStride = MemoryLayout<PrimitiveData>.stride
+geometryDescriptor.primitiveDataBufferOffset = primitiveDataOffset
+```
+
+キーポイント:
+
+- `primitiveDataBuffer`すべてのプリミティブ データを保持するメタル バッファーを指します。
+-`primitiveDataElementSize`各プリミティブが格納するバイト数を示します。
+-`primitiveDataStride`バッファ内のデータがしっかりと配置されていない状況に対処します。
+-`primitiveDataBufferOffset`プリミティブデータがバッファの先頭から格納されていない状況に対処します。
+
+([09:18](https://developer.apple.com/videos/play/wwdc2022/10105/?time=558)) プリミティブごとのデータは交差関数によってのみ使用されるわけではありません。また、交差結果および交差クエリから取得して、シェーディングに使用することもできます。
+
+```metal
+// Intersection function argument:
+const device void *primitiveData [[primitive_data]]
+
+// Intersection result:
+primitiveData = intersection.primitive_data;
+
+// Intersection query:
+primitiveData = query.get_candidate_primitive_data();
+primitiveData = query.get_committed_primitive_data();
+```
+
+キーポイント:
+
+- `[[primitive_data]]`交差関数パラメータへの入り口です。
+-`intersection.primitive_data`最終的な交差結果から同じデータを読み取ります。
+-`get_candidate_primitive_data()`ヒットした候補のプリミティブデータを読み取ります。
+-`get_committed_primitive_data()`ヒットが確認されたプリミティブデータを読み出します。
+
+Apple は、自社のテスト アプリでプリミティブ データごとに 10 ～ 16 パーセントのパフォーマンス向上を確認しました。この数値は、メモリ アクセスとポインタの逆参照の削減によって得られます。アルファテストの判定ロジックは変更されていません。
+
+### 交差関数テーブルのバッファを再利用する
+
+([10:18](https://developer.apple.com/videos/play/wwdc2022/10105/?time=618)) レイ トレーシング カーネルと交差関数は、多くの場合、同じリソースを必要とします。古いプロセスでは、アプリケーションはリソースを交差関数テーブルにバインドし、次に同じリソースをメイン レイ トレーシング カーネルにバインドしていました。
+
+Metal 3 の Metal Shading Language を使用すると、シェーダは交差関数テーブルからバッファおよび可視関数テーブルに直接アクセスできます。
+
+```metal
+device int *buffer = intersectionFunctionTable.get_buffer<device int *>(index);
+
+visible_function_table<uint(uint)> table =
+    intersectionFunctionTable.get_visible_function_table<uint(uint)>(index);
+
+uint result = table[0](parameter);
+```
+
+キーポイント:
+
+- `get_buffer<device int *>(index)`交差関数テーブルからインデックスによってバインドされたバッファを読み取ります。
+-`get_visible_function_table<uint(uint)>(index)`表示されている関数テーブルを関数タイプごとに読み取ります。
+-`table[0](parameter)`テーブルに表示されている関数を呼び出します。
+- この機能は重複したバインディングを減らし、交差関数とメイン カーネルがリソースを共有するシナリオに適しています。
+
+### 間接コマンド バッファからレイ トレーシングを開始する
+
+([11:15](https://developer.apple.com/videos/play/wwdc2022/10105/?time=675)) 間接コマンド バッファーは GPU 駆動のパイプラインに使用されます。 Metal 3 はレイ トレーシングのサポートをもたらします。これを有効にする記述子フラグは 1 つだけです。
+
+```swift
+let icbDescriptor = MTLIndirectCommandBufferDescriptor()
+
+icbDescriptor.supportRayTracing = true
+```
+
+キーポイント:
+
+- `MTLIndirectCommandBufferDescriptor()`ICB 記述オブジェクトを作成します。
+-`supportRayTracing = true`この ICB を宣言すると、レイ トレーシングを使用してグラフィックスまたは計算関数がスケジュールされます。
+- レイ トレーシングは、これらの機能で通常の方法で引き続き使用されます。
+
+この変更は、GPU 駆動のレンダラーに役立ちます。アプリケーションは、後続の作業を GPU にエンコードさせ、スケジュールされたシェーダーでレイ トレーシング クエリを実行させることができます。
+
+### アクセラレーション構造の構築、再調整、並列実行を高速化します。
+
+([13:16](https://developer.apple.com/videos/play/wwdc2022/10105/?time=796)) ゲームが新しいレベルをロードするとき、通常はモデルとテクスチャをロードし、モデルのプリミティブ アクセラレーション構造も構築します。メイン ループに入った後、動的キャラクターとアニメーション モデルは再調整によって更新されることがよくあります。シーン オブジェクトが追加、削除、または大幅に移動された場合、通常、インスタンス アクセラレーション構造は完全な再構築が必要になります。
+
+([14:39](https://developer.apple.com/videos/play/wwdc2022/10105/?time=879)) Metal 3 は、加速構造の構築を最大 2.3 倍に増加させ、Apple Silicon 上で最大 38% に再装備します。多くの小さなプリミティブ アクセラレーション構造の場合、Metal はビルド、コンパクト、再フィットを並行して実行しようとします。これにより、最大 2.8 倍のビルド改善を達成できます。
+
+([15:43](https://developer.apple.com/videos/play/wwdc2022/10105/?time=943)) 並列の利点を得るには、複数のビルドで同じアクセラレーション ストラクチャ コマンド エンコーダを使用する必要があり、同じスクラッチ バッファを共有することはできません。講演で示されたパターンは、小規模なスクラッチ バッファのセットをローテーションで使用することです。
+
+```swift
+for (index, accelerationStructure) in accelerationStructures.enumerated() {
+    encoder.build(accelerationStructure: accelerationStructure,
+                  descriptor: descriptors[index],
+                  scratchBuffer: scratchBuffers[index % numScratchBuffers],
+                  scratchBufferOffset: 0)
+}
+```
+
+キーポイント:
+
+- `accelerationStructures.enumerated()`構築する必要がある一連の加速構造を横断します。
+-`encoder.build(...)`複数のビルドを同じエンコーダーで連続してエンコードします。
+-`descriptors[index]`各加速構造の説明を入力します。
+-`scratchBuffers[index % numScratchBuffers]`すべてのビルドが同じスクラッチ バッファを取得しないように、スクラッチ バッファ プールからローテーションします。
+-`scratchBufferOffset: 0`各スクラッチ バッファが開始位置から使用されることを示します。
+
+### よりコンパクトな頂点フォーマットを直接使用する
+
+([16:29](https://developer.apple.com/videos/play/wwdc2022/10105/?time=989)) 以前のアクセラレーション構造では、3 コンポーネントの完全精度浮動小数点頂点データが必要でした。半精度、正規化された整数、または 2D 平面ジオメトリを使用する場合、アプリケーションは、アクセラレーション構造を構築するためだけに、最初に解凍して一時バッファにコピーすることがあります。
+
+Metal 3 を使用すると、アクセラレーション ストラクチャのビルドでより多くの頂点フォーマットを直接使用できるようになります。三角形ジオメトリ記述子にエントリ ポイントを設定します。
+
+```swift
+let geometryDescriptor = MTLAccelerationStructureTriangleGeometryDescriptor()
+
+geometryDescriptor.vertexFormat = .uint1010102Normalized
+```
+
+キーポイント:
+
+- `MTLAccelerationStructureTriangleGeometryDescriptor()`三角形のセットのジオメトリを記述します。
+-`vertexFormat`頂点バッファ内の頂点の実際の形式を宣言します。
+-`.uint1010102Normalized`は、講義例のコンパクトな正規化整数形式です。
+- ビルド フェーズではこのフォーマットを直接読み取ることができるため、アクセラレーション構造用に追加の完全精度の一時コピーを準備する必要がなくなります。
+
+### ジオメトリ記述子の変換行列を設定します
+
+([17:37](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1057)) 新しい変換行列は、コンパクトな頂点形式で使用できます。たとえば、モデルは座標を 0 ～ 1 の範囲に正規化し、正規化された整数として保存できます。次に、実行時にスケール行列とオフセット行列を指定して、頂点を元の位置に戻します。
+
+```swift
+var scaleTransform =
+    MTLPackedFloat4x3(columns: (
+        MTLPackedFloat3Make( scale.x,      0.0,      0.0),
+        MTLPackedFloat3Make(     0.0,  scale.y,      0.0),
+        MTLPackedFloat3Make(     0.0,      0.0,  scale.z),
+        MTLPackedFloat3Make(offset.x, offset.y, offset.z))
+
+let transformBuffer = device.makeBuffer(length: MemoryLayout<MTLPackedFloat4x3>.size,
+                                        options: .storageModeShared)!
+
+transformBuffer.contents().copyMemory(from: &scaleTransform,
+                                      byteCount: MemoryLayout<MTLPackedFloat4x3>.size)
+```
+
+キーポイント:
+
+- `MTLPackedFloat4x3`ビルド アクセラレーション構造を保存するときに使用される 4x3 変換行列。
+- 最初の 3 列を保存します`scale.x`、`scale.y`、`scale.z`。
+- 4列目に保存`offset.x`、`offset.y`、`offset.z`。
+- `makeBuffer`マトリックスを保持できるメタル バッファを作成します。
+-`copyMemory`CPU 側のマトリックスをバッファにコピーします。
+
+([18:51](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1131)) 次に、このバッファをジオメトリ記述子に渡します。
+
+```swift
+let geometryDescriptor = MTLAccelerationStructureTriangleGeometryDescriptor()
+
+geometryDescriptor.transformationMatrixBuffer = transformBuffer
+geometryDescriptor.transformationMatrixBufferOffset = 0
+```
+
+キーポイント:
+
+- `transformationMatrixBuffer`行列を保持するバッファへのポインタ。
+-`transformationMatrixBufferOffset`バッファ内の行列の開始位置を指定します。
+- 加速構造を構築するとき、Metal はこの行列を使用して頂点データを事前変換します。
+
+([19:05](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1145)) 同じ機能により、インスタンスの数を減らすこともできます。単純で重複するボックスと球のセットの場合、各ジオメトリ記述子を独自の変換行列で設定し、プリミティブな加速構造にマージできます。講演では、この方法で生成されたプリミティブ加速構造は構築にかかる時間が短縮され、より速く交差することが説明されました。
+
+### ヒープからアクセラレーション構造を割り当てる
+
+([21:04](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1264)) Metal 3 は、ヒープからのアクセラレーション構造の割り当てをサポートしています。これによりヒープ メモリが再利用され、高価なバッファ割り当てが回避され、メモリの使用量が削減されます。`useResource:`電話。
+
+大規模なシーンでは、インスタンス アクセラレーション構造は、多くのプリミティブ アクセラレーション構造を間接的に参照します。コマンド エンコーダを使用する場合、古い方法では各プリミティブ アクセラレーション構造を呼び出す必要があります。`useResource:`。すべてが同じヒープからのものである場合は、それを 1 回使用できます`useHeap:`これらのリソースをカバーします。
+
+([22:33](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1353)) 割り当て方法は 2 つあります。最初の方法では、記述子に従ってヒープに加速構造を直接作成させます。 2 番目の方法では、まずデバイスにサイズと位置合わせを問い合わせてから、サイズに基づいてデバイスを作成します。
+
+```swift
+let heap = device.makeHeap(descriptor: heapDescriptor)!
+
+let accelerationStructure = heap.makeAccelerationStructure(descriptor: descriptor)
+
+let sizeAndAlign = device.heapAccelerationStructureSizeAndAlign(descriptor: descriptor)
+
+let accelerationStructure = heap.makeAccelerationStructure(size: sizeAndAlign.size)
+```
+
+キーポイント:
+
+- `makeHeap(descriptor:)`リソース割り当て用のヒープを作成します。
+-`heap.makeAccelerationStructure(descriptor:)`記述子を使用して、加速構造をヒープ内に直接作成します。
+-`heapAccelerationStructureSizeAndAlign(descriptor:)`記述子に対応するサイズとアライメントの要件を照会します。
+-`heap.makeAccelerationStructure(size:)`最終的なサイズを使用して、ヒープからアクセラレーション構造体を割り当てます。
+
+ヒープを使用する場合は、常駐と同期にも対処する必要があります。講義リマインダー: レイ トレーシング パス中に呼び出されます`useHeap:`;ヒープ リソースは、デフォルトではメタル ハザードによって追跡されません。リソースの危険追跡をオンにするか、手動で使用するかを選択できます。`MTLFences`そして`MTLEvents`同期。
+
+### Xcode 14 ツールを使用してパフォーマンスと正確性を検証する
+
+([24:16](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1456)) Xcode 14 の Metal Debugger には、レイ トレーシング用のいくつかのツール サポートが追加されています。
+
+Acceleration Structure Viewer は、プリミティブまたはインスタンス化されたモーションを表示できます。また、各プリミティブのデータを展開できるプリミティブ ハイライト モードも追加されます。これは、このセッションの前半のプリミティブごとのデータに直接対応します。
+
+([25:55](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1555)) Shader Profiler は、交差関数、可視関数、および動的ライブラリをサポートしています。開発者は、レイ トレーシング パイプラインのコードの各行の実行コストを命令カテゴリ別に確認できます。
+
+([27:02](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1622)) シェーダー デバッガーは、リンクされた関数とダイナミック ライブラリにもアクセスできます。表示可能な関数テーブルまたはダイナミック ライブラリを使用する場合、デバッガは実際に実行された関数を追跡できます。
+
+([28:05](https://developer.apple.com/videos/play/wwdc2022/10105/?time=1685)) ランタイム シェーダー検証では、境界外のメモリ アクセスや Null テクスチャ読み取りなどの GPU ランタイム エラーを診断できます。 Metal 3 では、スタック オーバーフロー検出も追加されています。シェーダー内に交差関数、可視関数、ダイナミック ライブラリ、または関数ポインター呼び出しがある場合、開発者はパイプライン記述子に十分な最大呼び出しスタックの深さを設定する必要があります。設定が低すぎると、シェーダー検証はスタック オーバーフローが発生した場所を示します。
+
+## 重要ポイント
+- **内容**: アルファ テスト済みのジオメトリを使用するレンダラーの交差関数を変換します。
+  **実行する価値がある理由**: プリミティブごとのデータによりテクスチャと UV がアクセラレーション構造に組み込まれ、音声のテスト アプリケーションは 10% から 16% のパフォーマンス向上を達成しました。
+  **開始方法**: より小さいものを定義します`PrimitiveData`、存在する`MTLAccelerationStructureTriangleGeometryDescriptor`設定オン`primitiveDataBuffer`、`primitiveDataElementSize`、`primitiveDataStride`そして`primitiveDataBufferOffset`。
+
+- **内容**: レベル ローディング フェーズでの多数のプリミティブ アクセラレーション ストラクチャ ビルドを同じエンコーダにマージします。
+  **実行する価値がある理由**: Metal 3 は、ビルド、圧縮、再調整を並行して実行しようとします。これにより、小規模なビルドの数が多い場合に GPU 使用率を向上させることができます。
+  **開始方法**: 同じ加速構造コマンド エンコーダを使用して、複数のアクセラレーション ストラクチャ コマンド エンコーダをエンコードします。`build`、すべてのビルドが同じスクラッチ バッファを共有しないように、スクラッチ バッファ プールを準備します。
+
+- **内容**: 圧縮された頂点フォーマットをアクセラレーション構造の構築に直接参加させます。
+  **実行する価値がある理由**: 新しい頂点形式は、一時的な完全精度頂点コピーの削減、メモリ フットプリントと準備コストの削減をサポートします。
+  **開始方法**:`MTLAccelerationStructureTriangleGeometryDescriptor`設定オン`vertexFormat`、必要に応じて協力します`transformationMatrixBuffer`モデルの座標を復元します。
+
+- **内容**: 複数の単純なオーバーラップ インスタンスをプリミティブ アクセラレーション構造に結合します。
+  **実行する価値がある理由**: この講演では、インスタンス数を減らすことで、レイがインスタンスに到達したときの変換と切り替えのオーバーヘッドを削減できることが指摘されています。
+  **開始方法**: オブジェクトごとに独立したジオメトリ記述子を作成し、独自の変換行列を設定して、これらの記述子を同じオブジェクトに配置します。`MTLPrimitiveAccelerationStructureDescriptor`。
+
+- **内容**: 大規模なシーンのプリミティブ アクセラレーション構造を同じヒープに置きます。
+  **実行する価値がある理由**: 1 回`useHeap:`たくさん交換できる`useResource:`ヒープ メモリを呼び出して再利用します。
+  **開始方法**: を使用します`device.makeHeap(descriptor:)`ヒープを作成する`heap.makeAccelerationStructure(...)`レイ トレーシング パスの前に呼び出されるアクセラレーション構造の割り当て`useHeap:`。
+
+## 関連セッション
+
+- [Discover Metal 3](/articles/wwdc2022-10066) — Metal 3 の概要。リソースの読み込み、オフライン コンパイル、MetalFX、メッシュ シェーダー、レイ トレーシング、ツールのアップデートをカバーします。
+- [Metal 3 でバインドレス化](/articles/wwdc2022-10101) - バインドレス レンダリング、引数バッファー、およびヒープにおけるアクセラレーション構造とデバッグの改善について説明します。
+- [Metal 3 で GPU バイナリをターゲットにして最適化する](/articles/wwdc2022-10102) — GPU バイナリの生成をビルド フェーズに進めて、起動時と実行時のコンパイルのオーバーヘッドを削減します。
+- [MetalFX アップスケーリングによるパフォーマンスの向上](/articles/wwdc2022-10103) — MetalFX アップスケーリングを使用して、Metal アプリケーションのレンダリング パフォーマンスを向上させます。
+- [Metal 3 でリソースをより高速にロードする](/articles/wwdc2022-10104) — Metal 3 の高速リソース ロードを使用して、大規模なリソースとレベル データのロードを最適化します。

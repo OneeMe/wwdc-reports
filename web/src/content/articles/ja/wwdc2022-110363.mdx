@@ -1,0 +1,159 @@
+---
+title: "Improve app size and runtime performance"
+description: "learn how we've optimized the swift and objective-c runtimes to help you make your app smaller, quicker, and launch faster. discover how you can get access to efficient protocol checks, smaller message send calls, and optimized arc simply when you build your app with xcode 14 and update your deployment target."
+date: "2022-06-06"
+tags: ["Developer Tools", "Performance", "Swift", "Objective-C"]
+thumbnail: "/images/sessions/2022/110363.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110363/"
+sessionId: "wwdc2022-110363"
+year: "2022"
+relatedSessions:
+  - title: "App Startup Time: Past, Present, and Future"
+    code: "110363"
+    description: "プロトコル チェックの最適化に直接関連する、dyld およびスタートアップ クロージャについての深い理解"
+  - title: "What's new in Swift"
+    code: "110358"
+    description: "新しい Swift 言語機能、実行時の最適化で使用"
+  - title: "What's new in Xcode 14"
+    code: "110427"
+    description: "Xcode 14 の新しいコンパイラーとリンカーがこの最適化の基礎となります"
+  - title: "Swift concurrency: Update a sample app"
+    code: "110350"
+    description: "パフォーマンスの最適化と同時プログラミングの組み合わせ"
+  - title: "Diagnose Power and Performance regressions in your app"
+    code: "110370"
+    description: "パフォーマンスの診断と最適化のための補完セッション"
+---
+## ハイライト
+
+> Xcode 14 でアプリを再コンパイルし、iOS 16 で実行します。アプリのサイズは最大 4% 小さくなり、起動が速くなります。コードを 1 行も変更することなく、すべての改善が行われます。
+
+## 主要内容
+
+### プロトコルチェックにより起動が遅くなる
+
+Swift 開発ではプロトコルがよく使用されます。関数が受け取る`CustomLoggable`実行時にパラメータを使用する必要があります`as`または`is`受信オブジェクトがプロトコルに準拠しているかどうかを確認します。
+
+コンパイラがコンパイル時に最適化できるかどうかのチェックが行われています。ただし、ジェネリックなどのシナリオでは、多くのチェックは起動時にしか完了できません。 Apple は、実際のアプリではプロトコル チェックが起動時間の半分を占める場合があることを発見しました。
+
+### Xcode 14 および iOS 16 の 4 つの透過的な最適化
+
+Apple はコンパイラ レベルとランタイム レベルの両方で改善を行いました。
+
+1. **Swift プロトコル チェックの事前計算**: プロトコル チェックのメタデータを事前に計算し、dyld スタートアップ クロージャに入れます。既存のアプリは iOS 16 で直接恩恵を受けます。
+2. **Objective-C メッセージ送信サイズの削減**: それぞれ`objc_msgSend`呼び出しサイズが 12 バイトから 8 バイト (ARM64) に減少し、全体のバイナリ サイズが最大 2% 削減されます。
+3. **retain/release コールは小さくなります**: ARC によって自動的に挿入されます`objc_retain` / `objc_release`8 バイトから 4 バイト (ARM64) に減少し、サイズがさらに 2% 節約されました。
+4. **自動解放省略は高速かつ小型です**: 実行時に命令比較ではなくポインタ比較を使用します。これにより、速度が向上するだけでなく、マークされた命令のコード サイズも節約されます。
+
+## 詳細
+
+### プロトコルチェック: 起動計算から事前計算まで
+
+（[01:23](https://developer.apple.com/videos/play/wwdc2022/110363/?time=83)）
+
+Swift のプロトコル チェックにはメタデータのサポートが必要です。一部のメタデータはコンパイル時に決定できますが、一般的な関連メタデータは起動時にのみ構築できます。
+
+```swift
+protocol CustomLoggable {
+    var customLogString: String { get }
+}
+
+struct Event: CustomLoggable {
+    let name: String
+    let date: Date
+    
+    var customLogString: String {
+        "\(name) at \(date)"
+    }
+}
+
+func log(_ value: Any) {
+    if let loggable = value as? CustomLoggable {
+        print(loggable.customLogString)
+    }
+}
+
+let event = Event(name: "WWDC", date: Date())
+log(event)  // 运行时执行 as? CustomLoggable 检查
+```
+
+**キーポイント:**
+- `as? CustomLoggable`コンパイル時間を完全に決定できない場合は、ランタイムによって処理されます。
+- ランタイムは、プロトコル チェック メタデータに依存して、オブジェクトがプロトコルに準拠しているかどうかを判断します。
+- 一般的なシナリオでは、大量のメタデータは起動時にのみ構築でき、構築には数百ミリ秒かかる場合があります。
+- iOS 16 の Swift ランタイムは、これらの計算を dyld クロージャーに進め、起動時に結果を直接読み取ります。
+
+### メッセージ送信: セレクタ スタブ共有コード
+
+（[03:10](https://developer.apple.com/videos/play/wwdc2022/110363/?time=190)）
+
+Objective-C のすべてのメソッド呼び出しは、最終的には次のようになります。`objc_msgSend`。 ARM64 では、完全な呼び出しには 12 バイトが必要です: 4 バイトの呼び出し命令 + 8 バイトのセレクタ準備。
+
+```objc
+// 这段代码会产生大量 objc_msgSend 调用
+NSCalendar *cal = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+NSDateComponents *components = [[NSDateComponents alloc] init];
+components.year = 2022;
+components.month = 6;
+components.day = 6;
+NSDate *theDate = [cal dateFromComponents:components];
+```
+
+**キーポイント:**
+- それぞれ`objc_msgSend`呼び出しでは、セレクターを準備するために 8 バイトが使用されます。
+- 同じセレクターの準備コードはまったく同じであり、共有スタブ関数に抽出できます。
+- Xcode 14 コンパイラーとリンカーは、この最適化を自動的に実行します。
+- サイズとパフォーマンスのバランスをとったデフォルト モードも利用可能`-objc_stubs_small`リンカーフラグはサイズのみを最適化します
+
+### 保持/解放: カスタム呼び出し規則
+
+（[06:57](https://developer.apple.com/videos/play/wwdc2022/110363/?time=417)）
+
+ARC が自動的に挿入される`objc_retain`そして`objc_release`は通常の C 関数であり、C 呼び出し規約に準拠する必要があります。これは、コンパイラがオブジェクト ポインタを正しいレジスタに配置するために追加の命令を生成する必要があることを意味します。
+
+Apple は、保持/解放のためのカスタム呼び出し規則を設計しました。コンパイラは、オブジェクト ポインタの現在の位置に基づいて最も適切な呼び出しバリアントを選択し、不必要な呼び出しを排除します。`move`命令。
+
+**キーポイント:**
+- `objc_retain` / `objc_release`ARM64 では 8 バイトから 4 バイトに削減
+- ランタイム サポートが必要なため、デプロイメント ターゲットを iOS 16 / tvOS 16 / watchOS 9 に設定します。
+- メッセージ送信の最適化をオーバーレイすると、全体的なボリュームの増加がより明白になります
+
+### 自動解放省略: 命令比較の代わりにポインタ比較
+
+（[09:26](https://developer.apple.com/videos/play/wwdc2022/110363/?time=566)）
+
+関数が一時オブジェクトを返す場合、ARC は自動リリースを使用してリリースを遅らせます。呼び出し元がすぐに保持する場合、自動解放と保持のペアは互いに打ち消し合う可能性があり、これが自動解放省略です。
+
+古い実装では、ランタイムはコード命令をデータとしてロードし、それを特別なタグ値と比較して、それが省略可能かどうかを判断します。この操作は CPU では効率的ではありません。
+
+新しい実装では、代わりにポインター比較を使用します。
+1. `autorelease`次の場合に戻りアドレス ポインタを保存します。
+2. `retain`次の場合に現在の戻りアドレス ポインタを取得します。
+3. 2 つのポインタが同じ場合、それらは自動解放/保持のペアに一致しており、省略できることを意味します。
+
+**キーポイント:**
+- ポインターの比較は、命令をデータとしてロードするよりもはるかに高速です
+- 特別なマーキング命令が不要となり、コードサイズがさらに縮小されます。
+- iOS 16 の実行中に自動的に有効になります。コード量を増やすには、デプロイメント ターゲットを iOS 16 にアップグレードする必要があります
+
+## 重要ポイント
+
+- **既存のアプリを今すぐ再コンパイルします**
+コードを変更せずに Xcode 14 で再コンパイルすると、アプリのサイズを約 2% 削減できます。これはコストがかからないメリットであり、できるだけ早く実装する必要があります。
+
+- **展開ターゲットを iOS 16 にアップグレード**
+アップグレード後は、保持/解放の最適化と自動解放省略シーケンスの縮小により、ボリュームが約 2% 節約されます。ユーザー デバイスの分布を評価した後、このアップグレードを進めることを検討できます。
+
+- **起動時のプロトコルチェックの割合を確認します**
+アプリの起動が遅い場合は、Instruments の Time Profiler を使用して、起動段階で多くのプロトコル チェックが行われているかどうかを確認してください。この問題は iOS 16 では自動的に軽減されますが、コードを調べてプロトコル チェックの過剰使用のパターンを調べることもできます。
+
+- **音量に敏感なアプリケーションでの使用`-objc_stubs_small`**
+アプリのサイズがコア指標 (watchOS アプリなど) の場合は、リンカー設定に追加できます。`-objc_stubs_small`、メッセージ送信スタブのサイズの最適化を最大限に推し進めます。
+
+## 関連セッション
+
+- [アプリの起動時間: 過去、現在、未来](/articles/wwdc2022-110370) — dyld クロージャーと起動最適化メカニズムについての深い理解
+- [Swift の新機能](/articles/wwdc2022-110358) — Swift の言語レベルの新機能
+- [Xcode 14 の新機能](/articles/wwdc2022-110427) — Xcode 14 コンパイラーとリンカーの改善がこの最適化の基礎となっています。
+- [アプリの電力とパフォーマンスの回帰を診断する](/articles/wwdc2022-110370) — インストゥルメントを使用してパフォーマンスの問題を特定する方法を学びます
+- [Swift 同時実行: サンプル アプリを更新する](/articles/wwdc2022-110350) — 同時実行の最適化と実行時のパフォーマンスの向上を組み合わせた

@@ -1,0 +1,286 @@
+---
+title: "Use Core ML Tools for machine learning model compression"
+description: "discover how to reduce the footprint of machine learning models in your app with core ml tools. learn how to use techniques like palettization, pruning, and quantization to dramatically reduce model size while still achieving great accuracy. explore comparisons between compression during the training stages and on fully trained models, and learn how compressed models can run even faster when your app takes full advantage of the apple neural engine."
+date: "2023-06-10"
+tags: ["WWDC 2023", "Machine Learning", "Core ML"]
+thumbnail: "/images/sessions/2023/10047.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10047/"
+sessionId: "wwdc2023-10047"
+year: "2023"
+relatedSessions:
+  - title: "Discover machine learning enhancements in Create ML"
+    code: "10044"
+    description: "find out how create ml can help you do even more with machine learning models. learn about the latest updates to image understanding and text-based tasks with multilingual bert embeddings."
+  - title: "Improve Core ML integration with async prediction"
+    code: "10050"
+    description: "discover how to use the new async prediction api in core ml to improve the responsiveness of your app."
+  - title: "Explore Natural Language multilingual models"
+    code: "10042"
+    description: "learn how to create custom natural language models for text classification and word tagging using multilingual, transformer-based embeddings."
+---
+
+## ハイライト
+
+> Core ML Tools 7 では 3 つのモデル圧縮技術（プルーニング、量子化、パレット化）と 2 つのワークフロー（トレーニング後圧縮、トレーニング時圧縮）が導入されました。iOS 17 と macOS Sonoma のランタイム最適化と組み合わせることで、開発者はモデルサイズを元の 1/8 以下に縮小しつつ、Apple Neural Engine 上で最大 75% の推論高速化を得られます。
+
+---
+
+## 主要内容
+
+### 課題: モデルが大きくなり、App のサイズ圧力が増大
+
+ResNet50 は 2500 万パラメータを持ち、Float16 精度で 50MB を占めます。Stable Diffusion のような新しいモデルはさらに大きくなります。App にデプロイするモデル数も増え続けており、サイズ圧力は上昇し続けています。
+
+モデルを圧縮すると 3 つの直接的なメリットがあります。
+
+1. 同じメモリ予算でより多くのモデルをデプロイできる
+2. より大きく、より高機能なモデルをデプロイできる
+3. 小さいモデルはデータ移動が少なく、推論速度が向上する可能性がある
+
+### Apple のアプローチ: 3 つの圧縮技術 + 2 つのワークフロー
+
+Core ML Tools 7 は圧縮 API を `coremltools.optimize` モジュールに統合しました。
+
+- `coremltools.optimize.coreml`: トレーニング後圧縮。変換済み Core ML モデルを直接操作します
+- `coremltools.optimize.torch`: トレーニング時圧縮。PyTorch トレーニングパイプラインに圧縮を導入します
+
+---
+
+## 詳細
+
+### 3 つの圧縮技術の原理（[02:35](https://developer.apple.com/videos/play/wwdc2023/10047/?time=155)）
+
+**プルーニング（Pruning）**: 最小の重みを 0 に設定し、疎行列として保存します。
+
+```
+元の重み行列:      プルーニング後（50% スパース）:
+[0.1, 0.9, 0.3]   [0,   0.9, 0.3]
+[0.8, 0.2, 0.5]   [0.8, 0,   0.5]
+[0.4, 0.7, 0.1]   [0.4, 0.7, 0  ]
+```
+
+キーポイント:
+
+- 非ゼロ値とゼロの位置のみを保存します
+- モデルサイズはスパース度に線形比例: 50% スパース ≈ 50% サイズ
+- ResNet50 は 50% スパースで 50MB から約 28MB に縮小します
+
+**量子化（Quantization）**: Float16 重みを INT8 範囲にマッピングします。
+
+```
+scale = 2.35, bias = 0
+元の値 → スケール/オフセット/丸め → INT8
+最小値 → -127
+最大値 → 127
+```
+
+キーポイント:
+
+- 各重みが 2 バイトから 1 バイトに—圧縮比 2 倍
+- `scale` と `bias` で元の範囲に逆量子化します
+- 非ゼロの bias は量子化誤差を減らすことがあります
+
+**パレット化（Palettization）**: 類似した重みをクラスタリングし、クラスタ中心値で表現します。
+
+```
+元の重み: [0.12, 0.11, 0.89, 0.91, 0.13, 0.88]
+クラスタ中心: {0: 0.12, 1: 0.89}
+インデックス表: [0, 0, 1, 1, 0, 1]
+```
+
+キーポイント:
+
+- 4 クラスタ = 2 bit/重み、圧縮比 8 倍
+- 16 クラスタ = 4 bit/重み、圧縮比 4 倍
+- クラスタ中心はルックアップテーブルに保存され、元の行列はインデックステーブルになります
+
+### トレーニング後圧縮（[06:02](https://developer.apple.com/videos/play/wwdc2023/10047/?time=362)）
+
+トレーニング済みの Core ML モデルを直接圧縮—シンプルで高速です。
+
+```python
+import coremltools as ct
+from coremltools.optimize.coreml import (
+    OpMagnitudePrunerConfig,
+    OpPalettizerConfig,
+    OpLinearQuantizerConfig,
+    OptimizationConfig,
+    prune_weights,
+    palettize_weights,
+    quantize_weights
+)
+
+# 変換済みの Core ML モデルを読み込む
+model = ct.models.MLModel("my_model.mlpackage")
+
+# --- プルーニング: 目標 75% スパース ---
+pruner_config = OpMagnitudePrunerConfig(
+    target_sparsity=0.75
+)
+pruner_global_config = OptimizationConfig(
+    global_config=pruner_config
+)
+pruned_model = prune_weights(model, pruner_global_config)
+
+# --- パレット量子化: 6 bit ---
+palettizer_config = OpPalettizerConfig(
+    mode="kmeans",
+    nbits=6
+)
+palettizer_global_config = OptimizationConfig(
+    global_config=palettizer_config
+)
+palettized_model = palettize_weights(model, palettizer_global_config)
+
+# --- 線形量子化: 8 bit ---
+quantizer_config = OpLinearQuantizerConfig(
+    mode="linear_symmetric"
+)
+quantizer_global_config = OptimizationConfig(
+    global_config=quantizer_config
+)
+quantized_model = quantize_weights(model, quantizer_global_config)
+
+# 圧縮後のモデルを保存
+pruned_model.save("my_model_pruned.mlpackage")
+```
+
+キーポイント:
+
+- `OptimizationConfig` が圧縮方法を記述し、`global_config` がすべてのレイヤーに適用されます
+- レイヤーごとに異なる `op_config` を設定することもできます
+- トレーニング後圧縮は 1 ステップで完了し、トレーニングデータは不要です
+- 圧縮比が高いほど精度低下が大きくなるため、実データで検証が必要です
+
+### トレーニング時圧縮（[08:08](https://developer.apple.com/videos/play/wwdc2023/10047/?time=488)）
+
+PyTorch トレーニング中に圧縮を導入し、重みが圧縮制約に適応します。
+
+```python
+import torch
+import coremltools as ct
+from coremltools.optimize.torch import (
+    MagnitudePrunerConfig,
+    MagnitudePruner,
+    DKMPalettizerConfig,
+    DKMPalettizer
+)
+
+# --- トレーニング時プルーニング ---
+# 1. 設定を定義
+pruner_config = MagnitudePrunerConfig(
+    target_sparsity=0.75
+)
+
+# 2. pruner を作成
+pruner = MagnitudePruner(model, pruner_config)
+
+# 3. プルーニング層を挿入
+pruner.prepare()
+
+# 4. ファインチューニング
+for epoch in range(num_epochs):
+    for batch in dataloader:
+        optimizer.zero_grad()
+        output = model(batch.input)
+        loss = criterion(output, batch.target)
+        loss.backward()
+        optimizer.step()
+# pruner の内部状態を更新
+    pruner.step()
+
+# 5. プルーニングマスクを重みに畳み込む
+pruner.finalize()
+
+# 6. Core ML に変換
+compressed_model = ct.convert(model, inputs=[ct.ImageType(name="input", shape=(1, 3, 224, 224))])
+compressed_model.save("pruned_model.mlpackage")
+
+# --- トレーニング時パレット量子化（DKM アルゴリズム） ---
+palettizer_config = DKMPalettizerConfig(
+    global_config={"n_bits": 2}
+)
+palettizer = DKMPalettizer(model, palettizer_config)
+palettizer.prepare()
+
+# ファインチューニング...
+for epoch in range(num_epochs):
+    for batch in dataloader:
+# トレーニングループ
+        ...
+    palettizer.step()
+
+palettizer.finalize()
+
+# 変換時に palettization パイプラインを使用
+compressed_model = ct.convert(
+    model,
+    inputs=[ct.ImageType(name="input", shape=(1, 3, 224, 224))],
+    pass_pipeline=ct.PassPipeline.DEFAULT_PALETTIZATION
+)
+```
+
+キーポイント:
+
+- `prepare()` でモデルに圧縮フレンドリーなレイヤーを挿入します
+- `step()` でトレーニング中に圧縮状態を更新します
+- `finalize()` で圧縮後の重みをモデル重みに戻します
+- DKM（Differentiable K-Means）はアテンション機構ベースの微分可能 k-means アルゴリズムです
+- 変換時に `pass_pipeline=DEFAULT_PALETTIZATION` を設定してパレット表現を使用します
+
+### ランタイム性能最適化（[20:44](https://developer.apple.com/videos/play/wwdc2023/10047/?time=1244)）
+
+iOS 16 と iOS 17 ではランタイムの挙動が大きく異なります。
+
+| 機能 | iOS 16 | iOS 17 |
+|------|--------|--------|
+| サポートする圧縮タイプ | 重み圧縮のみ | 重み圧縮 + 8-bit 活性化量子化 |
+| 推論速度 | Float16 と同じ | 特定シナリオでより高速 |
+
+iOS 17 の改善点: 重みは演算直前に展開され、事前にメモリ全体に展開されません。メモリ制約のあるモデル（Neural Engine 上の大規模モデルなど）では、メモリ帯域幅の圧力が減り、推論が高速化されます。
+
+実測加速データ（iPhone 14 Pro Max）:
+
+- 4-bit パレット化モデル: 5%〜30% 高速化
+- スパースモデル: 最大 75% 高速化
+
+### 性能最適化戦略（[23:39](https://developer.apple.com/videos/play/wwdc2023/10047/?time=1419)）
+
+```
+ステップ 1: optimize.coreml API でさまざまな圧縮設定を素早く探索
+        ↓
+ステップ 2: ターゲットデバイス上でプロファイルし、Xcode の Core ML Performance Report を使う
+        ↓
+ステップ 3: 速度向上が最も大きい設定を絞り込む
+        ↓
+ステップ 4: それらの設定で精度を評価し、必要なら optimize.torch でトレーニング時圧縮を行う
+        ↓
+ステップ 5: 最終モデルを決定
+```
+
+キーポイント:
+
+- まずトレーニング後圧縮で迅速に検証—トレーニングデータ不要
+- Xcode の Core ML Performance Report で各レイヤーの実行場所（CPU/GPU/Neural Engine）を確認
+- 精度が不十分ならトレーニング時圧縮に切り替え—トレーニング時間は長くなります
+- 最終選択は圧縮比、精度、速度のトレードオフです
+
+---
+
+## 重要ポイント
+
+1. **Stable Diffusion モデルをモバイルで使えるサイズに圧縮**: 4-bit パレット化で Stable Diffusion を数百 MB から数十 MB に圧縮します。価値がある理由: Stable Diffusion の画像生成能力は非常に強力ですが、元のモデルは iPhone では大きすぎます。圧縮後はデバイス上でテキストから画像生成が可能になります。始め方: `coremltools.optimize.coreml` の `palettize_weights` で 4-bit と 6-bit 設定を試し、検証セットで生成品質を評価して最適なバランスを選びます。
+
+2. **リアルタイムカメラフィルター用に画像セグメンテーションモデルを圧縮**: トレーニング時プルーニングで人像セグメンテーションモデルを 50% 圧縮し、エッジ精度を維持します。価値がある理由: リアルタイムカメラ App には 30fps 以上の推論速度が必要で、モデルが小さいほど Neural Engine のスループットが上がります。始め方: PyTorch で事前学習済みセグメンテーションモデルを読み込み、`MagnitudePruner` で 50% 目標スパース度を設定し、5〜10 epoch 微調整後に Core ML に変換して実機でフレームレートをテストします。
+
+3. **8-bit 量子化で多言語 BERT モデルをデプロイ**: BERT テキスト分類モデルを Float16 から INT8 に量子化し、サイズを半分にします。価値がある理由: BERT モデルは精度が高いですが埋め込み層のパラメータ数が大きいです。量子化後は Apple Watch のようなメモリ制約デバイスでも動作します。始め方: `quantize_weights` で 8-bit 線形対称量子化を適用し、テストセットで分類精度が許容範囲か検証します。
+
+4. **モデル圧縮自動化パイプラインを構築**: CI/CD に Core ML Tools 圧縮ステップを統合し、モデル更新のたびに複数の圧縮設定を自動試行します。価値がある理由: 手動で圧縮設定を試すのは時間がかかり、最適解を見逃しやすいです。自動化ならモデル更新のたびに最適な圧縮比を素早く見つけられます。始め方: 異なる `nbits`（パレット化）と `target_sparsity`（プルーニング）の組み合わせを走査し、各設定でモデルサイズと検証精度を評価してパレートフロンティアを出力する Python スクリプトを書きます。
+
+---
+
+## 関連セッション
+
+- [Discover machine learning enhancements in Create ML](/articles/wwdc2023-10044) — Create ML でモデルをトレーニングした後、Core ML Tools で圧縮してサイズを削減
+- [Improve Core ML integration with async prediction](/articles/wwdc2023-10050) — Core ML の非同期予測 API。圧縮モデルと組み合わせてよりスムーズな UX を実現
+- [Explore Natural Language multilingual models](/articles/wwdc2023-10042) — 多言語 BERT モデルのトレーニング。圧縮後はエッジデプロイに適します

@@ -1,0 +1,202 @@
+---
+title: "Bring expression to your app with Genmoji"
+description: "discover how to bring genmoji to life in your app. we'll go over how to render, store, and communicate text that includes genmoji. if your app features a custom text engine, we'll also cover techniques for adding support for genmoji."
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10220.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10220/"
+sessionId: "wwdc2024-10220"
+year: "2024"
+relatedSessions:
+  - title: "Catch up on accessibility in SwiftUI"
+    code: "10073"
+    description: "swiftui makes it easy to build amazing experiences that are accessible to everyo"
+  - title: "Demystify SwiftUI containers"
+    code: "10146"
+    description: "learn about the capabilities of swiftui container views and build a mental model"
+  - title: "Evolve your document launch experience"
+    code: "10132"
+    description: "make your document-based app stand out, and bring its unique identity into focus"
+  - title: "Extend your app's controls across the system"
+    code: "10157"
+    description: "bring your app"
+---
+
+## Highlight
+
+> Apple は iOS 18/macOS 15 で Genmoji を導入しました。ユーザーは完全にカスタムな絵文字風画像を生成できます。ただし Genmoji は Unicode 文字ではなく、メタデータ付きのビットマップ画像です。Genmoji を標準 emoji と同様にテキストで使えるようにするため（コピー、ペースト、書式設定、シリアライズ）、Apple は新しいクラス NSAdaptiveImageGlyph を作成しました。
+
+## 主要内容
+
+Emoji は Unicode 文字で、送信時はプレーンテキストとして送られ、受信側デバイスがレンダリングします。この仕組みは長年機能していますが、Unicode 標準に定義済みの emoji しか使えないという制限があります。Genmoji はその制限を打破します。iOS 18 の emoji キーボードから、完全にカスタムな絵文字風画像を即座に生成できます。問題は、Genmoji はビットマップであり、対応する Unicode コードポイントがないことです。通常の emoji のようにテキストに埋め込み、コピー＆ペーストし、シリアライズして保存するにはどうすればよいのでしょうか。
+
+Apple の答えは NSAdaptiveImageGlyph です。この新しいクラスはビットマップとメタデータをまとめます。複数解像度の正方形画像、グローバルに一意で安定した contentIdentifier、アクセシビリティ用の contentDescription、テキスト配置用の組版メトリクスです。これらの情報により、Genmoji はリッチテキスト内で 1 文字分のスペースを占め、フォントサイズに合わせてスケールし、周囲のテキストと一緒に組版されます。
+
+セッションでは「ほぼ無料」から「完全カスタム」まで、3 つの統合シナリオを段階的に解説しています。1 つ目：アプリがすでに NSTextView / UITextView のリッチテキストモードを使い、データを RTFD で保存している場合—Genmoji サポートは自動的に有効になり、コードは不要です。2 つ目：バックエンドがプレーンテキストのみ受け付ける場合—attributed string を手動で分解・再構成し、画像を image store に保存し、テキストには参照だけを残す必要があります。3 つ目：CoreText でカスタム組版を行う場合—新しい CTFont API で組版境界を取得し、画像を描画します。
+
+## 詳細
+
+### 自動サポート：リッチテキストビュー
+
+UITextView に pasteConfiguration がある、または画像ペーストをサポートする target action がある場合、`supportsAdaptiveImageGlyph` はデフォルトで true で、追加コードは不要です（[03:36](https://developer.apple.com/videos/play/wwdc2024/10220/?time=216)）。macOS では対応するプロパティは `importsGraphics` です。
+
+手動で有効にするのも簡単です（[03:30](https://developer.apple.com/videos/play/wwdc2024/10220/?time=210)）：
+
+```swift
+let textView = UITextView()
+textView.supportsAdaptiveImageGlyph = true
+```
+
+キーポイント:
+- `supportsAdaptiveImageGlyph` は Genmoji 入力を受け付けるかどうかを制御する UITextView の新プロパティ
+- テキストビューがすでに画像ペーストをサポートしている場合、このプロパティは自動的に true
+
+シリアライズについては、SecureCoding と Pasteboard フレームワークが NSAdaptiveImageGlyph をネイティブにサポートしています。従来どおり attributed string を RTFD にシリアライズするだけです（[04:41](https://developer.apple.com/videos/play/wwdc2024/10220/?time=281)）：
+
+```swift
+// Extract contents of text view as an attributed string
+let textContents = textView.textStorage
+
+// Serialize as data for storage or transport
+let rtfData = try textContents.data(from: NSRange(location: 0, length: textContents.length),
+              documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd])
+
+// Create attributed string from serialized data
+let textFromData = try NSAttributedString(data: rtfData, documentAttributes: nil)
+
+// Set on text view
+textView.textStorage.setAttributedString(textFromData)
+```
+
+キーポイント:
+- `data(from:documentAttributes:)` で `.rtfd` を指定すれば Genmoji を含むリッチテキストをシリアライズできる
+- 逆シリアライズは `NSAttributedString(data:documentAttributes:)` で、Genmoji は自動的に復元される
+- データ層がすでに RTFD なら変更不要
+
+### プレーンテキスト保存：分解と再構成
+
+多くのアプリのバックエンドはプレーンテキストのみ受け付けます（ブログタイトル、メッセージ内容など）。この場合、attributed string を次の 3 つに分解する必要があります。プレーンテキスト文字列、画像位置の参照、画像データストアです。セッションでは完全な分解・再構成コードを提供しています（[06:08](https://developer.apple.com/videos/play/wwdc2024/10220/?time=368)）：
+
+```swift
+// Decompose an attributed string
+
+func decomposeAttributedString(_ attrStr: NSAttributedString) -> (String, [(NSRange, String)], [String: Data]) {
+    let string = attrStr.string
+    var imageRanges: [(NSRange, String)] = []
+    var imageData: [String: Data] = [:]
+    attrStr.enumerateAttribute(.adaptiveImageGlyph, in: NSMakeRange(0, attrStr.length)) { (value, range, stop) in
+        if let glyph = value as? NSAdaptiveImageGlyph {
+            let id = glyph.contentIdentifier
+            imageRanges.append((range, id))
+            if imageData[id] == nil {
+                imageData[id] = glyph.imageContent
+            }
+        }
+    }
+    return (string, imageRanges, imageData)
+}
+
+// Recompose an attributed string
+
+func recomposeAttributedString(string: String, imageRanges: [(NSRange, String)], imageData: [String: Data]) -> NSAttributedString {
+    let attrStr: NSMutableAttributedString = .init(string: string)
+    var images: [String: NSAdaptiveImageGlyph] = [:]
+    for (id, data) in imageData {
+        images[id] = NSAdaptiveImageGlyph(imageContent: data)
+    }
+    for (range, id) in imageRanges {
+        attrStr.addAttribute(.adaptiveImageGlyph, value: images[id]!, range: range)
+    }
+    return attrStr
+}
+```
+
+キーポイント:
+- `enumerateAttribute(.adaptiveImageGlyph, in:)` ですべての Genmoji 位置を走査
+- `contentIdentifier` はグローバルに一意で安定—同じ Genmoji は重複保存されない
+- `imageContent` は NSAdaptiveImageGlyph を再構築するための生の画像 Data
+- 分解結果は 3 つ組：プレーンテキスト + 位置/ID リスト + ID/画像データ辞書。データベースの別フィールドに直接保存可能
+
+### HTML 出力と Web 互換
+
+コンテンツを Web で表示する必要がある場合、attributed string を HTML に変換します（[06:30](https://developer.apple.com/videos/play/wwdc2024/10220/?time=390)）：
+
+```swift
+// Converting NSAttributedString to HTML
+
+let htmlData = try textContent.data(from: NSRange(location: 0, length: textContent.length),
+               documentAttributes: [.documentType: NSAttributedString.DocumentType.html])
+```
+
+キーポイント:
+- `apple-adaptive-glyph` タイプをサポートするエンジン（WebKit など）は画像をインラインでレンダリング
+- 非対応エンジンはフォールバック画像を表示。alt テキストは `contentDescription` から取得
+- Genmoji をクロスプラットフォーム表示する最も簡単な方法
+
+### プッシュ通知での Genmoji
+
+Communication notifications は Genmoji を含むリッチテキストメッセージをサポートするようになりました（[07:33](https://developer.apple.com/videos/play/wwdc2024/10220/?time=453)）：
+
+```swift
+func didReceive(_ request: UNNotificationRequest,
+      withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
+
+  ...
+  let message: NSAttributedString = _myAttributedMessageStringWithGlyph
+  let context = UNNotificationAttributedMessageContext(sendMessageIntent: sendMessageIntent,
+                                                       attributedContent: _message)
+
+  do {
+    let messageContent = try request.content.updating(from: context)
+    contentHandler(messageContent)
+  } catch {
+    // Handle error
+  }
+}
+```
+
+キーポイント:
+- `UNNotificationAttributedMessageContext` は image glyph を含む attributed string を受け取る新 API
+- Notification Service Extension でプッシュペイロードを解析し、リソースをダウンロードし、attributed string を構築して通知内容を更新
+
+### カスタム組版エンジン：CoreText API
+
+完全にカスタムなテキストレンダリングエンジン向けに、CoreText は 2 つの新関数を提供します（[09:45](https://developer.apple.com/videos/play/wwdc2024/10220/?time=585)）：
+
+```swift
+// Find typographic bounds for image in NSAdaptiveImageGlyph
+
+let provider = adaptiveImageGlyph
+
+let bounds = CTFontGetTypographicBoundsForAdaptiveImageProvider(font, provider)
+
+// Draw it at the typographic origin point on the baseline
+
+CTFontDrawImageFromAdaptiveImageProviderAtPoint(font, provider, point, context)
+```
+
+キーポイント:
+- `CTFontGetTypographicBoundsForAdaptiveImageProvider` はベースライン上の原点を基準とした組版境界（advance width など）を返す
+- `CTFontDrawImageFromAdaptiveImageProviderAtPoint` は指定したベースライン位置に画像を描画
+- この 2 つの API により、Genmoji は TextKit と CoreText のカスタム組版パイプラインで正しくレイアウトできる
+
+### 互換性の注意
+
+RTFD 内の Genmoji は標準の text attachment としてエンコードされ、image glyph をサポートしない旧システムでは自動的に添付画像にフォールバックします。インライン画像をサポートしないアプリでは、画像情報を捨てるのではなく `contentDescription` のテキストをフォールバックとして使うべきです。メールアドレス、電話番号、検索キーワードなどのプレーンテキストフィールドでは image glyph をサポートすべきではありません。
+
+## 重要ポイント
+
+- **やること**：アプリ内のすべての UITextView / NSTextView がリッチテキストモードか確認し、そうであれば `supportsAdaptiveImageGlyph`（iOS）または `importsGraphics`（macOS）が true か確認する。**価値**：Genmoji サポートをゼロコストで得られる。ユーザーは入力欄ですぐにカスタム emoji を使える。**始め方**：プロジェクト内の text view 設定を確認し、データ保存が RTFD 形式か確認する。
+
+- **やること**：プレーンテキストバックエンド向けに Genmoji の分解/再構成ロジックを実装する。**価値**：ブログタイトルやメッセージ内容など Genmoji に適したシーンでも、バックエンドはプレーンテキストのみのことが多い。分解方式で表現力とデータ互換性を両立できる。**始め方**：セッションの `decomposeAttributedString` と `recomposeAttributedString` を再利用し、データベースに image store テーブルを追加する。
+
+- **やること**：Communication Notifications に Genmoji を統合する。**価値**：メッセージングアプリの通知はユーザー接点の核心。Genmoji で通知内容の識別性が向上する。**始め方**：Notification Service Extension で `UNNotificationAttributedMessageContext` を使い、従来のプレーンテキスト通知内容を置き換える。
+
+- **やること**：Web 表示があるアプリでは HTML シリアライズで Genmoji をクロスプラットフォーム表示する。**価値**：ユーザー生成コンテンツは Web、Android など非 Apple プラットフォームでも表示が必要。HTML フォールバックで情報が失われない。**始め方**：`data(from:documentAttributes:)` で `.html` を指定し、`contentDescription` を常に alt テキストとして設定する。
+
+## 関連セッション
+
+- [Catch up on accessibility in SwiftUI](/articles/wwdc2024-10073) — SwiftUI のアクセシビリティ更新。Genmoji の contentDescription アクセシビリティサポートと補完関係
+- [Demystify SwiftUI containers](/articles/wwdc2024-10146) — SwiftUI コンテナビューの原理。テキストコンテナが Genmoji をどう保持するかを理解
+- [Evolve your document launch experience](/articles/wwdc2024-10132) — ドキュメント型アプリの起動体験最適化。リッチテキストドキュメントの保存と表示
+- [Extend your app's controls across the system](/articles/wwdc2024-10157) — システム全体へのコントロール拡張。Genmoji のクロスシナリオ表現アプローチと一致

@@ -1,0 +1,208 @@
+---
+title: "Safely manage pointers in Swift"
+description: "come with us as we delve into unsafe pointer types in swift. discover the requirements for each type and how to use it correctly. we'll discuss typed pointers, drop down to raw pointers, and finally circumvent pointer type safety entirely by binding memory."
+date: 2020-06-10
+tags: ["WWDC 2020", "Swift"]
+thumbnail: "/images/sessions/2020/10167.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10167/"
+sessionId: "wwdc2020-10167"
+year: "2020"
+relatedSessions:
+  - title: "Unsafe Swift"
+    code: "10648"
+    description: "This pre-session explains the basic boundaries of Swift unsafe operations, C API pointers, and undefined behavior."
+  - title: "Embrace Swift type inference"
+    code: "10165"
+    description: "Understand how Swift treats type information as facts about program correctness from a compiler perspective."
+  - title: "Advancements in the Objective-C runtime"
+    code: "10163"
+    description: "Continue looking at the low-level layout, tagged pointers, and runtime changes behind Objective-C and Swift classes."
+  - title: "Refine Objective-C frameworks for Swift"
+    code: "10680"
+    description: "Organize Objective-C header files into APIs more suitable for Swift calls to reduce type guessing during interoperability."
+---
+## Highlight
+
+> Swift divides unsafe pointer operations into three layers: typed pointer, raw pointer, and memory binding. Developers need to bear gradually increasing responsibilities in type binding, life cycle, and boundaries.
+
+## Core Content
+
+Most Swift code shouldn't touch pointers. Arrays, slices, iterators, and standard library collections already cover many problems that would have been solved with pointers in the past. Session makes this clear at the beginning: the safest strategy is not to use pointers; once you use`Unsafe`For prefixed APIs, the compiler and runtime have less to worry about, and developers need to provide corresponding correctness proofs.
+
+The trouble usually comes from interop. You may want to pass Swift data to the C API, or from`Data`Decode structured values ​​from such a byte stream. C code often uses pointer conversion to solve problems, but Swift's typed pointer rules are stricter: after the memory is bound to a certain type,`UnsafePointer<T>`and`UnsafeMutablePointer<T>`Only this type can be read and written. The pointer address looks correct, but it doesn't mean the type is correct.
+
+Apple gave a downward ladder in this session. Use typed pointer first to maintain type safety for generic parameters; when you need to interpret data in bytes, use`UnsafeRawPointer`or`UnsafeRawBufferPointer`;Only entered when the original pointer has lost its type or the bound type must be temporarily rewritten`assumingMemoryBound`、`bindMemory`、`withMemoryRebound`This layer. Each time you go down a level, the code becomes more flexible and the proof cost becomes higher.
+
+Debugging cannot rely solely on crashes either. The image counting example in transcript illustrates that the wrong pointer type may cause the compiler to make incorrect assumptions, which ultimately manifests as silent loss of data. Address Sanitizer and debug assertion can reduce troubleshooting time, but they do not cover all undefined behavior. A more reliable approach is to minimize the scope of unsafe and write bounds, alignment and binding type checks in the code.
+
+## Detailed Content
+
+### The type of typed pointer must match the memory binding
+
+([05:44](https://developer.apple.com/videos/play/wwdc2020/10167/?time=344)) Session uses an example of migrating from a C-style interface to illustrate that pointers with inconsistent types will hand over errors to the compiler optimization phase.`collage.imageCount`yes`Int`, C-style functions require`UnsafeMutablePointer<UInt32>`, the code bypasses Swift's type checking through raw pointer.
+
+```swift
+struct Image {
+    // elided...
+}
+
+struct Collage {
+    var imageData: UnsafeMutablePointer<Image>?
+    var imageCount: Int = 0
+}
+
+func addImages(_ countPtr: UnsafeMutablePointer<UInt32>) -> UnsafeMutablePointer<Image> {
+    // ...
+    let imageData = UnsafeMutablePointer<Image>.allocate(capacity: 1)
+    imageData[0] = Image()
+    countPtr.pointee += 1
+    return imageData
+}
+
+func saveImages(_ imageData: UnsafeMutablePointer<Image>, _ count: Int) {
+    // Arbitrary function body...
+    print(count)
+}
+
+var collage = Collage()
+collage.imageData = withUnsafeMutablePointer(to: &collage.imageCount) {
+    addImages(UnsafeMutableRawPointer($0).assumingMemoryBound(to: UInt32.self))
+}
+saveImages(collage.imageData!, collage.imageCount) // May see imageCount == 0
+```
+
+Key points:
+
+- `withUnsafeMutablePointer(to:)`given is pointing to`Int`Stored typed pointer.
+-`UnsafeMutableRawPointer($0)`The type information is erased, but the actual binding type of the memory is not changed.
+-`assumingMemoryBound(to: UInt32.self)`Requires the caller to ensure that memory has been bound to`UInt32`; Not satisfied here.
+- The compiler can think`Int`The property has not been modified and subsequent reads may still get the initial value.
+
+### typed pointer allocation will bind the type
+
+([10:06](https://developer.apple.com/videos/play/wwdc2020/10167/?time=606)) If you really want to allocate memory directly,`UnsafeMutablePointer<T>.allocate`will bind the new memory to`T`. This is one less level of proof than raw allocation because the type is fixed from the moment of allocation.
+
+```swift
+func directAllocation<T>(t: T, count: Int) {
+    let tPtr = UnsafeMutablePointer<T>.allocate(capacity: count)
+    tPtr.initialize(repeating: t, count: count)
+    tPtr.assign(repeating: t, count: count)
+    tPtr.deinitialize(count: count)
+    tPtr.deallocate()
+}
+```
+
+Key points:
+
+- `allocate(capacity:)`return`UnsafeMutablePointer<T>`, the memory has been bound to the generic parameter`T`。
+- `initialize`Responsible for putting uninitialized memory into valid values.
+-`assign`Replaces existing values ​​of the same binding type.
+-`deinitialize`End the value's lifetime,`deallocate`Release the storage; neither step can be missed.
+
+### raw pointer is suitable for reading external data by bytes
+
+([14:24](https://developer.apple.com/videos/play/wwdc2020/10167/?time=864)) When the goal is to read values ​​from a byte stream, raw pointer is more suitable. It treats memory as a string of bytes, and then specifies the target type when reading. Developers are responsible for byte offset, type layout, alignment, and endianness.
+
+```swift
+import Foundation
+
+func readUInt32(data: Data) -> UInt32 {
+    data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+        buffer.load(fromByteOffset: 4, as: UInt32.self)
+    }
+}
+
+let data = Data(Array<UInt8>([0, 0, 0, 0, 1, 0, 0, 0]))
+print(readUInt32(data: data))
+```
+
+Key points:
+
+- `Data.withUnsafeBytes`Expose the underlying storage as`UnsafeRawBufferPointer`, the pointer is only valid within the closure.
+-`fromByteOffset: 4`Indicates that reading starts from the fifth byte.
+-`as: UInt32.self`It only affects the interpretation method of this load and will not rebind the entire memory.
+- This type of code should verify the length and alignment before reading. Empty data or data that is too short cannot be loaded directly.
+
+### raw allocation is used to manage continuous layout by yourself
+
+([15:43](https://developer.apple.com/videos/play/wwdc2020/10167/?time=943)) The value of raw allocation lies in putting different types in a continuous memory, such as the header plus a variable number of elements. At this point you have to calculate the stride, alignment and starting address of each region yourself.
+
+```swift
+func contiguousAllocate<Header>(header: Header, numValues: Int) -> (UnsafeMutablePointer<Header>, UnsafeMutablePointer<Int32>) {
+    let offset = MemoryLayout<Header>.stride
+    let byteCount = offset + MemoryLayout<Int32>.stride * numValues
+    assert(MemoryLayout<Header>.alignment >= MemoryLayout<Int32>.alignment)
+    let bufferPtr = UnsafeMutableRawPointer.allocate(
+            byteCount: byteCount, alignment: MemoryLayout<Header>.alignment)
+    let headerPtr = bufferPtr.initializeMemory(as: Header.self, repeating: header, count: 1)
+    let elementPtr = (bufferPtr + offset).initializeMemory(as: Int32.self, repeating: 0, count: numValues)
+    return (headerPtr, elementPtr)
+}
+```
+
+Key points:
+
+- `byteCount`Must override header and all`Int32`element.
+-`alignment`It cannot be taken casually. The example uses assertion to ensure that the header alignment requirement is enough to cover the element area.
+-`initializeMemory(as:)`The corresponding area will be bound to the specified type and a typed pointer will be returned.
+- This technique is suitable for implementing internal containers and is not suitable as the default choice for business code.
+
+### The memory binding API is the last layer
+
+（[21:17](https://developer.apple.com/videos/play/wwdc2020/10167/?time=1277)）`bindMemory(to:capacity:)`Will change the memory binding type. It doesn't magically convert the value, it just declares to the compiler that this memory now belongs to a different type. The old typed pointer is now invalid.
+
+```swift
+func testBindMemory() {
+    let uint16Ptr = UnsafeMutablePointer<UInt16>.allocate(capacity: 2)
+    uint16Ptr.initialize(repeating: 0, count: 2)
+    let int32Ptr = UnsafeMutableRawPointer(uint16Ptr).bindMemory(to: Int32.self, capacity: 1)
+    // Accessing uint16Ptr is now undefined
+    int32Ptr.deallocate()
+}
+```
+
+Key points:
+
+- `uint16Ptr`Originally pointed to two paragraphs`UInt16`storage.
+-`bindMemory(to: Int32.self, capacity: 1)`Rebind the same address range into one`Int32`.
+- Continue access after rebinding`uint16Ptr`Belongs to undefined behavior.
+- When you only want to read different types, use raw pointer first.`load`, do not overwrite the binding state for reading.
+
+([23:13](https://developer.apple.com/videos/play/wwdc2020/10167/?time=1393)) If it is just to call a C API that requires a different type,`withMemoryRebound`Usually safer. It limits rebinding to the closure and restores the original type after completion.
+
+```swift
+func takesUInt8Pointer(_: UnsafePointer<UInt8>) { /* elided */ }
+
+func testWithMemoryRebound(int8Ptr: UnsafePointer<Int8>, count: Int) {
+    int8Ptr.withMemoryRebound(to: UInt8.self, capacity: count) {
+        (uint8Ptr: UnsafePointer<UInt8>) in
+        // int8Ptr cannot be used within this closure
+        takesUInt8Pointer(uint8Ptr)
+    }
+    // uint8Ptr cannot be used outside this closure
+}
+```
+
+Key points:
+
+- `withMemoryRebound`Limit the effects of type rebinding to the closure scope.
+- The original one cannot be used inside the closure.`int8Ptr`access the same memory.
+-`uint8Ptr`Cannot escape outside the closure.
+- Applicable scenarios are short-term calls to external APIs, especially when the C API uses different pointer types for the same batch of bytes.
+
+## Core Takeaways
+
+- **Binary format decoder**: Make a parsing layer that reads custom file headers or network packets; raw buffer allows reading by offset`UInt32`, flag bit and length field; from`Data.withUnsafeBytes`To start, first write the length, alignment and endian checks, and then call`load(fromByteOffset:as:)`。
+
+- **C callback context encapsulation**: put`pthread_create`This type only returns`void *`The interface is packaged into Swift API; session proof`assumingMemoryBound`Only suitable for restoring the type you just bound; from a`ThreadContext`Starting from the pointer, the life cycle is centrally managed in allocation, initialization, callback recovery and release.
+
+- **Internal continuous storage container**: implements a single block memory layout of header plus element area for performance-sensitive data structures; raw allocation can reduce scattered allocation; from`MemoryLayout<T>.stride`、`alignment`and`initializeMemory(as:)`Initially, hide the unsafe details inside a small type and expose the normal collection interface to the outside world.
+
+- **Legacy pointer code audit tool**: Find dangerous transition points for Swift code migrated from C; the core risk of this session is`bindMemory`and wrong`assumingMemoryBound`will invalidate the old typed pointer; search from`bindMemory`、`assumingMemoryBound`、`UnsafeMutableRawPointer`To start, change the read-only scene to raw`load`, change the short-term rebinding scenario to`withMemoryRebound`。
+
+## Related Sessions
+
+- [Unsafe Swift](/articles/wwdc2020-10648) — The prelude to this session, first explaining the basic boundaries of Swift unsafe operations, C API pointers, and undefined behavior.
+- [Embrace Swift type inference](/articles/wwdc2020-10165) — Understand how the compiler uses type facts from the perspective of type inference, and help determine why pointer types cannot be disguised at will.
+- [Advancements in the Objective-C runtime](/articles/wwdc2020-10163) — Continue to look at the low-level layout, tagged pointers, and runtime changes behind Objective-C and Swift classes.
+- [Refine Objective-C frameworks for Swift](/articles/wwdc2020-10680) — If the unsafe pointer comes from Objective-C interop, first clear up the Swift API surface through header file annotations and naming.

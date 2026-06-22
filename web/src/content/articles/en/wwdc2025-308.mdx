@@ -1,0 +1,267 @@
+---
+title: "Optimize CPU performance with Instruments"
+description: "learn how to optimize your app for apple silicon with two new hardware-assisted tools in instruments. we"
+date: 2026-06-10
+tags: ["Graphics & Games", "Machine Learning", "Developer Tools"]
+thumbnail: "/images/sessions/2025/308.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/308/"
+sessionId: "wwdc2025-308"
+year: "2025"
+relatedSessions:
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Engage players with the Apple Games app"
+    code: "215"
+    description: "meet the games app – a new destination for players to keep up with what"
+---
+
+## Highlight
+
+> The session uses a binary search optimization as a running example to demonstrate Instruments' three-layer performance analysis toolkit: CPU Profiler (sampling-based analysis, locating software-level overhead), Processor Trace (full instruction tracing, sub-1% overhead without sampling bias), and CPU Counters (hardware counters, analyzing CPU microarchitecture bottlenecks).
+
+---
+
+## Core Content
+
+The pain point of performance tuning is that you do not know where it is slow. Swift source code passes through the compiler, the Swift runtime, system frameworks, and the kernel before it finally hits the CPU's instruction pipeline. Every layer can hide cost: unspecialized generics, protocol dispatch, implicit Array boxing, branch misprediction, cache misses. The "hot functions" that Time Profiler shows are only the surface. The real CPU drain is often the part you cannot see.
+
+Apple introduced two new hardware-assisted tools in Instruments to fix this at the root. Processor Trace (added in Instruments 16.3) uses the hardware in M4 and A18 to record every user-space instruction executed at under 1% overhead, with no sampling bias, so you can precisely measure the cycle cost of each software abstraction layer. CPU Counters added a preset mode this year that abstracts hardware performance counters into four bottleneck categories: Instruction Delivery, Instruction Processing, Discarded, and Retired. Then a guided methodology tells you which mode to switch to next. The session takes a binary search from its raw version all the way to a 25x speedup, threading the full chain from software-level location to instruction-level verification to microarchitecture tuning.
+
+---
+
+## Detailed Content
+
+### Write a throughput test as your optimization ruler
+
+The first step in optimization is to build a repeatable measurement baseline; leave code changes for later. The session gives a simple pattern that needs no benchmark framework ([07:49](https://developer.apple.com/videos/play/wwdc2025/308/?time=469)):
+
+```swift
+import Testing
+import OSLog
+
+let signposter = OSSignposter(
+    subsystem: "com.example.apple-samplecode.MyBinarySearch",
+    category: .pointsOfInterest
+)
+
+func search(
+    name: StaticString,
+    duration: Duration,
+    _ search: () -> Void
+) {
+    var now = ContinuousClock.now
+    var outerIterations = 0
+
+    let interval = signposter.beginInterval(name)
+    let start = ContinuousClock.now
+    repeat {
+        search()
+        outerIterations += 1
+        now = .now
+    } while (start.duration(to: now) < duration)
+    let elapsed = start.duration(to: now)
+    let seconds = Double(elapsed.components.seconds) +
+            Double(elapsed.components.attoseconds) / 1e18
+    let throughput = Double(outerIterations) / seconds
+    signposter.endInterval(name, interval, "\(throughput) ops/s")
+    print("\(name): \(throughput) ops/s")
+}
+```
+
+Key points:
+
+- `OSSignposter` uses the `.pointsOfInterest` category. This is the track that Instruments shows by default, with no extra setup.
+- `signposter.beginInterval` / `endInterval` draws a clickable range on the Instruments timeline. Later you can use "Set Inspection Range and Zoom" to lock the analysis scope to the search itself, skipping startup noise.
+- `ContinuousClock` replaces `Date`. It guarantees no negative values from system time jumps, and the overhead is low.
+- Run until the `duration` (default 1 second) is filled, then divide `outerIterations` by `seconds` to get throughput. It is crude but enough to compare "before vs after."
+
+### Layer 1: CPU Profiler finds software-level overhead
+
+The session's starting binary search lives in a framework with the signature `<E: Comparable, C: Collection<E>>` ([06:37](https://developer.apple.com/videos/play/wwdc2025/308/?time=397)). After sampling in deferred mode, the CPU Profiler call tree shows one quarter of samples falling on protocol witness, Array Objective-C type checks, and memory allocation.
+
+Why CPU Profiler instead of Time Profiler? ([09:02](https://developer.apple.com/videos/play/wwdc2025/308/?time=542)) Time Profiler samples on a timer, which aliases with periodic system tasks. CPU Profiler samples on each CPU's cycle counter, which is fairer to Apple Silicon's asymmetric big/little cores. The higher-frequency cores get more samples, reflecting real load.
+
+The fix is to swap the container to `Span` ([13:46](https://developer.apple.com/videos/play/wwdc2025/308/?time=826)):
+
+```swift
+public func binarySearch<E: Comparable>(
+    needle: E,
+    haystack: Span<E>
+) -> Span<E>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let half = length / 2
+        let middle = haystack.indices.index(start, offsetBy: half)
+        let middleValue = haystack[middle]
+        if needle < middleValue {
+            length = half
+        } else if needle == middleValue {
+            return middle
+        } else {
+            start = haystack.indices.index(after: middle)
+            length -= half + 1
+        }
+    }
+
+    return start
+}
+```
+
+Key points:
+
+- `Span<E>` represents a slice of contiguous memory. It is essentially a base address plus length, and it cannot escape the function scope. This avoids Array's reference counting and ObjC bridging cost.
+- The algorithm logic is unchanged. Only the container type is swapped. Throughput rises about 4x ([13:52](https://developer.apple.com/videos/play/wwdc2025/308/?time=832)).
+
+### Layer 2: Processor Trace exposes unspecialized generics
+
+CPU Profiler shows nothing more, so switch to Processor Trace ([14:09](https://developer.apple.com/videos/play/wwdc2025/308/?time=849)). It is only available on M4 and A18. You must enable it in Privacy & Security -> Developer Tools. Keep trace time to a few seconds (data volume can reach GB/s).
+
+Processor Trace's flame graph differs from sampling tools: width shows real execution time, and color distinguishes binary origin (brown = system frameworks, magenta = Swift runtime / standard library, blue = your app or custom frameworks). Pick any one of ten iterations, sort the Function Calls table by cycles, and the author finds the real bottleneck is in Comparable generic dispatch, not the bounds check he expected. Because the function lives in a framework, the compiler cannot specialize across modules ([18:39](https://developer.apple.com/videos/play/wwdc2025/308/?time=1119)).
+
+Two fixes to choose from: add `@inlinable` to the framework function, or hand-write an `Int` specialized version ([19:17](https://developer.apple.com/videos/play/wwdc2025/308/?time=1157)):
+
+```swift
+public func binarySearchInt(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let half = length / 2
+        let middle = haystack.indices.index(start, offsetBy: half)
+        let middleValue = haystack[middle]
+        if needle < middleValue {
+            length = half
+        } else if needle == middleValue {
+            return middle
+        } else {
+            start = haystack.indices.index(after: middle)
+            length -= half + 1
+        }
+    }
+    return start
+}
+```
+
+Key points:
+
+- The function name becomes `binarySearchInt`, hard-coding `<E: Comparable>` to `Int`, letting the compiler inline the comparison directly.
+- It trades generality for a 1.7x speedup ([19:23](https://developer.apple.com/videos/play/wwdc2025/308/?time=1163)).
+- Reserve this for a small number of functions on hot paths. Do not spread it across the whole codebase.
+
+### Layer 3: CPU Counters for microarchitecture tuning
+
+The software layer is now clean. The remaining bottleneck is inside the CPU. CPU Counters added a preset mode this year ([22:35](https://developer.apple.com/videos/play/wwdc2025/308/?time=1355)). The first pass uses "CPU Bottlenecks" mode, which splits cycles into four categories: Instruction Delivery, Instruction Processing, Discarded, and Retired.
+
+The session's Span+Int version shows a high Discarded share (instructions speculatively executed then thrown away). Instruments gives a direct remark suggesting the next step: switch to "Discarded Sampling" mode to locate the specific instruction. The culprit is the comparison between needle and middleValue being mispredicted by the branch predictor ([25:20](https://developer.apple.com/videos/play/wwdc2025/308/?time=1520)). The searched elements are random, so the branch outcome has no pattern.
+
+The fix is a branchless version ([26:34](https://developer.apple.com/videos/play/wwdc2025/308/?time=1594)):
+
+```swift
+public func binarySearchBranchless(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let remainder = length % 2
+        length /= 2
+        let middle = start &+ length
+        let middleValue = haystack[middle]
+        if needle > middleValue {
+            start = middle &+ remainder
+        }
+    }
+
+    return start
+}
+```
+
+Key points:
+
+- The loop body has only one `if`, and it only assigns, never changing control flow. The Swift compiler emits a conditional move instruction (cmov), removing the hard-to-predict branch.
+- The early return for `needle == middleValue` is dropped, because early return needs a branch.
+- Use unchecked-overflow operators like `&+` to stop the compiler from inserting overflow-check branches.
+- This is 2x faster than the Span+Int version. The bottleneck shifts from Discarded to Instruction Processing ([27:24](https://developer.apple.com/videos/play/wwdc2025/308/?time=1644)).
+
+Switch to Instruction Processing mode. The remark suggests L1D Cache Miss Sampling, which points to memory access on haystack. Background ([27:57](https://developer.apple.com/videos/play/wwdc2025/308/?time=1677)): L1 cache lives inside the CPU, fastest but smallest. L2 sits outside the CPU. A miss to main memory is 50x slower than L1. Caches fetch in 64/128 byte cache lines. Binary search's access pattern is extremely cache-unfriendly: each midpoint access lands on a different cache line.
+
+The last move is the Eytzinger layout (named after a 16th-century Austrian genealogist), which reorders the array in breadth-first tree order so the first few search steps land on the same cache line ([29:27](https://developer.apple.com/videos/play/wwdc2025/308/?time=1767)):
+
+```swift
+public func binarySearchEytzinger(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex.advanced(by: 1)
+    let length = haystack.count
+
+    while start < length {
+        let value = haystack[start]
+        start *= 2
+        if value < needle {
+            start += 1
+        }
+    }
+
+    return start >> ((~start).trailingZeroBitCount + 1)
+}
+```
+
+Key points:
+
+- Array indices start at 1. Left child is `2*i`, right child is `2*i+1`, similar to heap indexing.
+- When the loop ends, `start` is out of bounds. The final expression uses the trailing zero bit count of `~start` to "walk back" to the nearest previously visited valid node.
+- Reordering the array hurts sequential traversal cache friendliness. This is a trade-off, not a blind optimization.
+- This is another 2x faster than the branchless version. Total speedup is about 25x ([31:04](https://developer.apple.com/videos/play/wwdc2025/308/?time=1864)).
+
+---
+
+## Key Takeaways
+
+**1. Build a throughput harness for hot paths**
+
+Why it matters: CPU Profiler, Processor Trace, and CPU Counters all need a stable, reproducible test entry to replay the hotspot. Without a repeatable baseline, the fanciest tool is just guesswork.
+
+How to start: Reuse the session's template. Wrap it in `OSSignposter` + `ContinuousClock` + a one-second `repeat-while` loop. Mark it with `@Test` in Xcode, then secondary-click the test name to Profile directly. Write one for each critical algorithm and keep them long-term.
+
+**2. Use Processor Trace to verify whether generics / protocols are actually specialized**
+
+Why it matters: Cross-module generic functions are likely not specialized, but CPU Profiler makes this hard to see because it lacks a concrete "protocol witness" flame bar. Processor Trace shows every cycle precisely, surfacing this hidden cost.
+
+How to start: Enable Processor Trace in Developer Tools on an M4 Mac or A18 iPhone. Shrink the test to ten iterations. Sort the Function Calls table by cycles. If you see a generic function inside a framework that is not inlined, add `@inlinable`, or hand-write a type-specialized version at the performance-critical point.
+
+**3. Treat CPU Counters' guided workflow as your default entry point**
+
+Why it matters: This year's CPU Counters preset mode plus the Suggested Next Mode column removes the barrier of "which counter should I look at." Start from CPU Bottlenecks, follow the remark through Discarded Sampling, Instruction Processing, L1D Cache Miss Sampling, and other modes. You can locate most microarchitecture problems without reading the Apple Silicon CPU Optimization Guide cover to cover.
+
+How to start: When choosing a template, pick CPU Counters -> CPU Bottlenecks first. Run once to see the main bottleneck. Secondary-click the next step in "Suggested Next Mode," then re-Profile. After every code change, return to CPU Bottlenecks to verify whether the bottleneck has shifted.
+
+**4. Before optimizing, ask "can this work be skipped"**
+
+Why it matters: The session repeats that the cheapest optimization is to delete code, defer execution, precompute, or add cache ([04:36](https://developer.apple.com/videos/play/wwdc2025/308/?time=276)). Micro-optimizations make code more brittle, harder to maintain, and dependent on compiler-specific behavior (auto-vectorization, ARC elision).
+
+How to start: In a performance review, list three questions first: "Does the user really need this result?" "Can it be lazy until first access?" "Can it be baked at compile time?" If the first three gates do not pass, then consider Span, specialization, branchless code, or cache-friendly layout.
+
+---
+
+## Related Sessions
+
+- [Visualize and optimize Swift concurrency](/articles/wwdc2025-266) — Use Instruments to analyze task blocking and thread switching. Complements CPU performance analysis.
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Deep dive into Span, Inline Array, and other contiguous memory types. Prerequisite knowledge for swapping Collection to Span in this session.
+- [Analyze hangs with Instruments](/articles/wwdc2025-248) — Use the Hangs tool to confirm the problem is really on the CPU, then decide whether to take the CPU optimization path from this session.
+- [What's new in Swift](/articles/wwdc2025-245) — Covers `@inlinable`, Span, the Testing framework, and other language features used in this session.
+- [Discover Metal 4](/articles/wwdc2025-205) — After CPU bottlenecks are solved, heavy compute workloads can be offloaded to the GPU.

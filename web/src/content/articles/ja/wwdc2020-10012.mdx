@@ -1,0 +1,409 @@
+---
+title: "Discover ray tracing with Metal"
+description: "achieve photorealistic 3d scenes in your apps and games through ray tracing — a core part of the metal graphics framework and shading language. discover the fundamentals of the metal ray tracing api and shading language extensions for ray tracing, find out how to use them in your graphics apps and games, and learn how to take control of your kernels and combine them into a single compute kernel for optimal performance."
+date: 2020-06-10
+tags: ["Metal", "Graphics & Games", "Ray Tracing"]
+thumbnail: "/images/sessions/2020/10012.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10012/"
+sessionId: "wwdc2020-10012"
+year: "2020"
+relatedSessions:
+  - title: "Get to know Metal function pointers"
+    code: "10013"
+    description: "Learn how Metal function pointers support dynamic shader calls and custom intersection functions in ray tracing renderers."
+  - title: "Harness Apple GPUs with Metal"
+    code: "10602"
+    description: "Review Apple GPU architecture and how Metal maps modern rendering techniques onto tile-based deferred rendering."
+  - title: "Optimize Metal apps and games with GPU counters"
+    code: "10603"
+    description: "Use GPU counters to profile Metal workloads and decide where ray tracing kernels need optimization."
+  - title: "Gain insights into your Metal app with Xcode 12"
+    code: "10605"
+    description: "Use Xcode 12 Metal debugging and performance tools to diagnose graphics issues in Metal apps."
+  - title: "Bring your Metal app to Apple silicon Macs"
+    code: "10631"
+    description: "Understand Apple silicon Mac GPU architecture and porting considerations for graphics-intensive Metal apps."
+---
+
+## ハイライト
+
+> Metal の 2020 年レイトレーシング API は ray intersector を Metal Shading Language に持ち込み、開発者が 1 つの compute kernel でレイ生成、交差判定、シェーディングを行えます。intersection function で透明マテリアルやカスタムジオメトリのヒット判定もカスタマイズできます。
+
+---
+
+## 主要内容
+
+このセッション以前、Apple は Metal Performance Shaders によるレイトレーシングを既に紹介していました。その経路は動きます。compute kernel でレイを生成し Metal buffer に書き、`MPSRayIntersector` で交差判定し、別の compute kernel で intersection 結果を読んでシェーディングします。反射が続くたびに、アプリは buffer 間でレイと intersection を往復させます。([01:33](https://developer.apple.com/videos/play/wwdc2020/10012/?time=93))
+
+2020 年の Metal レイトレーシング API はこのモデルを変えます。`intersector` を Metal Shading Language 内で直接作成・呼び出せ、複数 kernel と中間 buffer に散らばっていた処理を 1 つの compute kernel にまとめられます。レイと intersection データのメモリ読み書きが減り、複数バウンスの外側ループを shader コードに残せます。([02:14](https://developer.apple.com/videos/play/wwdc2020/10012/?time=134))
+
+もう 1 つの中核は acceleration structure です。開発者が triangle や bounding box などのジオメトリ記述を渡し、Metal が高速交差用のデータ構造を構築します。新しい制御点は、acceleration structure のメモリをいつ確保するか、scratch buffer をどう作るか、build コマンドをどの GPU command queue と command buffer に載せるかをアプリが決められることです。([03:48](https://developer.apple.com/videos/play/wwdc2020/10012/?time=228))
+
+後半は透明マテリアルとカスタムジオメトリという難しいケースを扱います。alpha test の葉で透明ピクセルごとにレイを再発射すると、acceleration structure のルートから毎回走査し直すコストが高くなります。Metal の triangle intersection function は走査中にヒットを accept/reject でき、bounding box intersection function は sphere、curve、hair strand を同じ交差フローに接続します。([10:01](https://developer.apple.com/videos/play/wwdc2020/10012/?time=601))
+
+Apple のデモは現実的な規模を示します。Advanced Content Team は path tracing シーンを作り、編集時はピクセルあたり 1 sample のインタラクティブプレビュー、オフライン fly-through では 400 samples で収束させました。Quixel Megascans のシーンで 3,200 万以上の triangle です。([08:28](https://developer.apple.com/videos/play/wwdc2020/10012/?time=508))
+
+---
+
+## 詳細
+
+### compute kernel 内で直接交差判定する
+
+([02:42](https://developer.apple.com/videos/play/wwdc2020/10012/?time=162)) 基本 kernel の形は単純です。ピクセルごとにレイを生成し、`intersector<triangle_data>` を作り、レイと `primitive_acceleration_structure` を渡し、`intersection_result<triangle_data>` を得てからシェーディングします。
+
+```metal
+[[kernel]]
+void rtKernel(primitive_acceleration_structure accelerationStructure [[buffer(0)]],
+              /* ... */)
+{
+    // Generate ray
+    ray r = generateCameraRay(tid);
+
+    // Create an intersector
+    intersector<triangle_data> intersector;
+
+    // Intersect with scene
+    intersection_result<triangle_data> intersection;
+
+    intersection = intersector.intersect(r, accelerationStructure);
+
+    // shading...
+}
+```
+
+キーポイント:
+
+- `primitive_acceleration_structure` は compute command encoder で bind する通常の buffer binding です。
+- `ray` はピクセルごとのカメラ計算から来ます。セッションは `generateCameraRay` の実装を展開しません。
+- `intersector<triangle_data>` を shader 内で作るため、MPS 方式の ray buffer と intersection buffer の往復を省けます。
+- `intersection_result<triangle_data>` は後段のシェーディングへ。シェーディングが重いなら kernel 分割を profiling で判断します。
+
+([07:25](https://developer.apple.com/videos/play/wwdc2020/10012/?time=445)) CPU 側は専用 encoder API で acceleration structure を bind します。
+
+```swift
+computeEncoder.setAccelerationStructure(accelerationStructure, bufferIndex: 0)
+```
+
+キーポイント:
+
+- `bufferIndex: 0` は kernel の `[[buffer(0)]]` に対応します。
+- acceleration structure は `MTLBuffer` ではありませんが、binding モデルは揃っています。
+- transcript では argument encoder にも対応する bind 方法があります。
+
+### primitive acceleration structure を構築する
+
+([04:48](https://developer.apple.com/videos/play/wwdc2020/10012/?time=288)) 構築は descriptor から始まります。ここでは triangle geometry を `MTLAccelerationStructureTriangleGeometryDescriptor` に vertex buffer と triangle count を入れます。
+
+```swift
+let accelerationStructureDescriptor = MTLPrimitiveAccelerationStructureDescriptor()
+
+// Create geometry descriptor(s)
+let geometryDescriptor = MTLAccelerationStructureTriangleGeometryDescriptor()
+
+geometryDescriptor.vertexBuffer = vertexBuffer
+geometryDescriptor.triangleCount = triangleCount
+
+accelerationStructureDescriptor.geometryDescriptors = [ geometryDescriptor ]
+```
+
+キーポイント:
+
+- `MTLPrimitiveAccelerationStructureDescriptor` は primitive acceleration structure を記述します。
+- `MTLAccelerationStructureTriangleGeometryDescriptor` は triangle geometry を記述します。
+- triangle geometry は独自の vertex buffer、index buffer、triangle count などを持てます。この snippet は最小経路です。
+- triangle データは acceleration structure に埋め込まれ、build 後は元の vertex buffer を保持する必要はありません。
+
+([05:46](https://developer.apple.com/videos/play/wwdc2020/10012/?time=346)) Metal はまず必要サイズを問い合わせ、アプリが acceleration structure と scratch buffer を確保します。
+
+```swift
+// Query for acceleration structure sizes
+let sizes = device.accelerationStructureSizes(descriptor: accelerationStructureDescriptor)
+
+// Allocate acceleration structure
+let accelerationStructure =
+    device.makeAccelerationStructure(size: sizes.accelerationStructureSize)!
+
+// Allocate scratch buffer
+let scratchBuffer = device.makeBuffer(length: sizes.buildScratchBufferSize,
+                                      options: .storageModePrivate)!
+```
+
+キーポイント:
+
+- `device.accelerationStructureSizes` は acceleration structure と build scratch buffer のサイズを返します。
+- `makeAccelerationStructure` で allocation のタイミングと場所を制御します。
+- scratch buffer は build 中だけの一時ストレージです。
+- セッションは CPU が触らないため `.storageModePrivate` を選びます。
+
+([06:24](https://developer.apple.com/videos/play/wwdc2020/10012/?time=384)) 実際の build は GPU command buffer にエンコードされます。
+
+```swift
+// Create command buffer/encoder
+let commandBuffer = commandQueue.makeCommandBuffer()!
+let commandEncoder = commandBuffer.makeAccelerationStructureCommandEncoder()!
+
+// Encode acceleration structure build
+commandEncoder.build(accelerationStructure: accelerationStructure,
+                     descriptor: accelerationStructureDescriptor,
+                     scratchBuffer: scratchBuffer,
+                     scratchBufferOffset: 0)
+
+// Commit command buffer
+commandEncoder.endEncoding()
+commandBuffer.commit()
+```
+
+キーポイント:
+
+- `makeAccelerationStructureCommandEncoder` で acceleration structure encoder を作ります。
+- build コマンドは descriptor、対象 acceleration structure、scratch buffer を受け取ります。
+- build は GPU タイムラインで動き、CPU 同期はありません。
+- build 後は GPU 上で intersection 処理を安全にスケジュールできます。
+
+### triangle intersection function で alpha test する
+
+([12:16](https://developer.apple.com/videos/play/wwdc2020/10012/?time=736)) 透明ヒットの非効率は、毎回ルートから走査し直すことです。triangle intersection function は走査中に alpha texture を見てヒットを accept/reject できます。
+
+```metal
+[[intersection(triangle, triangle_data)]]
+bool alphaTestIntersectionFunction(uint primitiveIndex        [[primitive_id]],
+                                   uint geometryIndex         [[geometry_id]],
+                                   float2 barycentricCoords   [[barycentric_coord]],
+                                   device Material *materials [[buffer(0)]])
+{
+    texture2d<float> alphaTexture = materials[geometryIndex].alphaTexture;
+
+    float2 UV = interpolateUVs(materials[geometryIndex].UVs,
+        primitiveIndex, barycentricCoords);
+
+    float alpha = alphaTexture.sample(sampler, UV).x;
+
+    return alpha > 0.5f;
+}
+```
+
+キーポイント:
+
+- `[[intersection(triangle, triangle_data)]]` は barycentric coordinate が必要な triangle intersection function です。
+- `primitiveIndex`、`geometryIndex`、`barycentricCoords` は intersector から来ます。
+- function は独自リソースを bind でき、ここでは `materials` から alpha texture と UV を読みます。
+- `true` でヒットを accept、`false` で走査継続です。
+
+### bounding box function でカスタム primitive を接続する
+
+([14:38](https://developer.apple.com/videos/play/wwdc2020/10012/?time=878)) カスタム primitive の入口は bounding box です。アプリが box を渡し、Metal が acceleration structure を構築し、sphere、curve、hair の交差は bounding box intersection function が担当します。
+
+```swift
+// Create a primitive acceleration structure descriptor
+let accelerationStructureDescriptor = MTLPrimitiveAccelerationStructureDescriptor()
+
+// Create one or more bounding box geometry descriptors:
+let geometryDescriptor = MTLAccelerationStructureBoundingBoxGeometryDescriptor()
+
+geometryDescriptor.boundingBoxBuffer = boundingBoxBuffer
+geometryDescriptor.boundingBoxCount = boundingBoxCount
+
+accelerationStructureDescriptor.geometryDescriptors = [ geometryDescriptor ]
+```
+
+キーポイント:
+
+- descriptor は依然 `MTLPrimitiveAccelerationStructureDescriptor` です。
+- geometry descriptor は `MTLAccelerationStructureBoundingBoxGeometryDescriptor` に差し替えます。
+- `boundingBoxBuffer` に axis-aligned bounding box を格納します。
+- Metal は ray と box の候補を見つけ、アプリの intersection function を呼びます。
+
+([15:38](https://developer.apple.com/videos/play/wwdc2020/10012/?time=938)) sphere 例は数学交差、距離範囲チェック、accept と intersection distance の返却を示します。
+
+```metal
+struct BoundingBoxResult {
+    bool accept [[accept_intersection]];
+    float distance [[distance]];
+};
+
+[[intersection(bounding_box)]]
+BoundingBoxResult sphereIntersectionFunction(float3 origin            [[origin]],
+                                             float3 direction         [[direction]],
+                                             float minDistance        [[min_distance]],
+                                             float maxDistance        [[max_distance]],
+                                             uint primitiveIndex      [[primitive_id]],
+                                             device Sphere *spheres   [[buffer(0)]])
+{
+    float distance;
+
+    if (!intersectRaySphere(origin, direction, spheres[primitiveIndex], &distance))
+        return { false, 0.0f };
+
+    if (distance < minDistance || distance > maxDistance)
+        return { false, 0.0f };
+
+    return { true, distance };
+}
+```
+
+キーポイント:
+
+- `BoundingBoxResult` は attribute で accept と距離を示します。
+- `origin`、`direction`、`minDistance`、`maxDistance` は intersector から渡されます。
+- function は `intersectRaySphere` で数学テストします。セッションは helper の中身を展開しません。
+- 返す `distance` はシーン全体の最近ヒット比較に使われます。
+
+([16:20](https://developer.apple.com/videos/play/wwdc2020/10012/?time=980)) シェーディングに追加データが必要なら ray payload で intersection function の結果を compute kernel に戻します。
+
+```metal
+[[intersection(bounding_box)]]
+BoundingBoxResult sphereIntersectionFunction(/* ... */,
+                                             ray_data float3 & normal [[payload]])
+{
+    // ...
+
+    if (distance < minDistance || distance > maxDistance)
+        return { false, 0.0f };
+
+    float3 intersectionPoint = origin + direction * distance;
+    normal = normalize(intersectionPoint - spheres[primitiveIndex].origin);
+
+    return { true, distance };
+}
+```
+
+キーポイント:
+
+- `ray_data float3 & normal [[payload]]` は payload 参照です。
+- intersection function が `normal` を書くと、交差を開始した kernel が読めます。
+- payload の変更は accept/reject どちらでも見えます。通常は accept 時だけ書きます。
+
+### intersection function と function table を接続する
+
+([17:18](https://developer.apple.com/videos/play/wwdc2020/10012/?time=1038)) intersector が intersection function を呼ぶには、先に compute pipeline state へリンクする必要があります。
+
+```swift
+// Load functions from Metal library
+let sphereIntersectionFunction = library.makeFunction(name: "sphereIntersectionFunction")!
+// other functions...
+
+// Attach functions to ray tracing compute pipeline descriptor
+let linkedFunctions = MTLLinkedFunctions()
+
+linkedFunctions.functions = [ sphereIntersectionFunction, alphaTestFunction, ... ]
+
+computePipelineDescriptor.linkedFunctions = linkedFunctions
+
+// Compile and link ray tracing compute pipeline
+let computePipeline = try device.makeComputePipeline(descriptor: computePipelineDescriptor,
+                                                     options: [],
+                                                     reflection: nil)
+```
+
+キーポイント:
+
+- intersection function は通常の Metal function と同様に library から読み込みます。
+- `MTLLinkedFunctions` で compute pipeline descriptor に付けます。
+- pipeline コンパイル時に compute kernel と intersection function がリンクされます。
+- kernel 内の ray intersector がカスタム intersection function を呼べるようになります。
+
+([18:35](https://developer.apple.com/videos/play/wwdc2020/10012/?time=1115)) リンク後は intersection function table で geometry や instance に function をマッピングします。
+
+```swift
+// Allocate intersection function table
+let descriptor = MTLIntersectionFunctionTableDescriptor()
+
+descriptor.functionCount = intersectionFunctions.count
+
+let functionTable = computePipeline.makeIntersectionFunctionTable(descriptor: descriptor)
+
+for i in 0 ..< intersectionFunctions.count {
+    // Get a handle to the linked intersection function in the pipeline state
+    let functionHandle = computePipeline.functionHandle(function: intersectionFunctions[i])
+
+    // Insert the function handle into the table
+    functionTable.setFunction(functionHandle, index: i)
+}
+
+// Bind intersection function resources
+functionTable.setBuffer(sphereBuffer, offset: 0, index: 0)
+```
+
+キーポイント:
+
+- `MTLIntersectionFunctionTableDescriptor` で table 容量を決めます。
+- table は特定の `computePipeline` から作り、その pipeline か派生だけで使います。
+- `functionHandle` は pipeline state にリンクされた実行コードを指します。
+- function table も resource 绑定点で、例は index 0 に sphere buffer を bind します。
+
+([19:26](https://developer.apple.com/videos/play/wwdc2020/10012/?time=1166)) kernel では function table を別の buffer 引数として intersector に渡します。
+
+```metal
+[[kernel]]
+void rtKernel(primitive_acceleration_structure accelerationStructure   [[buffer(0)]],
+              intersection_function_table<triangle_data> functionTable [[buffer(1)]],
+              /* ... */)
+{
+    // generate ray, create intersector...
+
+    intersection = intersector.intersect(r, accelerationStructure, functionTable);
+
+    // shading...
+}
+```
+
+キーポイント:
+
+- `intersection_function_table<triangle_data>` は shader 側の table 型です。
+- acceleration structure と function table は `[[buffer(0)]]` と `[[buffer(1)]]` です。
+- intersector は geometry descriptor と instance descriptor の table offset で entry を選びます。
+- CPU 側は `encoder.setIntersectionFunctionTable(functionTable, bufferIndex: 1)` で bind します。
+
+---
+
+## 重要ポイント
+
+1. **インタラクティブ path tracing プレビュー**
+
+やること: 3D シーンエディタにノイジーなプレビューを追加し、カメラ移動中はピクセルあたり 1 レイ、停止後に sample を蓄積する。
+
+価値: セッションのデモがこのワークフロー。編集は速度、オフラインは収束品質。
+
+始め方: `rtKernel` で 1 thread per pixel から始め、レイ生成、交差、シェーディングを 1 compute kernel に入れ、sample accumulation を追加する。
+
+2. **透明な葉と抜け素材の ray traced shadow**
+
+やること: レイトレース影で alpha texture を正しく扱い、葉、柵、メッシュ布を完全な triangle にしない。
+
+価値: triangle intersection function は走査中に透明ヒットを reject でき、ルートからレイを再発射しなくて済む。
+
+始め方: alpha texture 付き geometry に intersection function table entry を設定し、barycentric で UV を補間して alpha をサンプルし accept/reject を返す。
+
+3. **数学 primitive で sphere、curve、hair を描く**
+
+やること: 球、曲線、髪の毛を bounding box primitive として renderer に接続し、三角化のメモリと見た目の問題を減らす。
+
+価値: セッションは sphere と cubic Bezier hair strand を示す。curve は滑らか、hair は少数の control point で足りる。
+
+始め方: primitive ごとに axis-aligned bounding box を生成し、`MTLAccelerationStructureBoundingBoxGeometryDescriptor` で build し、`[[intersection(bounding_box)]]` function を書く。
+
+4. **renderer に kernel 分割実験スイッチを付ける**
+
+やること: 単一 kernel と複数 kernel の両経路を残し、実シーンで occupancy、メモリトラフィック、フレーム時間を比較する。
+
+価値: 交差は重い。シェーディングも重いと統合 kernel は occupancy を下げる。
+
+始め方: まず単一 kernel を実装し、重いシェーディングを別 compute pass に分離し、GPU counters か Xcode Metal tools で比較する。
+
+5. **acceleration structure 構築をリソーススケジューラに入れる**
+
+やること: シーンローダーが acceleration structure の確保、build、refit、compact のタイミングを決め、レンダーループで大きなメモリを都度管理しない。
+
+価値: 新 API は allocation と GPU タイムライン build の位置を制御できる。instancing、refitting、compaction は動的ジオメトリとメモリ回収に使える。
+
+始め方: `device.accelerationStructureSizes`、`makeAccelerationStructure`、scratch buffer、`makeAccelerationStructureCommandEncoder` を包む build job を作る。
+
+---
+
+## 関連セッション
+
+- [Get to know Metal function pointers](/articles/wwdc2020-10013) — セッション末尾で推す続編。任意マテリアルコード、動的 shader 呼び出し、レイトレーシング function table を説明します。
+- [Harness Apple GPUs with Metal](/articles/wwdc2020-10602) — 高性能 renderer の制約理解のための Apple GPU と Metal レンダリングアーキテクチャ。
+- [Optimize Metal apps and games with GPU counters](/articles/wwdc2020-10603) — 本セッションの profiling と kernel 分割の助言に対応する GPU counters。
+- [Gain insights into your Metal app with Xcode 12](/articles/wwdc2020-10605) — レイトレーシング renderer のリソース、帯域、API 問題向け Xcode 12 Metal デバッガ。
+- [Bring your Metal app to Apple silicon Macs](/articles/wwdc2020-10631) — Apple silicon Mac の Metal/TBDR とグラフィックス集約 App の移植。

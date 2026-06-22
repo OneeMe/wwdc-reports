@@ -1,0 +1,158 @@
+---
+title: "Get to know the ManagedApp Framework"
+description: "discover how the managedapp framework helps your app adapt to managed environments. we"
+date: 2026-06-10
+tags: ["ManagedApp", "Enterprise", "MDM", "Security"]
+thumbnail: "/images/sessions/2025/203.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/203/"
+sessionId: "wwdc2025-203"
+year: "2025"
+relatedSessions:
+  - title: "What's new in Apple device management and identity"
+    code: "258"
+    description: "designed for it administrators, mdm developers, and identity providers, this ses"
+---
+
+## Highlight
+
+> The ManagedApp framework arrives in iOS/iPadOS 18.4 and visionOS 2.4. It lets MDM push configuration, passwords, certificates, and ACME identities (with hardware-bound keys) straight to a managed app, and uses an async sequence to notify the app the moment anything changes.
+
+---
+
+## Core content
+
+The first launch of a freshly installed app inside a company is often the worst moment of the experience. The employee types in a server address, a username, a password, a second-factor code, then walks through the settings page checkbox by checkbox to line up with the organization's compliance rules. Bob Whiteman opens with this pain point ([00:51](https://developer.apple.com/videos/play/wwdc2025/203/?time=51)): the more steps there are, the more mistakes happen, employees give up, IT gets the tickets, and the organization eventually drops the app from its catalog. If a developer wants to fix this alone, it means building identity federation, hosting a configuration site, integrating with a certificate authority, and shipping organization-specific builds — none of it related to the actual product.
+
+The ManagedApp framework hands all of that work to the system. The administrator configures it on the MDM side; the app gets a ready-made configuration and key set the moment it launches, with no first-run setup flow at all ([02:25](https://developer.apple.com/videos/play/wwdc2025/203/?time=145)). The framework handles the secure delivery of four kinds of data in a single place: app-defined configuration, passwords, certificates, and identities (PKCS #12, SCEP, and ACME — the last one can bind to hardware keys and do remote attestation). The whole mechanism requires the MDM to use declarative device management, takes effect from the moment the app becomes managed, and works across every MDM enrollment type.
+
+The most important design choice is that the configuration schema is defined by the app developer, not by Apple or the MDM vendor. Bob hammers on this point ([06:44](https://developer.apple.com/videos/play/wwdc2025/203/?time=404)): you understand your app better than anyone else, so only you can describe the right configuration surface. The framework is not a solution; it is a platform for building solutions.
+
+---
+
+## Detailed content
+
+The ManagedApp framework is made of four independent providers, one each for passwords, certificates, identities, and custom configuration ([12:20](https://developer.apple.com/videos/play/wwdc2025/203/?time=740)). The first three return system-defined types; the custom configuration is shaped by the app.
+
+The first step is to write the schema for your custom configuration as a `Decodable` type. The Landmarks sample has a single field, `collection`:
+
+```swift
+// Your app's managed configuration
+
+struct LandmarksManagedConfig: Decodable {
+
+    private(set) var collection: LandmarkCollection?
+
+    private enum CodingKeys: String, CodingKey {
+        case collection
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        collection = try values.decode(LandmarkCollection.self, forKey: .collection)
+    }
+}
+```
+
+Key points:
+
+- `LandmarksManagedConfig` conforms to `Decodable`, so the framework can decode the dictionary delivered by MDM into a Swift type.
+- `collection` uses `private(set)` to expose a read-only view; only the framework can update the configuration.
+- `CodingKeys` declares the keys explicitly, instead of relying on implicit property-name matching.
+- `init(from:)` calls `decode` rather than `decodeIfPresent`, so a missing field throws — the app fails fast when the schema does not match.
+
+The second step is to wire the configuration into the app's runtime. `ManagedAppConfigurationProvider` returns an `AsyncSequence`, and the loop body runs again every time the configuration changes ([0:02](https://developer.apple.com/videos/play/wwdc2025/203/?time=2)):
+
+```swift
+// Receiving the current configuration
+
+import ManagedApp
+
+// [...]
+
+var managedCollection: LandmarkCollection?
+
+// [...]
+
+func loadCollections() {
+    // [...]
+    Task {
+        let configProvider = ManagedAppConfigurationProvider()
+
+        for await config in await configProvider.configurations(LandmarksManagedConfig.self) {
+            // config's type is LandmarksManagedConfig?
+            managedCollection = config?.collection
+        } // Loops forever
+    }
+}
+```
+
+Key points:
+
+- `import ManagedApp` pulls in the framework — that is the module name.
+- `configurations(_:)` takes the schema type and yields `LandmarksManagedConfig?`. The element is `nil` when there is no configuration or when the app is not managed.
+- The `for await` loop never ends. Each new configuration MDM pushes triggers another iteration, so you do not need KVO or NotificationCenter.
+- Putting the `Task` next to the data-loading code keeps configuration and data on the same lifecycle.
+
+The third step covers identity authentication. VPN extensions and enterprise services often need a client certificate, and the framework hands a `SecIdentity` straight to the URLSession delegate:
+
+```swift
+// Using an identity
+
+final class MyURLSessionDelegate: NSObject, URLSessionDelegate {
+
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge)
+        async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        switch challenge.protectionSpace.authenticationMethod {
+        case NSURLAuthenticationMethodClientCertificate:
+
+            // Look up the identity
+            let provider = ManagedAppIdentitiesProvider()
+            let id = "AssetDownloadClient"
+            guard let identity = try? await provider.identity(withIdentifier: id) else {
+                // No identity, cancel the challenge
+                return (.cancelAuthenticationChallenge, nil)
+            }
+
+            // Use the identity to authenticate.
+            return (.useCredential, URLCredential(identity: identity,
+                                                  certificates: nil,
+                                                  persistence: .forSession))
+        default:
+            return (.performDefaultHandling, nil)
+        }
+    }
+}
+```
+
+Key points:
+
+- The async version of `URLSessionDelegate` suspends when the challenge arrives and resumes after the identity is fetched.
+- `ManagedAppIdentitiesProvider().identity(withIdentifier:)` looks up the identity by the identifier the schema agreed on; the app picks that identifier itself.
+- If the identity is not available, call `cancelAuthenticationChallenge` so the request fails outright instead of falling back to weaker authentication.
+- `URLCredential` uses `.forSession` for `persistence`, so the private key is never copied outside the Keychain.
+
+Licensing is the most direct upgrade this framework brings. At [09:00](https://developer.apple.com/videos/play/wwdc2025/203/?time=540) Bob compares it with the old approach: shipping a string token risks leaks, while the ManagedApp framework can ship an encrypted identity signed by the organization's CA, with the private key generated on the device and never leaving it. VPN extensions go further and can pick up an ACME identity with hardware attestation ([10:46](https://developer.apple.com/videos/play/wwdc2025/203/?time=646)), shutting off the path that lets attackers take over VPN credentials in the middle.
+
+---
+
+## Core takeaways
+
+- **Move from the old ManagedAppConfiguration to the ManagedApp framework**: why it pays off — the old approach does not support app extensions, certificates, or identities, and gives no change notifications; the new framework is a more complete replacement starting in iOS/iPadOS 18.4 ([09:46](https://developer.apple.com/videos/play/wwdc2025/203/?time=586)). How to start — define a minimal schema, get the "MDM pushes → app receives" path working end-to-end, then port the old `UserDefaults` reads one field at a time, deleting the old code as you go.
+
+- **Give your VPN extension a hardware-bound ACME identity**: why it pays off — the VPN is one of the most exposed entry points; pinning the private key to the Secure Enclave with remote attestation makes the organization's VPN admission policy actually trustworthy ([10:30](https://developer.apple.com/videos/play/wwdc2025/203/?time=630)). How to start — declare an identity field in the schema, require the MDM to issue it via ACME, and reuse the `ManagedAppIdentitiesProvider` snippet above inside the `NEVPNManager` authentication callback.
+
+- **Replace license tokens with license identities**: why it pays off — once a token leaks the organization keeps paying, but a key pair generated on the device never leaves it, so the leak surface is close to zero ([08:30](https://developer.apple.com/videos/play/wwdc2025/203/?time=510)). How to start — add mTLS support on the server, hook up the issuance flow to the organization CA, and use `ManagedAppIdentitiesProvider` on the client to fetch the identity for client-certificate authentication.
+
+- **Receive one-time passwords and initial credentials in your SSO extension**: why it pays off — identity providers usually design their own authentication protocols, and in the past the only option was to make users type credentials by hand; now an administrator can pre-provision the initial password or binding token through MDM ([11:42](https://developer.apple.com/videos/play/wwdc2025/203/?time=702)). How to start — add a `ManagedAppPasswordsProvider` to the SSO extension, try to read it on launch, and skip the manual entry flow when one exists.
+
+- **Reload everything on each configuration change through the async sequence**: why it pays off — a `for await` loop handles repeated updates by design, avoiding the inconsistent intermediate state you get from per-field observers ([06:00](https://developer.apple.com/videos/play/wwdc2025/203/?time=360)). How to start — iterate `configurations(_:)` inside a `Task` and run the full "apply configuration" flow on each new value, instead of diffing individual fields.
+
+---
+
+## Related sessions
+
+- [What's new in Apple device management and identity](/articles/wwdc2025-258) — an overview of the new device management and identity features; pair it with the ManagedApp framework to see the full deployment picture.
+- [Discover the Enterprise APIs for iOS](/articles/wwdc2025-302) — extension capabilities for enterprise APIs, complementary to the ManagedApp framework on the permission model side.
+- [What's new in privacy](/articles/wwdc2025-265) — changes to the privacy boundary, useful for understanding how managed configuration is delivered safely under the privacy framework.
+- [Streamline sign-in with passkey upgrades and credential managers](/articles/wwdc2025-279) — the authentication side of the story; combine it with the identity capabilities ManagedApp provides.

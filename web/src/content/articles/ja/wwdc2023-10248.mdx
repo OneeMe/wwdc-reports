@@ -1,0 +1,183 @@
+---
+title: "Analyze hangs with Instruments"
+description: "Learn how to use Instruments to analyze, understand, and fix hangs in your apps on all Apple platforms. Discover how to efficiently navigate an Instruments trace document, interpret trace data, and record additional profiling data to better understand your specific hang."
+date: "2023-06-06"
+tags: ["Developer Tools", "Performance", "Instruments"]
+thumbnail: "/images/sessions/2023/10248.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10248/"
+sessionId: "wwdc2023-10248"
+year: "2023"
+relatedSessions:
+  - title: "Track down hangs with Xcode and on-device detection"
+    code: "110363"
+    description: "WWDC22 session covering tools for finding hangs before analyzing them"
+  - title: "Demystify SwiftUI performance"
+    code: "10252"
+    description: "SwiftUI performance analysis and optimization"
+  - title: "What's new in Xcode 15"
+    code: "10250"
+    description: "Xcode 15 improvements including Hangs instrument"
+---
+## ハイライト
+
+> Instruments に Hangs テンプレートが追加されました。 Time Profiler と SwiftUI テンプレートを併用すると、開発者はメイン スレッドの遅延、非同期遅延、メイン スレッドのブロックという 3 種類のパフォーマンスの問題を特定し、応答遅延を数百ミリ秒から 100 ミリ秒未満に短縮できます。
+
+## 主要内容
+
+アプリのユーザーがボタンをクリックしますが、インターフェイスは応答する前に 0.5 秒間ハングします。この体験は、スイッチを押してから遅れて点灯する電球のようなもので、「本物のインタラクション」という幻想を即座に打ち破ります。
+
+Apple の調査によると、100 ミリ秒未満の遅延は、個別のインタラクション (ボタンのクリックなど) をほとんど感知できないことがわかっています。 250 ミリ秒を超える遅延はユーザーに顕著です。レイテンシが 500 ミリ秒を超えると、実際にハングアップします。 Instruments のハング テンプレートは、250 ミリ秒から始まるマイクロ ハングをマークし、500 ミリ秒を超えると正式なハングをマークします。
+
+([01:52](https://developer.apple.com/videos/play/wwdc2023/10248/?time=112)) ハングを発見した後の分析は、通常、インストゥルメントでのハングの種類の特定、根本原因の特定、修復と検証の 3 つのステップに分かれています。この講演では分析セッションに焦点を当て、3 つの典型的なハングを示しました。
+
+### メインスレッドがビジー状態でハングします
+
+([19:38](https://developer.apple.com/videos/play/wwdc2023/10248/?time=1178)) このスピーチでは、例として背景選択インターフェイスが使用されています。`BackgroundThumbnailView`サムネイルをメインスレッドに直接同期的にロードします。
+
+```swift
+struct BackgroundThumbnailView: View {
+    static let thumbnailSize = CGSize(width:128, height:128)
+    var background: BackyardBackground
+
+    var body: some View {
+        Image(uiImage: background.thumbnail)
+    }
+}
+```
+
+グリッドに多数のサムネイルを同時に表示すると、それぞれのサムネイルが`background.thumbnail`画像のデコードとスケーリングはすべてメインスレッドで実行されるため、インターフェイスがスタックします。
+
+修正は、同期読み込みを非同期に変更することです。最初に使用する`ProgressView`席に座ってパスしてください`.task`バックグラウンドでの読み込み:
+
+```swift
+struct BackgroundThumbnailView: View {
+    static let thumbnailSize = CGSize(width:128, height:128)
+    var background: BackyardBackground
+    @State private var image: UIImage?
+
+    var body: some View {
+        if let image {
+            Image(uiImage: image)
+        } else {
+            ProgressView()
+                .frame(width: Self.thumbnailSize.width, height: Self.thumbnailSize.height, alignment: .center)
+                .task {
+                    image = await background.thumbnail
+                }
+        }
+    }
+}
+```
+
+キーポイント:
+- `@State private var image`非同期で読み込んだ画像を保存する
+-`ProgressView()`画像の準備ができる前に読み込みインジケーターを表示する
+-`.task`モディファイアはバックグラウンドで非同期コードを自動的に実行し、完了時に UI を更新します
+-`background.thumbnail`同期プロパティを次のように変更します。`async`計算されたプロパティ、時間のかかる操作をメインスレッドから移動
+
+### 非同期遅延ハング
+
+([33:40](https://developer.apple.com/videos/play/wwdc2023/10248/?time=2020))`await`バックグラウンド タスク自体に時間がかかりすぎる場合でも、ユーザーには長い ProgressView が表示されます。この状況は、Instruments では次のように現れます。メインスレッドはビジーではありませんが、長時間ハングします。
+
+解決策は、サムネイルの計算を非同期にすることです。
+
+```swift
+public var thumbnail: UIImage {
+    get async {
+        // compute and cache thumbnail
+    }
+}
+```
+
+このようにして、デコードとスケーリングはバックグラウンドで完了し、メインスレッドは結果を表示することだけを担当します。
+
+### メインスレッドのブロックハング
+
+([38:52](https://developer.apple.com/videos/play/wwdc2023/10248/?time=2332)) 最も隠されたカテゴリ。コードはそれを使用しているように見えます`await`ですが、後続のコードは引き続きメインスレッドをブロックします。
+
+```swift
+class ColorizingService {
+    static let shared = ColorizingService()
+    func colorize(_ grayscaleImage: CGImage) async throws -> CGImage
+}
+
+struct ImageTile: View {
+    var body: some View {
+        mainContent
+            .task {
+                let colorizer = ColorizingService.shared
+                result = try await colorizer.colorize(image)
+            }
+    }
+}
+```
+
+問題は`ColorizingService.shared`はい`@MainActor`同期プロパティがオンになっています。それでも`colorize`はい`async`、しかしアクセス`shared`メインスレッド自体をブロックします。さらに陰湿に、次のように書かれていても、`await ColorizingService.shared.colorize(image)`，`shared`同期アクセスは依然として発生します`await`前に。
+
+修正は、メインスレッドで同期されたシングルトンにアクセスしないようにすることです。シングルトン参照は事前に取得することも、メインスレッドに依存しない初期化メソッドにリファクタリングすることもできます。
+
+## 詳細
+### インストゥルメントを使用してハングを分析する
+
+([01:52](https://developer.apple.com/videos/play/wwdc2023/10248/?time=112)) Xcode 15 で、[Product] > [Profile] を選択し、次に Hangs テンプレートを選択します。アプリの実行を記録した後、Instruments はしきい値を超えるすべてのハング間隔をマークします。
+
+タイムライン領域には赤いバーが表示され、その下に各スレッドのアクティビティが表示されます。ハング間隔をクリックすると、下の詳細パネルにその期間の各スレッドのコール スタックが表示されます。
+
+### 3 種類のハングの識別特徴
+
+|吊り下げタイプ |メインスレッドのステータス |識別方法 |
+|----------|-----------|----------|
+|メインスレッドがビジー状態 | 100% CPU | Time Profiler は、コードを実行しているメイン スレッドを表示します。
+|非同期遅延 |アイドル状態、待機中 |ハング時間が長く、メインスレッドにアクティビティがない |
+|メインスレッドがブロックされました |アイドル状態だがブロックされている |呼び出しスタックが同期ロックまたはアクター分離コードで停止する |
+
+### Grid と LazyVGrid の選択
+
+([20:26](https://developer.apple.com/videos/play/wwdc2023/10248/?time=1226)) スピーチも比較しました`Grid`そして`LazyVGrid`性能の差。`Grid`すべてのサブビューを一度に作成しますが、`LazyVGrid`目に見える領域にのみ作成されます。大量のデータの場合は、次を使用します。`LazyVGrid`：
+
+```swift
+ScrollView {
+    LazyVGrid(columns: [.init(.adaptive(minimum: BackgroundThumbnailView.thumbnailSize.width))]) {
+        ForEach(BackyardBackground.allBackgrounds) { background in
+            BackgroundThumbnailView(background: background)
+        }
+    }
+}
+```
+
+キーポイント:
+- `LazyVGrid`セルが表示領域に入ったときのみビューを作成する
+-`.adaptive(minimum:)`さまざまな画面幅に適応するために列数を自動的に計算します。
+- 非同期読み込みと連携して、最初の表示時の集中的な遅延を回避します。
+
+### 他のインストゥルメントテンプレートと組み合わせる
+
+([00:55](https://developer.apple.com/videos/play/wwdc2023/10248/?time=55)) Hangs テンプレートは「どこでスタックしているか」を示しますが、「なぜスタックしているのか」を知るには、多くの場合、他のテンプレートを追加する必要があります。
+- 時間プロファイラー: 各スレッドの CPU 使用率を表示します。
+- SwiftUI: ビュー本体の実行時間を分析します。
+- ディスクアクティビティ: メインスレッドをブロックする同期 I/O があるかどうかを確認します。
+- ネットワーク: 遅延がネットワーク要求によるものかどうかを確認します。
+
+## 重要ポイント
+
+- **やるべきこと**: アプリの各リスト インターフェイスに非同期画像読み込みを追加します。
+- **実行する価値がある理由**: ユーザーがリストをスライドするときに最も敏感なのは、画像の読み込みの遅延です。使用`ProgressView` + `.task` + `async`属性により、画像のデコードをメインスレッドから完全に移動できます。
+- **開始方法**: リスト内で画像を直接同期的に読み込むコードを見つけ、読み込みロジックを次のように変更します。`async`計算されたプロパティ、ビューレイヤーで使用されます`.task`トリガー
+
+- **やるべきこと**: Instruments で「ハング + 時間プロファイラー」の組み合わせテンプレートを作成し、プロファイルを定期的にリリースします。
+- **実行する価値がある理由**: データ量が少なく、デバイスのパフォーマンスが良好であるため、開発環境では多くのハングが発生しても明らかではありません。実際のユーザー シナリオを記録すると問題が明らかになる可能性がある
+- **開始方法**: [製品] > [プロファイル] で、ハング テンプレートを選択し、録音後に赤いハング バーをクリックし、タイム プロファイラを追加してコール スタックを表示します。
+
+- **何をすべきか**: コード内のシングルトン パターンを監査し、存在するかどうかを確認します。`@MainActor`同期プロパティは頻繁にアクセスされます
+- **実行する価値がある理由**:`static let shared`協力する`@MainActor`これはメインスレッドがブロックされる隠れたトラップです。後続のコードを使用しても`await`、シングルトン自体にアクセスする同期操作がブロックされました。
+- **開始方法**: グローバル検索`.shared`、アクター分離プロパティを確認します。の場合`@MainActor`、事前に非分離初期化またはキャッシュ参照への変更を検討してください。
+
+- **やるべきこと**: を使用します`LazyVGrid`または`LazyVStack`大量のデータを一度にロードする置き換え`Grid`/`VStack`- **実行する価値がある理由**: リストに 2000 個のデータがある場合、`ForEach`2000 のビューが作成されます。`Lazy`シリーズは目に見える領域にのみ作成されるため、初期荷重圧力が大幅に軽減されます。
+- **開始方法**: すべての使用状況を確認してください`Grid`、`VStack` + `ForEach`データ量が Lazy バージョンへの変更に適しているかどうかを評価するリスト コード
+
+## 関連セッション
+
+- [Xcode とオンデバイス検出を使用してハングを追跡する](/articles/wwdc2023-110363) - WWDC22 コース、リリース前後のハングを検出する方法を説明
+- [Demystify SwiftUI パフォーマンス](/articles/wwdc2023-10252) — Instruments で使用される SwiftUI パフォーマンス分析
+- [Xcode 15 の新機能](/articles/wwdc2023-10250) — Xcode 15 の新機能 (改善されたインストゥルメントおよびハング テンプレートを含む)
+- [Swift 同時実行: 舞台裏](/articles/wwdc2023-10170) — アクターの分離によって引き起こされるブロッキングの診断に役立つ、Swift 同時実行のスレッド モデルの深い理解

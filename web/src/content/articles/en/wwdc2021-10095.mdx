@@ -1,0 +1,267 @@
+---
+title: "Use async/await with URLSession"
+description: "Discover how you can adopt Swift concurrency in URLSession using async/await and AsyncSequence, and how you can apply Swift concurrency concepts to improve your networking code."
+date: "2021-06-08"
+tags: ["Swift", "Networking", "URLSession", "async/await"]
+thumbnail: "/images/sessions/2021/10095.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10095/"
+sessionId: "wwdc2021-10095"
+year: "2021"
+relatedSessions:
+  - title: "Meet async/await in Swift"
+    code: "10132"
+    description: "Getting started with Swift async/await"
+  - title: "Accelerate networking with HTTP/3 and QUIC"
+    code: "10094"
+    description: "In-depth explanation of HTTP/3 and QUIC protocols"
+  - title: "Meet AsyncSequence"
+    code: "10133"
+    description: "How to use AsyncSequence"
+  - title: "Protect mutable state with Swift actors"
+    code: "10134"
+    description: "Concurrency safety mechanism of Swift Actor"
+---
+## Highlight
+
+> iOS 15 adds new URLSession`data(for:)`、`upload(for:from:)`、`download(from:)`、`bytes(from:)`Other native async methods support handling authentication challenges through task-specific delegates, while introducing AsyncSequence for incrementally receiving response bodies.
+
+## Core Content
+
+### Why introduce the async/await version of URLSession?
+
+A common network request code has three problems using completion handler:
+
+1. **Control flow jumps around**: Create task → resume → jump to completionHandler → jump to completionHandler of main queue
+2. **Thread safety trap**: Three execution contexts are involved (caller queue, session delegate queue, main queue), and the compiler cannot help detect data races.
+3. **Difficulty in error handling**: completionHandler may be called twice,`UIImage(data:)`Return optional but no corresponding error
+
+After changing to async/await, the control flow is executed linearly from top to bottom. All codes run in the same concurrency context. There is no need to worry about threading issues and incorrect use.`throw`Processing, the compiler will force processing of optional.
+
+### async method of URLSession
+
+New async methods in iOS 15 and macOS Monterey include:
+
+- `data(from:)` / `data(for:)`: Get data, equivalent to data task convenience method
+- `upload(for:from:)`: Upload data or files, equivalent to upload task
+- `download(from:)` / `download(for:)`: Download files to disk, not automatically deleted, need to be moved or deleted manually
+- `bytes(from:)` / `bytes(for:)`:return`AsyncBytes`, used to receive response body incrementally
+
+All methods support native Swift`try-catch`Error handling and Task cancellation.
+
+### Handling incremental responses: URLSession.bytes
+
+`data`、`upload`、`download`The methods all wait for the complete response body to arrive before returning.If incremental processing is required (e.g. SSE, streaming JSON), use`bytes`method.
+
+`bytes(from:)`Returns immediately after the response headers arrive, and the response body ends with`AsyncSequence<UInt8>`Form incremental delivery.`AsyncBytes`supply`lines`Transformation that parses the response body line by line.
+
+### Task-specific Delegate
+
+The delegate model of URLSession provides callbacks such as authentication challenges and metrics.The new async method no longer exposes the underlying task. How to handle authentication challenges for specific tasks?
+
+The answer is to pass a task-specific delegate parameter to the async method.This delegate only handles events for that specific task and is strongly referenced by the task until completion or failure.
+
+If both session delegate and task delegate implement the same method, the implementation of task delegate takes precedence.Note: Background URL Session does not support task-specific delegates.
+
+### Swift Concurrency cancellation mechanism
+
+`Task`The types are`cancel()`method, but be aware of Swift Concurrency's`Task`and`URLSessionTask`They are completely different concepts, just with similar names.
+
+Cancellation is collaborative - call`cancel()`After that, the code is at the next suspend point (e.g.`await`) checks the cancellation status and throws`CancellationError`。
+
+## Detailed Content
+
+### Get the async version of the photo
+
+（[02:52](https://developer.apple.com/videos/play/wwdc2021/10095/?time=172)）
+
+```swift
+func fetchPhoto(url: URL) async throws -> UIImage
+{
+    let (data, response) = try await URLSession.shared.data(from: url)
+
+    guard let httpResponse = response as? HTTPURLResponse,
+          httpResponse.statusCode == 200 else {
+        throw WoofError.invalidServerResponse
+    }
+
+    guard let image = UIImage(data: data) else {
+        throw WoofError.unsupportedImage
+    }
+
+    return image
+}
+```
+
+**Key points:**
+- `data(from:)`return`(Data, URLResponse)`tuple
+- use`guard`Check the status code, if it does not match the`throw`mistake
+- `UIImage(data:)`Return optional, must be processed`nil`Condition
+- The whole function is`async throws`, use when calling`try await`
+
+### URL Request version of data method
+
+（[03:45](https://developer.apple.com/videos/play/wwdc2021/10095/?time=225)）
+
+```swift
+let (data, response) = try await URLSession.shared.data(from: url)
+guard let httpResponse = response as? HTTPURLResponse,
+      httpResponse.statusCode == 200 else {
+    throw MyNetworkingError.invalidServerResponse
+}
+```
+
+**Key points:**
+- `data(for:)`accept`URLRequest`Parameters, you can configure HTTP headers, methods, etc.
+- The response check mode is the same: guard cast + check status code
+
+### Upload files
+
+（[04:03](https://developer.apple.com/videos/play/wwdc2021/10095/?time=243)）
+
+```swift
+var request = URLRequest(url: url)
+request.httpMethod = "POST"
+
+let (data, response) = try await URLSession.shared.upload(for: request, fromFile: fileURL)
+guard let httpResponse = response as? HTTPURLResponse,
+      httpResponse.statusCode == 201 else {
+    throw MyNetworkingError.invalidServerResponse
+}
+```
+
+**Key points:**
+- `upload(for:fromFile:)`Upload from disk file, suitable for large files
+- A successful upload usually returns 201 Created, check the corresponding status code
+- Also`upload(for:from:)`version, from`Data`upload
+
+### Download file
+
+（[04:21](https://developer.apple.com/videos/play/wwdc2021/10095/?time=261)）
+
+```swift
+let (location, response) = try await URLSession.shared.download(from: url)
+guard let httpResponse = response as? HTTPURLResponse,
+      httpResponse.statusCode == 200 else {
+    throw MyNetworkingError.invalidServerResponse
+}
+
+try FileManager.default.moveItem(at: location, to: newLocation)
+```
+
+**Key points:**
+- `download(from:)`Returns a temporary file URL that needs to be manually moved to the target location
+- The old version of the convenience method will automatically delete the file, but the new version will not
+- Be sure to delete or move temporary files after processing is complete
+
+### Task canceled
+
+（[04:44](https://developer.apple.com/videos/play/wwdc2021/10095/?time=284)）
+
+```swift
+let task = Task {
+    let (data1, response1) = try await URLSession.shared.data(from: url1)
+    let (data2, response2) = try await URLSession.shared.data(from: url2)
+}
+
+task.cancel()
+```
+
+**Key points:**
+- `Task { }`Create structured concurrency task, return`Task.Handle`
+- `cancel()`in the next`await`Click to take effect, throw`CancellationError`
+- if the first`await`has been returned, cancellation will not affect the second request, and both serial requests will complete
+
+### Incrementally receive response body
+
+（[07:53](https://developer.apple.com/videos/play/wwdc2021/10095/?time=473)）
+
+```swift
+let (bytes, response) = try await URLSession.shared.bytes(from: Self.eventStreamURL)
+guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+    throw WoofError.invalidServerResponse
+}
+for try await line in bytes.lines {
+    let photoMetadata = try JSONDecoder().decode(PhotoMetadata.self, from: Data(line.utf8))
+    await updateFavoriteCount(with: photoMetadata)
+}
+```
+
+**Key points:**
+- `bytes(from:)`return`(URLSession.AsyncBytes, URLResponse)`tuple
+- `AsyncBytes.lines`according to`\n`Split the response body and return`AsyncSequence<String>`
+- `for try await`Process each row in a loop, suitable for SSE and streaming JSON scenarios
+- `await updateFavoriteCount`Call another async function to update the UI
+
+### Task-specific Delegate handles authentication
+
+（[11:20](https://developer.apple.com/videos/play/wwdc2021/10095/?time=680)）
+
+```swift
+class AuthenticationDelegate: NSObject, URLSessionTaskDelegate {
+    private let signInController: SignInController
+
+    init(signInController: SignInController) {
+        self.signInController = signInController
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge
+    ) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodHTTPBasic {
+            do {
+                let (username, password) = try await signInController.promptForCredential()
+                return (.useCredential,
+                        URLCredential(user: username, password: password, persistence: .forSession))
+            } catch {
+                return (.cancelAuthenticationChallenge, nil)
+            }
+        } else {
+            return (.performDefaultHandling, nil)
+        }
+    }
+}
+```
+
+How to use:
+
+```swift
+let delegate = AuthenticationDelegate(signInController: signInController)
+let (data, response) = try await URLSession.shared.data(for: request, delegate: delegate)
+```
+
+**Key points:**
+- The delegate method itself can be`async`, supports await calls
+- The delegate is strongly referenced by the task and does not need to be held manually
+- For HTTP Basic authentication, a login box can pop up to obtain credentials
+- return`(useCredential, credential)`Tell the session to continue the request using the credentials
+
+## Core Takeaways
+
+1. **Migrate existing network layer to async/await**
+- **What to do**: Change all completion handler-based network request methods to async throws versions
+- **Why it’s worth doing**: code readability is greatly improved, error handling is safer, and thread safety bugs are reduced
+- **How ​​to start**: Start with the most commonly used request method and put`completionHandler: @escaping (Result<T, Error>) -> Void`Change to`async throws -> T`.The entry API is`URLSession.data(for:)`
+
+2. **Access to bytes API for real-time update interface**
+- **What to do**: Use`URLSession.bytes(from:)`Alternative polling or WebSocket handling for SSE/streaming interfaces
+- **Why is it worth doing**: Incrementally receive the response body, lower memory usage and smaller delay
+- **How ​​to get started**: Check existing SSE interfaces with`bytes.lines`Parse by line, in`for try await`Process each message in a loop
+
+3. **Use task-specific delegate to simplify authentication logic**
+- **What to do**: Create a dedicated delegate class for requests that require special authentication instead of dispatching with task ID in the global delegate
+- **Why is it worth doing**: Putting delegate logic and request logic together makes it easier to maintain.
+- **How ​​to start**: Implementation`URLSessionTaskDelegate`,exist`data(for:delegate:)`Pass in the instance.The delegate method can be marked as`async`
+
+4. **Optimize the memory usage of file download**
+- **What**: Use for large file downloads`download(from:)`instead of`data(from:)`
+- **Why it’s worth doing**:`data`Load the entire response body into memory,`download`Write to temporary file, memory usage is constant
+- **How ​​to start**: Change all pictures and video downloads to`download`, use after downloading is complete`FileManager.moveItem`Move to target location
+
+## Related Sessions
+
+- [Meet async/await in Swift](/articles/wwdc2021-10132) — Introduction to Swift async/await
+- [Accelerate networking with HTTP/3 and QUIC](/articles/wwdc2021-10094) — In-depth explanation of HTTP/3 and QUIC protocols
+- [Meet AsyncSequence](/articles/wwdc2021-10133) — How to use AsyncSequence
+- [Protect mutable state with Swift actors](/articles/wwdc2021-10134) — Concurrency safety mechanism of Swift Actor

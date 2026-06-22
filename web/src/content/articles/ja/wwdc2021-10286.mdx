@@ -1,0 +1,346 @@
+---
+title: "Explore bindless rendering in Metal"
+description: "unleash the full potential of your shaders and implement modern rendering techniques by adding argument buffers to adopt bindless rendering. learn how to make your entire scene and resources available to the gpu to make the most out of raytracing and rasterization pipelines."
+date: "2021-06-06"
+tags: ["Graphics & Games", "Metal"]
+thumbnail: "/images/sessions/2021/10286.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10286/"
+sessionId: "wwdc2021-10286"
+year: "2021"
+relatedSessions:
+  - title: "Enhance your app with Metal ray tracing"
+    code: "10149"
+    description: "メタル レイ トレーシングの新機能と、アプリやゲームでフォトリアルな 3D シーンを実現する方法を紹介します。"
+  - title: "Explore hybrid rendering with Metal ray tracing"
+    code: "10150"
+    description: "レイ トレーシングとラスター レンダリングを組み合わせてハイブリッド レンダリング効果を実現する方法を説明します。"
+  - title: "Discover Metal debugging, profiling, and asset creation tools"
+    code: "10157"
+    description: "Xcode での Metal のデバッグ、プロファイリング、アセット作成ツールを紹介します。"
+  - title: "Discover compilation workflows in Metal"
+    code: "10229"
+    description: "Metal Shading Languageのコンパイルワークフローと柔軟なシェーダ開発プロセスについて説明します。"
+---
+## ハイライト
+
+> Apple は、引数バッファ層 2 を使用して Metal でのバインドレス レンダリングをサポートしており、開発者がシーン アセットをナビゲート可能なデータ構造に編成し、レイ トレーシングやラスタライズされたシェーダのルート バッファを通じてメッシュ、マテリアル、テクスチャにアクセスできるようにします。
+
+## 主要内容
+
+レイ トレースされた反射は、従来のリギング モデルの限界を最も簡単に露呈させます。
+
+反射された光線は、シーン内の任意のオブジェクトに当たる可能性があります。ヒット後、シェーダーはピクセルを固定色にペイントするだけでは済みません。正しい反射色を把握するには、頂点法線、マテリアル、テクスチャを読み取るだけでなく、ヒット ポイントがどのインスタンス、どのメッシュ、どの三角形に属しているかを知る必要があります。
+
+従来のアプローチでは、各描画呼び出しまたはディスパッチの前に、必要なテクスチャとバッファを固定スロットに 1 つずつバインドします。このモデルは、リソースが明確なセットを使用する小規模なタスクに適しています。反射、拡散グローバル イルミネーション、および一部のアンビエント オクルージョン シーンは、多数のオブジェクトにアクセスします。シーン全体のリソースはパイプラインに直接結びついており、その量は非現実的です。
+
+Apple が提供した解決策はバインドレス レンダリングです。開発者はまず引数バッファを使用して、メッシュ、マテリアル、インスタンス、変換行列を整理します。レンダリング時にルート バッファーのみがシェーダーに渡されます。シェーダーは交差情報に基づいてデータ構造内を移動し、本当に必要なリソースを見つけます。
+
+このモデルはラスタライズにも機能します。 PBR (物理ベース レンダリング) フラグメント シェーダーは通常、アルベド、ラフネス、メタリック、オクルージョンなどの複数のテクスチャを読み取る必要があります。バインドレスにより、マテリアルがテクスチャ自体を参照できるようになり、描画呼び出しで各イメージを 1 つずつバインドする必要がなくなりました。
+
+このセッションの焦点は、特定の効果ではなく、リソースの編成方法にあります。シーンデータをGPUが動かせるグラフにする必要があります。レイ トレーシング シェーダとラスタライゼーション シェーダは両方とも、同じデータ構造セットに沿ってリソースにアクセスします。
+
+## 詳細
+
+### 引数バッファを使用してシーン グラフを表現する
+
+([03:00](https://developer.apple.com/videos/play/wwdc2021/10286/?time=180)) Metal でバインドレスを実装するための基礎は引数バッファーであり、バインドレス シナリオには引数バッファー Tier 2 が必要です。講演で述べたように、Tier 2 は Apple6 および Mac2 GPU ファミリで使用でき、すべての Metal シェーダー タイプから使用できます。
+
+一般的な組織スタイルは 3 層構造です。
+
+最初の層はメッシュ引数バッファーで、メッシュまたはサブメッシュを保持し、頂点配列とインデックス配列を参照します。 2 番目のレイヤーはマテリアル引数バッファーで、マテリアルはテクスチャを参照し、インライン定数を保存します。 3 番目の層はインスタンス引数バッファーです。各インスタンスはメッシュとマテリアルを参照し、モデル変換マトリックスを保存します。
+
+講義内の例題は以下のような構成になっています。
+
+```cpp
+struct Instance
+{
+    constant Mesh*     pMesh            [[id(0)]];
+    constant Material* pMaterial        [[id(1)]];
+    constant float4x4  modelTransform   [[id(2)]];
+};
+```
+
+キーポイント:
+
+- `Instance`引数バッファに書き込むことができる構造体です。
+- `pMesh`使用`[[id(0)]]`グリッド データを指すメンバー インデックスをマークします。
+- `pMaterial`使用`[[id(1)]]`マテリアルデータを指すメンバーインデックスをマークします。
+- `modelTransform`使用`[[id(2)]]`メンバー インデックスにラベルを付け、4x4 変換行列をローカル空間からワールド空間に保存します。
+- シェーダーはインスタンスを取得した後、ポインターに沿ってメッシュとマテリアルにアクセスし続けることができます。
+
+この構造の価値はリンクにあります。大量のテクスチャやバッファを固定スロットにフラット化する必要はなくなりました。代わりに、リソースは相互に参照します。シェーダへのエントリ ポイントにはルート ポインタのみが必要です。
+
+### MTLArgumentDescriptor を通じてエンコーダーを作成する
+
+([11:48](https://developer.apple.com/videos/play/wwdc2021/10286/?time=708)) 引数バッファ エンコーダを作成するには 2 つの方法があります。最初はスルーです`MTLFunction`反射。シェーダ関数が引数のバッファパラメータを直接受け取る場合、次のようにすることができます。`MTLFunction`エンコーダを作成します。
+
+このアプローチでは、シーン全体をエンコードするときに制限が発生します。`MTLFunction`シグネチャは、間接参照されたバッファについては認識しません。リフレクションは、リソースの読み込みとパイプライン状態の作成が分離されている場合にも不便です。関数が配列を受け取った場合、この方法でエンコーダーを反映することはできません。
+
+Apple が提供する 2 番目の方法は、`MTLArgumentDescriptor`。各構造体メンバーの記述子を作成し、バインディング インデックス、データ型、アクセスを指定してから、`MTLDevice`エンコーダを作成します。
+
+```objc
+MTLArgumentDescriptor* meshArg
+= [MTLArgumentDescriptor argumentDescriptor];
+
+meshArg.index    = 0;
+meshArg.dataType = MTLDataTypePointer;
+meshArg.access   = MTLArgumentAccessReadOnly;
+
+// Declare all other arguments (material and transform)
+
+id<MTLArgumentEncoder> instanceEncoder
+= [device newArgumentEncoderWithArguments:@[meshArg,
+                                            materialArg,
+                                            transformArg]];
+```
+
+キーポイント:
+
+- `argumentDescriptor`メンバーの説明を作成します。
+- `meshArg.index = 0`対応する`Instance`構造的に`[[id(0)]]`メンバー。
+- `MTLDataTypePointer`このメンバーがポインタ型リソースであることを示します。
+- `MTLArgumentAccessReadOnly`シェーダがリソースへの読み取りアクセスのみを持っていることを示します。
+- `newArgumentEncoderWithArguments:`記述子配列から作成`MTLArgumentEncoder`。
+- `materialArg`そして`transformArg`マテリアルメンバーとトランスフォームメンバーに対応して、同じ方法で宣言する必要があります。
+
+([13:34](https://developer.apple.com/videos/play/wwdc2021/10286/?time=814)) エンコーダーを取得したら、データをバッファーに書き込みます。配列をエンコードする場合、各要素のオフセットは次のようになります。`index * encodedLength`。講演では、シェーダ側がこの配列を特別に処理する必要がなく、バッファ長を知る必要もないことを強調しました。
+
+```objc
+// Offset for each array element
+NSUInteger offset = index * instanceEncoder.encodedLength;
+
+[instanceEncoder setArgumentBuffer:instancesBuffer offset:offset];
+```
+
+キーポイント:
+
+- `encodedLength`エンコーダによって与えられる単一構造のエンコード長です。
+- `index * encodedLength`配列内の数値を取得する`index`インスタンスの場所。
+- `setArgumentBuffer:offset:`エンコーダの書き込み位置をこのインスタンスに移動します。
+- その後、エンコーダでメッシュ、マテリアル、トランスフォームを設定すると、このインスタンス スロットが書き込まれます。
+
+### 間接的なリソース常駐を宣言する
+
+([06:15](https://developer.apple.com/videos/play/wwdc2021/10286/?time=375)) バインドレスはルート バッファーをパイプラインに渡すだけです。 Metal はこのルート バッファーについては知っていますが、シェーダーがどのテクスチャーとバッファーに間接的にアクセスするかは知りません。
+
+したがって、アプリケーションは、間接的にアクセスされるすべてのリソースを常駐として宣言する必要があります。常駐の意味は、リソース メモリを GPU で使用できるようにするようにドライバーに指示することです。この手順を怠ると、GPU の再起動やコマンド バッファの障害が発生する一般的な原因になります。
+
+このスピーチには 2 つの入り口があります: エンコーダーの使用法を計算する`useResource:usage:`、レンダリング コマンド エンコーダが使用する`useResource:usage:stages:`。
+
+```objc
+// Compute encoder
+[computeEncoder useResource:texture usage:MTLResourceUsageRead];
+
+// Render command encoder
+[renderEncoder useResource:texture
+                    usage:MTLResourceUsageRead
+                   stages:MTLRenderStageFragment];
+```
+
+キーポイント:
+
+- `useResource:usage:`コンピューティングエンコーダで使用されます。
+- `texture`これは、シェーダが引数バッファを通じて間接的にアクセスするリソースです。
+- `MTLResourceUsageRead`このアクセスがリソースの読み取りのみを行うことを示します。
+- `useResource:usage:stages:`レンダリング コマンド エンコーダで使用されます。
+- `MTLRenderStageFragment`常駐宣言をフラグメント段階に制限します。
+
+([07:12](https://developer.apple.com/videos/play/wwdc2021/10286/?time=432)) リソースが`MTLHeap`割り当てられた、利用可能な`useHeap`ヒープ全体が存在することを一度に宣言します。講演では、静的データのみを読み取る場合は、最初にこれを行うことを推奨しています。静的テクスチャとメッシュは読み込みフェーズ中にヒープに置かれ、レンダリング クリティカル パス上に常駐宣言が 1 つだけ必要になります。
+
+```objc
+[renderEncoder useHeap:staticResourceHeap
+                stages:MTLRenderStageFragment];
+```
+
+キーポイント:
+
+- `useHeap`同じから適切な`MTLHeap`子によって割り当てられたリソースのセット。
+- `staticResourceHeap`静的テクスチャやメッシュなどの読み取り専用リソースは保存する必要があります。
+- `stages`これらのリソースがどのレンダリング ステージで使用されるかを指定します。
+- 書き込む必要があるリソースは引き続き個別に使用する必要があります`useResource`書き込みアクセスをアサートします。
+
+### 誤ったヒープ共有によるシリアル化を回避する
+
+([07:35](https://developer.apple.com/videos/play/wwdc2021/10286/?time=455)) ヒープの利便性には代償も伴います。 Metal 2.3 以降、ヒープにハザード追跡 (アクセス違反追跡) を設定できるようになりました。問題は、Metal がヒープをリソースとして扱い、同期がヒープ レベルで発生することです。
+
+講演の例は 2 つのレンダー パスです。 A はレンダー テクスチャを追跡ヒープに書き込みます。 B は同じヒープ内の別のバッファを読み取ります。これら 2 つのリソースは本来無関係ですが、Metal は同じヒープ上の読み取りおよび書き込みのリスクのみを認識するため、アクセスをシリアル化する可​​能性があります。これは偽共有です。
+
+応答するには 2 つの方法があります。まず、更新可能なリソースと静的リソースを異なるヒープに配置します。次に、サブ割り当てリソースを追跡しないようにヒープを構成し、エンジン自体が同期を担当します。この講演では、Metal のデフォルトの動作は、ヒープ内でサブ割り当てされたリソースを追跡しないことであると付け加えられています。
+
+```objc
+MTLHeapDescriptor *descriptor = [[MTLHeapDescriptor alloc] init];
+descriptor.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+
+id<MTLHeap> heap = [device newHeapWithDescriptor:descriptor];
+```
+
+キーポイント:
+
+- `MTLHeapDescriptor`作成するヒープを記述します。
+- `hazardTrackingMode`ヒープがリソース アクセス違反を追跡するかどうかを制御します。
+- `MTLHazardTrackingModeUntracked`アプリケーションが同期の責任を引き継ぐことを示します。
+- `newHeapWithDescriptor:`記述子に基づいてヒープを作成します。
+- 追跡されていないヒープを使用した後、開発者は読み取りと書き込みの順序が正しいことを確認する必要があります。
+
+([10:19](https://developer.apple.com/videos/play/wwdc2021/10286/?time=619)) フェンスが必要な場合、講演では段階の粒度で指定することを推奨しています。このようにして、頂点ステージとラスタライザーは引き続き並列化でき、フラグメント ステージは前のパス フラグメントの出力に依存する場合にのみブロックされます。
+
+### レイ トレーシング シェーダーでのアセットの移動
+
+([14:35](https://developer.apple.com/videos/play/wwdc2021/10286/?time=875)) レイ トレーシングでのナビゲーションは交差結果から始まります。金属の交差結果は以下を提供します`instance_id`、`geometry_id`そして`primitive_id`。これらは、アクセラレーション構造内でヒット インスタンス、ジオメトリ、およびプリミティブを見つけるために使用されます。
+
+したがって、バインドレス シーン ストラクチャはレイ トレーシング アクセラレーション ストラクチャをミラーリングするのが最適です。このようにして、シェーダーは交差点情報を使用して、途中でリソースを見つけることができます。
+
+```cpp
+// Instance and Mesh
+
+constant Instance& instance = pScene->instances[intersection.instance_id];
+constant Mesh&     mesh     = instance.mesh[intersection.geometry_id];
+
+// Primitive indices
+
+ushort3 indices; // assuming 16-bit indices, use uint3 for 32-bit
+
+indices.x = mesh.indices[ intersection.primitive_id * 3 + 0 ];
+indices.y = mesh.indices[ intersection.primitive_id * 3 + 1 ];
+indices.z = mesh.indices[ intersection.primitive_id * 3 + 2 ];
+```
+
+キーポイント:
+
+- `pScene->instances`ルート シーン構造内のインスタンスの配列です。
+- `intersection.instance_id`ヒットのインスタンスを見つけます。
+- `instance.mesh`このインスタンスに対応するメッシュデータを参照します。
+- `intersection.geometry_id`ヒットしたジオメトリまたはサブメッシュを見つけます。
+- `intersection.primitive_id * 3`三角形の 3 つの指数を求めます。
+- `ushort3`16 ビットのインデックスに適しています。 32ビットインデックスの場合`uint3`。
+
+([16:43](https://developer.apple.com/videos/play/wwdc2021/10286/?time=1003)) インデックスを取得した後、シェーダーは頂点属性を読み取り、重心座標を使用して補間します。講義例では、3 つの頂点の法線を読み取り、ヒット ポイントの法線を計算します。
+
+```cpp
+// Vertex data
+
+packed_float3 n0 = mesh.normals[ indices.x ];
+packed_float3 n1 = mesh.normals[ indices.y ];
+packed_float3 n2 = mesh.normals[ indices.z ];
+
+// Interpolate attributes
+
+float3 barycentrics = calculateBarycentrics(intersection);
+float3 normal       = weightedSum(n0, n1, n2, barycentrics);
+```
+
+キーポイント:
+
+- `mesh.normals[indices.x]`三角形の最初の頂点の法線を読み取ります。
+- `mesh.normals[indices.y]`2 番目の頂点の法線を読み取ります。
+- `mesh.normals[indices.z]`3 番目の頂点の法線を読み取ります。
+- `calculateBarycentrics(intersection)`交点から重心の座標を計算します。
+- `weightedSum`重心座標を使用した 3 つの法線の加重合計。
+- `normal`はヒット ポイントの補間法線であり、反射シェーディングに使用できます。
+
+([17:15](https://developer.apple.com/videos/play/wwdc2021/10286/?time=1035)) これらのステップをカプセル化すると、シェーダーのメイン ロジックが短くなります。交差部分からインスタンス、メッシュ、マテリアルを見つけて、シェーディング関数に渡します。
+
+```cpp
+if(i.type == intersection_type::triangle)
+{
+  constant Instance& inst     = get_instance(i);
+  constant Mesh&     mesh     = get_mesh(inst, i);
+  constant Material& material = get_material(inst, i);
+
+  color = shade_pixel(mesh, material, i);
+}
+
+outImage.write(color, tid);
+```
+
+キーポイント:
+
+- `i.type`交差点が三角形に当たるかどうかを確認します。
+- `get_instance(i)`交差点に基づいて`instance_id`インスタンスを見つけます。
+- `get_mesh(inst, i)`インスタンスと交差点に基づく`geometry_id`メッシュを見つけます。
+- `get_material(inst, i)`インスタンスに関連付けられたマテリアルを見つけます。
+- `shade_pixel`メッシュ、マテリアル、交差情報を使用して色を計算します。
+- `outImage.write(color, tid)`結果を出力テクスチャに書き込みます。
+
+### ラスター化された PBR でのテクスチャ バインディングを削減します。
+
+([18:40](https://developer.apple.com/videos/play/wwdc2021/10286/?time=1120)) PBR フラグメント シェーダーは、多くの場合、複数のテクスチャを読み取ります。従来のバインディング モデルでは、各描画呼び出しの前に、これらのテクスチャを固定スロットにバインドする必要があります。次回描画呼び出しでマテリアルが変更されると、別のテクスチャのセットがバインドされます。
+
+このスピーチでは、アルベド、ラフネス、メタリック、オクルージョンの 4 つのテクスチャを使用して、従来の筆記方法を示しています。
+
+```cpp
+fragment half4 pbrFragment(ColorInOut in [[stage_in]],
+                           texture2d< float > albedo    [[texture(0)]],
+                           texture2d< float > roughness [[texture(1)]],
+                           texture2d< float > metallic  [[texture(2)]],
+                           texture2d< float > occlusion [[texture(3)]])
+{
+	half4 color = calculateShading(in, albedo, roughness, metallic, occlusion);
+
+  return color;
+}
+```
+
+キーポイント:
+
+- `albedo`バインドする`texture(0)`。
+- `roughness`バインドする`texture(1)`。
+- `metallic`バインドする`texture(2)`。
+- `occlusion`バインドする`texture(3)`。
+- `calculateShading`4 つのテクスチャを明示的に受け取ります。
+- 各描画呼び出しでは、現在のマテリアルに必要なテクスチャがスロットに配置されていることを確認する必要があります。
+
+([19:48](https://developer.apple.com/videos/play/wwdc2021/10286/?time=1188)) バインドレス バージョンはシーン ルート バッファーのみを受け取ります。シェーダーはインスタンスからマテリアルを検索し、テクスチャと定数データを参照します。
+
+```cpp
+fragment half4 pbrFragmentBindless(ColorInOut in [[stage_in]],
+                                   device const Scene* pScene [[buffer(0)]])
+{
+	device const Instance& instance = pScene->instances[in.instance_id];
+	device const Material& material = pScene->materials[instance.material_id];
+
+	half4 color = calculateShading(in, material);
+
+	return color;
+}
+```
+
+キーポイント:
+
+- `pScene`に縛られています`buffer(0)`ルートシーン構造。
+- `in.instance_id`現在のフラグメントが属しているインスタンスを見つけます。
+- `instance.material_id`配置されたインスタンスによって使用されるマテリアル。
+- `material`テクスチャと定数データは内部で参照されます。
+- `calculateShading(in, material)`資料から必要なリソースを読みます。
+- 描画呼び出しは同じルート バッファーを共有でき、テクスチャの選択はシェーダー ナビゲーション プロセスに転送されます。
+
+この講演では、この構造がインスタンス化されたレンダリングに最適化スペースを提供することも指摘されました。エンジンはルート バッファーをバインドするだけでよいため、インスタンス データとマテリアル データにさらに多くの違いを含めることができます。
+
+## 重要ポイント
+
+1. **やるべきこと**: レイ トレースされた反射にリアルなマテリアルの応答を追加します。
+**実行する価値がある理由**: 反射光がオブジェクトに当たると、バインドレスによりシェーダーは対応するメッシュ、頂点法線、およびマテリアルを取得できるようになります。
+**開始方法**: を使用して、シーン引数バッファーのインスタンス レベルをアクセラレーション構造と一致させます。`intersection.instance_id`、`geometry_id`、`primitive_id`「頂点とマテリアル」に移動します。
+
+2. **対処方法**: PBR マテリアル システムを、独自のテクスチャ参照を持つマテリアルに変更します。
+**実行する価値がある理由**: アルベド、ラフネス、メタリック、オクルージョンなどのテクスチャを描画呼び出しごとに 1 つずつバインドする必要はありません。
+**開始方法**: 定義`Material`引数バッファ。テクスチャと定数をマテリアル構造に入れます。フラグメント シェーダは受信のみを行います。`Scene* pScene [[buffer(0)]]`。
+
+3. **やるべきこと**: 静的モデルとテクスチャ用のロード時ヒープを作成します。
+**実行する価値がある理由**: この講演では、レンダリング時に使用できる読み取り専用の静的データにはヒープが最適であることが示唆されました。`useHeap`居住者明細書のコストを削減します。
+**開始方法**: リソースの読み込み段階で合計サイズと配置を計算し、メッシュと静的テクスチャを配置します。`MTLHeap`、レンダリング前にヒープを呼び出す`useHeap`。
+
+4. **対処方法**: エンジン内の静的リソース ヒープと動的リソース ヒープを分離します。
+**実行する価値がある理由**: 追跡されたヒープには書き込み可能なリソースと読み取り専用のリソースが混在しているため、ヒープ レベルの同期や誤った共有が引き起こされる可能性があります。
+**開始方法**: スキニング出力、動的テクスチャ、その他の書き込み可能なリソースを別のヒープに置きます。静的テクスチャとメッシュを読み取り専用ヒープに配置します。
+
+5. **やるべきこと**: バインドレス シーンのデバッグ ビューを作成します。
+**実行する価値がある理由**: Apple の例では、反射レイ トレーシング シェーダの出力が直接表示されるため、ヒット ポイントのシェーディング結果のデバッグが簡単になります。
+**開始方法**: レイ トレーシング パス内`shade_pixel`結果は、交差ヒット領域を示すスイッチとともにデバッグ テクスチャに書き込まれます。
+
+## 関連セッション
+
+- [メタル レイ トレーシングでアプリを強化する](/articles/wwdc2021-10149) — このセッションでは交差構造と加速構造を理解するための基礎となるメタル レイ トレーシング機能を紹介します。
+- [メタル レイ トレーシングを使用したハイブリッド レンダリングを探索する](/articles/wwdc2021-10150) — レイ トレーシングとラスタライゼーションを組み合わせて反射効果を継続的に実現する方法を示します。
+- [Discover Metal デバッグ、プロファイリング、およびアセット作成ツール](/articles/wwdc2021-10157) - GPU リソース、パフォーマンス、およびレイ トレーシングの問題のトラブルシューティングに使用できる Xcode Metal ツールについて説明します。
+- [Metal のコンパイル ワークフローを発見する](/articles/wwdc2021-10229) - 複雑な引数のバッファ シェーダ パイプラインでの使用に適した Metal シェーダのコンパイル プロセスについて説明します。

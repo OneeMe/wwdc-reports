@@ -1,0 +1,260 @@
+---
+title: "Use structured concurrency with Network framework"
+description: "network framework is the best way to make low-level network connections on apple platforms — and in ios, ipados, and macos 26, it"
+date: 2026-06-10
+tags: ["System Services"]
+thumbnail: "/images/sessions/2025/250.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/250/"
+sessionId: "wwdc2025-250"
+year: "2025"
+relatedSessions:
+  - title: "Filter and tunnel network traffic with NetworkExtension"
+    code: "234"
+    description: "learn about the apis in the networkextension framework that give your app the po"
+  - title: "Finish tasks in the background"
+    code: "227"
+    description: "discover background execution advancements and understand how the system schedul"
+  - title: "Get ahead with quantum-secure cryptography"
+    code: "314"
+    description: "learn how to protect your app"
+  - title: "Deliver age-appropriate experiences in your app"
+    code: "299"
+    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
+---
+
+## Highlight
+
+> This session introduces three new Swift types in Network framework on iOS/macOS 26: NetworkConnection, NetworkListener, and NetworkBrowser, all built on Swift structured concurrency. The design philosophy mirrors SwiftUI — declarative construction, automatic lifecycle management, and automatic cleanup when a task is canceled.
+
+---
+
+## Core Content
+
+Many app developers dread low-level networking. The BSD socket API is verbose: you handle sockaddr, ioctl, and blocking calls yourself; you bolt on a TLS library by hand; you write a state machine for switching between Wi-Fi and cellular; you handle message boundaries on top of a stream. Switching from TCP to QUIC often means rewriting from scratch. These details keep you from focusing on business logic.
+
+iOS/macOS 26 Network framework adds three new Swift types to fix this: NetworkConnection handles a single connection, NetworkListener accepts inbound connections, and NetworkBrowser discovers services on the network. All three integrate deeply with Swift structured concurrency, with a style close to SwiftUI — declarative protocol stack construction, async/await for send and receive, and automatic resource cleanup when the task is canceled.
+
+A NetworkConnection has three parts: an endpoint (where to connect), a protocol stack (how to connect, e.g. TLS over TCP over IP), and parameters (behavior constraints, e.g. forbid expensive networks). The framework manages connection state: preparing → ready → failed/canceled. You can install a stateUpdateHandler to refresh UI, or ignore state entirely — `send` and `receive` wait for ready before they run.
+
+Send and receive get two new features this year. First, a built-in TLV (Type-Length-Value) framer that frames messages automatically, so stream protocols like TCP no longer drop message boundaries. Second, the Coder protocol, which sends and receives Codable types directly with JSON or property list, removing the boilerplate of manual serialization.
+
+---
+
+## Detailed Content
+
+**The simplest connection: TLS over TCP over IP**
+
+The presenter Scott opens the video with a minimal example ([04:04](https://developer.apple.com/videos/play/wwdc2025/250/?time=244)):
+
+```swift
+// Make a connection
+
+import Network
+
+let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029)) {
+  TLS()
+}
+```
+
+Key points:
+
+- The first argument to `NetworkConnection(to:)` is the endpoint. `.hostPort` means hostname plus port; the framework resolves DNS and picks the best address with Happy Eyeballs.
+- The trailing closure describes the protocol stack. Here it only writes `TLS()`; TCP and IP are inferred as the layers below.
+- The protocol stack is declarative, in the style of a SwiftUI view builder.
+
+**Customizing protocol stack options**
+
+To turn off IP fragmentation, you spell out the lower layers ([04:41](https://developer.apple.com/videos/play/wwdc2025/250/?time=281)):
+
+```swift
+let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029) {
+  TLS {
+    TCP {
+      IP()
+        .fragmentationEnabled(false)
+    }
+  }
+}
+```
+
+Key points:
+
+- The protocol stack nests from top to bottom: TLS on the outside, TCP inside TLS, IP inside TCP.
+- `.fragmentationEnabled(false)` is a modifier on the IP layer; you write it only when you need to customize.
+- The defaults fit most cases. Override only as needed.
+
+**Sending and receiving bytes: stream protocols need a byte count**
+
+TLS/TCP are byte streams, so receive must tell the framework how many bytes to read ([07:30](https://developer.apple.com/videos/play/wwdc2025/250/?time=450)):
+
+```swift
+// Send and receive on a connection
+
+import Network
+
+public func sendAndReceiveWithTLS() async throws {
+  let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029)) {
+    TLS()
+  }
+
+  let outgoingData = Data("Hello, world!".utf8)
+  try await connection.send(outgoingData)
+
+  let incomingData = try await connection.receive(exactly: 98).content
+  print("Received data: \(incomingData)")
+}
+```
+
+Key points:
+
+- `send` is async and suspends until the framework finishes the data.
+- The first `send` or `receive` starts the connection automatically. No manual `start()`.
+- `receive(exactly: 98)` reads exactly 98 bytes and returns a `(content, metadata)` tuple. Here we take only `.content`.
+- Errors (e.g. airplane mode) are thrown, so do/catch handles them.
+
+**TLV framer: keep message boundaries**
+
+The trouble with byte streams: the sender calls `send(3 bytes)` once, but the receiver may get it in two reads, or merged into one. The new TLV framer this year frames messages automatically ([11:24](https://developer.apple.com/videos/play/wwdc2025/250/?time=684)):
+
+```swift
+// Send TicTacToe game messages with TLV
+
+import Network
+
+public func sendWithTLV() async throws {
+  let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029)) {
+    TLV {
+      TLS()
+    }
+  }
+
+  let characterData = try JSONEncoder().encode(GameCharacter(character: "🐨"))
+  try await connection.send(characterData, type: GameMessage.selectedCharacter.rawValue)
+}
+```
+
+Key points:
+
+- `TLV { TLS() }` stacks the TLV framer on top of TLS.
+- `send` gets an extra `type:` parameter that writes a type field into the message header. The peer can dispatch on it to different handlers.
+- Serialization stays your job (here, `JSONEncoder`). TLV only answers "how long is this message, and what type is it."
+
+**Coder protocol: send and receive Codable types directly**
+
+If you also want to skip serialization, use Coder ([13:13](https://developer.apple.com/videos/play/wwdc2025/250/?time=793)):
+
+```swift
+// Send TicTacToe game messages with Coder
+
+import Network
+
+public func sendWithCoder() async throws {
+  let connection = NetworkConnection(to: .hostPort(host: "www.example.com", port: 1029)) {
+    Coder(GameMessage.self, using: .json) {
+      TLS()
+    }
+  }
+
+  let selectedCharacter: GameMessage = .selectedCharacter("🐨")
+  try await connection.send(selectedCharacter)
+}
+```
+
+Key points:
+
+- `Coder(GameMessage.self, using: .json)` declares the message type and encoding format (`.json` or property list) inside the protocol stack.
+- `connection.send(selectedCharacter)` sends a Swift value directly; the framework encodes and frames it inside.
+- On the receive side, `connection.receive().content` gives you back a `GameMessage` enum value, ready to switch on.
+- This fits the case where you write both client and server in Swift. To talk to an existing server, stick with TLV or raw bytes.
+
+**Listening for inbound connections**
+
+The server uses NetworkListener. Each new connection starts a child task, so multiple connections are accepted concurrently without blocking ([15:16](https://developer.apple.com/videos/play/wwdc2025/250/?time=916)):
+
+```swift
+// Listen for incoming connections with NetworkListener
+
+import Network
+
+public func listenForIncomingConnections() async throws {
+  try await NetworkListener {
+    Coder(GameMessage.self, using: .json) {
+      TLS()
+    }
+  }.run { connection in
+    for try await (gameMessage, _) in connection.messages {
+      // Handle the GameMessage
+    }
+  }
+}
+```
+
+Key points:
+
+- `NetworkListener { ... }` reuses the same protocol stack builder.
+- `.run { connection in ... }` is the structured concurrency entry point; the closure runs once per new connection.
+- `connection.messages` is an AsyncSequence, so `for try await` iterates messages directly.
+- When the closure returns, the child task ends. When the listener is canceled, all connections are canceled in cascade.
+
+**Wi-Fi Aware: iOS 26 cross-platform peer-to-peer discovery**
+
+NetworkBrowser finds services on the network. iOS 26 adds Wi-Fi Aware support ([17:39](https://developer.apple.com/videos/play/wwdc2025/250/?time=1059)):
+
+```swift
+// Browse for nearby paired Wi-Fi Aware devices
+
+import Network
+import WiFiAware
+
+public func findNearbyDevice() async throws {
+  let endpoint = try await NetworkBrowser(for: .wifiAware(.connecting(to: .allPairedDevices, from: .ticTacToeService))).run { endpoints in
+    .finish(endpoints.first!)
+  }
+
+  // Make a connection to the endpoint
+}
+```
+
+Key points:
+
+- `.wifiAware(.connecting(to: .allPairedDevices, from: .ticTacToeService))` specifies the service to look for and the device scope.
+- The `.run { endpoints in ... }` closure returns `.finish(endpoint)` to stop browsing and return the result, or `.continue` to keep waiting for more devices.
+- Once you have an endpoint, pass it to `NetworkConnection(to:)` to open a connection.
+
+---
+
+## Core Takeaways
+
+**1. Replace homegrown protocols on BSD sockets with NetworkConnection**
+
+- Why it pays off: if you wrote a binary protocol on raw sockets and parse frame headers by hand, moving to `NetworkConnection { TLV { TLS() } }` gives you TLS, Happy Eyeballs, Wi-Fi Assist, and network-switch handling in one shot.
+- How to start: replace the send path of a single connection with `connection.send(data, type:)`, switch the receive side from a byte buffer to `connection.receive()`, and keep the wire format unchanged so you can interop while you migrate.
+
+**2. For app-to-app traffic, prefer Coder over TLS**
+
+- Why it pays off: when both ends are your own Swift apps with no protocol legacy, Coder lets you pass Codable enums directly, removes the JSON encode/decode glue, and surfaces type mistakes at compile time.
+- How to start: define messages as a `Codable` enum (each case carries associated values), then `Coder(MessageType.self, using: .json) { TLS() }`. To switch to a binary format later, change `.json` to `.propertyList` in one line.
+
+**3. Refactor the server accept loop with NetworkListener**
+
+- Why it pays off: a traditional `accept` loop dispatches each connection to GCD or a thread by hand. `NetworkListener.run` starts a child task per connection automatically; canceling the task cancels the connection in cascade. This fits structured concurrency, so shutting down the service leaves no orphan connections.
+- How to start: move the existing dispatch_async handler into the `.run { connection in ... }` closure, and replace the manual receive loop with `connection.messages`.
+
+**4. Wire stateUpdateHandler into the UI layer**
+
+- Why it pays off: connection state — preparing/waiting/ready/failed — can drive a connectionStatus banner so users see "connecting", "network constrained", or "disconnected" instead of waiting in silence.
+- How to start: register a state handler on `NetworkConnection`, map the state to a property on a SwiftUI `@Observable`, and let the view subscribe.
+
+**5. Try Wi-Fi Aware for iOS-only cases; stay on Bonjour for cross-platform**
+
+- Why it pays off: Wi-Fi Aware needs no shared Wi-Fi network, which fits outdoor or multi-person local collaboration. But for now it ships only on iPhone with iOS 26, so cross-platform support still needs Bonjour.
+- How to start: build an iOS-to-iOS demo with `NetworkBrowser(for: .wifiAware(...))` first, then wrap it behind an abstraction that falls back to `.bonjour(...)` based on device capabilities.
+
+---
+
+## Related Sessions
+
+- [Filter and tunnel network traffic with NetworkExtension](/articles/wwdc2025-234) — The NetworkExtension framework for VPN, content filtering, and proxy hooks.
+- [Finish tasks in the background](/articles/wwdc2025-227) — Updates to background execution and the scheduling policy for long-lived connections and background fetch.
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — Post-quantum cryptography in TLS and the migration path.
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — The new declared age range API and how it ties into network-layer content delivery.

@@ -1,0 +1,253 @@
+---
+title: "Build an Endpoint Security app"
+description: "system extensions improve the reliability and security of macos. learn about the modern replacement for kernel authorization kpis and discover tips for making a great security product with the endpoint security framework."
+date: 2020-06-10
+tags: ["WWDC 2020", "Privacy & Security", "System Services", "Endpoint Security", "macOS"]
+thumbnail: "/images/sessions/2020/10159.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10159/"
+sessionId: "wwdc2020-10159"
+year: "2020"
+code: "10159"
+relatedSessions:
+  - title: "Modernize PCI and SCSI drivers with DriverKit"
+    code: "10210"
+    description: "また、カーネル拡張機能のユーザー空間への移行を中心に展開し、DriverKit とシステム拡張機能の展開の背景を補足します。"
+  - title: "Secure your app: threat modeling and anti-patterns"
+    code: "10189"
+    description: "Endpoint Security のイベント インターセプト機能と併せて参照するのに適した、脅威モデリングとセキュリティ アンチパターンの観点から、セキュリティ製品が何を防ぐ必要があるかを説明します。"
+  - title: "Explore logging in Swift"
+    code: "10168"
+    description: "Endpoint Security 製品で検出およびデバッグ情報を記録するために使用できる、プライバシーに配慮した統合ログ API の導入。"
+  - title: "What's new in managing Apple devices"
+    code: "10639"
+    description: "エンタープライズ デバイス管理と MDM 機能をカバーしており、このフィールドで説明されているシステム拡張機能の自動承認はフル ディスク アクセス構成に関連しています。"
+---
+## ハイライト
+
+> Endpoint Security を使用すると、macOS セキュリティ製品がユーザー空間 C API を使用して約 100 のシステム イベントをサブスクライブできるようになり、Kauth KPI、Mac カーネル フレームワーク、OpenBSM 監査証跡が NOTIFY および AUTH イベントに置き換えられます。
+
+## 主要内容
+
+以前は、macOS エンドポイント セキュリティに関しては、多くの製品をカーネルに組み込む必要がありました。開発者はカーネル拡張機能 (KEXT) を作成する必要があり、カーネル インターフェイスの変更、デバッグの難しさ、メンテナンス コストの高さなどの問題にも直面します。小さなバグによってカーネル パニックが引き起こされ、マシン全体が不安定になる場合もあります。
+
+Endpoint Security (ES) は、これをユーザー空間に移動します。これは、macOS Catalina で初めて導入され、Kauth KPI、サポートされていない Mac カーネル フレームワーク、および OpenBSM 監査証跡を置き換えることを目的としています。セキュリティ製品は、通常のアプリケーションまたはシステム拡張機能を通じて ES クライアントを確立し、システム イベントをサブスクライブし、プロセス、ファイル、コード署名、パラメーター、コールバックのオープン フラグなどのコンテキストを分析します。
+
+このセッションでは、イベント ストリームを確立する方法、NOTIFY イベントを処理する方法、AUTH イベントでの操作を許可または拒否する方法、メッセージ キューの蓄積、キャッシュの誤用、デバッグ タイムアウト、早期起動リークを回避する方法など、セキュリティ製品が実際に遭遇する完全なリンクに焦点を当てます。
+
+ES をシステム拡張機能に組み込むことには、さらなる利点があります。拡張機能がインストールされると、システム整合性保護 (SIP) によって保護されます。 root ユーザーが任意に launchd ジョブをアンインストールすることはできません。早期ブートなど、一部の機能はシステム拡張に対してのみ公開されています。早期ブートを有効にすると、システムは ES 拡張機能が最初のサブスクリプションを完了するまで待機してから、サードパーティ アプリケーションの実行を許可します。
+
+## 詳細
+
+このゲームには公式のコード スニペットはありません。次のコード ブロックは、最小限のスケルトンと重要な判断ポイントを説明するために、トランスクリプトで段階的に示されている API の組み合わせからのものです。実際の製品でも、資格付与、エラー処理、ロギング、およびポリシーの保存を完了する必要があります。
+
+### ES クライアントを作成してイベントをサブスクライブする
+
+([03:15](https://developer.apple.com/videos/play/wwdc2020/10159/?time=195)) ES は C ライブラリです。 Apple は、メモリとパフォーマンス特性を制御し、Swift、Objective-C、Rust などの言語からの呼び出しを容易にするために C を選択しました。最小限のクライアントが最初に呼び出します`es_new_client`イベントストリームを作成して使用する`es_subscribe`イベントタイプを宣言して、最後に使用します`dispatch_main`プロセスが引き続きコールバックを処理できるようにします。
+
+```c
+es_client_t *client = NULL;
+
+es_new_client(&client, ^(es_client_t *client, const es_message_t *message) {
+    printf("event type: %u\n", message->event_type);
+});
+
+es_event_type_t events[] = {
+    ES_EVENT_TYPE_NOTIFY_EXEC,
+};
+
+if (es_subscribe(client, events, 1) != ES_RETURN_SUCCESS) {
+    es_delete_client(client);
+    return;
+}
+
+dispatch_main();
+```
+
+キーポイント:
+
+- `es_new_client`戻る`es_client_t`ハンドルを取得し、イベント処理ブロックを登録します。
+-`es_subscribe`このクライアントがどのイベントを受信するかを決定します。この例では、購読のみを行っています`NOTIFY_EXEC`。
+- サブスクリプションが失敗した場合に使用されます`es_delete_client`前に作成したクライアントをクリーンアップします。
+-`dispatch_main`プロセスを実行し続けると、ハンドラー ブロックを通じてイベントが送信されます。
+
+＃＃＃ 理解する`es_message_t`3種類の情報
+
+([05:54](https://developer.apple.com/videos/play/wwdc2020/10159/?time=354)) すべてのイベントは次のようにラップされます。`es_message_t`。これには、メッセージのメタデータ、イベントをトリガーしたプロセスに関する情報、およびイベント自体に関するデータが含まれます。デモに追加されました`NOTIFY_EXIT`その後、パスします`message->process`プロセス パスと監査トークンを取得します。`message->event.exit.stat`終了ステータスを取得します。
+
+```c
+switch (message->event_type) {
+case ES_EVENT_TYPE_NOTIFY_EXIT: {
+    es_string_token_t path = message->process->executable->path;
+    pid_t pid = audit_token_to_pid(message->process->audit_token);
+    int status = message->event.exit.stat;
+
+    os_log(log, "process %{public}.*s pid %d exited with status %d",
+           (int)path.length, path.data, pid, status);
+    break;
+}
+default:
+    break;
+}
+```
+
+キーポイント:
+
+- `message->event_type`何を読むべきかを決める`event`組合内のどのフィールド。
+-`message->process`実行可能ファイル、コード署名、PID、UID、その他の情報を含めて、イベントをトリガーしたプロセスを説明します。
+-`audit_token_to_pid`PID は監査トークンから抽出できます。監査トークンには、ユーザー ID などの ID 情報も含まれます。
+-`es_string_token_t`長さとデータ ポインターを運ぶため、出力をログに記録するときに、それが NULL で終了する C 文字列であると想定しないでください。
+
+### AUTH イベントを処理するときに応答する必要があります
+
+([13:59](https://developer.apple.com/videos/play/wwdc2020/10159/?time=839)) NOTIFY イベントは非同期通知であり、操作は続行されます。 AUTH イベントは同期認証です。カーネルは元の操作を一時停止し、ES クライアントの応答を待つか、期限が切れるまで待ちます。各 AUTH メッセージには独自の期限があり、クライアントは各メッセージを 1 つずつ確認し、時間内に応答する必要があります。
+
+```c
+static void handle_exec(es_client_t *client,
+                        const es_message_t *message,
+                        es_string_token_t signing_id_to_block) {
+    es_string_token_t signing_id = message->event.exec.target->signing_id;
+    bool should_block = matches_signing_id(signing_id, signing_id_to_block);
+
+    es_respond_auth_result(client,
+                           message,
+                           should_block ? ES_AUTH_RESULT_DENY : ES_AUTH_RESULT_ALLOW,
+                           true);
+}
+```
+
+キーポイント:
+
+- `AUTH_EXEC`利用可能`es_respond_auth_result`戻る`ALLOW`または`DENY`。
+- サンプルポリシーの読み取り`message->event.exec.target->signing_id`を選択し、ブロックする署名 ID と比較します。
+-`matches_signing_id`これは、ES API ではなく、製品独自の文字列比較ロジックです。
+- 最後のパラメータは、ES がこの結果をキャッシュできるかどうかを制御します。キャッシュはパフォーマンスのためにのみ使用でき、ポリシーのソースとしては使用できません。
+
+### フラグを使用してファイルを開く権限を制限する
+
+([24:12](https://developer.apple.com/videos/play/wwdc2020/10159/?time=1452)) 一部の AUTH イベントは、単に許可または拒否を返すことができません。`AUTH_OPEN`使用`es_respond_flags_result`許可されたオープンフラグを返します。デモには 3 つの戦略があります。すべての EICAR テスト ファイルを拒否する、`/usr/local/bin`読み取り専用で開くことのみが許可され、その他のファイルを開くことができます。
+
+```c
+static void deny_write_in_directory(es_client_t *client,
+                                    const es_message_t *message) {
+    uint32_t allowed_flags = UINT32_MAX;
+    allowed_flags &= ~FWRITE;
+
+    es_respond_flags_result(client, message, allowed_flags, true);
+}
+
+static void deny_all_open(es_client_t *client,
+                          const es_message_t *message) {
+    es_respond_flags_result(client, message, 0, true);
+}
+```
+
+キーポイント:
+
+- `AUTH_OPEN`オープンフラグのカーネルバージョンが使用されます。`open(2)`に共通する`oflags`。
+- `allowed_flags`クリア`FWRITE`最後に、書き込みが拒否されている間、読み取り専用アクセスを保持できます。
+- 戻る`0`ファイルに対するすべてのオープン操作を禁止するために、すべての許可ビットがクリアされます。
+- フラグ結果のキャッシュが有効になっている場合、応答にはクライアントが将来許可するすべてのフラグが含まれている必要があり、現在のリクエストでフラグのみを返すことはできません。
+
+### 非同期処理の前にメッセージをコピーする
+
+([24:23](https://developer.apple.com/videos/play/wwdc2020/10159/?time=1463)) メッセージ キューが大きくなってメッセージ損失が発生するのを避けるために、ハンドラー ブロックはできるだけ早く戻る必要があります。ファイル スキャン、I/O、または CPU を集中的に使用するタスクを実行している場合は、次を使用します。`es_copy_message`メッセージのライフサイクルを延長し、作業を非同期キューにスローして、`es_free_message`リリース。
+
+```c
+static void handle_open(es_client_t *client,
+                        const es_message_t *message,
+                        dispatch_queue_t worker_queue) {
+    const es_message_t *copied_message = es_copy_message(message);
+
+    dispatch_async(worker_queue, ^{
+        handle_open_worker(client, copied_message);
+        es_free_message(copied_message);
+    });
+}
+```
+
+キーポイント:
+
+- ハンドラーブロックが戻った後、元の`message`有効であることは保証されなくなりました。
+-`es_copy_message`AUTH イベントに後で応答することを許可し、異なる AUTH メッセージを順番どおりに応答することを許可します。
+- 非同期キューのサービス品質は、イベントの種類とイベントの量に基づいて選択する必要があります。 AUTH イベントをサブスクライブする場合は特に注意してください。
+- 非同期処理であっても、メッセージの期限までに応答する必要があります。
+
+### 早期ブート 主要なイベントを一度にサブスクライブするには
+
+([30:24](https://developer.apple.com/videos/play/wwdc2020/10159/?time=1824)) 早期ブートは ES システム拡張に対してのみ可能です。拡張子は Info.plist に設定されます`NSEndpointSecurityEarlyBoot`その後、システムが起動し、最初の処理が完了するまで待機します。`es_subscribe`、サードパーティ製アプリケーションの実行を許可します。
+
+```xml
+<key>NSEndpointSecurityEarlyBoot</key>
+<true/>
+```
+
+```c
+es_event_type_t startup_events[] = {
+    ES_EVENT_TYPE_AUTH_EXEC,
+    ES_EVENT_TYPE_NOTIFY_EXEC,
+    ES_EVENT_TYPE_NOTIFY_FORK,
+    ES_EVENT_TYPE_NOTIFY_EXIT,
+};
+
+es_subscribe(client,
+             startup_events,
+             sizeof(startup_events) / sizeof(startup_events[0]));
+```
+
+キーポイント:
+
+- 準備完了信号は最初から送信されます。`es_subscribe`電話。
+- 主要な起動イベントは、できる限り同じサブスクリプションに配置する必要があります。複数のサブスクリプションに分割すると、後続のサブスクリプションの前にサードパーティのプロセスが実行を開始します。
+- ES には開始期限があります。有効期限が過ぎると、サードパーティによる実行は自動的に解除されます。
+- 起動フェーズ中のイベントの欠落を避けるために、最初のサブスクリプションの後に長い初期化作業を配置する必要があります。
+
+### Big Sur の新機能と移行シグナル
+
+([38:00](https://developer.apple.com/videos/play/wwdc2020/10159/?time=2280)) Apple はこのセッションで、監査サブシステムが廃止され、監査証跡ファイルまたは Auditpipe に依存する製品は Endpoint Security に移行する必要があると発表しました。 macOS Big Sur では、EXEC イベントのファイル記述子情報も追加され、パフォーマンスが向上し、トレースと`CS_INVALIDATED`およびその他のイベント。
+
+```c
+if (message->version >= 2) {
+    const es_event_create_t *create = &message->event.create;
+    inspect_acl_if_present(create->acl);
+}
+```
+
+キーポイント:
+
+- `message->version`システム間のバージョン互換性のため。新しいフィールドにアクセスする前にバージョンを確認してください。
+- EXEC イベントは、新しいプロセスの開始時に伝送されるファイル記述子を提供し、パイプの一意の識別子を公開してプロセス間通信の追跡を容易にすることができます。
+-`CS_INVALIDATED`プロセス コード署名有効ビットがクリアされると、ES クライアントに直ちに通知されます。
+- トレース イベントは、プロセスがデバッグされていることをクライアントに通知できます。
+
+## 重要ポイント
+
+**1.プロセスのライフサイクル監査者を作成する**
+
+- **やるべきこと**: 購読する`NOTIFY_FORK`、`NOTIFY_EXEC`、`NOTIFY_EXIT`、プロセス ツリー、実行可能パス、PID、終了ステータス、およびコード署名情報を記録します。
+- **実行する価値がある理由**: セッションの最初のデモで使用します。`ps`fork、exec、exit の 3 つのイベントを組み合わせてコマンドを実行する方法を示しています。
+- **開始方法**: 最初に使用します`es_new_client`クライアントを作成し、同時に再度作成します`es_subscribe`これら 3 つの NOTIFY イベントをサブスクライブして、`message->process`イベント固有のフィールドは統合ログに書き込まれます。
+
+**2.エンタープライズ アプリケーションの起動阻止戦略を作成する**
+
+- **やるべきこと**: を使用します`AUTH_EXEC`特定の署名 ID または CD ハッシュを持つ実行可能ファイルをブロックして、未承認のツールが起動しないようにします。
+- **実行する価値がある理由**: AUTH イベントは元の操作を同期的に一時停止し、セキュリティ製品は期限前に許可または拒否の結果を与えることができます。
+- **開始方法**:から`message->event.exec.target->signing_id`対象プロセスのシグネチャIDを読み取り、ローカルポリシーに合わせて呼び出します。`es_respond_auth_result`。
+
+**3.機密ディレクトリを読み取り専用で保護する**
+
+- **何をすべきか**: はい`/usr/local/bin`またはエンタープライズカスタムカタログのサブスクリプション`AUTH_OPEN`、読み取りは許可されますが、書き込みは拒否されます。
+- **実行する価値がある理由**: デモのフラグ応答は、同じファイルを読み取ることはできるが、書き込みは拒否されることを示しています。ツール チェーン ディレクトリまたはセキュリティ ベースライン ディレクトリの保護に適しています。
+- **開始方法**: 確認してください`message->event.open.file`パスプレフィックス、ヒット後に使用されます`es_respond_flags_result`クリアに戻る`FWRITE`フラグ。
+
+**4.早期開始の警備延長を行う**
+
+- **対処方法**: ES クライアントをシステム拡張機能にし、早期ブートを有効にして、サードパーティ アプリケーションが実行される前にセキュリティ エージェントが主要なイベントをサブスクライブしていることを確認します。
+- **実行する価値がある理由**: セッションでは、早期ブートは ES System Extension でのみ使用できる機能であり、EDR およびウイルス対策製品に適していると明確に述べられています。
+- **開始方法**: 拡張機能 Info.plist を追加します`NSEndpointSecurityEarlyBoot`、発売後できるだけ早く 1 回限りのサブスクリプション`AUTH_EXEC`、`NOTIFY_EXEC`起動フェーズ中に必要なイベントを待ちます。
+
+## 関連セッション
+
+- [DriverKit を使用して PCI および SCSI ドライバーを最新化する](/articles/wwdc2020-10210) - また、カーネル拡張機能のユーザー空間への移行についても説明し、DriverKit とシステム拡張機能の展開の背景を補足します。
+- [アプリの保護: 脅威モデリングとアンチパターン](/articles/wwdc2020-10189) - 脅威モデリングとセキュリティ アンチパターンの観点から、セキュリティ製品が何を防ぐべきかを説明します。Endpoint Security のイベント インターセプト機能と合わせて表示するのに適しています。
+- [Swift でのログの探索](/articles/wwdc2020-10168) - Endpoint Security 製品で検出およびデバッグ情報をログに記録するために使用できる、プライバシーに配慮した統合ログ API を紹介します。
+- [Apple デバイス管理の新機能](/articles/wwdc2020-10639) - エンタープライズ デバイス管理と MDM 機能について説明しており、この分野で説明されているシステム拡張機能の自動承認とフル ディスク アクセス構成に関連しています。

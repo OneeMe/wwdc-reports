@@ -1,0 +1,263 @@
+---
+title: "Enhance your spatial computing app with RealityKit audio"
+description: "elevate your spatial computing experience using realitykit audio. discover how spatial audio can make your 3d immersive experiences come to life. from ambient audio, reverb, to real-time procedural au"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/111801.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/111801/"
+sessionId: "wwdc2024-111801"
+year: "2024"
+relatedSessions:
+  - title: "Discover RealityKit APIs for iOS, macOS, and visionOS"
+    code: "10103"
+    description: "learn how new cross-platform apis in realitykit can help you build immersive apps for ios, macos, and visionos"
+  - title: "Build a spatial drawing app with RealityKit"
+    code: "10104"
+    description: "harness the power of realitykit through the process of building a spatial drawing app"
+  - title: "Compose interactive 3D content in Reality Composer Pro"
+    code: "10102"
+    description: "discover how the timeline view in reality composer pro can bring your 3d content to life"
+  - title: "Enhance the immersion of media viewing in custom environments"
+    code: "10115"
+    description: "extend your media viewing experience using reality composer pro components like docking region, reverb, and virtual environments"
+---
+
+## Highlight
+
+> This session uses a spaceship game to demonstrate the full RealityKit audio API. The ship's sound design uses a layered structure—each engine has three sound layers (vapor trail, exhaust, turbine), implemented with file playback and real-time generation.
+
+---
+
+## Core Content
+
+The most common problem in spatial computing apps: 3D objects feel volumetric, but sound is flat. A ship flies overhead without volume changing with distance or directional cues—the experience breaks immediately. RealityKit's audio APIs solve this at the root: all sounds played through `Entity.playAudio` are spatialized by default, with six-degrees-of-freedom rendering, physics-based distance attenuation, and reverb simulated from your real environment in real time.
+
+This session walks through the entire audio toolchain with a spaceship game. The ship has two engines, each with three sound layers: vapor trail via looping file playback, exhaust volume following throttle, and turbine generated in real time with an AU audio unit. Collision sounds are selected by material pairing via AudioFileGroupResource, with gain driven by collision velocity. In an immersive environment, ReverbComponent switches reverb presets. Background music uses a four-channel layout with AmbientAudioComponent. Finally, AudioMixGroupsComponent lets users adjust volume ratios for each sound category.
+
+From the simplest two-line playback to directivity control, real-time audio generation, material-driven collision sounds, reverb presets, ambient music, and mix groups—this path covers nearly every spatial computing audio scenario.
+
+---
+
+## Detailed Content
+
+### Spatial audio file playback
+
+The most basic usage is two lines ([03:11](https://developer.apple.com/videos/play/wwdc2024/111801/?time=191)):
+
+```swift
+func playVaporTrailAudio(from engine: Entity) async throws {
+    let resource = try await AudioFileResource(named: "VaporTrail")
+    engine.playAudio(resource)
+}
+```
+
+- `AudioFileResource(named:)` loads an audio file from the bundle
+- `engine.playAudio(resource)` plays on the engine entity with automatic spatial rendering
+
+Playback is spatialized—no extra configuration. Two details matter: audio files should be mono (spatialization downmixes to mono anyway—using mono files avoids downmix artifacts); short files with looping and random start points make identical sources sound distinct ([04:02](https://developer.apple.com/videos/play/wwdc2024/111801/?time=242)):
+
+```swift
+let resource = try await AudioFileResource(
+    named: "VaporTrail",
+    configuration: AudioFileResource.Configuration(
+       shouldLoop: true,
+       shouldRandomizeStartTime: true
+    )
+)
+let controller: AudioPlaybackController = engine.playAudio(resource)
+controller.gain = -.infinity
+controller.fade(to: .zero, duration: 1)
+```
+
+- `shouldLoop: true` loops short files seamlessly
+- `shouldRandomizeStartTime: true` starts two engines at different positions in the file
+- `controller.gain = -.infinity` starts silent to avoid pops when looping
+- `controller.fade(to: .zero, duration: 1)` fades in to nominal volume over one second
+
+### Directivity and independent audio sources
+
+For directional engine sound—bright when facing you, muffled when behind—set `SpatialAudioComponent`'s `directivity` property ([04:02](https://developer.apple.com/videos/play/wwdc2024/111801/?time=242)):
+
+```swift
+let audioSource = Entity()
+audioSource.orientation = .init(angle: .pi, axis: [0, 1, 0])
+audioSource.components.set(
+    SpatialAudioComponent(directivity: .beam(focus: 0.25))
+)
+engine.addChild(audioSource)
+let controller = audioSource.playAudio(resource)
+```
+
+- Create a separate `Entity` as the audio source, child of the engine—position follows the engine, direction controlled independently
+- `.beam(focus: 0.25)` sets beam directivity; focus ranges from 0 (omnidirectional) to 1 (narrow beam); 0.25 is slight directionality
+- Rotate audioSource so sound emits from the engine nozzle direction
+
+### Throttle-driven gain
+
+Exhaust volume follows throttle linearly ([07:10](https://developer.apple.com/videos/play/wwdc2024/111801/?time=430)):
+
+```swift
+func updateAudio(for exhaust: Entity, throttle: Float) {
+    let gain = decibels(amplitude: throttle)
+    exhaust.components[SpatialAudioComponent.self]?.gain = Audio.Decibel(gain)
+}
+
+func decibels(amplitude: Float) -> Float { 20 * log10(amplitude) }
+```
+
+- Linear throttle (0~1) converts to logarithmic decibels, matching human perception
+- Modify `SpatialAudioComponent`'s `gain` directly—it conforms to Component, so update every frame in a custom System
+
+### Real-time audio generation (AudioGeneratorController)
+
+Turbine sound is generated in real time by a custom AU audio unit ([08:17](https://developer.apple.com/videos/play/wwdc2024/111801/?time=497)):
+
+```swift
+var turbineController: AudioGeneratorController?
+
+func playTurbineAudio(from engine: Entity) {
+    let audioUnit = try await AudioUnitTurbine.instantiate()
+    let configuration = AudioGeneratorConfiguration(layoutTag: kAudioChannelLayoutTag_Mono)
+    let format = AVAudioFormat(
+        standardFormatWithSampleRate: Double(AudioGeneratorConfiguration.sampleRate),
+        channelLayout: .init(layoutTag: configuration.layoutTag)!
+    )
+    try audioUnit.outputBusses[0].setFormat(format)
+    try audioUnit.allocateRenderResources()
+    let renderBlock = audioUnit.internalRenderBlock
+    turbineController = try engine.playAudio(configuration: configuration) {
+        isSilence, timestamp, frameCount, outputData in
+        var renderFlags = AudioUnitRenderActionFlags()
+        return renderBlock(&renderFlags, timestamp, frameCount, 0, outputData, nil, nil)
+    }
+}
+```
+
+- `AudioUnitTurbine` is a custom AU using multiple oscillators driven by throttle
+- `AudioGeneratorConfiguration` configures mono output
+- In `engine.playAudio(configuration:callback:)`, write directly to the audio buffer in the callback
+- The returned `AudioGeneratorController` must be retained or audio stops
+
+### Custom distance attenuation
+
+To hear cabin music only when the ship is nearby, increase distance attenuation ([11:28](https://developer.apple.com/videos/play/wwdc2024/111801/?time=688)):
+
+```swift
+func configureDistanceAttenuation(for spaceshipHifi: Entity) {
+    spaceshipHifi.components.set(
+        SpatialAudioComponent(
+            gain: -18,
+            distanceAttenuation: .rolloff(factor: 4)
+        )
+    )
+}
+```
+
+- `.rolloff(factor: 1)` is natural attenuation default; factor 4 means four times faster falloff
+- `gain: -18` further lowers volume so music is audible only at very close range
+
+### Material-driven collision sounds
+
+Collision sounds are selected by material pairing of both objects ([15:04](https://developer.apple.com/videos/play/wwdc2024/111801/?time=904)):
+
+```swift
+func handleCollisionBegan(_ collision: CollisionEvents.Began) {
+    guard
+        let audioMaterials = audioMaterials(for: collision),
+        let resource: AudioFileGroupResource = collisionAudio[audioMaterials]
+    else {
+        return
+    }
+    let controller = collision.entityA.playAudio(resource)
+    controller.gain = relativeLoudness(for: collision)
+}
+```
+
+- `AudioFileGroupResource` contains multiple variants; each playback picks randomly to avoid repetition
+- `relativeLoudness(for:)` computes gain from collision velocity
+- Materials are tagged on entities via custom `AudioMaterialComponent` (rock, plastic, metal, etc.)
+- Real-world collisions map ARKit scene reconstruction mesh face classifications to material enums
+
+### Reverb presets
+
+Set reverb when entering a virtual environment ([17:18](https://developer.apple.com/videos/play/wwdc2024/111801/?time=1038)):
+
+```swift
+func prepareStudioEnvironment() async throws {
+    let studio = try await Entity(named: "Studio", in: studioBundle)
+    studio.components.set(
+       ReverbComponent(reverb: .preset(.veryLargeRoom))
+    )
+    rootEntity.addChild(studio)
+}
+```
+
+- `ReverbComponent` in the entity hierarchy takes effect; only one reverb active at a time
+- In progressive immersion, real acoustics blend with preset reverb by immersion level
+- In full immersion, spatial sources use preset reverb entirely
+
+### Ambient music and mix groups
+
+Four-channel music renders with `AmbientAudioComponent` ([20:05](https://developer.apple.com/videos/play/wwdc2024/111801/?time=1205)):
+
+```swift
+let resource = try await AudioFileResource(
+    named: "JoyRideMusic",
+    configuration: .init(
+        loadingStrategy: .stream,
+        shouldLoop: true
+    )
+)
+entity.components.set(AmbientAudioComponent())
+entity.playAudio(resource)
+```
+
+- `loadingStrategy: .stream` streams large files, reducing memory
+- `AmbientAudioComponent` uses three-degrees-of-freedom rendering: responds to head and source rotation, not translation
+- Four-channel files must embed channel layout in the file for RealityKit to render each channel from the correct angle
+
+Mix groups let users control each sound category independently ([21:57](https://developer.apple.com/videos/play/wwdc2024/111801/?time=1317)):
+
+```swift
+let resource = try await AudioFileResource(
+    named: "JoyRideMusic",
+    configuration: .init(
+        loadingStrategy: .stream,
+        shouldLoop: true,
+        mixGroupName: "Music"
+    )
+)
+
+var audioMixerEntity = Entity()
+
+func updateMixGroup(named mixGroupName: String, to level: Audio.Decibel) {
+    var mixGroup = AudioMixGroup(name: mixGroupName)
+    mixGroup.gain = level
+    let component = AudioMixGroupsComponent(mixGroups: [mixGroup])
+    audioMixerEntity.components.set(component)
+}
+```
+
+- `mixGroupName: "Music"` assigns the resource to the Music group
+- `AudioMixGroupsComponent` conforms to Component—update from UI interaction or a custom System
+
+---
+
+## Core Takeaways
+
+1. **Create a separate Entity child node for each audio source**: Visual entity position and orientation may not suit sound propagation. Mount audio sources as child nodes to control sound direction and position independently—e.g., engine sound from the nozzle, not the engine center. **How to start**: Create `Entity()` for sources needing direction control, set `orientation` and `SpatialAudioComponent`, then `addChild` to the visual entity.
+
+2. **Use AudioFileGroupResource to eliminate mechanical collision sounds**: Provide several subtle variants per collision set; pick randomly each playback. Gain driven by logarithmic decibels from collision velocity—quiet slow collisions, powerful fast ones. **How to start**: Make 3~5 variant files per material pairing, build `AudioFileGroupResource`, compute gain from velocity in `CollisionEvents.Began`.
+
+3. **Use `.stream` for large files; `shouldLoop` + `shouldRandomizeStartTime` for short files**: A 10-second loop saves memory vs. a 5-minute full track; different start positions avoid in-phase stacking. **How to start**: Make continuous background sounds short loops with `shouldLoop: true` + `shouldRandomizeStartTime: true`; use `loadingStrategy: .stream` for large background music.
+
+4. **Use AudioMixGroupsComponent to give users volume control**: Split effects, music, and voice into different mix groups so users adjust each independently. **How to start**: Set `mixGroupName` in `AudioFileResource.Configuration`, create a dedicated `audioMixerEntity` holding `AudioMixGroupsComponent`, update each group's `gain` via UI sliders.
+
+---
+
+## Related Sessions
+
+- [Discover RealityKit APIs for iOS, macOS, and visionOS](/articles/wwdc2024-10103) — Full build of this session's example game, covering physics forces, joints, and portal traversal
+- [Build a spatial drawing app with RealityKit](/articles/wwdc2024-10104) — Another RealityKit hands-on case with a spatial drawing app
+- [Compose interactive 3D content in Reality Composer Pro](/articles/wwdc2024-10102) — Orchestrate 3D content in Reality Composer Pro, compatible with the audio workflow
+- [Enhance the immersion of media viewing in custom environments](/articles/wwdc2024-10115) — Reverb preset usage in the Destination Video example

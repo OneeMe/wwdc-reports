@@ -1,0 +1,214 @@
+---
+title: "Optimize high-end games for Apple GPUs"
+description: "Optimize your high-end games for Apple GPUs: we'll show you how you can use our rendering and debugging tools to eliminate performance issues and make your games great on Apple platforms. Learn from our experiences working with developers at Larian Studios and 4A Games."
+date: "2021-06-07"
+tags: ["Metal", "GPU", "Graphics", "Performance"]
+thumbnail: "/images/sessions/2021/10148.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10148/"
+sessionId: "wwdc2021-10148"
+year: "2021"
+relatedSessions:
+  - title: "Optimize for variable refresh rate displays"
+    code: "10147"
+    description: "Adaptive-Sync および ProMotion フレーム レートの最適化"
+  - title: "Enhance your app with Metal ray tracing"
+    code: "10149"
+    description: "メタル レイ トレーシング API"
+  - title: "Create image processing apps powered by Apple silicon"
+    code: "10153"
+    description: "Apple Silicon画像処理の最適化"
+  - title: "Discover Metal debugging, profiling, and asset creation tools"
+    code: "10157"
+    description: "Xcode 13 Metal デバッグおよびプロファイリング ツール"
+---
+## ハイライト
+
+> Apple は、Larian Studios (『Divinity: Original Sin 2』) および 4A Games (『Metro: Exodus』) と協力して、Apple GPU でのハイエンド ゲーム向けの 4 段階の最適化方法を要約しました。ボトルネックの分析、シェーダーの最適化、メモリ帯域幅の削減、GPU ワークロードの重複の増加です。
+
+## 主要内容
+
+ハイエンドの PC ゲームを Apple Silicon に移植します。グラフィックスは良好に見えますが、フレームレートが途切れ途切れになり、いくつかのシーンが突然 20fps に低下します。何が問題ですか?
+
+Apple GPU は TBDR (Tile-Based Deferred Rendering) アーキテクチャを使用します。これは、PC 上の IMR (Immediate Mode Rendering) とはまったく異なります。 PC では機能する最適化戦略が、Apple GPU では逆効果になる可能性があります。
+
+Apple のエンジニアは 1 年をかけて複数のゲームを分析し、体系的な最適化手法をまとめました。
+
+## 詳細
+
+### 4 段階の最適化プロセス
+
+（[00:52](https://developer.apple.com/videos/play/wwdc2021/10148/?time=52)）
+
+Apple では、次の順序で最適化することをお勧めします。
+
+1. **ボトルネックの分析** — GPU ツールを使用してパフォーマンスの制限を見つける
+2. **シェーダーの最適化** — ALU とレジスターの圧力を削減します
+3. **メモリ帯域幅の削減** — タイル メモリのオーバーフローとテクスチャ帯域幅を削減します。
+4. **ワークロードの重複を増やす** — GPU に複数のタスクを同時に処理させます
+
+この順序が重要です。ボトルネックがメモリ帯域幅である場合、シェーダーを最適化しても大きな効果はありません。
+
+### 事例分析: 「ディヴィニティ: オリジナル・シン 2」
+
+（[04:37](https://developer.apple.com/videos/play/wwdc2021/10148/?time=277)）
+
+Larian Studios の Divinity: Original Sin 2 は、iPad 上で実行すると特定のシーンでパフォーマンスが低下します。 Apple は Xcode 13 の新しい GPU タイムライン ツールを使用してこれを分析し、次のことを発見しました。
+
+**問題 1: Uber シェーダ レジスタ プレッシャー**
+
+このゲームでは、巨大な uber シェーダを使用してすべてのマテリアルを処理します。このシェーダには多数の条件付き分岐が含まれていますが、各フレームで実際に使用されるのはそのうちの少数のみです。シェーダが大きすぎてレジスタ割り当ての負荷が高いため、GPU は並列処理を最大限に活用できません。
+
+**解決策**: 実行時条件分岐の代わりに関数定数を使用します。
+
+```metal
+// 优化前：运行时条件分支，所有代码都占用寄存器
+fragment float4 uberShader(...) {
+    float4 color;
+    if (materialType == 0) {
+        color = computeMetal(...);
+    } else if (materialType == 1) {
+        color = computeFabric(...);
+    } else if (materialType == 2) {
+        color = computeStone(...);
+    }
+    // ... 更多分支
+    return color;
+}
+
+// 优化后：编译期 specialization，只保留用到的代码
+[[function_constant(0)]] const bool hasMetal = false;
+[[function_constant(1)]] const bool hasFabric = false;
+
+fragment float4 specializedShader(...) {
+    float4 color;
+    if (hasMetal) {
+        color = computeMetal(...);
+    } else if (hasFabric) {
+        color = computeFabric(...);
+    }
+    return color;
+}
+```
+
+（[12:25](https://developer.apple.com/videos/play/wwdc2021/10148/?time=745)）
+
+**キーポイント:**
+- `[[function_constant]]`コンパイル時に分岐を決定する
+- 使用されていないコードはコンパイラによって削除されます
+- レジスタ割り当てがよりコンパクトになりました
+- 組み合わせごとにパイプライン状態を作成する必要がありますが、実行時のパフォーマンスは向上します
+
+**問題 2: タイル メモリのオーバーフロー**
+
+TBDR アーキテクチャは、オンチップ タイル メモリでレンダリングを実行します。各フレームの中間データが多すぎてタイル メモリに収まらない場合、メイン メモリにオーバーフローしてパフォーマンスが大幅に低下します。
+
+**解決策**: レンダー ターゲットのビット深度を減らし、レンダー パスをマージします。
+
+```
+// 优化前：多个 render pass，每个都写主内存
+Pass 1: G-Buffer (albedo + normal + depth) → 主内存
+Pass 2: Lighting → 主内存
+Pass 3: Post-processing → 主内存
+
+// 优化后：合并到一个 render pass，数据留在 tile 内存
+Pass 1: G-Buffer → Lighting → Post-processing (tile 内存内完成)
+```
+
+（[15:24](https://developer.apple.com/videos/play/wwdc2021/10148/?time=924)）
+
+**キーポイント:**
+- TBDR の利点は、タイル メモリの帯域幅がメイン メモリよりもはるかに高いことです。
+- レンダー パスが切り替わるたびに、タイル データがメイン メモリに書き戻される可能性があります。
+- レンダーパスをマージして中間データをオンチップに保持
+- ライトバックを避けるためにメモリレス添付ファイルを使用する
+
+**問題 3: 冗長リソース バインディング**
+
+各フレームは同じバッファとテクスチャを繰り返しバインドするため、CPU オーバーヘッドが高くなります。
+
+**解決策**: 引数バッファを使用してバインド ステータスをキャッシュします。
+
+```
+// 优化前：每帧逐个绑定
+[encoder setVertexBuffer:buffer1 offset:0 atIndex:0];
+[encoder setVertexBuffer:buffer2 offset:0 atIndex:1];
+[encoder setFragmentTexture:texture1 atIndex:0];
+[encoder setFragmentTexture:texture2 atIndex:1];
+
+// 优化后：用 argument buffer 一次绑定
+[encoder setVertexBuffer:argumentBuffer offset:0 atIndex:0];
+[encoder useResources:resources usage:MTLResourceUsageRead];
+```
+
+（[21:40](https://developer.apple.com/videos/play/wwdc2021/10148/?time=1300)）
+
+**キーポイント:**
+- 引数バッファはリソース参照をバッファにパックします
+- エンコーダーの API 呼び出しの数を削減します。
+- 大量のリソースを使用するシナリオに適しています
+- 協力する`useResources:usage:`どのリソースにアクセスするかをドライバーに伝えます
+
+### 事例分析: 「メトロ: エクソダス」
+
+（[16:30](https://developer.apple.com/videos/play/wwdc2021/10148/?time=990)）
+
+Apple GPU 上の 4A Games の Metro Exodus の主な問題は、コンピューティング シェーダーのメモリ アクセス パターンです。
+
+**問題: 非結合メモリ アクセス**
+
+コンピューティング シェーダー内のスレッドによってアクセスされるメモリ アドレスが分散しているため、キャッシュ効率が低くなります。
+
+**解決策**: 隣接するスレッドが隣接するメモリ アドレスにアクセスできるように、データ レイアウトを再編成します。
+
+```metal
+// 优化前：线程 (x,y) 访问内存位置不连续
+uint index = y * width + x;
+float value = input[index];
+
+// 优化后：利用 threadgroup memory 合并访问
+threadgroup float sharedData[256];
+uint localIndex = thread_position_in_threadgroup.x;
+sharedData[localIndex] = input[globalIndex];
+threadgroup_barrier(mem_flags::mem_threadgroup);
+float value = sharedData[localIndex];
+```
+
+（[18:45](https://developer.apple.com/videos/play/wwdc2021/10148/?time=1125)）
+
+**キーポイント:**
+- スレッドグループのメモリはデバイスのメモリよりもはるかに高速です
+- `threadgroup_barrier`読み取る前に、すべてのスレッドが書き込みを完了していることを確認してください
+- アクセスパターンをより規則的にするためにデータレイアウトを再編成します。
+- キャッシュミスの削減は帯域幅最適化の中核です
+
+### GPU タイムライン ツール
+
+（[22:30](https://developer.apple.com/videos/play/wwdc2021/10148/?time=1350)）
+
+Xcode 13 の新しい GPU タイムラインは、パフォーマンスのボトルネックを分析するための中心的なツールです。それはタイムラインに表示されます。
+
+- レンダリング パスおよびコンピューティング ディスパッチごとに費やされる GPU 時間
+- メモリ帯域幅の使用量
+- タイルのメモリプレッシャー
+- ステージ間の重複度
+
+タイムラインを通して視覚的に確認できます。どのパスに最も時間がかかりますか?さらに多くの作業が重なる可能性があるアイドル期間はありますか?帯域幅がボトルネックになっていますか?
+
+## 重要ポイント
+
+1. **GPU タイムラインを使用して最初にボトルネックを特定し、次に最適化します**。自分の感覚に基づいて最適化しないでください。最適化を長期間続けると、ボトルネックが別の場所にあることがわかる場合があります。エントリ API: Xcode 13 GPU タイムライン。
+
+2. **uber-shader のランタイム ブランチを関数定数に置き換えます**。未使用のコードはコンパイル中に削除され、レジスターの負荷が大幅に軽減されます。入口API：`[[function_constant(N)]]`。
+
+3. **レンダリング パスをマージして中間データをタイル メモリに保持します**。 TBDR アーキテクチャでは、1 つの大きなレンダー パスは、複数の小さなレンダー パスよりもはるかに効率的です。入口API：`MTLLoadAction` + `MTLStoreAction` + memoryless attachment。
+
+4. **コンピューティング シェーダーのメモリ アクセス パターンを確認します**。スレッドグループ メモリを使用して頻繁にアクセスされるデータをキャッシュし、隣接するスレッドが隣接するアドレスに確実にアクセスできるようにします。入口API：`threadgroup` + `threadgroup_barrier`。
+
+5. **引数バッファを使用して、各フレームのリソース バインディング オーバーヘッドを削減します**。大量のリソースを使用するシナリオに特に適しています。入口API：`MTLArgumentEncoder` + `useResources:usage:`。
+
+## 関連セッション
+
+- [可変リフレッシュ レート ディスプレイの最適化](/articles/wwdc2021-10147) — Adaptive-Sync および ProMotion フレーム レートの最適化
+- [メタル レイ トレーシングでアプリを強化](/articles/wwdc2021-10149) — メタル レイ トレーシング API
+- [Apple シリコンを活用した画像処理アプリを作成する](/articles/wwdc2021-10153) — Apple シリコン画像処理の最適化
+- [Discover Metal デバッグ、プロファイリング、およびアセット作成ツール](/articles/wwdc2021-10157) — Xcode 13 Metal デバッグおよびパフォーマンス分析ツール

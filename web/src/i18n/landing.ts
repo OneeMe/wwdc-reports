@@ -1,3 +1,9 @@
+import { defaultLang } from "./routing";
+import type { LangCode } from "./routing";
+
+export { defaultLang, supportedLangs } from "./routing";
+export type { LangCode } from "./routing";
+
 export interface PromptItem {
   label: string;
   text: string;
@@ -5,10 +11,13 @@ export interface PromptItem {
 
 export interface LocaleData {
   documentTitle: string;
+  description: string;
   brandLabel: string;
+  navAriaLabel: string;
   navHome: string;
   navArticles: string;
   navSkill: string;
+  languageSwitcherLabel: string;
   kicker: string;
   title: string;
   subtitle: string;
@@ -23,6 +32,7 @@ export interface LocaleData {
   artCardResourceText: string;
   artCardEvidenceTitle: string;
   artCardEvidenceText: string;
+  heroArtLabel: string;
   promptLabel: string;
   promptTitle: string;
   promptIntro: string;
@@ -37,13 +47,16 @@ export interface LocaleData {
   footerChineseSiteLink: string;
 }
 
-export const localeData: Record<string, LocaleData> = {
+export const localeData: Record<LangCode, LocaleData> = {
   zh: {
     documentTitle: "wwdc-quick-look · 落地页",
+    description: "wwdc-quick-look 是一个 skills.sh 技能，安装后在提示词里即可查询 WWDC 课程与资源。",
     brandLabel: "SwiftGGTeam 技能",
+    navAriaLabel: "主导航",
     navHome: "首页",
     navArticles: "文章",
     navSkill: "技能",
+    languageSwitcherLabel: "语言切换",
     kicker: "SwiftGGTeam 技能",
     title: "wwdc-quick-look",
     subtitle: "一条命令安装到你的智能体。之后直接用提示词检索 WWDC 课程、资源链接、代码片段和逐字稿。",
@@ -58,6 +71,7 @@ export const localeData: Record<string, LocaleData> = {
     artCardResourceText: "直达 Apple 文档、示例代码和相关链接。",
     artCardEvidenceTitle: "读取依据",
     artCardEvidenceText: "按需提取代码标签和逐字稿行。",
+    heroArtLabel: "wwdc-quick-look 视觉卡片",
     promptLabel: "提示词示例",
     promptTitle: "直接询问 WWDC 档案。",
     promptIntro: "安装完成后，在支持技能的聊天环境里直接发这些提示词：",
@@ -87,10 +101,13 @@ export const localeData: Record<string, LocaleData> = {
   },
   en: {
     documentTitle: "wwdc-quick-look · Landing Page",
+    description: "wwdc-quick-look is a skills.sh skill for querying WWDC sessions and resources directly from prompts.",
     brandLabel: "SwiftGGTeam Skill",
+    navAriaLabel: "Primary navigation",
     navHome: "Home",
     navArticles: "Articles",
     navSkill: "Skill",
+    languageSwitcherLabel: "Language switcher",
     kicker: "SwiftGGTeam skill",
     title: "wwdc-quick-look",
     subtitle: "Install it into your agent with one command. Then query WWDC sessions, Resources, Code tabs, and transcripts directly from prompts.",
@@ -105,6 +122,7 @@ export const localeData: Record<string, LocaleData> = {
     artCardResourceText: "Jump to Apple docs, sample code, and related links.",
     artCardEvidenceTitle: "Read evidence",
     artCardEvidenceText: "Pull code tabs and transcript lines on demand.",
+    heroArtLabel: "wwdc-quick-look visual card",
     promptLabel: "Prompt examples",
     promptTitle: "Ask the archive directly.",
     promptIntro: "After installation, call the skill in a supported chat with prompts like:",
@@ -134,16 +152,19 @@ export const localeData: Record<string, LocaleData> = {
   },
   ja: {
     documentTitle: "wwdc-quick-look · ランディングページ",
+    description: "wwdc-quick-look は、プロンプトから WWDC セッションとリソースを直接検索できる skills.sh スキルです。",
     brandLabel: "SwiftGGTeam スキル",
+    navAriaLabel: "メインナビゲーション",
     navHome: "ホーム",
     navArticles: "記事",
     navSkill: "スキル",
+    languageSwitcherLabel: "言語切り替え",
     kicker: "SwiftGGTeam スキル",
     title: "wwdc-quick-look",
     subtitle: "1コマンドでAgentにインストール。プロンプトからWWDCセッション、リソース、コードタブ、文字起こしを直接検索できます。",
     installStep: "インストール",
     installLink: "skills.sh を開く",
-    githubStar: "GitHub でスター",
+    githubStar: "Star on GitHub",
     installCmd: "npx skills add SwiftGGTeam/wwdc-quick-look-skill",
     artCommandLabel: "インストールコマンド",
     artCardSearchTitle: "セッション検索",
@@ -152,20 +173,21 @@ export const localeData: Record<string, LocaleData> = {
     artCardResourceText: "Appleドキュメント、サンプルコード、関連リンクへ移動します。",
     artCardEvidenceTitle: "根拠を読む",
     artCardEvidenceText: "必要に応じてコードタブと文字起こし行を取り出します。",
+    heroArtLabel: "wwdc-quick-look ビジュアルカード",
     promptLabel: "プロンプト例",
     promptTitle: "WWDCアーカイブに直接聞く。",
     promptIntro: "導入後、skills対応のチャットで直接以下のように入力してください：",
     prompts: [
       {
-        label: "検索",
+        label: "Search",
         text: "wwdc-quick-lookを使って、2025年で「visionOS」「SwiftUI」を含むセッションを一覧化し、タイトルと開始情報を返してください。"
       },
       {
-        label: "セッション",
+        label: "Session",
         text: "WWDC25のセッションコード290の詳細をwwdc-quick-lookで表示し、Apple公式リソース・ドキュメント・デモURLを返してください。"
       },
       {
-        label: "文字起こし",
+        label: "Transcript",
         text: "WWDC24のセッションコード150の文字起こしをwwdc-quick-lookで取得し、「privacy」を含む行を先頭から20行だけ返してください。"
       }
     ],
@@ -180,6 +202,3 @@ export const localeData: Record<string, LocaleData> = {
     footerChineseSiteLink: "中国語サイト"
   }
 };
-
-export type LangCode = "zh" | "en" | "ja";
-export const defaultLang: LangCode = "zh";

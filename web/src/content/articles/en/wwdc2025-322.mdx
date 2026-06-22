@@ -1,0 +1,288 @@
+---
+title: "Track workouts with HealthKit on iOS and iPadOS"
+description: "learn best practices for building a great workout experience for ios. review the life cycle of a workout session, explore the differences between workouts on apple watch and iphone, and find out how t"
+date: 2026-06-10
+tags: ["App Services", "Health & Fitness"]
+thumbnail: "/images/sessions/2025/322.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/322/"
+sessionId: "wwdc2025-322"
+year: "2025"
+relatedSessions:
+  - title: "Discover Apple-Hosted Background Assets"
+    code: "325"
+    description: "building on background assets, this session will introduce the new capability to"
+  - title: "Dive deeper into Writing Tools"
+    code: "265"
+    description: "with writing tools, people can proofread, rewrite, and transform text directly w"
+  - title: "Dive into App Store server APIs for In-App Purchase"
+    code: "249"
+    description: "discover the latest updates for the app store server api, app store server notif"
+  - title: "Enhance child safety with PermissionKit"
+    code: "293"
+    description: "discover how permissionkit helps you enhance communication safety for children i"
+---
+
+## Highlight
+
+> If you previously only did workout tracking on Apple Watch, you can now port the same code to iPhone/iPad. The core workflow is identical:
+
+---
+
+## Core Content
+
+Building fitness apps used to have an awkward limitation: all the powerful workout APIs lived on Apple Watch. If users didn't buy a Watch, developers either abandoned workout tracking or cobbled together their own sensor reading and database writing logic. The result: Activity Rings wouldn't update, workout records wouldn't go into HealthKit, and cross-device state wouldn't sync. In the Health & Fitness category, users without a Watch have long received second-class experiences.
+
+WWDC25 brings the Workout Builder APIs to iPhone and iPad. Session, builder, data source, live metrics, and crash recovery that previously ran on Watch now run on iOS and iPadOS with minimal code changes ([00:55](https://developer.apple.com/videos/play/wwdc2025/322/?time=55)). Differences mainly fall into three areas: sensors (iPhone has no heart rate sensor, needs external BLE heart rate strap or Powerbeats Pro 2), screen lock (iPhone likely locks during workout, requiring Live Activity and Siri Intent), and crash recovery (new scene delegate entry). The flow itself is unchanged: configure → session → builder → countdown → start collection → delegate receives live data → stop → save.
+
+---
+
+## Details
+
+The lifecycle of a workout session, from configuration to completion, has four phases. First, create configuration and session, then wire builder to data source ([01:30](https://developer.apple.com/videos/play/wwdc2025/322/?time=90)):
+
+```swift
+// Set up workout session
+
+// Create workout configuration
+let configuration = HKWorkoutConfiguration()
+configuration.activityType = .running
+configuration.locationType = .outdoor
+
+// Create workout session
+let session = try HKWorkoutSession(healthStore: healthStore, configuration: configuration)
+session.delegate = self
+
+// Get associated workout builder and add data source
+let builder = session.associatedWorkoutBuilder()
+builder.delegate = self
+builder.dataSource = HKLiveWorkoutDataSource(healthStore: healthStore,
+                                             workoutConfiguration: configuration)
+```
+
+Key points:
+
+- `HKWorkoutConfiguration` describes the activity type and location for this workout. The sensor stack pulls data based on this configuration.
+- `HKWorkoutSession` initializes with `healthStore` and configuration. The session delegate receives state changes.
+- `associatedWorkoutBuilder()` returns the builder bound to this session. Use it to write the workout to HealthKit.
+- `HKLiveWorkoutDataSource` is the builder's input source. It feeds sensor or external samples to the builder.
+
+On startup, call `prepare()` to ready sensors, show a 3-second countdown in UI, then officially start when countdown ends ([01:54](https://developer.apple.com/videos/play/wwdc2025/322/?time=114)):
+
+```swift
+// Prepare and start session
+
+session.prepare()
+
+// Start and display count down
+
+// Start session and builder collection once count down finishes
+session.startActivity(with: startDate)
+try await builder.beginCollection(at: startDate)
+```
+
+Key points:
+
+- `prepare()` wakes on-board sensors and connects external heart rate straps, ensuring the first sample is valid when officially starting.
+- `startActivity(with:)` switches session to running. The passed time becomes the workout start point.
+- `beginCollection(at:)` makes builder start receiving samples from this time.
+
+During workout, all live metrics push through the builder delegate. No anchored object query needed ([02:14](https://developer.apple.com/videos/play/wwdc2025/322/?time=134)):
+
+```swift
+// Handling collected metrics
+
+func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder,
+                    didCollectDataOf collectedTypes: Set<HKSampleType>) {
+    for type in collectedTypes {
+        guard let quantityType = type as? HKQuantityType else { return }
+
+        let statistics = workoutBuilder.statistics(for: quantityType)
+
+        // Update the published values
+        updateForStatistics(statistics)
+    }
+}
+```
+
+Key points:
+
+- Each time builder receives new samples, it callbacks once. The parameter is the set of changed sample types.
+- `statistics(for:)` gets current cumulative statistics for that type (average, sum, max, etc.). Can drive UI directly.
+- Builder automatically syncs metrics when saving workout. UI data and final samples stay naturally consistent.
+
+Stop sequence must follow strict order: stop session first, wait for delegate to reach stopped state, then endCollection, finishWorkout, end ([02:28](https://developer.apple.com/videos/play/wwdc2025/322/?time=148)):
+
+```swift
+// Stopping the workout session
+
+session.stopActivity(with: .now)
+
+// Session transitions to stopped then call end
+func workoutSession(_ workoutSession: HKWorkoutSession,
+                    didChangeTo toState: HKWorkoutSessionState,
+                    from fromState: HKWorkoutSessionState,
+                    date: Date) {
+    guard change.newState == .stopped, let builder else { return }
+
+    try await builder.endCollection(at: change.date)
+    let finishedWorkout = try await builder.finishWorkout()
+    session.end()
+}
+```
+
+Key points:
+
+- `stopActivity` lets builder collect final batch of samples first, avoiding data tail drop.
+- Wait for session state to become `.stopped` before `endCollection`, otherwise builder is still collecting.
+- `finishWorkout()` returns the `HKWorkout` object saved to HealthKit. Use it for summary screen.
+- Finally `session.end()` actually releases session resources.
+
+Key differences between iPhone and Watch are **sensors** and **screen lock** ([03:00](https://developer.apple.com/videos/play/wwdc2025/322/?time=180)). iPhone/iPad have no heart rate sensor, but connecting a BLE device supporting GATT profile (like Powerbeats Pro 2) lets HealthKit automatically write heart rate to Health Store. System distinguishes two sample types: **Generated types** are what the system auto-produces during workout (calories, distance); **Collected types** are metrics the app wants to observe and write workout samples for (like water drank during exercise). Use `enableCollection(for:)` / `disableCollection(for:)` to add or remove ([04:43](https://developer.apple.com/videos/play/wwdc2025/322/?time=283)).
+
+Lock screen handling is iPhone-specific. On first workout launch, system shows a privacy prompt telling users "workout data remains accessible even when locked" ([06:15](https://developer.apple.com/videos/play/wwdc2025/322/?time=375)). App should use Live Activity to show key metrics on lock screen. If user denies lock screen access, UI should downgrade to showing only workout duration, not specific values.
+
+Next step is Siri lock screen control ([06:54](https://developer.apple.com/videos/play/wwdc2025/322/?time=414)). After registering Intent Handler, users can start, pause, resume, cancel workouts via Siri on lock screen without unlocking ([07:17](https://developer.apple.com/videos/play/wwdc2025/322/?time=437)):
+
+```swift
+// Create an INExtension within your main app
+
+// Define an intent handler
+public class IntentHandler: INExtension {
+
+}
+
+// Define the intents to support
+extension IntentHandler: INStartWorkoutIntentHandling
+
+extension IntentHandler: INPauseWorkoutIntentHandling
+
+extension IntentHandler: INResumeWorkoutIntentHandling
+
+extension IntentHandler: INEndWorkoutIntentHandling
+```
+
+Key points:
+
+- Intent Handler must be in main app. Extension form cannot trigger on lock screen.
+- Declare four workout intents at once: start, pause, resume, end.
+- This is the entry signature for subsequent handle implementation.
+
+When receiving `INStartWorkoutIntent`, first check if a workout is already running to avoid duplicate launch ([07:32](https://developer.apple.com/videos/play/wwdc2025/322/?time=452)):
+
+```swift
+// Handle the intent
+
+public func handle(intent: INStartWorkoutIntent) async -> INStartWorkoutIntentResponse {
+    let state = await WorkoutManager.shared.state
+
+    switch state {
+    case .running, .paused, .prepared, .stopped:
+        return INStartWorkoutIntentResponse(code: .failureOngoingWorkout,
+                                            userActivity: nil)
+    default:
+        break;
+    }
+    Task {
+        await MainActor.run {
+            // Handle the intents activity type and location
+            WorkoutManager.shared.setWorkoutConfiguration(activityType: .running,
+                                                          location: .outdoor)
+        }
+    }
+    return INStartWorkoutIntentResponse(code: .success, userActivity: nil)
+ }
+```
+
+Key points:
+
+- Check `WorkoutManager` state. Return `.failureOngoingWorkout` when already in running/paused/prepared/stopped.
+- Configuration work switches to `MainActor` to avoid thread issues.
+- Trigger subsequent startup flow via `setWorkoutConfiguration`. Handle returns success immediately.
+
+Crash recovery ([08:37](https://developer.apple.com/videos/play/wwdc2025/322/?time=517)): system auto-restarts app, restores session and builder state, but data source must be rebuilt by app. iOS uses scene delegate entry ([09:09](https://developer.apple.com/videos/play/wwdc2025/322/?time=549)):
+
+```swift
+// App Delegate
+
+func application(_ application: UIApplication,
+                 configurationForConnecting connectingSceneSession: UISceneSession,
+                 options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+    if options.shouldHandleActiveWorkoutRecovery {
+        let store = HKHealthStore()
+        store.recoverActiveWorkoutSession(completion: { (workoutSession, error) in
+            // Handle error
+            Task {
+                await WorkoutManager.shared.recoverWorkout(recoveredSession: workoutSession)
+            }
+        })
+    }
+    let configuration = UISceneConfiguration(name: "Default Configuration",
+                                             sessionRole: connectingSceneSession.role)
+    configuration.delegateClass = WorkoutsOniOSSampleAppSceneDelegate.self
+    return configuration
+}
+```
+
+Key points:
+
+- `options.shouldHandleActiveWorkoutRecovery` is a new flag marking this launch as recovery from crash.
+- `recoverActiveWorkoutSession` provided by HealthStore. Callback gets the restored session.
+- Pass restored session to `WorkoutManager` to complete business-side reconnection.
+
+`recoverWorkout` re-establishes delegate and data source ([09:25](https://developer.apple.com/videos/play/wwdc2025/322/?time=565)):
+
+```swift
+// Recover the workout for the session
+
+
+func recoverWorkout(recoveredSession: HKWorkoutSession) {
+    session = recoveredSession
+    builder = recoveredSession.associatedWorkoutBuilder()
+    session?.delegate = self
+    builder?.delegate = self
+    workoutConfiguration = recoveredSession.workoutConfiguration
+
+    let dataSource = HKLiveWorkoutDataSource(healthStore: healthStore,
+                                             workoutConfiguration: workoutConfiguration)
+    builder?.dataSource = dataSource
+}
+```
+
+Key points:
+
+- `associatedWorkoutBuilder()` still works on restored session. State preserved by system.
+- Delegate must re-point to current manager instance, otherwise won't receive callbacks.
+- Data source is the only part needing rebuild. Re-attach using the restored `workoutConfiguration`.
+
+---
+
+## Key Takeaways
+
+**1. Start workouts from Apple Watch first, then mirror to iPhone**
+
+Why: Watch has heart rate, motion sensors, skin contact, producing the most complete generated types. On iPhone, you need external BLE devices to fill in heart rate. How: When detecting user has paired Watch, call `healthStore.startWatchApp()` to launch Watch-side session, then use multi-device mirror (see WWDC23 "Build a multi-device workout app") to sync state to iPhone ([09:34](https://developer.apple.com/videos/play/wwdc2025/322/?time=574)).
+
+**2. Pair Live Activity + Siri Intent for workouts**
+
+Why: During iPhone workouts, screen is likely locked. Live Activity lets users see key metrics without unlocking. Siri Intent lets them control start/pause/end by voice. Both combined support outdoor running, cycling scenarios. How: Live Activity uses ActivityKit + builder delegate to push live data. Siri side registers 4 workout intents using INExtension template from [07:17](https://developer.apple.com/videos/play/wwdc2025/322/?time=437). Handler must be in main app.
+
+**3. Treat crash recovery as mandatory, not optional**
+
+Why: Outdoor workouts run 30-60 minutes. If app crashes mid-session and can't recover, user's entire record is lost and Activity Rings won't update. How: In `application(_:configurationForConnecting:options:)`, check `shouldHandleActiveWorkoutRecovery`, call `store.recoverActiveWorkoutSession`, then re-attach delegate and data source in `WorkoutManager`. Read configuration from restored session.
+
+**4. Strictly distinguish Generated types vs Collected types, enable/disable as needed**
+
+Why: Default data source observes all possible samples for current activity type, including ones your app doesn't care about. Extra samples increase battery drain and confuse UI data. How: Immediately after builder creation, call `enableCollection(for:)` / `disableCollection(for:)` to tighten collection set. For example, cycling app only cares about heart rate, calories, distance. If writing custom samples (like water intake), use enableCollection to explicitly turn on.
+
+**5. UI downgrade when lock screen permission denied**
+
+Why: After user denies "lock screen access to health data", HealthKit won't push values while locked. If UI forces display, it shows 0 or stale old values—worse than hiding outright. How: Detect if samples are currently readable. When not, replace value fields with "Workout in progress..." + duration. Restore full UI when unlocked.
+
+---
+
+## Related Sessions
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — Apple-hosted background resources, simplifying large asset distribution
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — Advanced Writing Tools integration, custom rewrite and proofreading
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — Latest App Store Server API updates and best practices
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — Enhance child communication safety with PermissionKit

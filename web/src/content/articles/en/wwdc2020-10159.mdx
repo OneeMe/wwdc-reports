@@ -1,0 +1,253 @@
+---
+title: "Build an Endpoint Security app"
+description: "system extensions improve the reliability and security of macos. learn about the modern replacement for kernel authorization kpis and discover tips for making a great security product with the endpoint security framework."
+date: 2020-06-10
+tags: ["WWDC 2020", "Privacy & Security", "System Services", "Endpoint Security", "macOS"]
+thumbnail: "/images/sessions/2020/10159.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10159/"
+sessionId: "wwdc2020-10159"
+year: "2020"
+code: "10159"
+relatedSessions:
+  - title: "Modernize PCI and SCSI drivers with DriverKit"
+    code: "10210"
+    description: "It also revolves around migrating kernel extensions to user space, supplementing the deployment background of DriverKit and System Extension."
+  - title: "Secure your app: threat modeling and anti-patterns"
+    code: "10189"
+    description: "Explain what security products should prevent from the perspective of threat modeling and security anti-patterns, suitable for viewing together with Endpoint Security's event interception capabilities."
+  - title: "Explore logging in Swift"
+    code: "10168"
+    description: "Introducing the privacy-friendly Unified Logging API that can be used by Endpoint Security products to log detection and debugging information."
+  - title: "What's new in managing Apple devices"
+    code: "10639"
+    description: "Covers enterprise device management and MDM capabilities, and the System Extension automatic approval mentioned in this field is related to Full Disk Access configuration."
+---
+## Highlight
+
+> Endpoint Security lets macOS security products subscribe to approximately 100 system events using a user-space C API, replacing Kauth KPIs, the Mac kernel framework, and the OpenBSM audit trail with NOTIFY and AUTH events.
+
+## Core Content
+
+In the past, when it came to macOS endpoint security, many products had to go into the kernel. Developers need to write kernel extensions (KEXT), and also face problems such as changes in kernel interfaces, difficulty in debugging, and high maintenance costs. A small bug may also trigger a kernel panic, making the entire machine unstable.
+
+Endpoint Security (ES) moves this thing into user space. It was first introduced in macOS Catalina and aims to replace the Kauth KPI, the unsupported Mac kernel framework, and the OpenBSM audit trail. Security products establish ES clients through ordinary applications or System Extensions, subscribe to system events, and then analyze context such as processes, files, code signatures, parameters, and open flags in callbacks.
+
+This session focuses on the complete link that security products actually encounter: how to establish event streams, how to handle NOTIFY events, how to allow or deny operations in AUTH events, and how to avoid message queue accumulation, cache misuse, debug timeouts, and early startup leaks.
+
+Putting ES into System Extension has additional benefits. After the extension is installed, it is protected by System Integrity Protection (SIP). The launchd job cannot be uninstalled by the root user at will; some capabilities are only open to System Extension, such as early boot. After enabling early boot, the system will wait for the ES extension to complete the first subscription before allowing third-party applications to execute.
+
+## Detailed Content
+
+There are no official code snippets for this game. The following code blocks are from the API combination shown step by step in the transcript to illustrate the minimum skeleton and key judgment points; the real product also needs to complete entitlement, error handling, logging and policy storage.
+
+### Create ES client and subscribe to events
+
+([03:15](https://developer.apple.com/videos/play/wwdc2020/10159/?time=195)) ES is a C library. Apple chose C to control memory and performance characteristics, and to facilitate calls from languages ​​such as Swift, Objective-C, and Rust. A minimal client calls first`es_new_client`Create an event stream and then use`es_subscribe`Declare the event type and finally use`dispatch_main`Let the process continue to handle callbacks.
+
+```c
+es_client_t *client = NULL;
+
+es_new_client(&client, ^(es_client_t *client, const es_message_t *message) {
+    printf("event type: %u\n", message->event_type);
+});
+
+es_event_type_t events[] = {
+    ES_EVENT_TYPE_NOTIFY_EXEC,
+};
+
+if (es_subscribe(client, events, 1) != ES_RETURN_SUCCESS) {
+    es_delete_client(client);
+    return;
+}
+
+dispatch_main();
+```
+
+Key points:
+
+- `es_new_client`return`es_client_t`handle, and register the event handling block.
+-`es_subscribe`Determine which events this client will receive; in the example, only subscribe`NOTIFY_EXEC`.
+- Used when subscription fails`es_delete_client`Clean up the client created earlier.
+-`dispatch_main`Let the process continue running and events will be sent through the handler block.
+
+### understand`es_message_t`three types of information
+
+([05:54](https://developer.apple.com/videos/play/wwdc2020/10159/?time=354)) All events will be wrapped in`es_message_t`. It contains message metadata, information about the process that triggered the event, and data about the event itself. Added to the demo`NOTIFY_EXIT`After, pass`message->process`Get the process path and audit token through`message->event.exit.stat`Get exit status.
+
+```c
+switch (message->event_type) {
+case ES_EVENT_TYPE_NOTIFY_EXIT: {
+    es_string_token_t path = message->process->executable->path;
+    pid_t pid = audit_token_to_pid(message->process->audit_token);
+    int status = message->event.exit.stat;
+
+    os_log(log, "process %{public}.*s pid %d exited with status %d",
+           (int)path.length, path.data, pid, status);
+    break;
+}
+default:
+    break;
+}
+```
+
+Key points:
+
+- `message->event_type`Determine what should be read`event`Which field in the union.
+-`message->process`Describe the process that triggered the event, including executable, code signature, PID, UID and other information.
+-`audit_token_to_pid`The PID can be extracted from the audit token; the audit token also contains identity information such as user ID.
+-`es_string_token_t`Carrying length and data pointers, do not assume it is a null-terminated C string when logging output.
+
+### Must respond when handling AUTH event
+
+([13:59](https://developer.apple.com/videos/play/wwdc2020/10159/?time=839)) The NOTIFY event is an asynchronous notification and the operation will continue. The AUTH event is a synchronous authorization. The kernel will pause the original operation and wait for the ES client to respond or wait for the deadline to expire. Each AUTH message has its own deadline, and the client must check each message one by one and respond in time.
+
+```c
+static void handle_exec(es_client_t *client,
+                        const es_message_t *message,
+                        es_string_token_t signing_id_to_block) {
+    es_string_token_t signing_id = message->event.exec.target->signing_id;
+    bool should_block = matches_signing_id(signing_id, signing_id_to_block);
+
+    es_respond_auth_result(client,
+                           message,
+                           should_block ? ES_AUTH_RESULT_DENY : ES_AUTH_RESULT_ALLOW,
+                           true);
+}
+```
+
+Key points:
+
+- `AUTH_EXEC`available`es_respond_auth_result`return`ALLOW`or`DENY`.
+- Sample policy reading`message->event.exec.target->signing_id`, and then compare it with the signing ID to be blocked.
+-`matches_signing_id`It's the product's own string comparison logic, not the ES API.
+- The last parameter controls whether ES is allowed to cache this result; caching can only be used for performance and cannot be used as a source of policy.
+
+### Use flags to limit file opening permissions
+
+([24:12](https://developer.apple.com/videos/play/wwdc2020/10159/?time=1452)) Some AUTH events cannot just return allow or deny.`AUTH_OPEN`use`es_respond_flags_result`Returns the allowed open flag. There are three strategies in the demo: reject all EICAR test files,`/usr/local/bin`Only read-only opening is allowed, and other files are allowed to be opened.
+
+```c
+static void deny_write_in_directory(es_client_t *client,
+                                    const es_message_t *message) {
+    uint32_t allowed_flags = UINT32_MAX;
+    allowed_flags &= ~FWRITE;
+
+    es_respond_flags_result(client, message, allowed_flags, true);
+}
+
+static void deny_all_open(es_client_t *client,
+                          const es_message_t *message) {
+    es_respond_flags_result(client, message, 0, true);
+}
+```
+
+Key points:
+
+- `AUTH_OPEN`The kernel version of open flags is used, not`open(2)`common in`oflags`。
+- `allowed_flags`clear`FWRITE`Finally, read-only access can be retained while writing is denied.
+- return`0`All allow bits will be cleared to prevent all open operations on a file.
+- When caching the flags result is enabled, the response should contain all flags that the client is willing to allow in the future, and cannot only return the flags in the current request.
+
+### Copy message before asynchronous processing
+
+([24:23](https://developer.apple.com/videos/play/wwdc2020/10159/?time=1463)) The handler block should return as soon as possible to avoid the message queue from growing larger and causing message loss. If you are doing file scanning, I/O or CPU intensive tasks, use`es_copy_message`Extend the message life cycle, then throw the work to the asynchronous queue, and use`es_free_message`release.
+
+```c
+static void handle_open(es_client_t *client,
+                        const es_message_t *message,
+                        dispatch_queue_t worker_queue) {
+    const es_message_t *copied_message = es_copy_message(message);
+
+    dispatch_async(worker_queue, ^{
+        handle_open_worker(client, copied_message);
+        es_free_message(copied_message);
+    });
+}
+```
+
+Key points:
+
+- After handler block returns, the original`message`No longer guaranteed to be valid.
+-`es_copy_message`Allows AUTH events to be responded to later, and allows different AUTH messages to be responded to out of sequence.
+- The quality of service of the asynchronous queue should be selected based on event type and event volume. Be especially careful when subscribing to AUTH events.
+- Even if it is processed asynchronously, it must respond before the deadline of the message.
+
+### early boot To subscribe to key events at one time
+
+([30:24](https://developer.apple.com/videos/play/wwdc2020/10159/?time=1824)) early boot is only open to ES System Extension. The extension is set in Info.plist`NSEndpointSecurityEarlyBoot`After that, the system starts up and waits for it to complete the first`es_subscribe`, and then allow third-party applications to execute.
+
+```xml
+<key>NSEndpointSecurityEarlyBoot</key>
+<true/>
+```
+
+```c
+es_event_type_t startup_events[] = {
+    ES_EVENT_TYPE_AUTH_EXEC,
+    ES_EVENT_TYPE_NOTIFY_EXEC,
+    ES_EVENT_TYPE_NOTIFY_FORK,
+    ES_EVENT_TYPE_NOTIFY_EXIT,
+};
+
+es_subscribe(client,
+             startup_events,
+             sizeof(startup_events) / sizeof(startup_events[0]));
+```
+
+Key points:
+
+- The readiness signal comes from the first`es_subscribe`call.
+- Key startup events should be placed in the same subscription as much as possible; splitting into multiple subscriptions will cause the third-party process to start executing before subsequent subscriptions.
+- ES has a startup deadline; after the expiration, third-party execution will be automatically released.
+- Long initialization work should be placed after the first subscription to avoid missing events during the startup phase.
+
+### Big Sur’s new capabilities and migration signals
+
+([38:00](https://developer.apple.com/videos/play/wwdc2020/10159/?time=2280)) Apple announced in this session that the audit subsystem is being deprecated and products that rely on audit trail files or Auditpipe should be migrated to Endpoint Security. macOS Big Sur also adds file descriptor information for EXEC events, improves performance, and adds trace and`CS_INVALIDATED`and other events.
+
+```c
+if (message->version >= 2) {
+    const es_event_create_t *create = &message->event.create;
+    inspect_acl_if_present(create->acl);
+}
+```
+
+Key points:
+
+- `message->version`For cross-system version compatibility; check the version before accessing new fields.
+- The EXEC event can provide the file descriptors carried when a new process is started, and expose the unique identifier of the pipe to facilitate tracking inter-process communication.
+-`CS_INVALIDATED`The ES client is notified immediately when the process code signature valid bit is cleared.
+- The trace event can notify the client that a process is being debugged.
+
+## Core Takeaways
+
+**1. Make a process life cycle auditor**
+
+- **What to do**: Subscribe`NOTIFY_FORK`、`NOTIFY_EXEC`、`NOTIFY_EXIT`, record process tree, executable path, PID, exit status and code signing information.
+- **Why is it worth doing**: Use it in the first demo of session`ps`It shows how the three events of fork, exec, and exit can be strung together to execute a command.
+- **How ​​to start**: Use first`es_new_client`Create the client, and again at the same time`es_subscribe`Subscribe to these three NOTIFY events and put`message->process`and event-specific fields are written to the unified log.
+
+**2. Create an enterprise application startup interception strategy**
+
+- **What to do**: Use`AUTH_EXEC`Block executable files with a specific signing ID or CD hash to prevent unapproved tools from starting.
+- **Why it’s worth doing**: The AUTH event will synchronously suspend the original operation, and the security product can give a permit or deny result before the deadline.
+- **How ​​to start**: From`message->event.exec.target->signing_id`Read the signature ID of the target process and call it after matching the local policy`es_respond_auth_result`。
+
+**3. Make a sensitive directory read-only protected**
+
+- **What to do**: Yes`/usr/local/bin`Or enterprise custom catalog subscription`AUTH_OPEN`, reading is allowed, writing is denied.
+- **Why it’s worth doing**: The flags response in the demo shows that the same file can be read, but writing will be denied. It is suitable for protecting tool chain directories or security baseline directories.
+- **How ​​to start**: Check`message->event.open.file`path prefix, used after hitting`es_respond_flags_result`Return to clear`FWRITE`flags.
+
+**4. Make an early start security guard extension**
+
+- **What to do**: Make the ES client a System Extension and enable early boot to ensure that the security agent has subscribed to key events before the third-party application is executed.
+- **Why it’s worth doing**: The session clearly mentioned that early boot is a capability that can only be used by ES System Extension and is suitable for EDR and anti-virus products.
+- **How ​​to start**: Add in extension Info.plist`NSEndpointSecurityEarlyBoot`, a one-time subscription as soon as possible after launch`AUTH_EXEC`、`NOTIFY_EXEC`Wait for events required during the startup phase.
+
+## Related Sessions
+
+- [Modernize PCI and SCSI drivers with DriverKit](/articles/wwdc2020-10210) — Also around migrating kernel extensions to user space, supplementing the deployment background of DriverKit and System Extension.
+- [Secure your app: threat modeling and anti-patterns](/articles/wwdc2020-10189) — Explains what security products should prevent from the perspective of threat modeling and security anti-patterns, suitable for viewing together with Endpoint Security’s event interception capabilities.
+- [Explore logging in Swift](/articles/wwdc2020-10168) — Introducing the privacy-friendly unified logging API that can be used by Endpoint Security products to log detection and debugging information.
+- [What's new in managing Apple devices](/articles/wwdc2020-10639) — Covers enterprise device management and MDM capabilities, and is related to the System Extension automatic approval and Full Disk Access configuration mentioned in this field.

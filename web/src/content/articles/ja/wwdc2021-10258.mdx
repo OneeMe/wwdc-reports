@@ -1,0 +1,318 @@
+---
+title: "Understand and eliminate hangs from your app"
+description: "discover how you can track down hangs and delays in your app. we'll show you tools and methods to discover hangs and their causes, learn about anti-patterns that can lead to hangs, explore best practices for eliminating hangs like gcd, and provide guidance on when you should consider asynchronous code to improve your app performance."
+date: "2021-06-06"
+tags: ["Developer Tools", "Performance", "MetricKit", "Dispatch"]
+thumbnail: "/images/sessions/2021/10258.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10258/"
+sessionId: "wwdc2021-10258"
+year: "2021"
+relatedSessions:
+  - title: "Ultimate application performance survival guide"
+    code: "10181"
+    description: "ツール、メトリクス、開発パラダイムを使用して、アプリケーションのパフォーマンス最適化プロセスを確立します。"
+  - title: "Diagnose Power and Performance regressions in your app"
+    code: "10087"
+    description: "Xcode Organizer で電力とパフォーマンスの低下を特定します。"
+  - title: "Detect and diagnose memory issues"
+    code: "10180"
+    description: "Xcode ツールを使用して、メモリ パフォーマンスの問題を理解し、診断します。"
+  - title: "Analyze HTTP traffic in Instruments"
+    code: "10212"
+    description: "Instruments を使用して、アプリケーションの HTTP トラフィックをログに記録し、分析します。"
+  - title: "Swift concurrency: Behind the scenes"
+    code: "10254"
+    description: "Swift の同時実行によってデータ競合とスレッドの爆発がどのように削減されるかを理解します。"
+---
+## ハイライト
+
+> Apple は、ハングアップを、アプリケーションのメインスレッドがユーザー イベントをタイムリーに処理できないときに発生する応答しない期間として定義し、そのようなハングアップを特定して排除するための Instruments、MetricKit、Xcode Organizer、および Dispatch プラクティスを提供しています。
+
+## 主要内容
+
+ユーザーがマンゴー タンゴ 1 杯のレシピをクリックすると、画面が応答しなくなります。数秒後にページが表示されます。ユーザーは、アプリが動かなくなり、遅くなり、クリックできないと言うでしょう。
+
+Apple では、このエクスペリエンスを「このセッションでハングする」と呼んでいます。その本質は非常に特殊です。メインスレッドは前のものを処理しており、新しいタッチ イベントはキューに入れて待つことしかできません。
+
+メインスレッドの Main Run Loop は、毎回イベントを受信して​​イベント処理を実行し、UI を更新します。イベント処理に時間がかかりすぎると、UI の更新が遅れます。ユーザーがクリックし続けると、イベントが蓄積され続けます。
+
+開発者は、この種の問題を見つけるためにローカルでの再現に頼っていました。このアプローチでは、実際のユーザー デバイス、ネットワーク、ストレージの負荷、古いハードウェアをカバーすることはできません。 Apple が指定したパスは次のとおりです。Instruments を使用して開発中にコール スタックを記録し、MetricKit を使用してオンラインになった後の実際のハングを収集し、次に Xcode Organizer を使用してバージョン間のハング率を観察します。
+
+解決の方向性も明確です。メインスレッドは、UI の更新に必要な重要な作業のみを実行します。画像のデコード、連絡先のクエリ、ネットワーク リクエスト、ファイル I/O、キャッシュの更新、およびメンテナンスのタスクは、削減するか、延期するか、バックグラウンド キューに移動する必要があります。
+
+## 詳細
+
+### メイン実行ループのイベント処理でハングが発生する
+
+([01:45](https://developer.apple.com/videos/play/wwdc2021/10258/?time=105)) メイン実行ループは、メインスレッドでのユーザー イベントの処理を担当します。ループ内で、アプリケーションはイベントを受信し、処理ロジックを実行し、必要に応じて UI を更新します。処理ロジックは長く、ユーザー入力と UI 更新の間に遅延が生じます。
+
+```swift
+import UIKit
+
+final class RecipeViewController: UIViewController {
+    private let statusLabel = UILabel()
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.addSubview(statusLabel)
+    }
+
+    @objc func didTapRecipe() {
+        statusLabel.text = "Loading"
+        renderVisibleRecipeContent()
+        statusLabel.text = "Ready"
+    }
+
+    private func renderVisibleRecipeContent() {
+        // Only do the work needed for the first visible screen.
+    }
+}
+```
+
+キーポイント:
+
+- `RecipeViewController`これは通常の UIKit ビュー コントローラーであり、すべての UI オブジェクトはメイン スレッドで作成および変更されます。
+- `didTapRecipe()`ユーザーのクリック イベントのハンドラー関数を表します。
+- `statusLabel.text = "Loading"`そして`statusLabel.text = "Ready"`これらはすべて UI の更新であり、メインスレッド上に存在する必要があります。
+- `renderVisibleRecipeContent()`スクロールせずに見える範囲に必要なコンテンツのみを生成する必要があります。セッション内の Desserted の例では、材料の 4 つの写真のみが表示され、メインスレッドがすべての写真を一度にロードする必要はありません。
+
+### メインスレッドがビジー状態です: ユーザーが事前に確認できないリソースをロードしています
+
+([04:02](https://developer.apple.com/videos/play/wwdc2021/10258/?time=242)) Desserted のレシピ ページには、材料の写真が 4 枚しか掲載されていません。メインスレッドがすべての材料画像を一度に読み取り、準備し、合成する場合、作業のほとんどは現在の画面を変更しませんが、実行ループを拡張します。
+
+```swift
+import UIKit
+
+final class ImageTileStore {
+    private let cache = NSCache<NSString, UIImage>()
+    private let renderQueue = DispatchQueue(label: "com.example.recipe.render", qos: .userInitiated)
+
+    func image(for identifier: String, makeImage: @escaping () -> UIImage, completion: @escaping (UIImage) -> Void) {
+        let key = identifier as NSString
+
+        if let image = cache.object(forKey: key) {
+            completion(image)
+            return
+        }
+
+        renderQueue.async { [cache] in
+            let image = makeImage()
+            cache.setObject(image, forKey: key)
+
+            DispatchQueue.main.async {
+                completion(image)
+            }
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `NSCache<NSString, UIImage>()`繰り返し生成されるのを避けるために、生成された画像タイルを保存します。
+- `renderQueue`これは、イメージの準備作業を実行するために使用されるバックグラウンドのディスパッチ キューです。
+- `cache.object(forKey:)`キャッシュがヒットした場合は直接戻り、メインスレッドはメモリ読み取りを 1 回だけ行います。
+- `renderQueue.async`時間がかかる`makeImage()`メインスレッドから外されました。
+- `DispatchQueue.main.async`実行のためにメインスレッドに戻ります`completion`、呼び出し元が UI を安全に更新できるようにします。
+
+### メインスレッドのブロック: 同期 API、I/O、およびすべてのキュー イベントをロック
+
+([06:53](https://developer.apple.com/videos/play/wwdc2021/10258/?time=413)) 同期 API は、呼び出しの開始から戻りまで現在のスレッドをブロックします。ネットワーク要求、ファイル I/O、データ ストレージの読み取り、および同期プリミティブはすべて、メイン スレッドを妨害する可能性があります。セッションは、セマフォを使用して非同期 API を同期呼び出しにラップすることは、メインスレッドに表示されるのを避ける必要があることに特に注意してください。
+
+```swift
+import Foundation
+
+let recipeQueue = DispatchQueue(label: "com.example.recipe.worker", qos: .userInitiated)
+
+func loadRecipeSummary(completion: @escaping (String) -> Void) {
+    recipeQueue.async {
+        let summary = "Mango Tango takes 5 minutes."
+
+        DispatchQueue.main.async {
+            completion(summary)
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `recipeQueue.async`レシピ概要の準備をバックグラウンドキューで実行させます。
+- `qos: .userInitiated`この作業がユーザーの現在の操作に関連していることを示します。
+- `summary`バックグラウンドで生成されるメインスレッドは、同期が戻るのを待ちません。
+- `DispatchQueue.main.async`Hand UI はメインスレッドに更新されます。
+- このモードは、セッション内の提案に対応します。非同期 API を使用できる場合はそれを使用します。非同期 API がない場合は、Grand Central Dispatch (GCD、中央ディスパッチ) を使用して独自のコードを移動します。
+
+### CPU ビットマップの再描画を回避するために、コア アニメーションを使用して丸い角を処理します。
+
+([05:55](https://developer.apple.com/videos/play/wwdc2021/10258/?time=355)) デザート 画像に丸い角を追加する場合、元の解決策は、ビットマップ グラフィックス コンテキストを作成し、画像をビットマップに変換し、UIBezierPath を適用して、それを画像に変換して戻すことでした。このプロセスは CPU とメモリを消費します。 CoreAnimation のレイヤー機能を使用してセッションを GPU に渡して処理することをお勧めします。
+
+```swift
+import UIKit
+
+func applyRoundedCorners(to imageView: UIImageView) {
+    imageView.layer.cornerRadius = 12
+    imageView.layer.masksToBounds = true
+}
+```
+
+キーポイント:
+
+- `imageView.layer`UIKit ビューの背後にあるコア アニメーション レイヤーにアクセスします。
+- `cornerRadius = 12`コーナーの半径を設定します。
+- `masksToBounds = true`画像コンテンツを丸い角に切り取ってみましょう。
+- このコードは、メインスレッドでの CPU 負荷の高い画像変換を回避するために、ビットマップ グラフィックス コンテキストを作成しません。
+
+### 開発中に Instruments を使用して、メインスレッドが何を行っているかを確認します。
+
+([11:23](https://developer.apple.com/videos/play/wwdc2021/10258/?time=683)) ハングを診断する場合、最初に行うべきことは、ハング中にアプリケーションが何をしていたかを知ることです。 Time Profiler は、時間の経過に伴う呼び出しスタックの変化を表示します。システム トレースは、システム コール、仮想メモリ ページ フォールト、I/O、プロセス内およびプロセス間の対話を補足します。
+
+```text
+Instruments
+  Template: Time Profiler + System Trace
+  Target: Desserted
+  Steps:
+    1. Record
+    2. Reproduce the tap that hangs
+    3. Select the hang interval
+    4. Inspect the main-thread call tree
+```
+
+キーポイント:
+
+- `Time Profiler + System Trace`セッションで同時に使用される 2 つのインストゥルメント ツールに対応します。
+- `Reproduce the tap that hangs`ユーザーがトレースをクリックすることによって生じる遅延を記録します。
+- `Select the hang interval`ハングが発生する時間帯に注目してください。
+- `Inspect the main-thread call tree`対応するセッションで見つかりました`loadAllMessages`4.6 秒かかるステップ。
+
+### MetricKit を使用して、オンラインになった後に実際のユーザーからハングを収集する
+
+([13:02](https://developer.apple.com/videos/play/wwdc2021/10258/?time=782)) アプリケーションがリリースされた後は、ネイティブ トレースだけでは十分ではありません。 MetricKit は、現場で発生したハング コール ツリーを収集できます。ハング中にサンプリングされたコール スタックをコール ツリーに集約し、開発者が実際のユーザーが遭遇する頻度に応じてコール スタックを並べ替えて修正できるようにします。
+
+```swift
+import MetricKit
+
+final class AppMetricsSubscriber: NSObject, MXMetricManagerSubscriber {
+    func start() {
+        MXMetricManager.shared.add(self)
+    }
+
+    func didReceive(_ payloads: [MXDiagnosticPayload]) {
+        for payload in payloads {
+            print(payload)
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `MXMetricManagerSubscriber`は MetricKit の加入者契約です。
+- `MXMetricManager.shared.add(self)`サブスクライバーを登録して、アプリが MetricKit ペイロードを受信できるようにします。
+- `didReceive(_ payloads: [MXDiagnosticPayload])`受信診断ペイロード、ハング診断は、このタイプのフィールド問題データに属します。
+- `print(payload)`これは最小限の例です。実際のアプリケーションでは、診断コンテンツを独自の分析システムに保存またはアップロードする必要があります。
+
+### クリックごとに高価なクエリを通知とキャッシュに置き換えます
+
+([16:31](https://developer.apple.com/videos/play/wwdc2021/10258/?time=991)) Desserted のソーシャル アイコンは、連絡先が友達かどうかを知る必要があります。ページに入るたびにすべての連絡先をクエリすると、フレームワークが負荷の高い操作を実行するまでメインスレッドが待機することになります。セッションは変更通知を監視し、通知が到着したときにキャッシュを非同期で更新することをお勧めします。
+
+```swift
+import Foundation
+
+extension Notification.Name {
+    static let friendsDidChange = Notification.Name("friendsDidChange")
+}
+
+final class FriendStatusStore {
+    private let updateQueue = DispatchQueue(label: "com.example.friends.update", qos: .utility)
+    private var cachedFriendIDs = Set<String>()
+
+    func startObserving() {
+        NotificationCenter.default.addObserver(
+            forName: .friendsDidChange,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.refreshCache()
+        }
+    }
+
+    private func refreshCache() {
+        updateQueue.async { [weak self] in
+            let latestIDs = Set(["contact-1", "contact-2"])
+            self?.cachedFriendIDs = latestIDs
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `Notification.Name`監視可能な状態変更名を定義します。
+- `NotificationCenter.default.addObserver`オブジェクトの状態が変化したときにコールバックを受信できるようにオブザーバーを登録します。
+- `refreshCache()`コールバックで直接重い作業を行うことを避け、代わりに更新をディスパッチします。`updateQueue`。
+- `cachedFriendIDs`クエリ結果を保存すると、ページに入るときにキャッシュのステータスを読み取ることができます。
+- この構造は、セッションでの提案に対応しています。値が頻繁に変更されない場合は、ユーザーが操作するたびに負荷の高いクエリを再実行しないでください。
+
+### GCD を使用して計算をウォームアップしますが、タスクの順序に注意してください
+
+([20:28](https://developer.apple.com/videos/play/wwdc2021/10258/?time=1228)) GCD は計算をウォームアップすることもできます。アプリケーションはタスクをディスパッチします`prefetchQueue`、メインスレッドはユーザーに応答し続けます。実際に結果が必要な場合は、ウォームアップ キューが完了するまで待ちます。また、セッションでは、非同期によりコードの実行順序が変更されること、およびどのタスクに逐次的な依存関係があるかを確認する必要があることも思い出させます。
+
+```swift
+import Foundation
+
+let prefetchQueue = DispatchQueue(label: "com.example.recipe.prefetch", qos: .utility)
+
+func prefetchIngredients() {
+    prefetchQueue.async {
+        _ = ["mango", "yogurt", "ice"]
+    }
+}
+
+func usePrefetchedIngredients(completion: @escaping ([String]) -> Void) {
+    prefetchQueue.async {
+        let ingredients = ["mango", "yogurt", "ice"]
+
+        DispatchQueue.main.async {
+            completion(ingredients)
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `prefetchQueue`ウォームアップタスクの実行順序を維持するのに適したシリアルキューです。
+- `prefetchIngredients()`メインスレッドをブロックせずに、事前にバックグラウンド作業を開始します。
+- `usePrefetchedIngredients`予熱タスクの順序が狂わないように、同じキュー内の結果を読み取ります。
+- `DispatchQueue.main.async`最終的な UI 更新のみをメインスレッドに戻します。
+
+## 重要ポイント
+
+1. **やるべきこと**: 最初の画面の優先レンダリングと背景のウォームアップを画像リストに追加します。
+**実行する価値がある理由**: セッション レシピの例は、目に見えない画像を事前に処理するとハングが発生することを示しています。
+**開始方法**: を使用します`NSCache`生成された画像を保存するには、次を使用します。`DispatchQueue.async`次の画面の写真をバックグラウンドで準備する場合のみ、`DispatchQueue.main.async`中程度の設定`UIImageView.image`。
+
+2. **やるべきこと**: 連絡先、権限、サブスクリプションステータスなどの、低頻度で変更されるデータ用のキャッシュを作成します。
+**実行する価値がある理由**: クリックするたびにシステム リソースをクエリすると、メインスレッドが制御不能な遅延にさらされることになります。
+**開始方法**: を使用します`NotificationCenter.default.addObserver`ステータスの変化を監視し、バックグラウンド キュー内のキャッシュを更新し、ページに入ったときにキャッシュを読み取ります。
+
+3. **やるべきこと**: ハング診断チャネルを既存のアプリに追加します。
+**実行する価値がある理由**: MetricKit は、実際のユーザーが遭遇したハングをコール ツリーに集約し、最も大きな影響を与えるラグを最初に修正するのに役立ちます。
+**開始方法**: 実装`MXMetricManagerSubscriber`、合格`MXMetricManager.shared.add`購読者として登録して、`MXDiagnosticPayload`ロギング システムに書き込みます。
+
+4. **対処方法**: 同期ネットワーク、ファイルの読み取り、およびデータの解析をメイン スレッドの外に移動します。
+**実行する価値がある理由**: セッションは、同期 API が呼び出しから復帰までをブロックし、ネットワークと I/O の遅延もデバイス環境の影響を受けることを指摘しています。
+**開始方法**: まず、完了ハンドラーを備えた非同期 API を探します。独自のコードを使用する`DispatchQueue.async`実行し、最後にメインスレッドに戻って UI を更新します。
+
+5. **やるべきこと**: エントリ ページのパフォーマンス回帰チェックを作成します。
+**実行する価値がある理由**: Xcode Organizer はバージョンごとにハング レートを表示できるため、新しいバージョンによってもたらされたパフォーマンスの低下を発見するのに適しています。
+**開始方法**: 主要なページのインストゥルメント トレースを記録し、時間のかかるメイン スレッドのベースラインを記録します。リリース後にオーガナイザーで新しいバージョンのハング率を観察します。
+
+## 関連セッション
+
+- [究極のアプリケーション パフォーマンス サバイバル ガイド](/articles/wwdc2021-10181) — アプリケーション パフォーマンスを最適化するためのメトリクス、ツール、ワークフローを確立します。
+- [アプリの電力とパフォーマンスの回帰を診断する](/articles/wwdc2021-10087) — Xcode Organizer を使用して電力とパフォーマンスの回帰を特定します。
+- [メモリ問題の検出と診断](/articles/wwdc2021-10180) - Xcode ツールを使用してメモリ負荷を診断し、メモリによって引き起こされるパフォーマンスの問題を軽減します。
+- [Instruments で HTTP トラフィックを分析する](/articles/wwdc2021-10212) — Instruments を使用してネットワーク リクエストを分析し、ネットワーク遅延によって引き起こされる待機のトラブルシューティングを行います。
+- [Swift 同時実行性: 舞台裏](/articles/wwdc2021-10254) — 同時実行性ランタイムがスレッド管理の問題の軽減にどのように役立つかを理解します。

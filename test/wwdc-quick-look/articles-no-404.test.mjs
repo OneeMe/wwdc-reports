@@ -14,11 +14,11 @@ function listRawDataFiles() {
   for (const entry of fs.readdirSync(DATA_DIR, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const yearDir = path.join(DATA_DIR, entry.name);
-    const filePath = path.join(yearDir, 'raw_data.json');
-    if (fs.existsSync(filePath)) {
+    const canonicalPath = path.join(yearDir, 'raw_data.json');
+    if (fs.existsSync(canonicalPath)) {
       files.push({
         yearShort: entry.name,
-        filePath,
+        filePath: canonicalPath,
       });
     }
   }
@@ -42,8 +42,20 @@ function isNonArticleSession(video) {
   );
 }
 
-function isSkippedSession(video) {
-  return isAslSession(video) || isNonArticleSession(video);
+function isDubDubDaily(video) {
+  return /^Dub Dub Daily:/i.test(video.title ?? '');
+}
+
+function isExcludedFromLocalArticles(video, year) {
+  const contentId = Number.parseInt(video.eventContentId, 10);
+  return (
+    isAslSession(video) ||
+    isNonArticleSession(video) ||
+    (year === 2026 && (
+      isDubDubDaily(video) ||
+      (Number.isFinite(contentId) && contentId >= 8000)
+    ))
+  );
 }
 
 function getLocalArticleCodes(year) {
@@ -77,12 +89,12 @@ describe('articles-no-404', () => {
       const videos = data.videos ?? {};
       const localCodes = getLocalArticleCodes(year);
       const cdnCodes = new Set();
-      const skippedCodes = new Set();
+      const allowedExcludedLocalCodes = new Set();
       const missing = [];
 
       for (const video of Object.values(videos)) {
-        if (isSkippedSession(video)) {
-          skippedCodes.add(video.eventContentId);
+        if (isExcludedFromLocalArticles(video, year)) {
+          if (isAslSession(video)) allowedExcludedLocalCodes.add(video.eventContentId);
           continue;
         }
         cdnCodes.add(video.eventContentId);
@@ -97,13 +109,13 @@ describe('articles-no-404', () => {
 
       const orphans = [];
       for (const code of localCodes) {
-        if (!cdnCodes.has(code) && !skippedCodes.has(code)) {
+        if (!cdnCodes.has(code) && !allowedExcludedLocalCodes.has(code)) {
           orphans.push(code);
         }
       }
 
       if (isActive) {
-        it('every non-ASL session has a local article', () => {
+        it('every generated session has a local article', () => {
           const msg = missing.length > 0
             ? `Missing ${missing.length} local article(s) for ${yearShort}:\n` +
               missing.map(m => `  - ${m.code}: ${m.title} [${m.topic}]`).join('\n')

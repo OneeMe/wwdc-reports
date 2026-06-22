@@ -1,0 +1,331 @@
+---
+title: "Update Live Activities with push notifications"
+description: "Discover how you can remotely update Live Activities in your app when you push content through Apple Push Notification service (APNs). We'll show you how to configure your first Live Activity push locally so you can quickly iterate on your implementation."
+date: "2023-06-06"
+tags: ["ActivityKit", "Push Notifications", "APNs", "Live Activities"]
+thumbnail: "/images/sessions/2023/10185.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10185/"
+sessionId: "wwdc2023-10185"
+year: "2023"
+relatedSessions:
+  - title: "Meet ActivityKit"
+    code: "10184"
+    description: "Live アクティビティの基本を始める"
+  - title: "Bring widgets to life"
+    code: "277"
+    description: "WidgetKit のインタラクティブ性"
+  - title: "Sending notification requests to APNs"
+    code: "226"
+    description: "APN プッシュ通知"
+---
+## ハイライト
+
+> Apple プッシュ通知サービスが追加されました`liveactivity`プッシュ タイプでは、アプリをフォアグラウンドで実行する必要がなく、サーバーがライブ アクティビティに更新を直接送信できるため、バッテリーへの影響が大幅に軽減されます。
+
+## 主な内容
+
+ローカル更新ライブ アクティビティには制限があります。データを更新するにはアプリをバックグラウンドで実行する必要があります。マルチユーザー ステータスのリアルタイム同期が必要なシナリオ (チーム ゲーム、複数人による配信など) の場合、これはアプリが頻繁に起動されるか、データが同期していないことを意味します。
+
+アップデートをリモートでプッシュすると、この問題が解決されます。サーバーは、APN を通じてコン​​テンツの更新をデバイスのライブ アクティビティに直接送信し、ウィジェット拡張機能が起動されて新しい UI がレンダリングされます。プロセス全体にメイン アプリの参加は必要ありません。
+
+実装パスは 3 つのステップに分かれています。アプリがライブ アクティビティを開始すると、プッシュ トークンを取得してサーバーに報告します。サーバーは APN を構築し、ステータスが変化したときに更新の送信を要求します。デバイスはプッシュを受信した後、ライブ アクティビティ UI を自動的に更新します。
+
+プッシュ更新は 2 つの優先順位をサポートします。低優先順位 (5) は数量制限がなく、緊急でない更新に適しています。高優先度 (10) は、システム予算に制限があるため、すぐに配信する必要がある更新プログラムに適しています。また、アラート オブジェクトを追加して Apple Watch で通知をトリガーし、ローカライズされた文字列やカスタム サウンドをサポートすることもできます。
+
+＃＃詳細
+
+### プッシュ更新を有効にする
+
+([03:53](https://developer.apple.com/videos/play/wwdc2023/10185/?time=233)) まず、Xcode の署名と機能にプッシュ通知機能を追加し、それからコードに設定します。`pushType`：
+
+```swift
+func startActivity(hero: EmojiRanger) throws {
+    let adventure = AdventureAttributes(hero: hero)
+    let initialState = AdventureAttributes.ContentState(
+        currentHealthLevel: hero.healthLevel,
+        eventDescription: "Adventure has begun!"
+    )
+
+    let activity = try Activity.request(
+        attributes: adventure,
+        content: .init(state: initialState, staleDate: nil),
+        pushType: .token  // 启用推送更新
+    )
+
+    Task {
+        for await pushToken in activity.pushTokenUpdates {
+            let pushTokenString = pushToken.reduce("") {
+                $0 + String(format: "%02x", $1)
+            }
+            Logger().log("New push token: \(pushTokenString)")
+            try await self.sendPushToken(hero: hero, pushTokenString: pushTokenString)
+        }
+    }
+}
+```
+
+キーポイント:
+- `pushType: .token`このライブ アクティビティのプッシュ トークンを申請するように ActivityKit に指示します。
+- アクセスを同期しない`activity.pushToken`、最初に作成されたときは nil である可能性が高くなります。
+- 使用`pushTokenUpdates`非同期シーケンスはトークンの変更を監視します
+- トークンはライフサイクル中に更新される可能性があります。新しいトークンが到着したら、古いトークンを破棄するようにサーバーに通知する必要があります。
+- システムは、トークンの更新を処理するためにアプリのフォアグラウンド実行時間を与えます。
+
+### APN はペイロードをプッシュします
+
+([06:54](https://developer.apple.com/videos/play/wwdc2023/10185/?time=414)) ライブ アクティビティのプッシュ ペイロード形式を更新します。
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "content-state": {
+            "currentHealthLevel": 0.941,
+            "eventDescription": "Power Panda found a sword!"
+        }
+    }
+}
+```
+
+キーポイント:
+- `timestamp`: Unix タイムスタンプ。システムはそれを使用して最新のコンテンツを判断します。
+-`event`：`update`または`end`
+- `content-state`: JSON オブジェクト。デコードできる必要があります。`ContentState`タイプ
+- デフォルトを使用する`JSONDecoder`デコード。カスタム デコード戦略を使用しないでください。
+
+### コンテンツ状態 JSON を生成する
+
+([07:37](https://developer.apple.com/videos/play/wwdc2023/10185/?time=457)) アプリで使用`JSONEncoder`正しい形式を生成します。
+
+```swift
+let contentState = AdventureAttributes.ContentState(
+    currentHealthLevel: 0.941,
+    eventDescription: "Power Panda found a sword!"
+)
+
+let encoder = JSONEncoder()
+encoder.outputFormatting = .prettyPrinted
+
+let json = try! encoder.encode(contentState)
+Logger().log("\(String(data: json, encoding: .utf8)!)")
+```
+
+キーポイント:
+- 出力はキャメルケースのキー名です
+- サーバーによって送信された JSON キー名は一致する必要があります`ContentState`プロパティ名は一貫しています
+- カスタムのエンコード戦略を使用しないでください。
+
+###カールを使用してプッシュをテストする
+
+([09:18](https://developer.apple.com/videos/play/wwdc2023/10185/?time=558)) 開発段階では、テスト プッシュを端末から直接送信できます。
+
+```bash
+curl \
+  --header "apns-topic: com.example.app.push-type.liveactivity" \
+  --header "apns-push-type: liveactivity" \
+  --header "apns-priority: 10" \
+  --header "authorization: bearer $AUTHENTICATION_TOKEN" \
+  --data '{
+      "aps": {
+          "timestamp": '$(date +%s)',
+          "event": "update",
+          "content-state": {
+              "currentHealthLevel": 0.941,
+              "eventDescription": "Power Panda found a sword!"
+          }
+      }
+  }' \
+  --http2 https://api.sandbox.push.apple.com/3/device/$ACTIVITY_PUSH_TOKEN
+```
+
+キーポイント:
+- `apns-topic`：app bundle ID + `.push-type.liveactivity`
+- `apns-push-type`： でなければなりません`liveactivity`
+- `apns-priority`：`5`(低い) または`10`（高い）
+-`authorization`：JWTベアラートークン
+- URL は HTTP/2 を使用する必要があります
+- 使用する`date +%s`現在のタイムスタンプを自動的に生成する
+
+### アラート付きプッシュ
+
+([14:21](https://developer.apple.com/videos/play/wwdc2023/10185/?time=861)) 重要なアップデートによりアラートがトリガーされる場合があります。
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "content-state": {
+            "currentHealthLevel": 0.0,
+            "eventDescription": "Power Panda has been knocked down!"
+        },
+        "alert": {
+            "title": "Power Panda is knocked down!",
+            "body": "Use a potion to heal Power Panda!",
+            "sound": "default"
+        }
+    }
+}
+```
+
+キーポイント:
+- アラートは Apple Watch に通知として表示されます
+・iPhone/iPadでは音声のみが再生され、ポップアップは表示されません。
+- タイトルと本文は Apple Watch でのみ使用されます
+
+### ローカリゼーションアラート
+
+([14:56](https://developer.apple.com/videos/play/wwdc2023/10185/?time=896)) 複数の言語をサポート:
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "content-state": {
+            "currentHealthLevel": 0.0,
+            "eventDescription": "Power Panda has been knocked down!"
+        },
+        "alert": {
+            "title": {
+                "loc-key": "%@ is knocked down!",
+                "loc-args": ["Power Panda"]
+            },
+            "body": {
+                "loc-key": "Use a potion to heal %@!",
+                "loc-args": ["Power Panda"]
+            },
+            "sound": "HeroDown.mp4"
+        }
+    }
+}
+```
+
+キーポイント:
+- `loc-key`アプリのローカリゼーション ファイルのキーに対応します
+-`loc-args`ローカライズされた文字列に挿入されるパラメータです
+- デバイスはユーザーのロケールに基づいて言語を自動的に選択します
+-`sound`カスタムオーディオファイル名を使用できます
+
+### ライブアクティビティの終了
+
+([15:52](https://developer.apple.com/videos/play/wwdc2023/10185/?time=952)) プッシュ経由でアクティビティを終了します。
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "end",
+        "dismissal-date": 1685959200,
+        "content-state": {
+            "currentHealthLevel": 0.23,
+            "eventDescription": "Adventure over! Power Panda is taking a nap."
+        }
+    }
+}
+```
+
+キーポイント:
+- `event: "end"`アクティビティの終了を示します
+-`dismissal-date`ロック画面から削除するタイミングを指定します (Unix タイムスタンプ)
+- 省略`dismissal-date`システムに決めてもらう
+- 最終的なコンテンツ状態を渡して、ユーザーに概要を提供できます
+
+### 古い日付と有効期限の UI
+
+([16:44](https://developer.apple.com/videos/play/wwdc2023/10185/?time=1004)) コンテンツの有効期限が切れたときにマークを付ける:
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "stale-date": 1685959200,
+        "content-state": {
+            "currentHealthLevel": 0.79,
+            "eventDescription": "Egghead is in the woods and lost connection."
+        }
+    }
+}
+```
+
+SwiftUI での期限切れステータスへの応答:
+
+```swift
+ActivityConfiguration(for: AdventureAttributes.self) { context in
+    AdventureLiveActivityView(
+        hero: context.attributes.hero,
+        isStale: context.isStale,  // 过期时变为 true
+        contentState: context.state
+    )
+    .activityBackgroundTint(Color.gameWidgetBackground)
+}
+```
+
+キーポイント:
+- `stale-date`到着後`context.isStale`なる`true`- UI は有効期限のプロンプトを表示する必要があります (グレー表示にしたり、「有効期限が切れた可能性がある」ラベルを追加したりするなど)。
+
+### Relevance Score
+
+([17:19](https://developer.apple.com/videos/play/wwdc2023/10185/?time=1039)) 複数のライブ アクティビティの順序を制御します。
+
+```json
+{
+    "aps": {
+        "timestamp": 1685952000,
+        "event": "update",
+        "relevance-score": 100,
+        "content-state": {
+            "currentHealthLevel": 0.941,
+            "eventDescription": "Power Panda found a sword!"
+        }
+    }
+}
+```
+
+キーポイント:
+- スコアが高いほど、ロック画面のランキングが高くなります
+- 最高スコアのアクティビティがスマート アイランドを占有します
+- プッシュ時にスコアを動的に調整できます
+
+### 優先順位と予算をプッシュする
+
+([11:18](https://developer.apple.com/videos/play/wwdc2023/10185/?time=678)) 2 つの優先事項:
+
+|優先順位 |値 |特徴 |
+|------|-----|------|
+|低い | 5 |日和見配送、節電、数量制限なし |
+|高 | 10 |即時配信。システム予算の制約があるため、緊急の更新に適しています。
+
+ほとんどの更新は優先度が低いはずです。高優先度は、ヒーローがダウンしたりゲームが終了したりするなど、すぐに対処する必要があるイベントに適しています。
+
+アプリで優先度の高い更新が頻繁に必要な場合は、Info.plist に追加できます。`NSSupportsLiveActivitiesFrequentUpdates`より高い更新予算を取得するには、YES に設定します。ユーザーは設定でこの機能をオフにすることができます。`ActivityAuthorizationInfo.frequentPushesEnabled`検出ステータス。
+
+## 重要なポイント
+
+**1.マルチプレイヤーのリアルタイム ゲーム ステータスの同期**
+- **やるべきこと**: チーム ゲームでは、各チーム メンバーのライブ アクティビティにチーム全体のステータスとイベントがリアルタイムで表示されます。
+- **実行する価値がある理由**: サーバーはステータスを計算してプッシュします。各クライアントが頻繁にポーリングしたり、接続を維持したりする必要はありません。
+- **開始方法**: イベントが発生すると、ゲーム サーバーは次の方法で APN ペイロードを構築します。`liveactivity`各チームメンバーに送信されるプッシュ型トークン
+
+**2.持ち帰り/物流のリアルタイム追跡**
+- **何をすべきか**: 配送状況が変化したとき (集荷、出発、到着)、ユーザーのロック画面上のライブ アクティビティを自動的に更新します。
+- **実行する価値がある理由**: ライダーが位置を報告すると、サーバーは到着予定時刻を計算し、ユーザーにプッシュします。ユーザーはプロセス全体を通じてアプリを開く必要はありません。
+- **開始方法**: Rider GPS レポート → サーバー計算 → APN プッシュ`content-state`ETAと距離を更新する
+
+**3.試合/スコアライブプッシュ**
+- **やるべきこと**: フォローしている試合でゴール、レッドカード、イエローカードなどが発生すると、ライブアクティビティがすぐに更新され、通知音が鳴ります。
+- **価値がある理由**: 従来のプッシュ通知よりも没入感があり、ユーザーはフルスコアとイベントのタイムラインを一目で確認できます。
+- **開始方法**: イベント データ サプライヤーのプッシュ イベント → サーバー構造アラート ペイロード → APN の高優先度プッシュ
+
+**4.フライト/列車の動態情報**
+- **内容**: ゲートの変更、遅延、搭乗開始、その他の重要な情報は、プッシュ ライブ アクティビティを通じてリアルタイムで更新されます。
+- **価値がある理由**: 旅行者は空港の画面を繰り返しチェックしたり、アプリを開いたりする必要がなく、ロック画面には常に最新の情報が表示されます。
+- **開始方法**: フライト データ API に接続し、ステータスが変化したときに更新をプッシュし、遅延がある場合は関連性スコアを上げて上位にランク付けします。
+
+## 関連セッション
+
+- [Meet ActivityKit](/articles/wwdc2023-10184) — ライブ アクティビティの基本実装
+- [ウィジェットに命を吹き込む](/articles/wwdc2023-277) — WidgetKit のインタラクティブ性
+- [APN への通知リクエストの送信](/articles/wwdc2023-226) — APN プッシュ通知の基本

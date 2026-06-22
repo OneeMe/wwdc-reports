@@ -1,0 +1,421 @@
+---
+title: "Eliminate data races using Swift Concurrency"
+description: "join us as we explore one of the core concepts in swift concurrency: isolation of tasks and actors. we'll take you through swift's approach to eliminating data races and its effect on app architecture. we'll also discuss the importance of atomicity in your code, share the nuances of sendable checking to maintain isolation, and revisit assumptions about ordering work in a concurrent system."
+date: "2022-06-07"
+tags: ["Swift", "Concurrency", "Essentials"]
+thumbnail: "/images/sessions/2022/110351.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110351/"
+sessionId: "wwdc2022-110351"
+year: "2022"
+relatedSessions:
+  - title: "Visualize and optimize Swift concurrency"
+    code: "110350"
+    description: "learn how you can optimize your app with the swift concurrency template in instruments."
+  - title: "Swift concurrency: Behind the scenes"
+    code: "10254"
+    description: "dive deep into the swift concurrency runtime and learn how async/await and actors work under the hood."
+  - title: "Meet async/await in Swift"
+    code: "10132"
+    description: "learn how to use async/await to write asynchronous code that is easier to read and maintain."
+---
+## Highlight
+
+> Swift Concurrency eliminates data competition through three mechanisms: Task isolation, Sendable protocol, and Actor. Doug uses the "ship at sea" analogy to explain the difference between value types and reference types in concurrency, demonstrates how the compiler checks Sendable compliance at Task boundaries and Actor boundaries, and discusses advanced topics such as atomicity, main thread isolation, and strict concurrency checking modes.
+
+## Core Content
+
+Swift 5.5 introduces async/await, Tasks, and Actors to make concurrent code easier to write. This session explains at a high level how these mechanisms work together to eliminate data races and their impact on app architecture. ([00:10](https://developer.apple.com/videos/play/wwdc2022/110351/?time=10))
+
+Doug used an analogy throughout the whole scene: Task is a ship on the sea, each sailing independently; Actor is an island on the sea, with its own status, and can only receive one ship at a time; Sendable is a customs inspection to ensure that things passed between ships and between ships and islands are safe. ([01:17](https://developer.apple.com/videos/play/wwdc2022/110351/?time=77))
+
+Value types (struct, enum) are naturally suitable for concurrent sharing, because they are copied during transfer, and each has an independent copy of data. The reference type (class) transfers a reference. If multiple tasks modify the same data at the same time, data competition will occur. Swift uses the Sendable protocol to mark which types can be safely passed across isolated domains: value types automatically conform to Sendable (as long as the members are all Sendable), and reference types can only conform if they are immutable or do their own synchronization. ([02:31](https://developer.apple.com/videos/play/wwdc2022/110351/?time=151))
+
+Actors are a safe way to share mutable state. All properties and methods of Actor are isolated inside Actor by default, and external access must go through`await`. Only one Task can execute on an Actor at a time, which eliminates data races. Actor itself implicitly conforms to Sendable, because referencing an Actor only gets a "map", and actual access to the state requires passing isolation checks. ([10:28](https://developer.apple.com/videos/play/wwdc2022/110351/?time=628))
+
+The main thread corresponds to the Main Actor, and all UI operations must be performed on it. Main Actor is also an Actor, so it can only perform one task at a time. If it is occupied for a long time, the UI will freeze. The correct architecture is to put the view and controller in the Main Actor, and separate the business logic into other Actors or ordinary Tasks. ([16:04](https://developer.apple.com/videos/play/wwdc2022/110351/?time=964))
+
+Atomicity is another key topic. Actor guarantees that only one task is executed at the same time, but`await`Is the suspension point, during which the Actor can perform other tasks. If between two`await`State assumptions are made between them, and high-level data races may occur (inconsistent states but no data corruption). The solution is to write operations that require atomicity as synchronized methods within the Actor. ([19:08](https://developer.apple.com/videos/play/wwdc2022/110351/?time=1148))
+
+Swift 5.7 introduces strict concurrency checking mode, which is divided into three levels: Minimal (only checks where Sendable is explicitly marked), Targeted (checks code that has adopted concurrency features), and Complete (checks all code, close to Swift 6 semantics). It is recommended to enable it gradually, using`@preconcurrency import`Temporarily suppress warnings for external modules. ([24:36](https://developer.apple.com/videos/play/wwdc2022/110351/?time=1476))
+
+## Detailed Content
+
+### Task isolation and Sendable protocol
+
+([01:17](https://developer.apple.com/videos/play/wwdc2022/110351/?time=77)) Task is the basic unit of work in concurrency. Each Task has its own resources and executes independently. But tasks need to communicate with each other, which involves data sharing.
+
+Value types are copied when passed:
+
+```swift
+enum Ripeness {
+    case hard
+    case perfect
+    case mushy(daysPast: Int)
+}
+
+struct Pineapple {
+    var weight: Double
+    var ripeness: Ripeness
+    
+    mutating func ripen() async { ... }
+    mutating func slice() -> Int { ... }
+}
+```
+
+Key points:
+- `Pineapple`is a struct, copied when passed
+- Each Task gets its own copy, and modifications do not affect each other.
+- Swift compiler automatically infers`Pineapple: Sendable`, since all members are Sendable
+
+Reference types pass references:
+
+```swift
+final class Chicken {
+    let name: String
+    var currentHunger: HungerLevel
+    
+    func feed() { ... }
+    func play() { ... }
+    func produce() -> Egg { ... }
+}
+```
+
+Key points:
+- `Chicken`Is a class, copy the reference when passing
+- Two Tasks refer to the same object, and simultaneous modification will cause data competition.
+-`Chicken`Cannot conform to Sendable because it has mutable state
+
+The Sendable protocol is used to mark types that can be passed safely across isolated domains:
+
+```swift
+protocol Sendable { }
+
+struct Pineapple: Sendable { ... } // Conforms automatically
+class Chicken: Sendable { } // Compiler error: unsynchronized reference type
+```
+
+The compiler checks Sendable at Task boundaries:
+
+```swift
+// Compiler error: Chicken is not Sendable
+let petAdoption = Task {
+    let chickens = await hatchNewFlock()
+    return chickens.randomElement()!
+}
+let pet = await petAdoption.value
+```
+
+Key points:
+- `Task`Generic parameters of`Success: Sendable`The return value must be Sendable
+- This constraint comes from the definition of Task:`struct Task<Success: Sendable, Failure: Error>`- Sendable constraints should also be used on your generic parameters if values ​​will be passed across isolated domains
+
+Sendables of collection types propagate via conditional consistency:
+
+```swift
+// Conforms to Sendable: all members are Sendable
+struct Crate: Sendable {
+    var pineapples: [Pineapple]
+}
+
+// Compiler error: Chicken is not Sendable
+struct Coop: Sendable {
+    var flock: [Chicken]
+}
+```
+
+For a class to be Sendable it needs to meet strict conditions:
+
+```swift
+// Compiler error: currentHunger is mutable
+final class Chicken: Sendable {
+    let name: String
+    var currentHunger: HungerLevel
+}
+
+// A final class with only immutable members can conform to Sendable
+final class Egg: Sendable {
+    let color: EggColor
+    let weight: Double
+}
+```
+
+For reference types that do their own internal synchronization, you can use`@unchecked Sendable`, but be careful:
+
+```swift
+class ConcurrentCache<Key: Hashable & Sendable, Value: Sendable>: @unchecked Sendable {
+    var lock: NSLock
+    var storage: [Key: Value]
+}
+```
+
+Key points:
+- `@unchecked Sendable`Disable compiler checks
+- Only used if correct synchronization is actually done
+- Abuse can break Swift's data race safety guarantees
+
+The closure on Task creation also has a Sendable check:
+
+```swift
+let lily = Chicken(name: "Lily")
+Task.detached { @Sendable in
+    lily.feed() // Compiler error: captures non-Sendable lily
+}
+```
+
+Key points:
+- `@Sendable`Closures require that all captured values are Sendable
+-`Task.detached`The operation parameter type is`@Sendable`closure
+- This ensures that the new Task does not introduce data races
+
+### Actor isolation and state protection
+
+([10:28](https://developer.apple.com/videos/play/wwdc2022/110351/?time=628)) Actors provide a way to safely share mutable state:
+
+```swift
+actor Island {
+    var flock: [Chicken]
+    var food: [Pineapple]
+
+    func advanceTime()
+}
+```
+
+Key points:
+- Actor's instance properties and instance methods are isolated on the Actor by default
+- External access must be through`await`, which is a potential hanging point
+- Only one Task can be executed on the Actor at the same time
+- Actor implicitly conforms to Sendable
+
+Call the Actor method:
+
+```swift
+func nextRound(islands: [Island]) async {
+    for island in islands {
+        await island.advanceTime()
+    }
+}
+```
+
+Key points:
+- each`await island.advanceTime()`It's all a "landing on the island"
+- All states of the Actor can be accessed while on the island
+- After leaving the island (await ends), other tasks can land on the island
+
+Non-Sendable data cannot be shared between Tasks and Actors:
+
+```swift
+// Both are compiler errors
+await myIsland.addToFlock(myChicken) // Passes a non-Sendable chicken to the Actor
+myChicken = await myIsland.adoptPet() // Retrieves a non-Sendable chicken from the Actor
+```
+
+Actor isolated code scope:
+
+```swift
+actor Island {
+    var flock: [Chicken]
+    var food: [Pineapple]
+
+    func advanceTime() {
+        // The closure is not marked @Sendable, so it inherits Actor isolation
+        let totalSlices = food.indices.reduce(0) { (total, nextIndex) in
+            total + food[nextIndex].slice()
+        }
+
+        // Task inherits the Actor isolation from where it is created
+        Task {
+            flock.map(Chicken.produce)
+        }
+
+        // Task.detached does not inherit Actor isolation
+        Task.detached {
+            let ripePineapples = await food.filter { $0.ripeness == .perfect }
+            print("There are \(ripePineapples.count) ripe pineapples on the island")
+        }
+    }
+}
+```
+
+Key points:
+- Not`@Sendable`Closures inherit Actor isolation within Actor methods
+-`Task {}`Inherit the Actor isolation context on creation
+-`Task.detached {}`Is completely independent and does not inherit any Actor isolation
+
+use`nonisolated`Explicitly break out of Actor isolation:
+
+```swift
+extension Island {
+    nonisolated func meetTheFlock() async {
+        let flockNames = await flock.map { $0.name }
+        print("Meet our fabulous flock: \(flockNames)")
+    }
+}
+```
+
+Key points:
+- `nonisolated`Let the method execute outside the Actor
+- Access to Actor state still requires`await`- Suitable for auxiliary methods that do not require frequent access to Actor state
+
+### Main Actor and App Architecture
+
+([16:04](https://developer.apple.com/videos/play/wwdc2022/110351/?time=964)) The Main Actor represents the main thread on which all UI operations must be performed:
+
+```swift
+@MainActor func updateView() { ... }
+
+Task { @MainActor in
+    view.selectedChicken = lily
+}
+
+nonisolated func computeAndUpdate() async {
+    computeNewValues()
+    await updateView()
+}
+```
+
+Key points:
+- `@MainActor`Can mark functions, closures or types
+- Required when calling from a non-Main Actor context`await`- Using the Main Actor for a long time will cause the UI to freeze.
+
+Main Actors can also mark entire types:
+
+```swift
+@MainActor
+class ChickenValley: Sendable {
+    var flock: [Chicken]
+    var food: [Pineapple]
+
+    func advanceTime() {
+        for chicken in flock {
+            chicken.eat(from: &food)
+        }
+    }
+}
+```
+
+Key points:
+- All properties and methods of the type are isolated to the Main Actor by default
+- Main Actor type references are Sendable because the data is isolated
+- Suitable for views, view controllers, etc. that must run on the main thread
+
+Impact on App architecture:
+- Views and view controllers on the Main Actor
+- Separate business logic to other Actors or ordinary Tasks
+- Task shuttles between Main Actor and other Actors on demand
+
+### Atomicity and high-level data races
+
+([19:08](https://developer.apple.com/videos/play/wwdc2022/110351/?time=1148)) Actors eliminate low-level data races (data corruption), but high-level data races (inconsistent state) may still occur:
+
+```swift
+// Problematic: state can change between the two awaits
+func deposit(pineapples: [Pineapple], onto island: Island) async {
+    var food = await island.food // await 1: get a copy
+    food += pineapples // Modify it locally
+    await island.food = food // await 2: write it back, but it may have changed in the meantime
+}
+```
+
+Key points:
+- two`await`Actors can perform other tasks in between
+- If other tasks are modified`food`, the final assignment will overwrite those modifications
+- This is a high-level data race: no data corruption, but logic errors
+
+Correct approach: write the operation as a synchronization method in the Actor:
+
+```swift
+extension Island {
+    func deposit(pineapples: [Pineapple]) {
+        var food = self.food
+        food += pineapples
+        self.food = food
+    }
+}
+```
+
+Key points:
+- Synchronous methods are executed indivisibly on the Actor
+- No`await`, no other tasks will be inserted
+- When designing Actors, make operations that require atomicity into synchronized methods
+
+### Strict concurrency check mode
+
+([24:36](https://developer.apple.com/videos/play/wwdc2022/110351/?time=1476)) Swift 5.7 introduces three levels of strict concurrency checking:
+
+**Minimal (default):**
+- Only check where Sendable is explicitly marked
+- Similar behavior to Swift 5.5/5.6
+
+```swift
+import FarmAnimals
+struct Coop: Sendable {
+    var flock: [Chicken] // Warning: Chicken is not Sendable
+}
+```
+
+**Targeted：**
+- Check code that has adopted concurrency features (async/await, Task, Actor)
+- Remain compatible with code that does not use concurrency
+
+```swift
+@preconcurrency import FarmAnimals
+
+func visit(coop: Coop) async {
+    guard let favorite = coop.flock.randomElement() else {
+        return
+    }
+    Task {
+        favorite.play()
+    }
+}
+```
+
+Key points:
+- `@preconcurrency import`Temporarily suppress Sendable warnings for external modules
+- When external modules are updated, the compiler will recheck
+- Suitable for gradual migration scenarios
+
+**Complete:**
+- Check all code in the module
+- Close to the expected semantics of Swift 6
+
+```swift
+import FarmAnimals
+
+func doWork(_ body: @Sendable @escaping () -> Void) {
+    DispatchQueue.global().async {
+        body()
+    }
+}
+
+func visit(friend: Chicken) {
+    doWork {
+        friend.play() // Warning: captures non-Sendable Chicken
+    }
+}
+```
+
+Key points:
+- Complete mode finds all potential data races
+- It is recommended to enable it gradually: Targeted first, then Complete
+- use`@preconcurrency`Handle dependent modules that have not been updated yet
+
+## Core Takeaways
+
+- **What to do**: Review the class in the project and change the mutable state to struct or Actor.  
+  **Why it’s worth doing**: Doug used the comparison of Pineapple (struct) and Chicken (class) to illustrate that value types are naturally suitable for concurrency because they are copied when passed. Shared references to classes are the source of data races. The Swift compiler automatically infers Sendable for struct/enum, but strict conditions are required for class.  
+  **How ​​to start**: Loop through the data models in your project and ask yourself "Does this type really need reference semantics?" If not, change it to a struct. If you need to share mutable state, change it to Actor.
+
+- **What**: Enable Targeted strict concurrency checking, fix Sendable warnings.  
+  **Why it’s worth doing**: Swift 5.7’s Targeted mode only checks code that already adopts concurrency features and won’t break existing code. Fixing these warnings eliminates most potential data races. Doug recommends gradually moving towards Complete checks to prepare for Swift 6.  
+  **How ​​to start**: Change "Strict Concurrency Checking" to Targeted in Build Settings, compile the project, and fix Sendable related warnings one by one. For use with external modules`@preconcurrency import`Temporarily suppressed.
+
+- **What to do**: Check the asynchronous methods in the Actor and change operations that require atomicity to synchronous methods.  
+  **Why it’s worth doing**: Doug’s deposit example, two`await`Actor status may change between. Encapsulating multi-step operations into synchronized methods within Actors can ensure atomicity.  
+  **How ​​to start**: Examine the public methods of all Actors to find out if there are multiple`await`method. Ask yourself "If other tasks are inserted between these two awaits, will the state still be correct?" If you are not sure, change the logic to a synchronous method.
+
+## Related Sessions
+
+- [Visualize and optimize Swift concurrency](/articles/wwdc2022-110350) — learn how you can optimize your app with the swift concurrency template in instruments.
+- [Swift concurrency: Behind the scenes](/articles/wwdc2022-10254) — dive deep into the swift concurrency runtime and learn how async/await and actors work under the hood.
+- [Meet async/await in Swift](/articles/wwdc2022-10132) — learn how to use async/await to write asynchronous code that is easier to read and maintain.

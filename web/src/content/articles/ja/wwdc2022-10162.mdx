@@ -1,0 +1,210 @@
+---
+title: "Transform your geometry with Metal mesh shaders"
+description: "Meet Metal mesh shaders — a modern and flexible pipeline in Metal for GPU-driven geometry creation and processing. We'll explore how this API can improve and add flexibility to your render pipeline, and share some of the opportunities that GPU-driven work can create. Discover how you can create procedural geometry — like hair rendering — on the GPU using mesh shaders, and build single render passes without additional compute passes or intermediate buffers. We'll also show you how to improve scene processing and rendering through GPU-driven meshlet culling."
+date: "2022-06-07"
+tags: ["Metal", "GPU", "Graphics", "Mesh Shaders"]
+thumbnail: "/images/sessions/2022/10162.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10162/"
+sessionId: "wwdc2022-10162"
+year: "2022"
+relatedSessions:
+  - title: "Discover Metal 3"
+    code: "10007"
+    description: "Metal 3 の新機能の概要"
+  - title: "Scale compute workloads across Apple GPUs"
+    code: "10159"
+    description: "Apple GPU 全体でコンピューティング ワークロードをスケーリングする"
+  - title: "Program Metal in C++ with metal-cpp"
+    code: "10160"
+    description: "C++ で Metal コードを書く"
+---
+## ハイライト
+
+> メタル メッシュ シェーダーは、従来の頂点シェーダーをプログラム可能なオブジェクト シェーダーとメッシュ シェーダーの 2 つのステージに置き換えることで、追加のコンピューティング チャネルや中間バッファーを使用せずに、ジオメトリを GPU 上で直接生成し、ラスタライゼーション パイプラインに直接送信できるようにし、プロシージャル ヘア レンダリングや GPU 駆動のメッシュレット カリングなどのシナリオをサポートします。
+
+## 主要内容
+
+従来のレンダリング パイプラインの頂点シェーダー ステージには基本的な制限があります。つまり、頂点ごとにデバイス メモリに既に存在するジオメトリ データしか処理できません。 GPU 上でプロシージャル ジオメトリ (モデルに髪を追加するなど) を生成する場合、従来のアプローチでは 2 つの手順が必要です。まず、コンピューティング カーネルを使用してジオメトリ データを生成し、メモリに書き込みます。次に、レンダリング チャネルを使用してデータを読み取って描画します。これにより、追加のメモリ割り当て、同期障壁、およびコードの複雑さが生じます。
+
+([01:19](https://developer.apple.com/videos/play/wwdc2022/10162/?time=79)) メッシュ シェーダーは、頂点シェーダーを 2 つの新しいプログラム可能なステージ、オブジェクト シェーダーとメッシュ シェーダーに置き換えます。オブジェクト シェーダーは入力データを受け取り、ペイロードを処理してメッシュ シェーダーに出力します。メッシュ シェーダーはペイロード データを使用して手続き型ジオメトリを生成し、それがラスタライザーとフラグメント シェーダーに直接供給されます。プロセス全体を通じて、ジオメトリック データは描画呼び出し内にのみ存在し、デバイス メモリを割り当てる必要はありません。
+
+([04:22](https://developer.apple.com/videos/play/wwdc2022/10162/?time=262)) オブジェクト シェーダーとメッシュ シェーダーは、計算カーネルと同様に起動され、スレッドグループ グリッドでディスパッチされます。各スレッド グループ内のスレッドは相互に通信できます。各オブジェクト スレッド グループは、メッシュ グリッドを動的に生成し、グリッドのサイズをプログラムで制御できます。
+
+メッシュ描画コールと従来の描画コールは同じタイプのレンダー コマンド エンコーダを使用し、同じレンダー パス内で混合できます。
+
+## 詳細
+
+### プロシージャル ヘア レンダリング
+
+([05:20](https://developer.apple.com/videos/play/wwdc2022/10162/?time=320)) 例として、平面上でのヘアのレンダリングを考えます。入力ジオメトリはタイルに分割され、各タイルはオブジェクト スレッド グループに対応します。オブジェクト スレッド グループは、タイルが生成する必要があるヘアの数と各ヘアのカーブ コントロール ポイントを計算し、それらをペイロードとして出力します。次に、オブジェクト スレッド グループがメッシュを開始し、各メッシュ スレッド グループが 1 つのヘアを生成します。
+
+**Object Shader（MSL）**：
+
+```metal
+[[object]]
+void objectShader(object_data CurvePayload *payloadOutput [[payload]],
+                  const device void *inputData [[buffer(0)]],
+                  uint hairID [[thread_index_in_threadgroup]],
+                  uint triangleID [[threadgroup_position_in_grid]],
+                  mesh_grid_properties mgp)
+{
+    if (hairID < kHairsPerBlock)
+        payloadOutput[hairID] = generateCurveData(inputData, hairID, triangleID);
+    if (hairID == 0)
+        mgp.set_threadgroups_per_grid(uint3(kHairPerBlockX, kHairPerBlockY, 1));
+}
+```
+
+キーポイント:
+- `[[object]]`プロパティ マーカー これはオブジェクト シェーダです
+- `object_data`アドレス空間と`[[payload]]`属性定義ペイロードの出力
+- `mesh_grid_properties`メッシュ グリッド サイズをプログラムで設定するために使用されるパラメータ
+- 競合を避けるために、スレッド インデックス 0 のスレッドのみがグリッド サイズを設定します
+
+**オブジェクトの初期化フェーズ**:
+
+```swift
+let meshPipelineDescriptor = MTLMeshRenderPipelineDescriptor()
+meshPipelineDescriptor.objectFunction = objectFunction
+meshPipelineDescriptor.payloadMemoryLength = payloadLength
+meshPipelineDescriptor.maxTotalThreadsPerObjectThreadgroup = hairsPerBlock
+```
+
+キーポイント:
+- 使用`MTLMeshRenderPipelineDescriptor`伝統的なものに代わるもの`MTLRenderPipelineDescriptor`
+- `payloadMemoryLength`ペイロードサイズを指定します。上限は16KBです
+- 各オブジェクト スレッド グループは最大 1024 のメッシュ スレッド グループを生成できます
+
+**メタル メッシュ タイプを定義**:
+
+```metal
+struct VertexData    { float4 position [[position]]; };
+struct PrimitiveData { float4 color; };
+
+using triangle_mesh_t = metal::mesh<
+    VertexData,               // 顶点类型
+    PrimitiveData,            // 图元类型
+    10,                       // 最大顶点数
+    6,                        // 最大图元数
+    metal::topology::triangle // 拓扑类型
+>;
+
+[[mesh]]
+void myMeshShader(triangle_mesh_t outputMesh, ...);
+```
+
+キーポイント:
+- `metal::mesh`これは、頂点データ タイプ、プリミティブ データ タイプ、頂点の最大数、プリミティブの最大数、およびトポロジ タイプを定義する Metal の組み込みタイプです。
+- トポロジ タイプは点、線、三角形をサポートします
+- メッシュ シェーダーの頂点の最大数は 256、プリミティブの最大数は 512 です。
+- 全体`metal::mesh`サイズは16KBを超えることはできません
+
+**Mesh Shader（MSL）**：
+
+```metal
+[[mesh]] void myMeshShader(triangle_mesh_t outputMesh,
+                           uint tid [[thread_index_in_threadgroup]])
+{
+    if (tid < kVertexCount)
+        outputMesh.set_vertex(tid, calculateVertex(tid));
+
+    if (tid < kIndexCount)
+        outputMesh.set_index(tid, calculateIndex(tid));
+
+    if (tid < kPrimitiveCount)
+        outputMesh.set_primitive(tid, calculatePrimitive(tid));
+
+    if (tid == 0)
+        outputMesh.set_primitive_count(kPrimitiveCount);
+}
+```
+
+キーポイント:
+- `[[mesh]]`プロパティタグ これはメッシュシェーダです
+- スレッド グループ内のスレッドが連携して頂点、インデックス、メタデータをエンコードします
+- `set_vertex`、`set_index`、`set_primitive`頂点、インデックス、プリミティブのプロパティを個別に設定する
+- 競合を避けるために、プリミティブの総数を設定するスレッドは 1 つだけです
+
+**初期化メッシュフェーズ**:
+
+```swift
+meshPipelineDescriptor.meshFunction = meshFunction
+meshPipelineDescriptor.maxTotalThreadsPerMeshThreadgroup = vertexCountPerHair
+```
+
+**メッシュ レンダリング パイプラインを作成**:
+
+```swift
+let meshPipeline: MTLRenderPipelineState
+
+do {
+    let (pipeline, reflection) = try device.makeRenderPipelineState(
+        descriptor: meshRenderPipelineDescriptor,
+        options: [])
+    meshPipeline = pipeline
+} catch {
+    print("The device can't create a mesh pipeline state: \(error)")
+    return
+}
+```
+
+**コード化されたメッシュ描画**:
+
+```swift
+let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor)
+encoder.setRenderPipelineState(meshPipeline)
+
+// 绑定各阶段资源
+encoder.setObjectBuffer(objectBuffer, offset: 0, index: 0)
+encoder.setMeshTexture(meshTexture, index: 2)
+encoder.setFragmentBuffer(fragmentBuffer, offset: 0, index: 0)
+
+// 定义线程组尺寸
+let objectGridDimensions = MTLSize(width: trianglesPerModel, height: 1, depth: 1)
+let threadsPerObject = MTLSize(width: hairsPerBlock, height: 1, depth: 1)
+let threadsPerMesh = MTLSize(width: threadsPerHair, height: 1, depth: 1)
+
+// 编码 Mesh 绘制命令
+encoder.drawMeshThreadgroups(objectGridDimensions,
+                             threadsPerObjectThreadgroup: threadsPerObject,
+                             threadsPerMeshThreadgroup: threadsPerMesh)
+encoder.endEncoding()
+```
+
+キーポイント:
+- 使用`drawMeshThreadgroups`従来の描画呼び出しを置き換える
+- オブジェクト グリッドの寸法、オブジェクト スレッド グループ サイズ、およびメッシュ スレッド グループ サイズを指定する必要があります
+- リソースバインディングは次のように分割されます。`setObjectBuffer`、`setMeshTexture`、`setFragmentBuffer`3段階
+
+### GPU 駆動のメッシュレット カリング
+
+([13:16](https://developer.apple.com/videos/play/wwdc2022/10162/?time=796)) メッシュ シェーダーのもう 1 つの重要な用途は、大量のジオメトリを含むシーン レンダリングの効率的な処理です。中心的なアイデアは、シーン メッシュをより小さな単位のメッシュレットに分割し、GPU 上できめの細かいカリングを実行することです。
+
+従来の GPU 駆動のパイプラインには 2 つのパスが必要です。1 つは錐台のカリング、LOD の選択、デバイス メモリへの描画コマンドのエンコードを行う計算パスです。そしてそれらの描画コマンドを実行するレンダー パス。メッシュ シェーダは、これら 2 つのパスを 1 つのレンダー パスに結合できます。
+
+([14:35](https://developer.apple.com/videos/play/wwdc2022/10162/?time=875)) オブジェクト シェーダは、各モデルで錐台カリングを実行し、表示されているメッシュレットの LOD を計算して、メッシュを起動します。メッシュ シェーダーはメッシュレット ID リストをペイロードとして受け取り、対応するデータをエンコードします。`metal::mesh`物体。非表示のメッシュレットはメッシュ スレッド グループを開始せず、オブジェクト ステージで直接削除されます。
+
+このアーキテクチャの利点:
+- 描画コマンドを保存するための中間バッファがない
+- 計算パスとレンダリング パスの間に同期障壁がない
+- 表示されているジオメトリのみがラスタライズおよびフラグメント シェーディングの段階に入ります。
+
+## 重要ポイント
+
+**プロシージャルな髪/草を 3D キャラクターに追加します**
+
+メッシュ シェーダーを使用して、GPU 上でファーや草をリアルタイムで生成します。キャラクターが動くと、オブジェクト シェーダーは距離と遠近感に応じて各領域のヘア密度 (LOD) を動的に調整し、近くでは密度が高く、遠くでは疎になります。メッシュ シェーダーは、各ヘアを独立したメッシュとして生成します。事前に計算されたヘア ジオメトリは必要なく、大きな中間バッファも必要ありません。エントリーAPIは`MTLMeshRenderPipelineDescriptor`そして`drawMeshThreadgroups`。
+
+**GPU 駆動のシーン レンダラーの実装**
+
+大きなシーンをメッシュレットに分割し、オブジェクト シェーダーを使用して、錐台カリング、オクルージョン カリング、LOD 選択を GPU 上で並行して実行します。表示されているメッシュレットのみがメッシュ シェーダに入り、ジオメトリを生成します。これにより、GPU での非表示のジオメトリの処理コストを削減しながら、CPU 側でのシーン管理のオーバーヘッドを大幅に削減できます。
+
+**プログラムされたジオメトリをパーティクル エフェクトに使用します**
+
+爆発や魔法のエフェクトなど、大量の動的ジオメトリを必要とするシーンでは、メッシュ シェーダを使用して GPU 上でパーティクル メッシュを直接生成できます。各オブジェクト スレッド グループはパーティクル システムを管理し、時間パラメータに基づいて各パーティクルの位置とサイズを計算し、メッシュ シェーダが対応するビルボードまたはジオメトリを生成します。プロセス全体に CPU の関与は必要なく、パーティクル データをメモリに書き戻す必要もありません。
+
+## 関連セッション
+
+- [Discover Metal 3](/articles/wwdc2022-10007) — Metal 3 の新機能の概要
+- [Apple GPU 全体でコンピューティング ワークロードをスケールする](/articles/wwdc2022-10159) — Apple GPU 全体でコンピューティング ワークロードをスケールする
+- [metal-cpp を使用した C++ での Metal のプログラム](/articles/wwdc2022-10160) — C++ で Metal コードを作成する

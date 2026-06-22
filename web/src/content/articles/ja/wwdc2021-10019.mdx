@@ -1,0 +1,199 @@
+---
+title: "Discover concurrency in SwiftUI"
+description: "Discover how you can use Swift's concurrency features to build even better SwiftUI apps. We'll show you how concurrent workflows interact with your ObservableObjects, and explore how you can use them directly in your SwiftUI views and models. Find out how to use await to make your app run smoothly on the SwiftUI run loop, and learn how to fetch remote images quickly with the AsyncImage API. And we'll take you through the process of enabling additional asynchronous flows in your custom views."
+date: "2021-06-07"
+tags: ["Swift", "SwiftUI"]
+thumbnail: "/images/sessions/2021/10019.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10019/"
+sessionId: "wwdc2021-10019"
+year: "2021"
+relatedSessions:
+  - title: "Meet async/await in Swift"
+    code: "10132"
+    description: "Swift 並行処理の基礎"
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "構造化並行処理の詳細"
+  - title: "Swift concurrency: Update a sample app"
+    code: "10194"
+    description: "並行処理への移行実践"
+---
+
+## ハイライト
+
+> SwiftUI は async/await をネイティブにサポートしています。`@MainActor`、`task`、`AsyncImage` を使えば、データ読み込みとリモート画像の表示を簡潔かつ安全に実装できます。
+
+## 主要内容
+
+これまで SwiftUI でネットワークリクエストを行うには、開発者が `URLSession` のコールバックを自分で管理する必要がありました。コードは `onAppear` や completion handler に散らばり、状態更新がバックグラウンドスレッドで走ると UI の更新でクラッシュすることもありました。
+
+WWDC 2021 では Swift 5.5 の並行処理機能が SwiftUI に直接組み込まれました。スケジューリング用のコードは不要で、フレームワークが状態更新をメインスレッドで実行することを保証します。
+
+`AsyncImage` は今回追加された View です。URL を渡すだけでダウンロード、キャッシュ、プレースホルダーを自動処理します。`ImageLoader` ObservableObject でラップする必要はありません。
+
+`task` modifier は View が表示されたときに非同期タスクを開始し、消えると自動的にキャンセルします。`onAppear` とは異なり、ライフサイクルが View に紐づくためリークしません。
+
+`refreshable` と `await` を組み合わせれば、プルダウン更新は 1 行で済みます。ローディング状態とアニメーションはシステムが処理します。
+
+## 詳細
+
+### ObservableObject と async/await
+
+宇宙写真アプリのデータモデルは次のようになります。
+
+```swift
+@MainActor
+class Photos: ObservableObject {
+    @Published private(set) var items: [SpacePhoto] = []
+
+    func updateItems() async {
+        let fetched = await fetchPhotos()
+        items = fetched
+    }
+
+    func fetchPhotos() async -> [SpacePhoto] {
+        var downloaded: [SpacePhoto] = []
+        for date in randomPhotoDates() {
+            let url = SpacePhoto.requestFor(date: date)
+            if let photo = await fetchPhoto(from: url) {
+                downloaded.append(photo)
+            }
+        }
+        return downloaded
+    }
+
+    func fetchPhoto(from url: URL) async -> SpacePhoto? {
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            return try SpacePhoto(data: data)
+        } catch {
+            return nil
+        }
+    }
+}
+```
+
+キーポイント:
+- `@MainActor` でクラス全体をマークし、すべてのメソッドがデフォルトでメインスレッドで実行される（10:09）
+- `@Published` プロパティの更新は SwiftUI の再描画を自動的にトリガーする
+- `await URLSession.shared.data(from:)` がコールバック形式の dataTask に代わる
+- 手動の `DispatchQueue.main.async` は不要。フレームワークがスレッド安全性を保証する
+
+### View 層での非同期データ接続
+
+```swift
+struct CatalogView: View {
+    @StateObject private var photos = Photos()
+
+    var body: some View {
+        NavigationView {
+            List {
+                ForEach(photos.items) { item in
+                    PhotoView(photo: item)
+                        .listRowSeparator(.hidden)
+                }
+            }
+            .navigationTitle("Catalog")
+            .listStyle(.plain)
+            .refreshable {
+                await photos.updateItems()
+            }
+        }
+        .task {
+            await photos.updateItems()
+        }
+    }
+}
+```
+
+キーポイント:
+- `.task { await photos.updateItems() }` は View 表示時に読み込みを開始する（14:07）
+- `.refreshable` はプルダウン更新をサポートし、システムがローディングインジケーターを表示する
+- View が消えると、`task` が作成したタスクは自動的にキャンセルされる
+
+### AsyncImage: リモート画像を 1 行で
+
+```swift
+struct PhotoView: View {
+    var photo: SpacePhoto
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            AsyncImage(url: photo.url) { image in
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } placeholder: {
+                ProgressView()
+            }
+            .frame(minWidth: 0, minHeight: 400)
+
+            HStack {
+                Text(photo.title)
+                Spacer()
+                SavePhotoButton(photo: photo)
+            }
+            .padding()
+            .background(.thinMaterial)
+        }
+        .background(.thickMaterial)
+        .mask(RoundedRectangle(cornerRadius: 16))
+        .padding(.bottom, 8)
+    }
+}
+```
+
+キーポイント:
+- `AsyncImage(url:)` は画像を自動的にダウンロードしてキャッシュする（15:11）
+- `placeholder` クロージャはダウンロード中に `ProgressView` を表示する
+- ダウンロード完了後は実際の画像に切り替わり、`.resizable()` などの modifier に対応する
+- `URLSession` や画像キャッシュを自分で管理する必要はない
+
+### ボタン内の非同期操作
+
+```swift
+struct SavePhotoButton: View {
+    var photo: SpacePhoto
+    @State private var isSaving = false
+
+    var body: some View {
+        Button {
+            Task {
+                isSaving = true
+                await photo.save()
+                isSaving = false
+            }
+        } label: {
+            Text("Save")
+                .opacity(isSaving ? 0 : 1)
+                .overlay {
+                    if isSaving {
+                        ProgressView()
+                    }
+                }
+        }
+        .disabled(isSaving)
+        .buttonStyle(.bordered)
+    }
+}
+```
+
+キーポイント:
+- `Task { }` はボタンタップ時に非同期タスクを開始する（18:06）
+- `@State var isSaving` はボタンのローディング状態を制御する
+- `.disabled(isSaving)` は重複タップを防ぐ
+- `@State` を更新するために `DispatchQueue.main.async` は不要
+
+## 重要ポイント
+
+1. **新規プロジェクトでは `@MainActor` を使う。** ObservableObject に `@MainActor` を付ければ、スレッド安全性の問題を根本から解消できる。
+2. **AsyncImage でカスタム画像ローダーを置き換える。** 数百行の `ImageLoader` コードが不要になり、キャッシュとプレースホルダーが組み込まれている。
+3. **`onAppear + DispatchQueue` の代わりに `task` を使う。** ライフサイクルが自動管理され、View 消滅時にタスクがキャンセルされるため、解放済み View へのコールバックが起きない。
+4. **`refreshable` でプルダウン更新を簡単に。** 1 行で済み、システムが標準的な操作感と視覚フィードバックを提供する。
+5. **ボタンの非同期操作は `Task { }` で包む。** Button action のような同期コンテキストから非同期コードを起動する標準的な方法。
+
+## 関連セッション
+
+- [Meet async/await in Swift](/articles/wwdc2021-10132) — Swift 5.5 の並行処理構文の基礎
+- [Explore structured concurrency in Swift](/articles/wwdc2021-10134) — Task、TaskGroup、キャンセル機構
+- [Swift concurrency: Update a sample app](/articles/wwdc2021-10194) — 既存プロジェクトを async/await に移行する

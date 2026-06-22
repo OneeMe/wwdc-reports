@@ -1,0 +1,535 @@
+---
+title: "ARC in Swift: Basics and beyond"
+description: "learn about the basics of object lifetimes and arc in swift. dive deep into what language features make object lifetimes observable, consequences of relying on observed object lifetimes and some safe techniques to fix them."
+date: "2021-06-06"
+tags: ["Swift", "ARC", "Memory Management"]
+thumbnail: "/images/sessions/2021/10216.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10216/"
+sessionId: "wwdc2021-10216"
+year: "2021"
+relatedSessions:
+  - title: "What‘s new in Swift"
+    code: "10192"
+    description: "Swift 5.5 の言語アップデート、Swift パッケージ、async/await、構造化同時実行性、およびアクターを紹介します。"
+  - title: "Detect and diagnose memory issues"
+    code: "10180"
+    description: "Xcode、MetricKit、XCTest を使用してメモリ パフォーマンスの問題と回帰を診断します。"
+  - title: "Swift concurrency: Behind the scenes"
+    code: "10254"
+    description: "Swift 同時実行ランタイム、タスク モデル、協調スレッド プール、およびパフォーマンスの考慮事項について説明します。"
+  - title: "Protect mutable state with Swift actors"
+    code: "10133"
+    description: "可変状態を分離し、Swift アクターとの同時データ競合を削減します。"
+---
+## ハイライト
+
+> Apple は、Swift 自動参照カウント (ARC) が最後の使用に基づいてオブジェクトの有効期間を管理する方法を説明し、弱い/所有されていない参照を作成する安全な方法、withExtendedLifetime()、API の再設計、および隠れたメモリ エラーを回避するための deinit 副作用の削除を提供します。
+
+## 主要内容
+
+Swift クラスは参照型です。 1つ`Traveler`オブジェクトは次のとおりです`traveler1`そして`traveler2`同時にポイントします。開発者が通常の割り当てを作成すると、コンパイラがそれをバックグラウンドで挿入します。`retain`そして`release`。
+
+問題は「オブジェクトはいつリリースされるのか」から始まります。 Swift のオブジェクトのライフサイクルは使用状況に基づいています。最小保証ライフサイクルは初期化から始まり、最後の使用で終了します。閉じ中括弧まで存続することは保証されません。
+
+ほとんどのコードはこの詳細を気にしません。オブジェクトが先に解放されても後で解放されても結果は同じです。
+
+問題は 2 つの場所で発生します。初め、`weak`そして`unowned`参照によりライフサイクルが観察可能になります。オブジェクトが解放されると、`weak`と読まれます`nil`，`unowned`アクセスはトラップになります。 2番、`deinit`ログの印刷、メトリクスの公開、グローバル状態の書き込みなどの副作用が発生する可能性があります。副作用が現れるタイミングは、手術の結果に影響を与える可能性があります。
+
+このセッションで Apple が行ったことは非常に単純明快で、まず ARC の最低保証について説明し、次にどの言語機能がライフサイクルに影響するかを示し、最後に 3 種類の修復方法を示しました。軽量な方法は、`withExtendedLifetime()`。より安定した方法は、外部オブジェクトが強参照を通じてのみアクセスできるように API を変更することです。最も根本的な方法は、参照リングを避けるか、`deinit`副作用は明示的なメソッドに移動されます。
+
+## 詳細
+
+### ARC の最低保証: オブジェクトは最後に使用されるまで存続します
+
+([01:49](https://developer.apple.com/videos/play/wwdc2021/10216/?time=109)) ARC (自動参照カウント) は Swift コンパイラーによって駆動されます。コンパイラの挿入`retain`そして`release`。実行時参照カウントがゼロに達すると、オブジェクトを解放できます。
+
+```swift
+final class Traveler {
+    var name: String
+    var destination: String?
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+func test() {
+    let traveler1 = Traveler(name: "Lily")
+    let traveler2 = traveler1
+    traveler2.destination = "Big Sur"
+    print("Done traveling")
+}
+
+test()
+```
+
+キーポイント:
+- `final class Traveler`参照型を定義すると、インスタンスがヒープ上に配置されます。
+- `name`これは、旅行者を識別するために使用される一般的なストレージ属性です。
+- `destination`オブジェクトの状態の変化を示すオプションの文字列です。
+- `init(name:)`オブジェクト作成時に設定します`name`、オブジェクトの初期参照カウントは 1 です。
+- `traveler1`は最初の強力な参照です。
+- `traveler2 = traveler1`参照をコピーします。2 つの定数が同じオブジェクトを指します。
+- `traveler2.destination = "Big Sur"`はい`traveler2`最後に使用したもの。
+- `print("Done traveling")`再度使用されません`Traveler`オブジェクト、ARC では、コンパイラによって挿入されたリリースに応じて、オブジェクトをその前または近くでリリースできます。
+
+このコードに関する重要な事実は、Swift がオブジェクトが少なくとも最後に使用されるまで存続することを保証しているということです。 ARC の最適化により保持/リリースの場所が変更されるため、観察されるリリース ポイントは遅くなる可能性があります。
+
+### 参照サイクル: 2 つの強い参照により、オブジェクトは永久に解放されなくなります。
+
+([06:37](https://developer.apple.com/videos/play/wwdc2021/10216/?time=397)) トラベルアプリにポイントアカウントを追加した後、`Traveler`を指す`Account`，`Account`もう一度ポイントバック`Traveler`。両側に強参照があり、関数終了後も 2 つのオブジェクトの参照カウントが 0 にならない場合、メモリ リークが発生します。
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func printSummary() {
+        if let account = account {
+            print("\(name) has \(account.points) points")
+        }
+    }
+}
+
+final class Account {
+    var traveler: Traveler
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+    traveler.printSummary()
+}
+
+test()
+```
+
+キーポイント:
+- `Traveler.account`通常のクラス属性はデフォルトでオブジェクトへの強参照を持っているため、これは強参照です。
+- `Account.traveler`こちらも力強い名言。
+- `Account(traveler: traveler, points: 1000)`アカウントに旅行者を保持させます。
+- `traveler.account = account`旅行者に口座を持たせましょう。
+- `test()`それが終了すると、ローカル定数は消えますが、2 つのオブジェクトはまだ相互に保持しています。
+- ARC は参照カウントのみを確認し、このサイクルを自動的に識別して中断しません。
+
+### 弱い参照: サイクルを壊し、ライフサイクルも暴露します
+
+([09:05](https://developer.apple.com/videos/play/wwdc2021/10216/?time=545)) 一般的な解決策は、リングの片側で使用することです。`weak`。`weak`参照カウントには参加しません。参照されたオブジェクトが解放された後、Swift ランタイムは弱い参照を読み取ります。`nil`。
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func printSummary() {
+        if let account = account {
+            print("\(name) has \(account.points) points")
+        }
+    }
+}
+
+final class Account {
+    weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+    traveler.printSummary()
+}
+
+test()
+```
+
+キーポイント:
+- `weak var traveler: Traveler?`増加なし`Traveler`参照カウント。
+- `weak`このプロパティは、オブジェクトがもう存在しないことを示すことができる必要があるため、ここではオプションのタイプです。
+- `Traveler`まだ根強い保持力`Account`。
+- `Account`保持を強制されなくなりました`Traveler`、参照ループが壊れています。
+- `traveler.printSummary()`Traveler は強参照を通じてアクセスされ、オブジェクトの有効期間は呼び出し中に保証されます。
+
+このコードは、参照ループを中断するためのweak:の正しい使用法を示しています。弱い参照はプライマリ アクセス パスとして扱われません。
+
+### 弱いバインディングを介してオブジェクトにアクセスする: オプションのバインディングは問題を隠すことしかできません
+
+([10:05](https://developer.apple.com/videos/play/wwdc2021/10216/?time=605))`printSummary()`に移動します`Account`オンの場合、弱い参照を通じてアクセスされます。`Traveler`。講演では、このコードは今日でも正常に印刷できるかもしれないが、それは観測された有効期間 (観測された有効期間) が十分に長いだけである、と指摘しました。コンパイラの最適化後、`Traveler`電話しているかもしれない`account.printSummary()`以前にも発売されています。
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+final class Account {
+    weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+
+    func printSummary() {
+        print("\(traveler!.name) has \(points) points")
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+    account.printSummary()
+}
+
+test()
+```
+
+キーポイント:
+- `Account.printSummary()`合格`traveler!`弱い参照にアクセスします。
+- `traveler.account = account`はい`traveler`最後に使用したもの。
+- `account.printSummary()`呼ばれると、`Traveler`最低保証ライフサイクルが終了しました。
+- もし`Traveler`解放され、`traveler`と読まれます`nil`。
+- `traveler!`右`nil`強制的に解凍するとクラッシュが発生します。
+
+([11:14](https://developer.apple.com/videos/play/wwdc2021/10216/?time=674)) 強制アンパックをオプションのバインディングに変更すると、クラッシュがサイレント スキップに変わります。
+
+```swift
+final class Account {
+    weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+
+    func printSummary() {
+        if let traveler = traveler {
+            print("\(traveler.name) has \(points) points")
+        }
+    }
+}
+```
+
+キーポイント:
+- `if let traveler = traveler`として弱い状態で参照されます`nil`印刷をスキップします。
+- コードは壊れず、テストで問題を見つけるのが難しくなる可能性があります。
+・集計が出力されていないため、業績が間違っているままです。
+- セッションは、この状況をサイレント バグとして分類します。
+
+### withExtendedLifetime(): オブジェクトのライフサイクルを明示的に延長します
+
+([11:45](https://developer.apple.com/videos/play/wwdc2021/10216/?time=705)) Swift 提供`withExtendedLifetime()`。これにより、クロージャが終了するまでオブジェクトのライフサイクルを延長し、弱い参照が発生するのを防ぐことができます。`nil`。
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+final class Account {
+    weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+
+    func printSummary() {
+        if let traveler = traveler {
+            print("\(traveler.name) has \(points) points")
+        }
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+
+    withExtendedLifetime(traveler) {
+        account.printSummary()
+    }
+}
+
+test()
+```
+
+キーポイント:
+- `withExtendedLifetime(traveler)`コンパイラに拡張するように指示します`traveler`ライフサイクル。
+- クロージャ内で呼び出される`account.printSummary()`。
+- `Account.printSummary()`弱い参照を読み取る場合、`Traveler`まだ生きています。
+- このアプローチでは、開発者は危険な呼び出しポイントをすべて覚えておく必要があります。
+- 講演では、これは脆弱なソリューションであり、メンテナンスコストはコードベースとともに増加するとされています。
+
+### より安定した設計: 強参照を介したオブジェクトへのアクセスのみを許可します。
+
+([12:55](https://developer.apple.com/videos/play/wwdc2021/10216/?time=775)) より良い修正は、API を再クラス化することです。バンドル`printSummary()`元に戻す`Traveler`、バンドル`Account`内部の弱参照は非表示になります。呼び出し元は、強参照を介してのみ Traveler にアクセスできます。
+
+```swift
+final class Traveler {
+    var name: String
+    var account: Account?
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func printSummary() {
+        if let account = account {
+            print("\(name) has \(account.points) points")
+        }
+    }
+}
+
+final class Account {
+    private weak var traveler: Traveler?
+    var points: Int
+
+    init(traveler: Traveler, points: Int) {
+        self.traveler = traveler
+        self.points = points
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily")
+    let account = Account(traveler: traveler, points: 1000)
+    traveler.account = account
+    traveler.printSummary()
+}
+
+test()
+```
+
+キーポイント:
+- `private weak var traveler`外部コードがアクセス ポイントとして弱い参照を使用しないようにします。
+- `Traveler.printSummary()`合格`self`読む`name`、現在のメソッド呼び出しは強い参照を保持します。
+- `account.points`アカウントデータのみを読み取るため、旅行者を逆に読み取る必要はありません。
+- API は呼び出し元に使用を強制します`traveler.printSummary()`。
+- ライフサイクルの正確性は型設計によって保証され、人為的なメモリが削減されます。
+
+### 参照ループを避ける: 共有情報を抽出する
+
+([14:20](https://developer.apple.com/videos/play/wwdc2021/10216/?time=860)) スピーチで示されたより徹底的な方法は、再モデル化です。`Account`必要なのは旅行者の個人情報だけであり、そのすべてを保持する必要はありません。`Traveler`。個人情報の一部を切り取る`PersonalInfo`最後に、関係はリングからツリーに変わります。
+
+```swift
+final class PersonalInfo {
+    var name: String
+
+    init(name: String) {
+        self.name = name
+    }
+}
+
+final class Traveler {
+    var info: PersonalInfo
+    var account: Account?
+
+    init(info: PersonalInfo) {
+        self.info = info
+    }
+}
+
+final class Account {
+    var info: PersonalInfo
+    var points: Int
+
+    init(info: PersonalInfo, points: Int) {
+        self.info = info
+        self.points = points
+    }
+}
+
+func test() {
+    let info = PersonalInfo(name: "Lily")
+    let traveler = Traveler(info: info)
+    let account = Account(info: info, points: 1000)
+    traveler.account = account
+    print("\(account.info.name) has \(account.points) points")
+}
+
+test()
+```
+
+キーポイント:
+- `PersonalInfo`保存`name`、小さな共有可能なオブジェクトになります。
+- `Traveler`所有`PersonalInfo`そしてオプションの`Account`。
+- `Account`同じことを保持する`PersonalInfo`、保持する必要はありません`Traveler`。
+- `traveler.account = account`一方向の関係のみが形成されます。
+- 弱い参照がなくなり、ライフサイクル エラーのエントリ ポイントがなくなりました。
+
+### deinit の副作用: リリース時間が外部結果に影響する
+
+（[15:23](https://developer.apple.com/videos/play/wwdc2021/10216/?time=923)）`deinit`オブジェクトが解放される前に実行されます。インジケーターを印刷、公開し、グローバル ステータスを書き込むことができます。これらの副作用により、オブジェクトの解放時間が観察可能になります。
+
+```swift
+final class Traveler {
+    var name: String
+    var destination: String?
+
+    init(name: String) {
+        self.name = name
+    }
+
+    deinit {
+        print("\(name) is deinitializing")
+    }
+}
+
+func test() {
+    let traveler1 = Traveler(name: "Lily")
+    let traveler2 = traveler1
+    traveler2.destination = "Big Sur"
+    print("Done traveling")
+}
+
+test()
+```
+
+キーポイント:
+- `deinit`オブジェクトが解放される前に実行されます。
+- `print("\(name) is deinitializing")`外部から目に見える副作用です。
+- `traveler2.destination = "Big Sur"`オブジェクトが最後に使用された時刻です。
+- `print("Done traveling")`オブジェクトは使用されません。
+- `deinit`入っているかもしれない`Done traveling`前後に実行されるコードは、この順序に依存できません。
+
+([19:08](https://developer.apple.com/videos/play/wwdc2021/10216/?time=1148)) より安定したアプローチは、公開動作を次から変更することです。`deinit`それを明示的なメソッドに移動して使用します`defer`スコープを離れるときに必ず呼び出されます。`deinit`ただ検証をしてください。
+
+```swift
+final class TravelMetrics {
+    let id: UInt
+    var destinations = [String]()
+    var category: String?
+    var published = false
+
+    init(id: UInt) {
+        self.id = id
+    }
+
+    func computeTravelInterest() {
+        category = destinations.contains("Big Sur") ? "Nature" : nil
+    }
+
+    func publish() {
+        published = true
+        print("id: \(id), count: \(destinations.count), category: \(category ?? "nil")")
+    }
+}
+
+final class Traveler {
+    var name: String
+    var destination: String?
+    private var travelMetrics: TravelMetrics
+
+    init(name: String, id: UInt) {
+        self.name = name
+        self.travelMetrics = TravelMetrics(id: id)
+    }
+
+    func updateDestination(_ destination: String) {
+        self.destination = destination
+        travelMetrics.destinations.append(destination)
+    }
+
+    func publishAllMetrics() {
+        travelMetrics.computeTravelInterest()
+        travelMetrics.publish()
+    }
+
+    deinit {
+        assert(travelMetrics.published)
+    }
+}
+
+func test() {
+    let traveler = Traveler(name: "Lily", id: 1)
+    defer { traveler.publishAllMetrics() }
+    traveler.updateDestination("Big Sur")
+    traveler.updateDestination("Catalina")
+}
+
+test()
+```
+
+キーポイント:
+- `TravelMetrics`保存先、カテゴリ、公開済みかどうか。
+- `computeTravelInterest()`記録された目的地に基づいて分類を計算します。
+- `publish()`インジケーターを明示的に公開し、`published`に設定`true`。
+- `Traveler.updateDestination(_:)`メトリクスを記録しながら宛先を更新します。
+- `publishAllMetrics()`通常の方法で計算と公開を行います。
+- `defer { traveler.publishAllMetrics() }`確保する`test()`終了する前にインジケーターを公開します。
+- `deinit`指標がリリースされたかどうかを確認するだけであり、ビジネスリリースについては責任を負いません。
+
+([19:50](https://developer.apple.com/videos/play/wwdc2021/10216/?time=1190)) Xcode 13 は実験的なビルド設定を追加します`Optimize Object Lifetimes`。 Swift コンパイラーをオンにすると、オブジェクトのライフタイムがより積極的に短縮され、観測されるライフタイムが最小保証ライフタイムに近づきます。これにより、以前に隠されていた弱い/未所有の、または初期化されていない順序付けエラーが露呈する可能性があります。
+
+```swift
+// Xcode 13 Build Settings
+// Optimize Object Lifetimes: Yes
+```
+
+キーポイント:
+- これは、Swift コンパイラーのビルド設定です。
+- 一度開封された物体は、最後に使用された直後に解放されることが多くなります。
+- 観察された有効期間に依存するコードは、問題を引き起こす可能性が高くなります。
+- 修復の指示は依然として上記の 3 つのカテゴリです: ライフサイクルの延長、API の変更、および deinit の副作用の削除。
+
+## 重要ポイント
+
+- **何をすべきか**: 既存のプロジェクトに対して弱い/所有されていないアクセスの監査を実行します。
+- **実行する価値がある理由**: セッションは、弱い/非所有によりライフ サイクルが監視可能になり、オプションのバインディングによりエラーがサイレント スキップに変わる可能性があると指摘しています。
+- **開始方法**: 検索`weak var`、`unowned`、`!`そして`if let`、弱参照を通じてビジネス動作を開始するコードのチェックに重点を置き、エントリを強参照メソッドに変更するか、`withExtendedLifetime()`重要な呼び出しをラップします。
+
+- **何をすべきか**: オブジェクトが破棄されたときのインジケーターの公開ロジックを明示的な送信に変更します。
+- **実行する価値がある理由**: deinit の副作用の順序は不安定であり、コンパイラは最適化後に未計算のデータを事前に解放する可能性があります。
+- **開始方法**:`deinit { publish() }`に変更します`publishAllMetrics()`、呼び出し側で使用されます`defer { object.publishAllMetrics() }`終了する前に実行されることが保証されています。`deinit`だけ保管してください`assert(published)`。
+
+- **内容**: 相互に保持するモデル オブジェクトをリファクタリングします。
+- **実行する価値がある理由**: 参照ループは弱いものによって中断される必要があり、弱いものはライフサイクル観察の問題を引き起こします。講演では、まずループを回避できるかどうかを考えるよう提案した。
+- **開始方法**: クラス間の保持関係を描画し、双方が必要とするデータを見つけて抽出します`PersonalInfo`このタイプの共有価値または小さなオブジェクトは、関係を一方通行の構造にします。
+
+- **内容**: CI またはローカル デバッグ構成で開きます。`Optimize Object Lifetimes`。
+- **実行する価値がある理由**: この設定は、オブジェクトの有効期間をより安定して短縮し、観測された有効期間に依存する隠れたエラーを事前に明らかにするのに役立ちます。
+- **開始方法**: Xcode 13 のビルド設定で実験版を有効にします`Optimize Object Lifetimes`、弱い/未所有および初期化リリース ロジックをカバーするテストの実行に重点を置いています。
+
+- **やるべきこと**: メモリ リークに対する最小限の回帰テストを作成します。
+- **価値がある理由**: 参照サイクルを使用すると、ローカル参照が消えた後もオブジェクトを存続させることができます。機能が正常な場合、この問題は無視されることがよくあります。
+- **開始方法**: ループが発生しやすいモデルのオブジェクトを作成して解放し、Xcode メモリ ツールまたは XCTest メモリを使用して、記録されたオブジェクトが期待どおりに解放されるかどうかを確認します。ループを発見したら、まずデータ構造を変更してから、次のことを検討してください。`weak`。
+
+## 関連セッション
+
+- [Swift の新機能](/articles/wwdc2021-10192) — Swift 5.5 の言語アップデート、および async/await、構造化同時実行性、アクターへのエントリ ポイントについて学びます。
+- [メモリの問題の検出と診断](/articles/wwdc2021-10180) — Xcode、MetricKit、XCTest を使用してメモリの問題とパフォーマンスの低下を見つける方法を学びます。
+- [Swift 同時実行性: 舞台裏](/articles/wwdc2021-10254) — Swift コンパイラーとランタイムがタスク、スレッド プール、最適化を通じてプログラムの動作にどのような影響を与えるかを理解します。
+- [Swift アクターを使用して可変状態を保護する](/articles/wwdc2021-10133) — 共有可変状態の観点から Swift の安全な設計を学び続けます。

@@ -1,0 +1,314 @@
+---
+title: "Swift concurrency: Behind the scenes"
+description: "dive into the details of swift concurrency and discover how swift provides greater safety from data races and thread explosion while simultaneously improving performance. we'll explore how swift tasks differ from grand central dispatch, how the new cooperative threading model works, and how to ensure the best performance for your apps."
+date: "2021-06-06"
+tags: ["Swift", "Concurrency", "Performance", "Actors"]
+thumbnail: "/images/sessions/2021/10254.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10254/"
+sessionId: "wwdc2021-10254"
+year: "2021"
+relatedSessions:
+  - title: "Meet async/await in Swift"
+    code: "10132"
+    description: "Swift の async/await 構文、一時停止動作、および完了ハンドラーを非同期関数に移行する方法の紹介"
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "タスク グループ、非同期レット、キャンセルの伝播、構造化されたタスクの関係について説明する"
+  - title: "Protect mutable state with Swift actors"
+    code: "10133"
+    description: "アクターの分離、共有可変状態保護、MainActor の導入"
+  - title: "Understand and eliminate hangs from your app"
+    code: "10258"
+    description: "ツールを使用してラグやハングを特定し、同期のブロックや GCD の使用問題を特定する"
+---
+## ハイライト
+
+> 迅速な同時実行`await`、タスク グループ、アクター、および協調的なスレッド プールを使用して、Swift ランタイムにタスクの依存関係を認識させることで、スレッドの爆発、データ競合、メイン スレッドの切り替えオーバーヘッドを削減します。
+
+## 主要内容
+
+あなたはニュースリーダーを書いています。
+
+ユーザーが「更新」をクリックしました。アプリはフィード リストを読み取り、多くのネットワーク リクエストを開始し、返されたデータを解析してデータベースに書き込み、最後にインターフェイスを更新する必要があります。
+
+Grand Central Dispatch (GCD) でこれを書くのは自然なことだと感じました。データベースはシリアル キューに配置され、ネットワーク コールバックは同時キューに配置されます。メインスレッドはブロックされず、データベースには相互排他保護もあります。
+
+問題はネットワーク コールバックに隠されています。
+
+各フィードのコールバックはデータを解析し、データベース キューに同期的に入力します。データベース キューがビジーな場合、現在のスレッドはブロックされます。 GCD は、同時キューにまだ作業があることを確認し、スレッドの作成を続けます。 100 個のフィードにより、6 コアの iPhone が 100 個のコールバック スレッドに押し上げられる可能性があり、これはスレッド爆発です。
+
+スレッドが多すぎる場合、CPU はスレッド コンテキストの切り替えを頻繁に実行する必要があります。ブロックされた各スレッドは、スタックとカーネルのデータ構造も保持します。一部のスレッドがロックを保持し、他のスレッドが待機したままになる場合があります。
+
+Swift Concurrency は実行モデルを変更します。
+
+`await`非同期待機です。ここで関数を一時停止し、スレッドを解放して他のタスクを実行することができます。継続を使用して、実行時に後続の作業を記録します。スレッドがタスクを切り替えるときのコストは、スレッド コンテキストの完全な切り替えよりも関数呼び出しに近くなります。
+
+これには前提条件が必要です。Swift ランタイムはタスク間の依存関係を認識している必要があります。
+
+`await`継続の依存関係を明示的にします。タスク グループは、親タスクとサブタスクの依存関係を明示します。アクターは、可変状態への相互排他的なアクセスを明示的に行います。実行時にこの情報を取得した後、協調スレッド プールを使用して、CPU コアの数に近いスレッドのみを作成できます。
+
+このセッションの目的は書き方を教えることではありません`async`文法。 Swift 同時実行によってパフォーマンスが向上する理由が説明されています。言語機能は依存関係をランタイムに渡し、依存関係を使用してスケジューリングを改善します。
+
+## 詳細
+
+### GCD の隠れたコスト
+
+([04:57](https://developer.apple.com/videos/play/wwdc2021/10254/?time=297)) 従来の記述方法は、URLSession デリゲート キューを同時キューとして設定し、各コールバックで同期的にデータベース キューに入力することです。
+
+```swift
+func deserializeArticles(from data: Data) throws -> [Article] { /* ... */ }
+func updateDatabase(with articles: [Article], for feed: Feed) { /* ... */ }
+
+let urlSession = URLSession(configuration: .default, delegate: self, delegateQueue: concurrentQueue)
+
+for feed in feedsToUpdate {
+    let dataTask = urlSession.dataTask(with: feed.url) { data, response, error in
+        // ...
+        guard let data = data else { return }
+        do {
+            let articles = try deserializeArticles(from: data)
+            databaseQueue.sync {
+                updateDatabase(with: articles, for: feed)
+            }
+        } catch { /* ... */ }
+    }
+    dataTask.resume()
+}
+```
+
+キーポイント:
+
+- `deserializeArticles(from:)`ダウンロード結果を記事の配列に変換します。
+- `updateDatabase(with:for:)`指定されたフィードに対応するデータベース レコードに記事を書き込みます。
+- `URLSession`使用`concurrentQueue`デリゲート キューとして、複数のコールバックを同時に実行できます。
+- `for feed in feedsToUpdate`フィードごとに 1 つ作成する`dataTask`。
+- `guard let data = data else { return }`データがない場合、コールバックは直接終了します。
+- `databaseQueue.sync`データベース キューが更新を完了するまで同期的に待機します。
+- 複数のコールバックが同時に入った場合`databaseQueue.sync`、待機中のスレッドはブロックされます。
+- GCD は、同時キューでの作業の消化を続けるために、さらに多くのスレッドを作成する場合があります。
+
+([05:58](https://developer.apple.com/videos/play/wwdc2021/10254/?time=358)) GCD の戦略は次のとおりです。キューに作業がある場合は、それを実行するスレッドを見つけます。同時キューは複数の作業項目を同時に実行できます。スレッドがブロックされたとき、キューにまだ作業が残っている場合、システムは別のスレッドを作成します。
+
+この戦略では同時実行性を維持できますが、スレッドの爆発を引き起こす可能性もあります。
+
+Apple Watch などのデュアルコア デバイスでは、2 つのスレッドがブロックされた後も、GCD は残りのコールバックを処理するために新しいスレッドを作成し続けます。 CPU は複数のスレッド間の切り替えを開始します。スレッド数がコア数よりもはるかに多い場合、スケジューリング コストが実際の業務作業を超えます。
+
+### タスク グループは、Swift ランタイムへの同時実行性を表現します。
+
+([13:18](https://developer.apple.com/videos/play/wwdc2021/10254/?time=798)) Swift 同時実行では、タスク グループを使用してフィード更新タスクのこのバッチを表現します。各フィードは子タスクです。ダウンロード、解析、データベースの更新はすべてシーケンシャル コードで記述されます。
+
+```swift
+func deserializeArticles(from data: Data) throws -> [Article] { /* ... */ }
+func updateDatabase(with articles: [Article], for feed: Feed) async { /* ... */ }
+
+await withThrowingTaskGroup(of: [Article].self) { group in
+    for feed in feedsToUpdate {
+        group.async {
+            let (data, response) = try await URLSession.shared.data(from: feed.url)
+            // ...
+            let articles = try deserializeArticles(from: data)
+            await updateDatabase(with: articles, for: feed)
+            return articles
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `updateDatabase(with:for:) async`データベースの更新を非同期関数として宣言します。
+- `withThrowingTaskGroup(of:)`エラーを伝播するタスク グループを作成します。
+- `for feed in feedsToUpdate`各フィードにサブタスクを追加します。
+- `group.async`子タスクを開始すると、親タスクはこれらの子タスクの存在を認識します。
+- `try await URLSession.shared.data(from:)`ネットワークを待機している間、現在のタスクを一時停止すると、スレッドは他の作業を行うことができます。
+- `deserializeArticles(from:)`これは同期解析ロジックであり、ダウンロードの完了後も実行され続けます。
+- `await updateDatabase(with:for:)`データベースの更新中にハングする可能性もあります。
+- `return articles`各サブタスクの結果をタスク グループに返します。
+
+このコードの値は依存関係にあります。
+
+親タスクは、自分が作成したサブタスクを認識しています。サブタスクは、URLSession とデータベースの更新を待機していることを認識しています。これらの依存関係は、Swift コンパイラーとランタイムに表示されます。 GCD はキューとブロックされたスレッドのみを表示できますが、Swift は実行中にタスク グラフを表示できます。
+
+### `await`スレッドを解放する方法
+
+([15:16](https://developer.apple.com/videos/play/wwdc2021/10254/?time=916)) 非同期関数は次のとおりです。`await`ハングする可能性があります。一時停止すると、一時停止ポイントを越えて保存する必要がある状態は、ヒープ上の非同期フレームに入れられます。一時停止ポイントを越えて保存する必要のないローカル変数は、引き続きスレッド スタックに配置されます。
+
+```swift
+// on Database
+func save(_ newArticles: [Article], for feed: Feed) async throws -> [ID] { /* ... */ }
+
+// on Feed
+func add(_ newArticles: [Article]) async throws {
+    let ids = try await database.save(newArticles, for: self)
+    for (id, article) in zip(ids, newArticles) {
+        articles[id] = article
+    }
+}
+
+func updateDatabase(with articles: [Article], for feed: Feed) async throws {
+    // skip old articles ...
+    try await feed.add(articles)
+}
+```
+
+キーポイント:
+
+- `save(_:for:) async throws -> [ID]`これはデータベース保存操作であり、新しい記事に対応する ID を返します。
+- `add(_:) async throws`はい`Feed`非同期メソッドがオンです。
+- `try await database.save(...)`が吊り下げポイントです。データベースの保存中、現在のスレッドはブロックして待機する必要はありません。
+- `newArticles`存在する`await`前に渡されました、`await`後で`zip(ids, newArticles)`これも使用する必要があるため、非同期フレームに保存されます。
+- `zip(ids, newArticles)`これは同期操作であり、スレッド スタック上に通常のスタック フレームを作成します。
+- `try await feed.add(articles)`させて`updateDatabase`フィードが更新されるのを待っている間、一時停止することもできます。
+
+これらの非同期フレームは、実行時に継続に構成されます。
+
+データベース要求が完了していない場合、スレッドは他のタスクを実行できます。リクエストが完了した後、元のスレッドが実行を継続することも、別のアイドル状態のスレッドが実行を再開することもできます。コードは想定できません`await`どちらも同じスレッド上にあります。
+
+([22:12](https://developer.apple.com/videos/play/wwdc2021/10254/?time=1332)) これにより、3 つの移行ルールが導入されます。
+
+```swift
+// Safe shape: keep the critical section synchronous and short.
+lock.lock()
+updateSharedState()
+lock.unlock()
+
+// Avoid this shape: do not hold a lock across await.
+lock.lock()
+try await database.save(newArticles, for: feed)
+lock.unlock()
+```
+
+キーポイント:
+
+- 同期コード内の短いクリティカル セクションでは、ロックを保持しているスレッドが実行を継続してロックを解放できるため、ロックを使用できます。
+- `await`原子性が壊れ、タスクがアクティブに一時停止される可能性があります。
+- ロック付きクロス`await`これにより、ロックの解放が非同期回復に依存することになり、簡単に前進進行コントラクトを破ってしまう可能性があります。
+- スレッド固有のデータは存在しません。`await`前後を保存してください。
+- セマフォ (セマフォ) と条件変数 (条件変数) はタスクの依存関係を隠し、Swift ランタイムによってスケジュールすることはできません。
+
+セッション パフォーマンスを分析するには、Instruments システム トレースを使用することをお勧めします。また、安全でないブロッキング プリミティブをチェックするには、デバッグ ランタイム環境変数を使用することも推奨します。協調スレッド プール内のスレッドがハングしているように見える場合は、通常、コード内の隠れたブロックを示しています。
+
+### アクターは非ブロッキングな方法で状態を保護します
+
+([28:01](https://developer.apple.com/videos/play/wwdc2021/10254/?time=1681)) アクター (参加者) は相互排他的なアクセスを提供します。アクターは一度に最大 1 つのメソッド呼び出しを実行できるため、その状態が同時にアクセスされることはありません。
+
+```swift
+// on Database
+func save(_ newArticles: [Article], for feed: Feed) async throws -> [ID] { /* ... */ }
+
+// on Feed
+func add(_ newArticles: [Article]) async throws {
+    let ids = try await database.save(newArticles, for: self)
+    for (id, article) in zip(ids, newArticles) {
+        articles[id] = article
+    }
+}
+```
+
+キーポイント:
+
+- `database.save(...)`データベース アクターへの呼び出しである可能性があります。
+- `await`現在のタスクがフィード アクターからデータベース アクターにジャンプする可能性があることを示します。
+- データベース アクターがアイドル状態の場合、現在のスレッドはデータベース アクターのメソッドを直接実行できます。
+- データベース アクターがビジー状態の場合、現在のタスクは一時停止され、スレッドは解放されて他の作業を実行します。
+- アクターは相互排他的なままです。アクター上で一度に実行できるワークアイテムは 1 つだけです。
+
+これはシリアルキューとは異なります。
+
+競合が発生すると、シリアル キューは呼び出し元のスレッドをブロックします。`dispatch async`ブロックはしませんが、競合がない場合は新しいスレッドを起動して非同期作業を行うことができます。アクターは協調スレッド プールを使用して、競合がない場合は現在のスレッドを再利用し、競合がある場合は現在のタスクを一時停止します。
+
+([34:24](https://developer.apple.com/videos/play/wwdc2021/10254/?time=2064)) アクターは再入可能性もサポートしています。アクターに関する以前の作業項目が`await`一時停止中も、新しい作業項目は引き続き実行できます。アクターは依然として一度に 1 つの作業項目のみを実行しますが、実行順序は厳密には FIFO (先入れ先出し) ではなくなりました。
+
+この動作により、ランタイムに優先度の高い作業を最初に実行する機会が与えられ、優先度の逆転が軽減されます。
+
+### MainActor ジャンプはバッチ化する必要があります
+
+([37:13](https://developer.apple.com/videos/play/wwdc2021/10254/?time=2233)) MainActor はメインスレッドを抽象化します。協調スレッド プールはメイン スレッドから分離されているため、MainActor から他のアクターにジャンプしてから MainActor に戻ると、スレッド コンテキストの切り替えが発生します。
+
+```swift
+// on database actor
+func loadArticle(with id: ID) async throws -> Article { /* ... */ }
+
+@MainActor func updateUI(for article: Article) async { /* ... */ }
+
+@MainActor func updateArticles(for ids: [ID]) async throws {
+    for id in ids {
+        let article = try await database.loadArticle(with: id)
+        await updateUI(for: article)
+    }
+}
+```
+
+キーポイント:
+
+- `loadArticle(with:)`データベース アクターに関する記事を 1 つ読んでください。
+- `updateUI(for:)`マーク`@MainActor`、メインスレッドに関連付けられたアクター上でインターフェイスを更新する必要があります。
+- `updateArticles(for:)`もマークされています`@MainActor`、ループはメインスレッドのコンテキストから開始されます。
+- 各ループはまず MainActor からデータベース アクターにジャンプします。
+- `await updateUI(for:)`MainActor に戻ります。
+- それぞれ`id`少なくとも 2 つのコンテキスト スイッチを用意してください。
+
+少量の循環は大きな問題ではありません。サイクル数が多く、毎回実行される実際の作業量が少ない場合、スイッチング コストが累積します。
+
+([38:18](https://developer.apple.com/videos/play/wwdc2021/10254/?time=2298)) 変更点は、単一処理をバッチ処理に変更することです。データベースは記事配列を 1 回返し、UI は記事配列を 1 回更新します。
+
+```swift
+// on database actor
+func loadArticles(with ids: [ID]) async throws -> [Article]
+
+@MainActor func updateUI(for articles: [Article]) async
+
+@MainActor func updateArticles(for ids: [ID]) async throws {
+    let articles = try await database.loadArticles(with: ids)
+    await updateUI(for: articles)
+}
+```
+
+キーポイント:
+
+- `loadArticles(with:)`データベース アクターを通じてループをプッシュして、複数の記事を一度に読み込みます。
+- `updateUI(for:)`引き継ぐ`[Article]`, インターフェイスのアップデートは一度で完了します。
+- `updateArticles(for:)`データベース アクターへのジャンプは 1 回だけ必要です。
+- `await updateUI(for: articles)`一度 MainActor に戻る必要があるだけです。
+- バッチ処理により、MainActor と協調スレッド プール間のコンテキストの切り替えが減少します。
+
+このルールは実用的です。アクター間のジャンプは軽いですが、MainActor への出入りは注意して行う必要があります。 UI の更新は可能な限りマージする必要があります。
+
+## 重要ポイント
+
+### 1. フィード リフレッシャーの同時再構築を行う
+
+- **対処方法**: タスク グループへの GCD コールバックに基づいて元のフィード更新ロジックを変更します。
+- **実行する価値がある理由**: セッション ニュース アプリの例は、まさにこのシナリオです。タスク グループにより、親子タスク関係を Swift ランタイムに入れることができ、隠れたブロックによって引き起こされるスレッドの爆発が減少します。
+- **開始方法**:から`withThrowingTaskGroup(of:)`各フィードを開始、ダウンロード、解析、保存するには`group.async`、データベース保存関数を次のように変更します。`async`。
+
+### 2. アクターのレイヤーをローカル データベースに追加します
+
+- **何をすべきか**: 元のデータベースのシリアル キューを次のキューに置き換えます。`Database` actor。
+- **実行する価値がある理由**: アクターは相互排他的なアクセスを提供し、競合中に協調スレッド プール内のスレッドをブロックすることなくタスクを一時停止します。
+- **開始方法**: 作成する`actor Database`、読み取りおよび書き込み方法を次のように変更します。`async`、電話をかけるときに使用します`await database.save(...)`または`await database.loadArticles(...)`。
+
+### 3. スキャン`await`ロックとスレッドに近い仮定
+
+- **対処方法**: プロジェクトにロック スパンがあるかどうかを確認します。`await`、スレッドローカル状態に依存し、セマフォを使用して非同期タスクを待機するコード。
+- **実行する価値がある理由**:`await`前後の実行スレッドは異なる可能性があり、隠れた依存関係により、協調スレッド プールの前進進行契約が破棄されます。
+- **開始方法**: 検索`await`、`NSLock`、`os_unfair_lock`、`DispatchSemaphore`、クリティカルセクションを同期コードに短縮し、非同期依存関係を次のように変更します。`await`、タスク グループまたはアクター。
+
+### 4. メインスレッド UI のバッチ更新
+
+- **対処方法**: データを 1 つずつ読み取り、UI を 1 つずつ更新するループを配列レベルの API に変更します。
+- **実行する価値がある理由**: MainActor は協調スレッド プールから分離されています。 MainActor への出入りが頻繁に行われると、スレッド コンテキストの切り替えが発生します。
+- **開始方法**:`loadArticle(with:) -> Article`に変更します`loadArticles(with:) -> [Article]`、バンドル`updateUI(for article:)`に変更します`updateUI(for articles:)`。
+
+### 5. Instruments を使用して移行の利点を検証する
+
+- **やるべきこと**: Swift Concurrency を移行した後、Instruments システム トレースを使用して、スレッド数、コンテキスト スイッチ、メイン スレッド アクティビティを確認します。
+- **実行する価値がある理由**: セッションは、小規模な同期作業のためのタスクを作成しないように開発者に思い出させます。タスクには実行時管理コストもかかります。
+- **開始方法**: 最初に GCD バージョンのトレースを記録し、次に async/await バージョンのトレースを記録し、スレッド数とコンテキスト スイッチの密度を比較します。
+
+## 関連セッション
+
+- [Swift の async/await について](/articles/wwdc2021-10132) — Swift Concurrency の入り口で、非同期関数、一時停止ポイント、完了ハンドラーの移行について説明します。
+- [Swift で構造化された同時実行性を探る](/articles/wwdc2021-10134) — タスク グループについて話します。`async let`このシーンで言及されている親子タスクの依存関係を補うためのタスクのキャンセル。
+- [Swift アクターを使用して可変状態を保護する](/articles/wwdc2021-10133) — アクターの分離、MainActor、および共有状態の保護について説明することは、この分野のアクター実装の詳細を理解するための前提条件となる内容です。
+- [アプリのハングを理解して排除する](/articles/wwdc2021-10258) - ツールとアンチパターンの観点からハングを分析することは、この分野のブロッキング プリミティブと GCD リスクに直接関連しています。

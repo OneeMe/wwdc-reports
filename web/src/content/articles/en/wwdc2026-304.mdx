@@ -1,0 +1,241 @@
+---
+title: "Implement high-resolution photo capture"
+description: "Learn when to use RAW, exposure-bracketed, and fully processed capture, and how to configure 24 MP and 48 MP photo capture across iPhone cameras."
+date: "2026-06-10"
+tags: ["AVFoundation", "Camera", "High Resolution", "Deferred Processing"]
+thumbnail: "/images/sessions/2026/304.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/304/"
+sessionId: "wwdc2026-304"
+year: "2026"
+relatedSessions:
+  - title: "Support Center Stage front camera in your iOS app"
+    code: "341"
+    description: "The iPhone 17 front Center Stage camera supports 18 MP high-resolution capture, which follows the same logic as this session's 24 MP and 48 MP capture."
+  - title: "Build a responsive camera app that launches quickly"
+    code: "303"
+    description: "Camera app launch optimization that complements this session's responsive photo capture techniques."
+  - title: "Capture High-Quality Photos Using Video Formats"
+    code: "305"
+    description: "Core Image RAW processing that connects with this session's RAW and ProRAW capture discussion."
+  - title: "Create a More Responsive Camera Experience"
+    code: "268"
+    description: "Instruments responsiveness analysis tools that can measure the real effects of deferred processing and responsive shutter behavior."
+---
+
+## Highlight
+
+> On iOS 27, Apple opens the native Camera app's Deferred Photo Processing and Fast Capture Prioritization capabilities to third-party apps. High-resolution 24 MP and 48 MP capture no longer has to block the shutter, so developers can output maximum-quality photos without sacrificing burst responsiveness.
+
+## Core Content
+
+### What makes a high-resolution photo high resolution?
+
+The preview stream has enough resolution to display on screen, but captured photos from that stream have less detail and more noise. If you need cropping, zoomed-in inspection, or image analysis, the preview stream is not enough.
+
+Apple introduced the 48 MP quad-pixel sensor starting with iPhone 14 Pro. It supports two modes: combine four pixels into one 12 MP output for more light in dark scenes, or use the full pixel array for 48 MP output and maximum detail. With iPhone 15, Apple added a 24 MP mode. It first captures a 12 MP multi-frame fused HDR photo using quad-pixel output, then uses the Photonic Engine computational photography pipeline to fuse it with a 48 MP full-resolution image, producing a photo with twice the resolution while increasing file size by only about 50%.
+
+Support for 24 MP and 48 MP is expanding. The telephoto camera on iPhone 16 Pro and the ultra-wide camera on iPhone 17 both support these high-resolution modes.
+
+### Four high-resolution capture types
+
+Your app can ask the system for four different kinds of high-resolution photos:
+
+- **Fully processed photo**: Multi-frame fusion processed by the Photonic Engine, improving dynamic range and detail. This is the most common mode.
+- **Exposure brackets**: Multiple frames of the same scene at different exposures, useful for HDR compositing or manual frame selection.
+- **Bayer RAW**: Minimally processed sensor data, suitable for later editing.
+- **Apple ProRAW**: RAW flexibility plus iPhone image processing, giving more room when editing exposure, color, and detail.
+
+### The tradeoff between quality and speed
+
+The biggest pain point in high-resolution photography is processing time. A single 48 MP frame already takes seconds to process, and 24 MP multi-frame fusion is slower. If users have to wait for one photo to finish processing before taking the next, they miss important moments.
+
+Apple's solution has four layers:
+
+**Layer 1: resource preallocation**. Use `setPreparedPhotoSettingsArray` to tell the system in advance which resolution and quality settings you plan to use, so low-level resources are ready before the user presses the shutter. If you skip this, resources are allocated on the first capture, causing visible delay.
+
+**Layer 2: responsive shutter with Responsive Capture**. After `isResponsiveCaptureEnabled` is enabled, the next photo can begin as soon as the previous photo's capture phase finishes. It does not need to wait for processing to complete. With the `captureReadiness` property, you can know exactly when the next frame can be captured.
+
+**Layer 3: Deferred Photo Processing**. After capture completes, the system first returns a lightweight proxy photo and moves expensive multi-frame fusion and depth processing to the background or an idle period. The final photo can be fetched on demand through PhotoKit or completed automatically by the system in the background.
+
+**Layer 4: Fast Capture Prioritization**. This is new in iOS 27. When the system detects rapid continuous shooting, it automatically downgrades `photoQualityPrioritization` from `.quality` to `.balanced`, reducing capture and processing time. These downgraded photos are later improved in the background through deferred processing. In the demo, the same basketball scene produced only one shot without these APIs, and five shots with them enabled.
+
+## Details
+
+### Configure AVCaptureSession
+
+([05:26](https://developer.apple.com/videos/play/wwdc2026/304/?time=326))
+
+Only the `.photo` preset supports 24 MP and 48 MP. Other presets do not support high-resolution capture.
+
+```swift
+import AVFoundation
+
+private let session = AVCaptureSession()
+
+private func configureSession() {
+    session.beginConfiguration()
+    session.sessionPreset = .photo
+}
+```
+
+Key points:
+
+- `sessionPreset` must be `.photo`, otherwise high-resolution options are unavailable.
+
+### Configure AVCapturePhotoOutput
+
+([06:11](https://developer.apple.com/videos/play/wwdc2026/304/?time=371))
+
+```swift
+import AVFoundation
+
+private let photoOutput = AVCapturePhotoOutput()
+
+private let configurePhotoOutput: () -> Void = {
+    photoOutput.maxPhotoQualityPrioritization = .quality
+}
+```
+
+Key points:
+
+- When `maxPhotoQualityPrioritization` is `.quality`, the system prepares resources for all three levels: speed, balanced, and quality.
+- 24 MP and 18 MP capture, including the Center Stage front camera, require `.quality`. If set to `.balanced` or `.speed`, capture falls back to 12 MP.
+- 48 MP single-frame photos support `.balanced` and `.quality`, but not `.speed`.
+
+### Set maximum photo dimensions
+
+([06:38](https://developer.apple.com/videos/play/wwdc2026/304/?time=398))
+
+```swift
+import AVFoundation
+
+let supportedMaxPhotoDimensions = device?.activeFormat.supportedMaxPhotoDimensions ?? []
+
+if let largestDimension = supportedMaxPhotoDimensions.max(by: { lhs, rhs in
+    Int(lhs.width) * Int(lhs.height) < Int(rhs.width) * Int(rhs.height)
+}) {
+    photoOutput?.maxPhotoDimensions = largestDimension
+}
+
+session?.commitConfiguration()
+session?.startRunning()
+```
+
+Key points:
+
+- `supportedMaxPhotoDimensions` has been available since iOS 16 and lists every photo size supported by the current format.
+- The sample chooses the largest dimension for demonstration. In real apps, choose the dimension that fits the product requirement.
+- Finish photo output configuration before `commitConfiguration()`. Changing committed settings can trigger expensive pipeline reconfiguration.
+
+### Configure capture settings
+
+([07:21](https://developer.apple.com/videos/play/wwdc2026/304/?time=441))
+
+```swift
+import AVFoundation
+
+let settings = AVCapturePhotoSettings()
+settings.maxPhotoDimensions = dimension.cmVideoDimensionsValue
+settings.photoQualityPrioritization = .quality
+
+var delegate: AVCapturePhotoCaptureDelegate?
+
+if let delegate {
+    photoOutput?.capturePhoto(with: settings, delegate: delegate)
+}
+```
+
+Key points:
+
+- `maxPhotoDimensions` is a request, not a guarantee. The system chooses the best path based on light, scene, and available processing capacity.
+- The actual output size is returned in `AVCaptureResolvedSettings`, and the delegate is notified when capture finishes.
+- Each capture can independently set `maxPhotoDimensions` and `photoQualityPrioritization`. One session can support multiple qualities and sizes without reconfiguring the pipeline.
+
+### Preallocate resources
+
+([08:59](https://developer.apple.com/videos/play/wwdc2026/304/?time=539))
+
+```swift
+import AVFoundation
+
+let prepareSettings = AVCapturePhotoSettings()
+prepareSettings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+prepareSettings.photoQualityPrioritization = .quality
+
+photoOutput.setPreparedPhotoSettingsArray([prepareSettings]) { prepared, error in
+    if let error = error {
+        print("Failed to prepare: \(error)")
+        return
+    }
+    print("Pipeline prepared: \(prepared)")
+}
+
+// Create a new settings object for the actual capture
+let captureSettings = AVCapturePhotoSettings()
+captureSettings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+captureSettings.photoQualityPrioritization = .quality
+photoOutput.capturePhoto(with: captureSettings, delegate: self)
+```
+
+Key points:
+
+- Call `setPreparedPhotoSettingsArray` as early as possible when the user enters the matching capture mode, such as the moment they switch to 48 MP mode.
+- `prepareSettings` and `captureSettings` must be two independent objects and cannot be reused. Their configuration must match exactly so the actual capture hits the preallocated resources.
+- If resources are not preallocated, first capture has to allocate them on the spot and becomes slower.
+
+### Deferred processing and Fast Capture Prioritization
+
+([12:43](https://developer.apple.com/videos/play/wwdc2026/304/?time=763))
+
+```swift
+// Enable responsive shutter
+photoOutput.isResponsiveCaptureEnabled = true
+
+// Enable deferred photo processing
+photoOutput.isDeferredPhotoDeliveryEnabled = true
+
+// iOS 27: enable fast capture prioritization
+if #available(iOS 27.0, *) {
+    photoOutput.fastCapturePrioritizationEnabled = true
+}
+```
+
+Key points:
+
+- `isResponsiveCaptureEnabled` allows capture phases to overlap, so the next photo can start immediately after the previous capture phase ends.
+- `isDeferredPhotoDeliveryEnabled` makes the system return a proxy photo first and move final processing to the background. The proxy photo arrives through the `didFinishCapturingDeferredPhotoProxy` callback.
+- `fastCapturePrioritizationEnabled` automatically lowers quality from `.quality` to `.balanced` during rapid burst shooting. Starting in iOS 27, downgraded photos also use deferred processing to be improved in the background.
+- Deferred processing does not consume capture session memory, which makes 18 MP and 24 MP multi-frame fusion practical.
+
+## Key Ideas
+
+**1. Build a professional manual camera app**
+
+- **What to build**: Let users manually choose 12 MP, 24 MP, or 48 MP and show the estimated processing time for the current setting in real time.
+- **Why it is worth doing**: The `photoProcessingTimeRange` property can tell users how much longer they need to wait. Combined with `captureReadiness`, it can drive a more professional shutter-button state than the native camera.
+- **How to start**: Observe `AVCapturePhotoOutput.captureReadiness` and display "Ready" / "Processing" in the UI. Use `AVCaptureResolvedSettings.photoProcessingTimeRange` to estimate remaining time.
+
+**2. Add a 48 MP mode to a document scanner**
+
+- **What to build**: Switch to 48 MP when scanning documents, then automatically crop, correct perspective, and output a very high-precision PDF.
+- **Why it is worth doing**: 48 MP single-frame photos contain extremely rich detail. Text edges are sharp and remain clear when zoomed. Deferred processing lets users take the next page immediately, so multi-page scanning does not feel stuck.
+- **How to start**: Configure `maxPhotoDimensions` to a 48 MP size, set `photoQualityPrioritization` to `.balanced` because 48 MP single-frame capture supports balanced, and enable `isDeferredPhotoDeliveryEnabled`.
+
+**3. Build a burst camera that selects the best shot**
+
+- **What to build**: Let users hold the shutter for continuous capture, then automatically choose the sharpest and best-composed frame afterward.
+- **Why it is worth doing**: After `fastCapturePrioritizationEnabled` is enabled, burst speed rises significantly. With deferred processing, the app can score each photo's quality in the background.
+- **How to start**: Enable `isResponsiveCaptureEnabled` and `fastCapturePrioritizationEnabled`, record metadata for each photo in the `didCapturePhotoFor` callback, then perform sharpness analysis after fetching the final photo through deferred processing.
+
+**4. Capture RAW and high-resolution processed photos together**
+
+- **What to build**: Request both a 48 MP ProRAW and a 24 MP fully processed photo, giving users RAW editing flexibility and an instantly useful computational photography result.
+- **Why it is worth doing**: The session explains that RAW, ProRAW, and fully processed photos are independent capture types. You can configure multiple outputs and get two formats from one shutter press.
+- **How to start**: Configure two `AVCapturePhotoOutput` instances, one with `isHighResolutionCaptureEnabled` and a RAW format, and another as 24 MP fully processed. Or use bracketed capture on the same output.
+
+## Related Sessions
+
+- [Support Center Stage front camera in your iOS app](/articles/wwdc2026-341) - The iPhone 17 front Center Stage camera supports 18 MP high-resolution capture, which follows the same logic as this session's 24 MP and 48 MP capture.
+- [Build a responsive camera app that launches quickly](/articles/wwdc2026-303) - Camera app launch optimization that complements this session's responsive photo capture techniques.
+- [Capture High-Quality Photos Using Video Formats](/articles/wwdc2026-305) - Core Image RAW processing that connects with this session's RAW and ProRAW capture discussion.
+- [Create a More Responsive Camera Experience](/articles/wwdc2026-268) - Instruments responsiveness analysis tools that can measure the real effects of deferred processing and responsive shutter behavior.

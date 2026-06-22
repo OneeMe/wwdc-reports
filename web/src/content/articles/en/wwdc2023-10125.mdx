@@ -1,0 +1,305 @@
+---
+title: "Bring your game to Mac, Part 3: Render with Metal"
+description: "Discover how you can support Metal in your rendering code as we close out our three-part series on bringing your game to Mac. Once you've evaluated your existing Windows binary with the Game Porting Toolkit and brought your HLSL shaders over to Metal, learn how you can optimally implement the features that high-end, modern games require. We'll show you how to manage GPU resource bindings, residency, and synchronization. Find out how to optimize GPU commands submission, render rich visuals with MetalFX upscaling, and more."
+date: "2023-06-06"
+tags: ["Metal", "Rendering", "MetalFX"]
+thumbnail: "/images/sessions/2023/10125.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10125/"
+sessionId: "wwdc2023-10125"
+year: "2023"
+relatedSessions:
+  - title: "Bring your game to Mac, Part 1: Make a game plan"
+    code: "10123"
+    description: "Evaluate the feasibility of Windows games on Mac with Game Porting Toolkit"
+  - title: "Bring your game to Mac, Part 2: Compile your shaders"
+    code: "10124"
+    description: "Use Metal Shader Converter to convert HLSL shaders to Metal"
+  - title: "Optimize GPU renderers with Metal"
+    code: "10127"
+    description: "Optimize GPU renderers with the latest Metal features"
+---
+
+## Highlight
+
+> This is the final chapter in the trilogy of porting games to Mac. It explains how to port the renderer to Metal, covering four core topics: resource binding and persistence, command submission optimization, indirect rendering, and MetalFX super-resolution.
+
+## Core Content
+
+### From Root Signature to Argument Buffer
+
+Direct3D uses Root Signature to describe resource bindings. A typical Root Signature has four entries: texture descriptor table, buffer parameters, 32-bit constants, and sampler descriptor table.
+
+Metal's Argument Buffer is more flexible and supports mixed type elements. But it's also easy to code if the engine expects a homogeneous array.
+
+**Encoded texture descriptor table**:
+
+```objc
+// Create the texture table outside the render loop
+id<MTLBuffer> textureTable = [device newBufferWithLength:sizeof(MTLResourceID) * texturesCount
+                                                 options:MTLResourceStorageModeShared];
+
+MTLResourceID* textureTableCPUPtr = (MTLResourceID*)textureTable.contents;
+for (uint32_t i = 0; i < texturesCount; ++i) {
+    // Create the texture
+    id<MTLTexture> texture = [device newTextureWithDescriptor:textureDesc[i]];
+    // Store the texture GPU resource ID in the table
+    textureTableCPUPtr[i] = texture.gpuResourceID;
+}
+```
+
+**Key Points**:
+- `MTLResourceID` is a resource identifier introduced in Metal 3
+- The texture table is created during the initialization phase, not in the rendering loop
+- `gpuResourceID` directly obtains the GPU side identifier of the texture
+
+([03:55](https://developer.apple.com/videos/play/wwdc2023/10125/?time=235))
+
+**Encoding sampler descriptor table**:
+
+```objc
+id<MTLBuffer> samplerTable = [device newBufferWithLength:sizeof(MTLResourceID) * samplersCount
+                                                 options:MTLResourceStorageModeShared];
+
+MTLResourceID* samplerTableCPUPtr = (MTLResourceID*)samplerTable.contents;
+for (uint32_t i = 0; i < samplersCount; ++i) {
+    MTLSamplerDescriptor* desc = [MTLSamplerDescriptor new];
+    desc.supportArgumentBuffers = YES;  // Required
+    // ... Configure other sampler properties
+
+    id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:desc];
+    samplerTableCPUPtr[i] = sampler.gpuResourceID;
+}
+```
+
+**Key Points**:
+- `supportArgumentBuffers = YES` is the prerequisite for the sampler to be put into the Argument Buffer
+- Like the texture table, the sampler table is also created during the initialization phase
+
+([04:33](https://developer.apple.com/videos/play/wwdc2023/10125/?time=273))
+
+**Encoding the top-level Argument Buffer**:
+
+```objc
+struct TopLevelAB {
+    MTLResourceID* textureTable;
+    float*         myBuffer;
+    uint32_t       myConstant;
+    MTLResourceID* samplerTable;
+};
+
+id<MTLBuffer> topAB = [device newBufferWithLength:sizeof(TopLevelAB)
+                                          options:MTLResourceStorageModeShared];
+
+TopLevelAB* topABCPUPtr = (TopLevelAB*)topAB.contents;
+topABCPUPtr->textureTable = (MTLResourceID*)textureTable.gpuAddress;
+topABCPUPtr->myBuffer     = (float*)myBuffer.gpuAddress;
+topABCPUPtr->myConstant   = 128;
+topABCPUPtr->samplerTable = (MTLResourceID*)samplerTable.gpuAddress;
+```
+
+**Key Points**:
+- The top-level structure corresponds to the four entries of Root Signature
+- `gpuAddress` Get the GPU address of the subtable
+- Only need to bind this top-level buffer in the rendering loop: `[encoder setVertexBuffer:topAB offset:0 atIndex:0]`
+
+([05:05](https://developer.apple.com/videos/play/wwdc2023/10125/?time=305))
+
+### Resource residency management
+
+Bindless resources require explicit management of residency. Core recommendations:
+
+**Read-only resource**: Grouped into a large Heap, called once per encoder `useHeap`.
+
+```objc
+// Create the heap
+MTLHeapDescriptor* heapDesc = [MTLHeapDescriptor new];
+heapDesc.size = requiredSize;
+heapDesc.type = MTLHeapTypeAutomatic;
+id<MTLHeap> heap = [device newHeapWithDescriptor:heapDesc];
+
+// Allocate textures and buffers from the heap
+id<MTLTexture> texture = [heap newTextureWithDescriptor:desc];
+id<MTLBuffer> buffer = [heap newBufferWithLength:length options:options];
+
+// Mark the entire heap resident at once during rendering
+[encoder useHeap:heap];
+```
+
+**Key Points**:
+- Heap's hazard tracking mode is set to Untracked
+- All read-only resources are allocated from one Heap
+- Only one `useHeap` call per encoder
+
+([06:49](https://developer.apple.com/videos/play/wwdc2023/10125/?time=409))
+
+**Writable resources**: Allocate separately, specify the usage flag with `useResource`, and let Metal handle the synchronization.
+
+```objc
+// Allocate writable resources separately
+id<MTLTexture> textureRW = [device newTextureWithDescriptor:desc];
+id<MTLBuffer> bufferRW = [device newBufferWithLength:length options:options];
+
+// Mark resources resident and specify read/write flags
+[encoder useResource:textureRW usage:MTLResourceUsageWrite stages:stage];
+[encoder useResource:bufferRW usage:MTLResourceUsageRead stages:stage];
+```
+
+**Key Points**:
+- Do not put writable resources into Heap
+- Explicitly specify read and write intentions with `useResource`
+- Metal automatically handles hazard tracking and synchronization across encoders
+
+([07:34](https://developer.apple.com/videos/play/wwdc2023/10125/?time=454))
+
+### Command submission optimization
+
+Apple GPU is a TBDR (Tile-Based Deferred Renderer) architecture with unified memory and on-chip Tile Memory. Metal uses the Pass concept, which requires commands to be grouped by type.
+
+Problem sequence before optimization: Clear → Draw → Copy → Calculate → Draw. This sequence has 5 round trips between Tile Memory and system memory.
+
+Optimization steps:
+
+1. **Move the copy operation before rendering starts**
+2. **Group commands by type**: Put drawing commands together and calculation commands together
+3. **Merge Passes that share the same render target**
+4. **Use LoadActionClear instead of empty encoder clear**
+5. **Optimize Store Action**: Store render target content only when needed
+
+After optimization, there is only one final flush left, and the memory bandwidth is greatly reduced.
+
+([10:53](https://developer.apple.com/videos/play/wwdc2023/10125/?time=653))
+
+### Metal Debugger automatically discovers optimization opportunities
+
+Xcode's Metal Debugger lists optimization suggestions in the Insights section of the Summary viewer, divided into four categories: Memory, Bandwidth, Performance, and API Usage.
+
+Example: GBuffer Pass stores more attachments than needed. The Albedo texture is not used in subsequent frames and the Store operation is redundant. The fix is ​​to set the store action to DontCare.
+
+Another example: the two Passes GBuffer and Forward can be merged because they read and write the same attachment. Save bandwidth after merging.
+
+Dependencies viewer can view the data flow between Passes, confirm load/store actions and merge opportunities.
+
+([15:06](https://developer.apple.com/videos/play/wwdc2023/10125/?time=906))
+
+## Detailed Content
+
+### Indirect rendering
+
+ExecuteIndirect stores the parameters of multiple drawing commands into a buffer, and the GPU reads the parameters from the buffer to execute drawing. This allows the GPU to decide what to render and is key to implementing a GPU-driven rendering loop.
+
+Metal has two translation methods:
+
+**Method 1: Draw Indirect**
+
+```objc
+// Translate ExecuteIndirect into a series of drawIndexedPrimitives calls
+uint32_t drawArgumentsBufferOffset = 0;
+for (uint32_t i = 0; i < maxDrawCount; ++i) {
+    [renderEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                              indexType:MTLIndexTypeUInt16
+                            indexBuffer:indexBuffer
+                      indexBufferOffset:indexBufferOffset
+                         indirectBuffer:drawArgumentsBuffer
+                   indirectBufferOffset:drawArgumentsBufferOffset];
+
+    drawArgumentsBufferOffset += sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
+}
+```
+
+**Key Points**:
+-Each draw command is coded individually
+- Read different indirect parameters by offset
+- Simple to implement and suitable for most scenarios
+
+([19:31](https://developer.apple.com/videos/play/wwdc2023/10125/?time=1171))
+
+**Method 2: Indirect Command Buffer (ICB)**
+
+Use ICB when the scene has thousands of draw commands and CPU encoding time is the bottleneck. ICB encodes commands on the GPU, including setting pipeline state and buffer binding.
+
+```metal
+// Compute kernel: translate indirect draw arguments into ICB commands
+kernel void translateToICB(device const Command* indirectCommands [[buffer(0)]],
+                           device const ICBContainerAB* icb [[buffer(1)]],
+                           ...)
+{
+    device const Command* indirectCommand = &indirectCommands[commandIndex];
+    device const MTLDrawIndexedPrimitivesIndirectArguments* args =
+        &command->mdiBuffer[mdiIndex];
+
+    render_command drawCall(icb->buffer, indirectCommand->mdiCmdStart + mdiIndex);
+
+    if (args->indexCount > 0 && args->instanceCount > 0) {
+        encodeCommand(indirectCommand, args, drawCall);
+    } else {
+        cmd.reset();
+    }
+}
+
+void encodeCommand(device const Command* indirectCommand,
+                   device const MTLDrawIndexedPrimitivesIndirectArguments* args,
+                   thread render_command& drawCall)
+{
+    drawCall.set_render_pipeline_state(indirectCommand->pso);
+
+    for (ushort i = 0; i < indirectCommand->vertexBuffersCount; ++i) {
+        drawCall.set_vertex_buffer(indirectCommand->vertexBuffer[i].buffer,
+                                   indirectCommand->vertexBuffer[i].slot);
+    }
+
+    drawCall.draw_indexed_primitives(primitive_type::triangle,
+                                     args->indexCount,
+                                     indirectCommand->indexBuffer + args->indexStart,
+                                     args->instanceCount,
+                                     args->baseVertex,
+                                     args->baseInstance);
+}
+```
+
+**Key Points**:
+- ICB commands are encoded on the GPU, reducing CPU overhead
+- No need to split indirect execution commands for each state change
+- Can reuse existing indirect parameter generation shaders
+
+([21:48](https://developer.apple.com/videos/play/wwdc2023/10125/?time=1308))
+
+### MetalFX Super Resolution
+
+MetalFX lets games render at a lower resolution and then oversample to the target resolution, saving GPU time per frame.
+
+MetalFX supports two algorithms:
+- **Spatial**: Best performance
+- **Temporal**: Quality close to native resolution rendering
+
+New this year: iOS support, up to 3x supersampling, Metal-cpp support.
+
+Integrating MetalFX requires:
+1. The engine supports super-resolution
+2. The renderer manually controls the level of detail of texture sampling.
+3. Temporal supersampling requires dither sequences and motion vectors (already available if TAA already exists)
+
+([22:54](https://developer.apple.com/videos/play/wwdc2023/10125/?time=1374))
+
+## Core Takeaways
+
+- **What to build**: Port existing Root Signature binding model with Argument Buffer
+  - **Why it's worth doing**: Metal 3's Argument Buffer has higher performance and can fully map Direct3D's descriptor table concept
+  - **How to start**: Encode the texture table and sampler table during the initialization phase, and the rendering loop only binds the top-level Argument Buffer
+
+- **What to build**: Automatically discover bandwidth optimization opportunities with Metal Debugger’s Insights feature
+  - **Why it's worth doing**: You can intuitively see which Passes can be merged and which Store operations are redundant
+  - **How to start**: To capture a Metal workload in Xcode, view the Insights section of the Summary viewer
+
+- **What to build**: Use Indirect Command Buffer in CPU encoding bottleneck scenarios
+  - **Why it's worth doing**: Move command encoding from CPU to GPU, significantly reducing CPU overhead
+  - **How to start**: Add a calculation kernel to translate indirect drawing parameters into ICB commands, and then execute them with `executeCommandsInBuffer`
+
+- **What to build**: Integrated MetalFX Upscaling to improve frame rate
+  - **Why it's worth doing**: Render at a lower resolution and then oversample to get significant performance improvements on Apple Silicon
+  - **How to start**: Confirm that the engine supports super-resolution and manual LOD control, select Spatial or Temporal algorithm
+
+## Related Sessions
+
+- [Bring your game to Mac, Part 1: Make a game plan](/articles/wwdc2023-10123) — Use the Game Porting Toolkit to evaluate the feasibility of Windows games on Mac
+- [Bring your game to Mac, Part 2: Compile your shaders](/articles/wwdc2023-10124) — Convert HLSL shaders to Metal using Metal Shader Converter
+- [Optimize GPU renderers with Metal](/articles/wwdc2023-10127) — Optimized GPU renderer using the latest features of Metal

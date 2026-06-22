@@ -1,0 +1,310 @@
+---
+title: "Optimize Metal Performance for Apple silicon Macs"
+description: |
+  apple silicon macs are a transformative new platform for graphics-intensive apps — and we're going to show you how to fire up the gpu to create blazingly fast apps and games.
+
+  discover how to take advantage of apple's unique tile-based deferred rendering (tbdr) gpu architecture within apple silicon macs and learn how to schedule workloads to provide maximum throughput, structure your rendering pipeline, and increase overall efficiency. and dive deep with our graphics team as we explore shader optimizations for the apple gpu shader core.
+
+  we've designed this session in tandem with “bring your metal app to apple silicon macs,” and recommend you watch that first.
+
+  For more, watch “Harness Apple GPUs with Metal” to learn how TBDR applies to a variety of modern rendering techniques.
+
+tags: ["WWDC 2020", "Metal", "Performance"]
+date: 2020-06-10
+thumbnail: "/images/sessions/2020/10632.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10632/"
+sessionId: "wwdc2020-10632"
+year: "2020"
+relatedSessions:
+  - title: "Bring your Metal app to Apple silicon Macs"
+    code: "10631"
+    description: "Apple GPU の TBDR アーキテクチャと Apple シリコン Mac ポートの違いを理解する"
+  - title: "Harness Apple GPUs with Metal"
+    code: "10602"
+    description: "Metal を使用して Apple GPU アーキテクチャの最新のレンダリング技術を体系化する方法を学びます"
+  - title: "Optimize Metal apps and games with GPU counters"
+    code: "10603"
+    description: "GPU カウンターを使用して Metal パフォーマンスのボトルネックを特定し、最適化の効果を検証する"
+  - title: "Gain insights into your Metal app with Xcode 12"
+    code: "10605"
+    description: "Xcode 12 の Metal デバッグおよびパフォーマンス ツールを使用してグラフィックスの問題を確認する"
+  - title: "Build GPU binaries with Metal"
+    code: "10615"
+    description: "Metal シェーダーのコンパイルと GPU バイナリ配信プロセスを最適化します。"
+---
+## ハイライト
+
+> Apple は、Apple シリコン Mac 上の Metal のパフォーマンス調整パスについて説明しています。レンダリング パスの依存関係と帯域幅を削減し、タイル シェーダを使用してオンチップ データを保持し、Apple シェーダ コア機能に従ってシェーダを書き換えます。
+
+## 主要内容
+
+多くの Mac グラフィックス アプリには、すでに完成度の高いレンダラーが備わっています。これらは何年も Intel または AMD GPU で実行されており、一般的な最適化はイミディエイト モード レンダリングを中心に展開されています。 Apple Silicon Mac に移行した後、アプリを最初に Rosetta で実行し、その後ネイティブ バージョンに再コンパイルできますが、これは「実行」の問題のみを解決します。フレーム レートと消費電力に実際に影響を与えるのは、レンダラが Apple GPU のタイルベース遅延レンダリング (TBDR、タイルベース遅延レンダリング) アーキテクチャを理解しているかどうかです。
+
+TBDR の主な変更点はタイル メモリ (オンチップ タイル メモリ) です。 Apple GPU は、まずレンダー パスの頂点を処理し、ジオメトリを画面タイルに分割し、次にチップ上の各タイルのフラグメント作業を完了します。ロード アクションとストア アクションは、添付ファイルがタイル メモリに出入りする方法を決定します。これまでは、複数のパスに分割し、中間結果を頻繁にクリアし、頻繁に保存することにより、システム メモリの帯域幅が直接圧迫されていました。
+
+このセッションの説明は非常に明確です。最初に GPU タイムラインの穴を見つけ、次にレンダー パスによって引き起こされるロード/ストアを削減し、次に隠れたサーフェスの削除を使用して非効果的なシェーディングを削減し、最後にディファード シェーディング、ライト カリング、およびシェーダのデータ タイプを Apple GPU に適した形状に変更します。
+
+開発者にとって、焦点は API 名の置換ではありません。より実際的な作業は、ワークロードを再配置し、元々同じ論理パスに属していたレンダリングをマージし、中間のアタッチメントを選択することです。`.memoryless`次に、Metal System Trace、GPU フレーム デバッガー、パイプライン統計を使用して結果を確認します。
+
+## 詳細
+
+### 1. 頂点、フラグメント、計算を可能な限りオーバーラップさせます
+
+([04:17](https://developer.apple.com/videos/play/wwdc2020/10632/?time=257)) Apple GPU には、頂点、フラグメント、および計算作業を処理するための独立したハードウェア チャネルがあります。データの依存関係がない場合、Metal はそれらを自動的にオーバーラップします。パフォーマンスの問題は、「共有リソースのように見えるが、実際のデータとは何の関係もない」誤った依存関係で発生することがよくあります。
+
+([06:05](https://developer.apple.com/videos/play/wwdc2020/10632/?time=365)) レンダー パス 0 によって書き込まれたリソースがレンダー パス 1 の頂点ステージによって読み取られる場合、Metal はリソース レベルで依存関係を確立します。 2 つのパスが同じリソースの異なる領域を使用している場合でも、スケジューラはデータが無関係であることを知る方法がありません。ソリューションには 2 種類あります。データを異なるリソースに分割します。または、リソースを追跡なしに設定し、開発者がメタル フェンスまたはイベントを使用して必要な同期を挿入できるようにします。
+
+([07:23](https://developer.apple.com/videos/play/wwdc2020/10632/?time=443)) もう 1 つの低コストの方法は、パスの並べ替えです。独立したコンピューティング パスまたはレンダー パスは、タイムラインの穴を埋めるためにできるだけ早くエンコードする必要があります。 Metal は独立したパスを再配置することがありますが、確認できる情報は限られており、明示的な再配置の方が信頼性が高くなります。
+
+ここでの実行可能境界は次のとおりです。隣接するパスが同じ Metal リソースを共有しているが、無関係なデータの読み取りと書き込みを行う場合、それらは最初に異なるリソースに分割されます。分割できない場合は、リソースを未追跡としてマークし、Metal が依存関係を確立するためにリソース全体に依存しなくなります。次に、アプリケーションはメタル フェンスまたはイベントを使用して、本当に必要な同期を挿入します。
+
+キーポイント:
+
+- 誤った依存関係は、API が誤って書かれたものではなく、リソース レベルの追跡から発生します。
+- Metal は 2 つのパスが関連していないことを自動的に認識できるため、リソースを分割することが最も直接的な修正です。
+- 追跡されていないリソースは自動依存関係を削除するため、開発者は実際のデータが依存するフェンスまたはイベントのみを使用する必要があります。
+- パスの並べ替えは、リソースの依存関係を修正した後に配置し、タイムラインの穴を独立したコンピューティング/レンダリング パスで埋める必要があります。
+
+### 2. 並列レンダリング コマンド エンコーダーを使用して、論理的に同一のパスをマージします
+
+([09:08](https://developer.apple.com/videos/play/wwdc2020/10632/?time=548)) Apple GPU レンダー パスの添付ファイルはタイル ストレージで処理されます。添付ファイルのロードとストアはそれぞれ、システム メモリ帯域幅を消費します。よくある問題は、CPU マルチスレッド エンコーディングのために、同じ G バッファの異なる部分を複数のコマンド バッファに分割することです。 GPU は複数のレンダー パスを認識するため、添付ファイルの同じバッチを繰り返しロード/保存します。
+
+([10:49](https://developer.apple.com/videos/play/wwdc2020/10632/?time=649)) Metal の並列レンダー コマンド エンコーダーは、このシナリオを解決します。CPU は引き続きマルチスレッドでエンコードでき、GPU 側は依然としてレンダー パスです。
+
+```
+// Encoding with parallel render commands
+
+let parallelDescriptor = MTLRenderPassDescriptor()
+// … setup render pass as usual …
+
+let parallelEncoder = commandBuffer.makeParallelRenderCommandEncoder(descriptor:parallelDescriptor)
+
+let subEncoder0 = parallelEncoder.makeRenderCommandEncoder()
+let subEncoder1 = parallelEncoder.makeRenderCommandEncoder()
+
+let syncPoint = DispatchGroup()
+DispatchQueue.global(qos: .userInteractive).async(group: syncPoint) {
+    /* … encode with subEncoder0 … */ }
+DispatchQueue.global(qos: .userInteractive).async(group: syncPoint) {
+    /* … encode with subEncoder1 … */ }
+
+syncPoint.wait()
+parallelEncoder.end()
+```
+
+キーポイント:
+
+- `MTLRenderPassDescriptor()`通常のレンダー パスと同じアタッチメント構成を使用し、すべてのサブエンコーダーがこの構成を共有します。
+- `makeParallelRenderCommandEncoder`並列エンコーダーを作成すると、Metal はサブエンコーダーを単一のレンダー パスに合成して実行します。
+- `makeRenderCommandEncoder()`作成順序によってサブエンコーダコマンドの実行順序が決まるため、想定される順序で最初に作成してください。
+- 二`DispatchQueue.global`このブロックはエンコーディングをさまざまなワーカー スレッドに分散し、CPU の並列性を維持します。
+- `syncPoint.wait()`電話をかける前にすべてのサブタスクが完了していることを確認してください`parallelEncoder.end()`そうでない場合、パラレル エンコーダーはまだコマンド ストリームを完了していません。
+
+### 3. 接続ピンポンと冗長ストアを削減する
+
+([12:12](https://developer.apple.com/videos/play/wwdc2020/10632/?time=732)) もう 1 つの帯域幅の罠は、ロード/ストア アクションが変更されたという理由だけでパスを破棄することです。たとえば、フォワード レンダラーは最初に不透明を描画し、次に半透明を描画します。添付ファイルのコレクションが同じ場合、2 つの描画を同じパスで組み合わせることができ、色は最後に 1 回だけ保存されます。深度アタッチメントがパスの外で使用されなくなった場合は、ストア アクションを次のように設定する必要があります。`.dontCare`、テクスチャを次のように設定することもできます。`.memoryless`。
+
+([13:29](https://developer.apple.com/videos/play/wwdc2020/10632/?time=809)) アタッチメントのピンポンはさらに微妙です。たとえば、各ライトは最初にスクリーン空間の減衰テクスチャを生成し、それをメイン シーンに合成します。各ライトの 1 つのパスにより、メイン シーンのアタッチメントが繰り返しロード/保存されます。 Metal はパスごとに最大 8 つのカラー アタッチメントをサポートし、メイン シーンと減衰を同じパスに入れることができます。
+
+```
+// Multiple render target setup
+
+let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(…)
+let lightingTexture = device.makeTexture(descriptor: textureDescriptor)
+
+textureDescriptor.storageMode = .memoryless
+let attenuationTexture = device.makeTexture(descriptor: textureDescriptor)
+
+let renderPassDesc = MTLRenderPassDescriptor()
+renderPassDesc.colorAttachments[0].texture      = lightingTexture
+renderPassDesc.colorAttachments[0].loadAction   = .clear
+renderPassDesc.colorAttachments[0].storeAction  = .store
+renderPassDesc.colorAttachments[1].texture      = attenuationTexture
+renderPassDesc.colorAttachments[1].loadAction   = .clear
+renderPassDesc.colorAttachments[1].storeAction  = .dontCare
+
+let renderPass = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc);
+```
+
+キーポイント:
+
+- `lightingTexture`これはメイン シーンの出力であり、パスが終了した後も必要となるため、`storeAction`はい`.store`。
+- `textureDescriptor.storageMode = .memoryless`パス内でのみ使用されるデータに対するシステム メモリ バッキングの割り当てを避けるために、中間減衰テクスチャで使用されます。
+- `colorAttachments[0]`そして`colorAttachments[1]`レンダー パス記述子にも表示され、ピンポンが排除されます。
+- `attenuationTexture`の`storeAction`はい`.dontCare`パス外では読み取られないため。
+- `makeRenderCommandEncoder`この記述子を使用して単一パスを開始し、中間のロード/ストアを削減します。
+
+([15:17](https://developer.apple.com/videos/play/wwdc2020/10632/?time=917)) 画面のクリアも、実際に必要なレンダー パスに組み込む必要があります。別のクリア パスは添付ファイルをクリアするためにのみ使用され、追加のメモリ トラフィックが生成されます。 MSAA の解決も同様です。サンプル データは通常、パス内でのみ役立ち、前のパス内で解決される必要があります。マルチサンプル添付ファイルはメモリレスに設定できます。
+
+### 4. 隠面の削除による無効なフラグメントの作業を減らす
+
+([17:09](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1029)) Apple GPU の隠面除去 (HSR、隠面除去) の目標は、可視ピクセルのみをシェーディングすることです。描画順序は効率に影響します。最初は不透明、次にフィードバック、最後に半透明になります。不透明描画の内部順序は通常、マテリアル システムによって決まります。フィードバックと半透明は、独自の順序を考慮する必要があります。
+
+([19:01](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1141)) フラグメント関数がバッファまたは非レンダー パス テクスチャを書き込むとき、Metal はメモリ書き込みの決定性を確保するためにデフォルトでこれらのフラグメントを実行します。ブロックされたフラグメントの書き込みが結果にとって意味がない場合は、初期フラグメント テスト属性をフラグメント関数に追加して、深さテストに失敗したフラグメントが実行されないようにすることができます。
+
+([19:47](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1187))書き込みマスクも HSR 効率を低下させます。予約されたチャネルは基礎となるフラグメントから生成する必要があるため、追加のシェーディングが発生します。
+
+```
+let descriptor = MTLRenderPipelineDescriptor();
+// ...
+descriptor.colorAttachments[0].writeMask = .red | .green;
+```
+
+キーポイント:
+
+- `MTLRenderPipelineDescriptor`パイプラインのカラーアタッチメントの動作を制御します。
+- `writeMask = .red | .green`フラグメント関数が赤と緑のチャネルのみを更新することを示します。
+- ブルー チャンネルとアルファ チャンネルは古い値を保持するため、Apple GPU はこれらの値を取得するためにシェード アンダーラップ フラグメントを必要とする場合があります。
+- 本当にマスクを記述する必要がある場合は、それを使用できます。シェーダーで特定のアタッチメントだけが欠落している場合は、代わりにすべてのアタッチメントを入力する必要があります。
+
+([21:15](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1275)) G バッファの生成フェーズ中に添付ファイルが誤って見逃されることがよくあります。セッションによって与えられた修正は、特定のステージを 0 に初期化するだけでよい場合でも、すべてのレンダー パス アタッチメントに値を書き込むことです。
+
+```
+struct FragInput { ... };
+struct FragOutput { float3 albedo; float3 normals; float3 lighting; };
+
+fragment FragOutput GenerateGbuffer(
+                         FragInput in [[stage_in]]) {
+    FragOutput out;
+    out.albedo = sampleAlbedo(in);
+    out.normals = interpolateNormals(in);
+    out.lighting = float3(0, 0, 0);
+    return out;
+}
+```
+
+キーポイント:
+
+- `FragOutput`アルベド、法線、ライティングの 3 つの出力を明示的にリストし、G バッファー アタッチメントと位置合わせします。
+- `sampleAlbedo(in)`マテリアルの色を書き込みます。
+- `interpolateNormals(in)`法線を書きます。
+- `out.lighting = float3(0, 0, 0)`未書き込みによる書き込みマスク動作を回避するために、ライティング アタッチメントをアクティブに初期化します。
+- `return out`完全な出力を一度に返すことで、HSR による不透明なフラグメントの処理が容易になります。
+
+### 5. タイル シェーダを使用してチップ上でディファード シェーディングを維持する
+
+([23:22](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1402)) ディファード シェーディングは通常、最初に G バッファを生成し、次に G バッファを読み取ってライティングを計算します。従来の 2 パス書き込み方法では、アルベド、法線、ラフネス、およびその他のアタッチメントをシステム メモリに書き込み、すぐにそれらを読み取ります。 Apple GPU でのより良い方法は、プログラム可能なブレンディングとメモリレス レンダー ターゲットを使用して、G バッファ データをタイル メモリに保持することです。
+
+([28:29](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1709)) レンダラーがレンダリングと計算 (タイルベースのライト カリングなど) を混合する場合、通常の計算エンコーダーはプロセスを複数のパスに分割します。 Apple GPU は、A11 Bionic 以降、タイルベースのコンピューティング ディスパッチをサポートします。タイル シェーダは、レンダー コマンド エンコーダ内でタイルごとに実行でき、イメージブロック、スレッドグループ メモリ、デバイス メモリを読み取ります。
+
+([30:19](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1819)) 次のレンダー パス記述子は、G バッファーをメモリレスに設定し、`.dontCare`保存、最終的な照明テクスチャのみを保存します。
+
+```
+let renderPassDesc = MTLRenderPassDescriptor()
+
+renderPassDesc.tileWidth = 32
+renderPassDesc.tileHeight = 32
+
+renderPassDesc.threadgroupMemoryLength = MemoryLayout<LightInfo>.size * 8
+
+renderPassDesc.colorAttachments[0].texture      = albedoMemorylessTexture
+renderPassDesc.colorAttachments[0].loadAction   = .clear
+renderPassDesc.colorAttachments[0].storeAction  = .dontCare
+renderPassDesc.colorAttachments[1].texture      = normalsMemorylessTexture
+renderPassDesc.colorAttachments[1].loadAction   = .clear
+renderPassDesc.colorAttachments[1].storeAction  = .dontCare
+renderPassDesc.colorAttachments[2].texture      = roughnessMemorylessTexture
+renderPassDesc.colorAttachments[2].loadAction   = .clear
+renderPassDesc.colorAttachments[2].storeAction  = .dontCare
+renderPassDesc.colorAttachments[3].texture      = lightingTexture
+renderPassDesc.colorAttachments[3].loadAction   = .clear
+renderPassDesc.colorAttachments[3].storeAction  = .store
+```
+
+キーポイント:
+
+- `tileWidth`そして`tileHeight`オンチップ タイル サイズを定義します。この例では 32×32 を使用し、ライト カリング スキームに合わせます。
+- `threadgroupMemoryLength`スレッドグループ メモリを各タイルのライト リストに割り当てます。例は 8 です。`LightInfo`計算します。
+- アルベド、法線、ラフネスの 3 つのアタッチメントはメモリレス テクスチャを使用し、パスの終了時にシステム メモリに書き戻されません。
+- これらの中間アタッチメント`storeAction`全て`.dontCare`後続のステージで同じレンダー パス内でそれらが消費されるためです。
+- `lightingTexture`は最終出力なので、`storeAction`はい`.store`。
+
+([32:20](https://developer.apple.com/videos/play/wwdc2020/10632/?time=1940)) タイル シェーダーはイメージブロックのレイアウトを再配置することもできます。この例では、イメージブロックをディファード シェーディングからマルチレイヤー アルファ ブレンディングに必要なレイアウトに変換し、ライティングと深度を新しい構造に保存します。
+
+```
+// Transitioning from deferred rendering to multi-layer alpha blending layout
+struct DeferredShadingFragment {
+    rgba8unorm<half4> albedo;
+    rg11b10f<half3>   normal;
+    float             depth;
+    rgb9e5<half3>     lighting;
+};
+struct MultiLayerAlphaBlendFragments {
+    half4 color_and_transmittence[3];
+    float depth[3];
+};
+struct FragmentOutput {
+    MultiLayerAlphaBlendFragments v [[imageblock_data]];
+};
+fragment FragmentOutput my_tile_shader(DeferredShadingFragment input [[imageblock_data]]) {
+    FragmentOutput output;
+    output.v.color_and_transmittence[0] = half4(input.lighting, 0.0h);
+    output.v.depth[0]                   = input.depth;
+    return output;
+}
+```
+
+キーポイント:
+
+- `DeferredShadingFragment`アルベド、法線、深度、照明などの古いイメージブロック レイアウトについて説明します。
+- `MultiLayerAlphaBlendFragments`新しいレイアウトを説明し、マルチレイヤー透明ブレンド用の色/透過率と深度の配列を準備します。
+- `[[imageblock_data]]`タイル メモリ内のデータの入出力をマークします。
+- `my_tile_shader`古いレイアウトから照明と深度を読み取り、新しいレイアウトのレイヤー 0 に書き込みます。
+- `0.0h`後のシェーダー コアの章の 16 ビットの推奨事項と一致するように、ハーフ リテラルを使用します。
+
+### 6. Apple シェーダ コアに従ってシェーダ データ アクセスを書き換えます
+
+([34:11](https://developer.apple.com/videos/play/wwdc2020/10632/?time=2051)) Metal Shading Language のアドレス空間はパフォーマンスに影響します。`device`大量のデータの読み取りと書き込みに適しており、サイズは固定されておらず、各スレッドは異なる要素にアクセスします。`constant`読み取り専用でサイズが制限されており、同じ描画またはディスパッチで複数のスレッドによって繰り返し読み取られるデータに適しています。
+
+([36:03](https://developer.apple.com/videos/play/wwdc2020/10632/?time=2163)) コンパイラが定数バッファを均一レジスタにプリロードしやすくするために、定数は次のようにして単一の構造体に編成する必要があります。`constant`アドレス空間は参照によって渡されます。配列のサイズはコンパイル時に最もよくわかります。このセクションの焦点は、新しいシェーダー エントリではなく、データ構成にあります。
+
+キーポイント:
+
+- `device`アドレス空間は、サイズが固定されておらず、各スレッドが異なる要素を読み取るデータに適しています。
+- `constant`アドレス空間は、読み取り専用でサイズが制限され、複数のスレッドによって繰り返し読み取られるデータに適しています。
+- コンパイル時に定数の配列サイズがわかっている場合、コンパイラがデータをユニフォーム レジスタにプリロードすることが容易になります。
+- 定数データは単一の構造体として参照によって渡されます。これは、デバイスのアドレス空間から動的配列を読み取るよりも、この最適化目標との一貫性が高くなります。
+
+([37:43](https://developer.apple.com/videos/play/wwdc2020/10632/?time=2263)) Apple GPU は 16 ビット タイプに最適化されています。使用できます`half`そして`short`デフォルトを使用しないでください`float`そして`int`。 16 ビット タイプでは、レジスタの負荷が軽減され、シェーダ コアの占有率が向上し、多くの場合、ALU の使用率が向上します。
+
+([40:04](https://developer.apple.com/videos/play/wwdc2020/10632/?time=2404)) 見落とされやすいメモリ アクセスの問題が 3 つあります。動的インデックスを持つスタック割り当て配列を避けることです。コンパイラが符号なしのラッピング セマンティクスを保持する必要がないように、メモリ インデックスには符号付き型を使用するようにしてください。構造体内で一緒に読み取られるフィールドは、できるだけ隣接するか、コンパイラのマージロードを支援するためにベクトル型に直接変更する必要があります。
+
+## 重要ポイント
+
+### 1. レンダーパス帯域幅監査パネルを作成する
+
+- **やるべきこと**: フレームごとのレンダー パスの数、各アタッチメントのロード/ストア アクション、およびメモリレスの使用状況をエンジン デバッグ メニューにリストします。
+- **実行する価値がある理由**: セッションは、ロード/ストア トラフィックを Apple GPU の主要な帯域幅ソースとして定義します。パスの分割、独立したクリア、MSAA サンプル ストアによりコストが増大します。
+- **開始方法**: フレーム グラフまたはレンダー パス記述子からアタッチメント設定を収集し、`.store`、`.load`、非メモリレスの中間テクスチャを強調表示し、メタル システム トレースを使用して検証します。
+
+### 2. シングルパス Apple GPU パスを G-Buffer パイプラインに追加する
+
+- **何をすべきか**: Apple GPU 固有のパスを遅延レンダラーに追加し、G バッファ、ライト カリング、およびライティングをできるだけ 1 つのレンダー パスに組み込みます。
+- **実行する価値がある理由**: プログラマブル ブレンディング、メモリレス レンダー ターゲット、タイル シェーダにより、中間 G バッファをタイル メモリに保持し、システム メモリの読み取りと書き込みを削減できます。
+- **開始方法**: まず、アルベド、法線、ラフネスをメモリレス アタッチメントに変更し、次にタイル シェーダーを使用してレンダー コマンド エンコーダーでタイルごとのライト リストを構築し、最終的なライティング テクスチャのみを保存します。
+
+### 3. HSR 対応の描画ソート チェッカーを作成する
+
+- **何をすべきか**: レンダラーのデバッグ ビルドで不透明、フィードバック、半透明描画をマークし、これらがこの順序で送信されているかどうかを確認します。
+- **実行する価値がある理由**: Apple GPU の隠面除去により、隠れたフラグメントのシェーディングを節約できます。間違った順序、意図しない書き込みマスク、フラグメント リソースの書き込みにより効率が低下します。
+- **開始方法**: ブレンディング、破棄、深度出力、マスクの書き込みなどのステータスをマテリアルまたはパイプラインのメタデータに記録します。不透明ステージでアタッチメントが欠落していることが判明すると、ゼロパディング出力が要求されます。
+
+### 4. シェーダー アドレス空間と 16 ビット タイプの lint を追加します。
+
+- **何をすべきか**: メタル シェーダの静的チェックを追加します。プロンプトは次のように変更できます。`constant`読み取り専用データは次のように変更できます。`half`/`short`のローカル計算、不足`h`接尾辞の半分リテラル。
+- **価値がある理由**: セッションでは、一定のプリロード、16 ビット ALU、およびより低いレジスタ プレッシャーが Apple シェーダ コアのパフォーマンスに影響を与えると指摘しています。
+- **開始方法**: まず、シェーダー内のバッファー パラメーター、配列サイズ、浮動リテラル、および符号なしループ インデックスをスキャンし、候補ポイントを警告として出力し、次に GPU フレーム デバッガーを使用してパイプライン統計を表示します。
+
+### 5. Rosetta と移植された Mac ゲームのネイティブ パフォーマンスを比較する
+
+- **作業内容**: 同じシーン内の、Rosetta、最適化されていないネイティブ、および最適化されたネイティブ Apple GPU の GPU タイムラインと帯域幅メトリクスを記録します。
+- **実行する価値がある理由**: セッションの冒頭では、Rosetta と整合性機能がパフォーマンスにコストをもたらすことを説明します。ネイティブ コンパイル後も、パスとシェーダーを TBDR 用に調整する必要があります。
+- **開始方法**: 固定カメラ パスでメタル システム トレースをキャプチャし、パス マージ、メモリレス、HSR ソート、シェーダー タイプの最適化を 1 つずつ適用し、データの各ステップを保持します。
+
+## 関連セッション
+
+- [Metal アプリを Apple シリコン Mac に導入](/articles/wwdc2020-10631) - まず、TBDR アーキテクチャ、ストレージ モード、Apple GPU の移行の違いを理解してから、このパフォーマンス最適化の分野に入ります。
+- [Apple GPU を Metal で利用する](/articles/wwdc2020-10602) -- より一般的な観点から、Apple GPU と Metal レンダリング テクノロジの連携について説明します。
+- [GPU カウンターを使用して Metal アプリとゲームを最適化する](/articles/wwdc2020-10603) — GPU カウンターを使用して、このセッションで言及されたワークロードの重複、帯域幅、シェーダー コアの問題を定量化します。
+- [Xcode 12 を使用して Metal アプリについて洞察を得る](/articles/wwdc2020-10605) - Xcode の Metal デバッガーとパフォーマンス ツールを使用して、グラフィックスの問題を特定します。
+- [Metal を使用して GPU バイナリを構築する](/articles/wwdc2020-10615) - シェーダーのコンパイルと GPU バイナリの配布を最適化し、パフォーマンスの最適化後に配信リンクを完了します。

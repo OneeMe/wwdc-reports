@@ -1,0 +1,418 @@
+---
+title: "Consume noncopyable types in Swift"
+description: "get started with noncopyable types in swift. discover what copying means in swift, when you might want to use a noncopyable type, and how value ownership lets you state your intentions clearly."
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10170.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10170/"
+sessionId: "wwdc2024-10170"
+year: "2024"
+relatedSessions:
+  - title: "Analyze heap memory"
+    code: "10173"
+    description: "dive into the basis for your app"
+  - title: "Explore Swift performance"
+    code: "10217"
+    description: "discover how swift balances abstraction and performance. learn what elements of "
+  - title: "Explore the Swift on Server ecosystem"
+    code: "10216"
+    description: "swift is a great language for writing your server applications, and powers criti"
+  - title: "Go further with Swift Testing"
+    code: "10195"
+    description: "learn how to write a sweet set of (test) suites using swift testing"
+---
+
+## Highlight
+
+> Swift introduced noncopyable types last year (marked with `~Copyable`), letting you define types that "cannot be copied." This year's session focuses on "how to consume noncopyable types in real projects"—what to do when your generic parameters, protocols, and extensions encounter noncopyable types.
+
+---
+
+## Core Content
+
+Swift assumes all types can be copied by default. That's a reasonable default—value types make code easier to understand; you can freely pass values without worrying that a modification somewhere else affects another place. But in some scenarios, copying causes problems.
+
+The session uses a bank transfer (`BankTransfer`) example to show copying risks. Suppose you have a class-type `BankTransfer` with a `run()` method that executes the transfer. In a schedule function, if delay is less than 1 second it runs immediately, but the developer forgets to return, causing the transfer to run twice. Worse, if the sleep task is cancelled, the thrown error may be ignored, so the transfer isn't cancelled. Even if you add cancel logic in deinit, the caller holding a copy prevents it from running.
+
+Last year's Swift 5.9 introduced `~Copyable` to solve this. After changing `BankTransfer` to a noncopyable struct, the compiler prevents copying. Marking `run()` as `consuming` means the value no longer exists after the call. The compiler can directly catch the bug in the schedule function—forgetting return causes transfer to be consumed twice.
+
+This year's focus is making noncopyable types work in generic code. Previous limitations: generic parameters default to requiring `Copyable` types, and protocols default to inheriting `Copyable`, preventing noncopyable types from participating in generic programming. Swift 6 made three key changes: generic parameters can be declared `~Copyable`, noncopyable types can have extensions, and noncopyable types can conform to protocols. This turns `~Copyable` from an experimental feature into a tool usable in production code.
+
+The session also demonstrates conditional copyable—a generic type can decide whether it's Copyable based on whether its parameter type is Copyable. For example, `Job<Action>` can be Copyable as long as Action is Copyable.
+
+---
+
+## Detailed Content
+
+### Copying Mechanism Review
+
+Swift has two kinds of copying: value copy and reference copy. Illustrated with a Player example ([0:52](https://developer.apple.com/videos/play/wwdc2024/10170/?time=52)):
+
+```swift
+struct Player {
+  var icon: String
+}
+
+func test() {
+  let player1 = Player(icon: "🐸")
+  var player2 = player1
+  player2.icon = "🚚"
+  assert(player1.icon == "🐸")
+}
+```
+
+**Key points**:
+- struct is a value type; `player2 = player1` copies all data
+- Modifying `player2.icon` doesn't affect `player1` because they're independent copies
+
+If it's a class ([1:55](https://developer.apple.com/videos/play/wwdc2024/10170/?time=115)):
+
+```swift
+class PlayerClass {
+  var icon: String
+  init(_ icon: String) { self.icon = icon }
+}
+
+func test() {
+  let player1 = PlayerClass("🐸")
+  let player2 = player1
+  player2.icon = "🚚"
+  assert(player1.icon == "🐸")
+}
+```
+
+**Key points**:
+- class is a reference type; `player2 = player1` only copies the reference (shallow copy)
+- Both variables point to the same object; modifying `player2.icon` affects `player1`
+
+### Why Noncopyable Is Needed
+
+Copying is sometimes dangerous. The session uses a bank transfer example ([5:10](https://developer.apple.com/videos/play/wwdc2024/10170/?time=310)):
+
+```swift
+class BankTransfer {
+  var complete = false
+
+  func run() {
+    assert(!complete)
+    // .. do it ..
+    complete = true
+  }
+
+  deinit {
+    if !complete { cancel() }
+  }
+
+  func cancel() { /* ... */ }
+}
+
+func schedule(_ transfer: BankTransfer,
+              _ delay: Duration) async throws {
+
+  if delay < .seconds(1) {
+    transfer.run()
+  }
+
+  try await Task.sleep(for: delay)
+  transfer.run()
+}
+
+func startPayment() async {
+  let payment = BankTransfer()
+  log.append(payment)
+  try? await schedule(payment, .seconds(3))
+}
+
+let log = Log()
+
+final class Log: Sendable {
+  func append(_ transfer: BankTransfer) { /* ... */ }
+}
+```
+
+**Key points**:
+- `schedule` runs immediately when delay < 1 second but forgets to return, causing the transfer to run twice
+- Even with the `complete` flag and assertion, it may not trigger at runtime
+- `log.append(payment)` holds a copy of transfer, preventing deinit from running
+- If sleep is cancelled, transfer isn't cancelled
+
+### Noncopyable Type Basics
+
+Declare a non-copyable type with `~Copyable` ([7:46](https://developer.apple.com/videos/play/wwdc2024/10170/?time=466)):
+
+```swift
+struct FloppyDisk: ~Copyable {}
+
+func copyFloppy() {
+  let system = FloppyDisk()
+  let backup = consume system
+  load(system)
+  // ...
+}
+
+func load(_ disk: borrowing FloppyDisk) {}
+```
+
+**Key points**:
+- `~Copyable` suppresses the default Copyable conformance
+- The `consume` keyword consumes the variable's value, leaving an uninitialized state
+- Attempting to read a consumed variable is a compile error
+
+Noncopyable type parameters must declare ownership ([8:18](https://developer.apple.com/videos/play/wwdc2024/10170/?time=498)):
+
+```swift
+struct FloppyDisk: ~Copyable { }
+
+func newDisk() -> FloppyDisk {
+  let result = FloppyDisk()
+  format(result)
+  return result
+}
+
+func format(_ disk: consuming FloppyDisk) {
+  // ...
+}
+```
+
+**Key points**:
+- `consuming` means the function takes ownership of the parameter
+- format returns nothing, so `newDisk` fails to compile
+
+Three ownership modifiers ([9:00](https://developer.apple.com/videos/play/wwdc2024/10170/?time=540)):
+
+```swift
+// consuming: take ownership.
+func format(_ disk: consuming FloppyDisk) {
+  // ...
+}
+
+// borrowing: read-only borrow.
+func format(_ disk: borrowing FloppyDisk) {
+  var tempDisk = disk
+  // ...
+}
+
+// inout: mutable borrow.
+func format(_ disk: inout FloppyDisk) {
+  var tempDisk = disk
+  // ...
+  disk = tempDisk
+}
+```
+
+**Key points**:
+- `consuming` takes ownership—the caller can't use the value afterward
+- `borrowing` provides read-only access, similar to a let binding
+- `inout` provides writable access but must reinitialize the parameter before returning
+
+### Noncopyable BankTransfer
+
+Rewrite BankTransfer as noncopyable ([10:28](https://developer.apple.com/videos/play/wwdc2024/10170/?time=628)):
+
+```swift
+struct BankTransfer: ~Copyable {
+  consuming func run() {
+    // .. do it ..
+    discard self
+  }
+
+  deinit {
+    cancel()
+  }
+
+  consuming func cancel() {
+    // .. do the cancellation ..
+    discard self
+  }
+}
+```
+
+**Key points**:
+- `consuming func run()` means calling run consumes this value
+- `discard self` destroys self without calling deinit
+- The compiler guarantees run can't be called twice
+
+schedule function ([11:10](https://developer.apple.com/videos/play/wwdc2024/10170/?time=670)):
+
+```swift
+func schedule(_ transfer: consuming BankTransfer,
+              _ delay: Duration) async throws {
+
+  if delay < .seconds(1) {
+    transfer.run()
+    return
+  }
+
+  try await Task.sleep(for: delay)
+  transfer.run()
+}
+```
+
+**Key points**:
+- `consuming BankTransfer` means schedule takes ownership of transfer
+- Forgetting return causes a compile error—transfer would be consumed twice
+- If sleep is cancelled, transfer is destroyed and deinit runs cancel
+
+### Noncopyable Generics
+
+Before Swift 6, generic parameters default to requiring Copyable. Now you can use `~Copyable` to remove this constraint ([15:50](https://developer.apple.com/videos/play/wwdc2024/10170/?time=950)):
+
+```swift
+protocol Runnable: ~Copyable {
+  consuming func run()
+}
+
+struct Command: Runnable {
+  func run() { /* ... */ }
+}
+
+struct BankTransfer: ~Copyable, Runnable {
+  consuming func run() { /* ... */ }
+}
+
+func execute2<T>(_ t: T)
+  where T: Runnable {
+  t.run()
+}
+
+func execute3<T>(_ t: consuming T)
+  where T: Runnable,
+        T: ~Copyable {
+  t.run()
+}
+
+func test() {
+  execute2(Command())
+  execute2(BankTransfer()) // expected error: 'execute2' requires that 'BankTransfer' conform to 'Copyable'
+
+  execute3(Command())
+  execute3(BankTransfer())
+}
+```
+
+**Key points**:
+- `execute2`'s generic parameter T defaults to requiring Copyable, so it can't accept BankTransfer
+- `execute3` uses `T: ~Copyable` to remove this constraint, accepting both types
+- `~Copyable` constraint "widens" the type space rather than narrowing it
+
+### Conditional Copyable
+
+A type can decide whether it's Copyable based on whether its generic parameter is Copyable ([18:05](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1085)):
+
+```swift
+struct Job<Action: Runnable & ~Copyable>: ~Copyable {
+  var action: Action?
+}
+
+func runEndlessly(_ job: consuming Job<Command>) {
+  while true {
+    let current = copy job
+    current.action?.run()
+  }
+}
+
+extension Job: Copyable where Action: Copyable {}
+
+protocol Runnable: ~Copyable {
+  consuming func run()
+}
+
+struct Command: Runnable {
+  func run() { /* ... */ }
+}
+```
+
+**Key points**:
+- `Job` itself is `~Copyable` because it needs to store a noncopyable Action
+- `extension Job: Copyable where Action: Copyable` makes Job Copyable when Action is Copyable
+- `Job<Command>` is Copyable; `Job<BankTransfer>` is not
+
+### Extension Default Constraints
+
+Extensions on noncopyable types default to applying only when generic parameters are Copyable ([19:27](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1167)):
+
+```swift
+extension Job {
+  func getAction() -> Action? {
+    return action
+  }
+}
+
+func inspectCmd(_ cmdJob: Job<Command>) {
+  let _ = cmdJob.getAction()
+  let _ = cmdJob.getAction()
+}
+
+func inspectXfer(_ transferJob: borrowing Job<BankTransfer>) {
+  let _ = transferJob.getAction() // expected error: method 'getAction' requires that 'BankTransfer' conform to 'Copyable'
+}
+```
+
+**Key points**:
+- Regular extensions default to assuming generic parameters are Copyable
+- `getAction()` returning action requires copying, so it only works for Copyable Action
+- Calling `getAction()` on `Job<BankTransfer>` errors
+
+To make an extension apply in all cases, declare explicitly ([20:14](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1214)):
+
+```swift
+protocol Cancellable {
+  mutating func cancel()
+}
+
+extension Job: Cancellable {
+  mutating func cancel() {
+    action = nil
+  }
+}
+```
+
+**Key points**:
+- This extension defaults to applying only when Action is Copyable
+- To make Cancellable apply to all Job, the protocol itself also needs to be `~Copyable`
+
+Making the extension apply in all cases ([21:00](https://developer.apple.com/videos/play/wwdc2024/10170/?time=1260)):
+
+```swift
+protocol Cancellable: ~Copyable {
+  mutating func cancel()
+}
+
+extension Job: Cancellable where Action: ~Copyable {
+  mutating func cancel() {
+    action = nil
+  }
+}
+```
+
+**Key points**:
+- After declaring the protocol as `~Copyable`, conformance no longer requires the type to be Copyable
+- `where Action: ~Copyable` makes this extension apply to all Action, Copyable or not
+
+---
+
+## Core Takeaways
+
+1. **Wrap exclusive resources with `~Copyable`**
+   - File handles, network connections, database transactions, and encryption keys naturally suit noncopyable type wrapping
+   - The compiler ensures resources aren't accidentally copied, and deinit always runs when the "last user" leaves
+   - Start by picking a resource management type (like `FileHandle`), change it to a `~Copyable struct`, and do cleanup in deinit
+
+2. **Introduce generic support incrementally**
+   - You don't need to change all generic code to support noncopyable at once
+   - Start with new generic functions: use `<T: ~Copyable>` instead of `<T>` so both type kinds work
+   - Keep existing generic code unchanged; modify when you actually need noncopyable support
+
+3. **Use conditional Copyable for flexibility**
+   - If your generic type is just a "container," consider conditional Copyable
+   - `extension MyType: Copyable where T: Copyable` lets your type be copied when T is Copyable
+   - Callers writing only Copyable code don't need changes, while noncopyable types can still use it
+
+---
+
+## Related Sessions
+
+- [Analyze heap memory](/articles/wwdc2024-10173) — Deep dive into heap memory, understanding value and reference type memory layout
+- [Explore Swift performance](/articles/wwdc2024-10217) — How Swift balances abstraction and performance, including copy semantics performance impact
+- [Explore the Swift on Server ecosystem](/articles/wwdc2024-10216) — Swift server application scenarios; noncopyable types are useful for server resource management
+- [Go further with Swift Testing](/articles/wwdc2024-10195) — Swift Testing framework; when testing noncopyable types, you can leverage consuming semantics

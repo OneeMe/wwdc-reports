@@ -1,0 +1,411 @@
+---
+title: "Create Swift Package plugins"
+description: "Tailor your development workflow and learn how to write your own package plugins in Swift. We'll show you how you can extend Xcode's functionality by using the PackagePlugin API to generate source code or automate release tasks and share best practices for creating great plugins."
+date: "2022-06-06"
+tags: ["Swift", "Developer Tools", "Swift Package Manager"]
+thumbnail: "/images/sessions/2022/110401.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110401/"
+sessionId: "wwdc2022-110401"
+year: "2022"
+relatedSessions:
+  - title: "Meet Swift Package plugins"
+    code: "110359"
+    description: "基本概念と Swift パッケージ プラグインの使用開始"
+  - title: "Demystify parallelization in Xcode builds"
+    code: "110364"
+    description: "Xcodeビルドシステムの並列化機構"
+  - title: "Create Swift Packages"
+    code: "10192"
+    description: "WWDC19 の Swift パッケージ作成の開始"
+---
+## ハイライト
+
+> Xcode 14 では Swift Package Plugin が導入され、開発者が Swift コードを使用してビルド プロセスを拡張できるようになります。カスタム コマンド プラグインはパブリッシュ タスクを自動化し、ビルド ツール プラグインはコンパイルの前後にソース コードまたはリソース ファイルを生成します。これらはすべて PackagePlugin API を通じて実装されます。
+
+## 主要内容
+
+### スクリプトからプラグインまで: この新しいツールが必要な理由
+
+プロジェクトには、バージョン番号の生成、Git 貢献者リストの抽出、コードのフォーマットなど、各リリースの前に手動で実行するシェル スクリプトが存在する場合があります。これらのスクリプトはさまざまなウェアハウスに分散しており、新しいメンバーはスクリプトの使い方を知らず、CI 環境とローカル環境の動作が一貫していません。
+
+Swift Package Plugin は、これらのワークフローも Swift Package システムに組み込みます。プラグインは、ライブラリと同様に、バージョン管理、依存、共有が可能です。さらに重要なのは、プラグインは Xcode の右クリック メニューと SwiftPM のコマンド ラインに直接統合されているため、大量のスクリプト パスを記憶する必要がありません。
+
+### 2 種類のプラグイン
+
+**カスタム コマンド プラグイン (コマンド プラグイン)**: ユーザーによって手動でトリガーされます。 CONTRIBUTORS ファイルの生成、タグ付け、CocoaPods への公開など、1 回限りのタスクに適しています。トリガー方法は 2 つあります。Xcode プロジェクト ナビゲーション バーの右クリック メニュー、または`swift package`コマンドライン。
+
+**ビルド ツール プラグイン**: ビルド プロセス中に自動的に実行されます。コード生成とリソース処理に適しています。次の 2 つのタイプがあります。
+
+- **ビルド内コマンド**: 明確な入力ファイルと出力ファイルがあります。ビルド システムは、入力と出力の変更時間を比較して、再実行が必要かどうかを判断します。コード生成シナリオに適しています。
+- **ビルド前コマンド**: 明確な出力はなく、ビルドされるたびに実行されます。ローカライズされた文字列の抽出などのタスクに適しています。ビルドの速度が低下しないように注意して使用してください。
+
+### サンドボックスと権限
+
+プラグインはサンドボックス内で実行され、ネットワーク アクセスはデフォルトで禁止されており、一時ディレクトリへの書き込みのみが可能です。プラグインがパッケージのルート ディレクトリに書き込む必要がある場合 (CONTRIBUTORS.txt の生成など)、マニフェストで権限を宣言し、その理由を指定する必要があります。ユーザーが初めて実行すると、macOS のシステム許可プロンプトと同様の許可要求ダイアログ ボックスが表示されます。
+
+## 詳細
+
+### カスタム コマンド プラグインを作成する: 貢献者のリストを生成する
+
+（[03:40](https://developer.apple.com/videos/play/wwdc2022/110401/?time=220)）
+
+Package.swift でプラグインを宣言します。
+
+```swift
+// swift-tools-version: 5.6
+
+import PackageDescription
+
+let package = Package(
+    name: "MyPackage",
+    products: [...],
+    targets: [
+        .plugin(
+            name: "GenerateContributors",
+            capability: .command(
+                intent: .custom(
+                    verb: "regenerate-contributors-list",
+                    description: "Generates the CONTRIBUTORS.txt file based on Git logs"
+                ),
+                permissions: [
+                    .writeToPackageDirectory(reason: "This command writes the new CONTRIBUTORS.txt to the source root.")
+                ]
+            )
+        ),
+    ]
+)
+```
+
+**キーポイント:**
+- `swift-tools-version`少なくとも 5.6、プラグインはこのバージョンからサポートします
+- `.plugin()`に対応するプラグイン ターゲットを定義します。`Plugins/`ディレクトリの下のサブフォルダ
+- `capability: .command()`カスタム コマンド プラグインを表します
+- `intent: .custom(verb:description:)`SwiftPM コマンドのアクションと説明を定義する
+- `permissions`必要な権限を宣言します。`.writeToPackageDirectory`パッケージのルート ディレクトリへの書き込みを許可する
+- `reason`ユーザーがそれを承認するかどうかを判断するためにユーザーに表示されます。
+
+プラグイン実装コード (Plugins/GenerateContributors/plugin.swift):
+
+（[05:06](https://developer.apple.com/videos/play/wwdc2022/110401/?time=306)）
+
+```swift
+import PackagePlugin
+import Foundation
+
+@main
+struct GenerateContributors: CommandPlugin {
+
+    func performCommand(
+        context: PluginContext,
+        arguments: [String]
+    ) async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["log", "--pretty=format:- %an <%ae>%n"]
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        try process.run()
+        process.waitUntilExit()
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(decoding: outputData, as: UTF8.self)
+
+        let contributors = Set(output.components(separatedBy: CharacterSet.newlines))
+            .sorted()
+            .filter { !$0.isEmpty }
+
+        try contributors.joined(separator: "\n")
+            .write(toFile: "CONTRIBUTORS.txt", atomically: true, encoding: .utf8)
+    }
+}
+```
+
+**キーポイント:**
+- `@main`エントリ ポイントをマークすると、プラグインがスタンドアロンの実行可能ファイルにコンパイルされます。
+- 成し遂げる`CommandPlugin`同意した`performCommand(context:arguments:)`方法
+- `context`パッケージマップ情報とプラグイン作業ディレクトリを提供します。
+- `arguments`ユーザーによって渡されたコマンドラインパラメータを受け取ります
+- 使用`Foundation.Process`外部コマンド(Gitなど)を呼び出す
+- プラグイン実行時の作業ディレクトリはパッケージのルートディレクトリなので、ファイルを直接書き込むだけです
+
+実行方法:
+
+```bash
+# コマンドライン
+swift package regenerate-contributors-list
+
+# または Xcode で Package を右クリックし、プラグインコマンドを選択します
+```
+
+### インビルド プラグインを作成する: アセット カタログからタイプ セーフな定数を生成する
+
+（[14:56](https://developer.apple.com/videos/play/wwdc2022/110401/?time=896)）
+
+このプラグインには、コードを生成するヘルパー実行可能ファイルが必要です。この構造は 2 つの部分に分かれています。実行可能ファイルが実際の作業を実行し、プラグインが実行可能ファイルをビルド システムにプラグインします。
+
+実行可能ファイル (AssetConstantsExec/main.swift):
+
+（[15:03](https://developer.apple.com/videos/play/wwdc2022/110401/?time=903)）
+
+```swift
+import Foundation
+
+let arguments = ProcessInfo().arguments
+if arguments.count < 3 {
+    print("missing arguments")
+    exit(1)
+}
+let (input, output) = (arguments[1], arguments[2])
+
+struct Contents: Decodable {
+    let images: [Image]
+}
+
+struct Image: Decodable {
+    let filename: String?
+}
+
+var generatedCode = """
+    import Foundation
+    import SwiftUI
+
+    """
+
+try FileManager.default.contentsOfDirectory(atPath: input).forEach { dirent in
+    guard dirent.hasSuffix("imageset") else {
+        return
+    }
+
+    let contentsJsonURL = URL(fileURLWithPath: "\(input)/\(dirent)/Contents.json")
+    let jsonData = try Data(contentsOf: contentsJsonURL)
+    let assetCatalogContents = try JSONDecoder().decode(Contents.self, from: jsonData)
+    let hasImage = assetCatalogContents.images.filter { $0.filename != nil }.isEmpty == false
+
+    if hasImage {
+        let basename = contentsJsonURL.deletingLastPathComponent().deletingPathExtension().lastPathComponent
+        generatedCode.append("public let \(basename) = Image(\"\(basename)\", bundle: .module)\n")
+    }
+}
+
+try generatedCode.write(to: URL(fileURLWithPath: output), atomically: true, encoding: .utf8)
+```
+
+**キーポイント:**
+- 実行可能ファイルは、アセット カタログ パスと出力ファイル パスの 2 つのパラメータを受け取ります。
+- トラバース`.imageset`ディレクトリ、解析`Contents.json`実際の画像があるかどうかを確認する
+- 有効な画像ごとに生成`public let`型の定数`SwiftUI.Image`
+- `bundle: .module`パッケージのリソースバンドルから画像をロードします
+
+Package.swift は次のように宣言します。
+
+（[15:48](https://developer.apple.com/videos/play/wwdc2022/110401/?time=948)）
+
+```swift
+.executableTarget(name: "AssetConstantsExec"),
+.plugin(
+    name: "AssetConstants",
+    capability: .buildTool(),
+    dependencies: ["AssetConstantsExec"]
+),
+```
+
+プラグインの実装:
+
+（[16:12](https://developer.apple.com/videos/play/wwdc2022/110401/?time=972)）
+
+```swift
+import PackagePlugin
+
+@main
+struct AssetConstants: BuildToolPlugin {
+
+    func createBuildCommands(
+        context: PluginContext,
+        target: Target
+    ) async throws -> [Command] {
+        guard let target = target as? SourceModuleTarget else {
+            return []
+        }
+
+        return try target.sourceFiles(withSuffix: "xcassets").map { assetCatalog in
+            let base = assetCatalog.path.stem
+            let input = assetCatalog.path
+            let output = context.pluginWorkDirectory.appending(["\(base).swift"])
+
+            return .buildCommand(
+                displayName: "Generating constants for \(base)",
+                executable: try context.tool(named: "AssetConstantsExec").path,
+                arguments: [input.string, output.string],
+                inputFiles: [input],
+                outputFiles: [output]
+            )
+        }
+    }
+}
+```
+
+**キーポイント:**
+- 成し遂げる`BuildToolPlugin`同意した`createBuildCommands(context:target:)`方法
+- `target.sourceFiles(withSuffix: "xcassets")`ターゲット内のすべてのアセット カタログを検索します
+- `context.pluginWorkDirectory`これは、プラグインの一時的な作業ディレクトリです。生成されたファイルはここに配置されます。
+- `context.tool(named:)`プラグインが依存する実行可能ファイルのパスを見つけます。
+- `.buildCommand()`ビルド内コマンドを宣言し、ビルド システムが追跡する入力ファイルと出力ファイルを指定します。
+- 出力ファイルはターゲットのコンパイルに自動的に参加します。
+
+プラグインのライブラリ ターゲットを使用します。
+
+```swift
+.target(
+    name: "IconLibrary",
+    dependencies: [],
+    plugins: ["AssetConstants"]
+),
+```
+
+### ビルド前プラグインの作成: ローカライズされた文字列を自動的に抽出します
+
+（[20:19](https://developer.apple.com/videos/play/wwdc2022/110401/?time=1219)）
+
+このプラグインはスタンドアロン パッケージとしてリリースされ、他のパッケージから利用できます。
+
+Package.swift：
+
+```swift
+// swift-tools-version: 5.6
+
+import PackageDescription
+
+let package = Package(
+    name: "GenstringsPlugin",
+    products: [
+        .plugin(name: "GenstringsPlugin", targets: ["GenstringsPlugin"]),
+    ],
+    targets: [
+        .plugin(
+            name: "GenstringsPlugin",
+            capability: .buildTool()
+        ),
+    ]
+)
+```
+
+**キーポイント:**
+- `.plugin(name:targets:)`製品宣言により、プラグインを外部パッケージに依存できるようになります
+- いいえ`dependencies`実行可能ファイル、システム ツールを直接呼び出す`xcrun genstrings`
+
+プラグインの実装:
+
+（[20:44](https://developer.apple.com/videos/play/wwdc2022/110401/?time=1244)）
+
+```swift
+import PackagePlugin
+
+@main
+struct GenstringsPlugin: BuildToolPlugin {
+
+    func createBuildCommands(
+        context: PluginContext,
+        target: Target
+    ) async throws -> [Command] {
+        guard let target = target as? SourceModuleTarget else {
+            return []
+        }
+
+        let resourcesDirectoryPath = context.pluginWorkDirectory
+            .appending(subpath: target.name)
+            .appending(subpath: "Resources")
+        let localizationDirectoryPath = resourcesDirectoryPath
+            .appending(subpath: "Base.lproj")
+
+        try FileManager.default.createDirectory(
+            atPath: localizationDirectoryPath.string,
+            withIntermediateDirectories: true
+        )
+
+        let swiftSourceFiles = target.sourceFiles(withSuffix: ".swift")
+        let inputFiles = swiftSourceFiles.map(\.path)
+
+        return [
+            .prebuildCommand(
+                displayName: "Generating localized strings from source files",
+                executable: .init("/usr/bin/xcrun"),
+                arguments: [
+                    "genstrings",
+                    "-SwiftUI",
+                    "-o", localizationDirectoryPath.string
+                ] + inputFiles.map(\.string),
+                outputFilesDirectory: localizationDirectoryPath
+            )
+        ]
+    }
+}
+```
+
+**キーポイント:**
+- `.prebuildCommand()`ビルドごとに実行するビルド前コマンドを宣言します。
+- 通話システム`xcrun genstrings`ツール抽出`NSLocalizedString`電話
+- `-SwiftUI`パラメーターは SwiftUI の文字列ローカリゼーション構文をサポートします
+- `outputFilesDirectory`出力ディレクトリを指定し、特定の出力ファイル リストを宣言しないでください。
+- 生成される`.strings`ファイルはターゲット リソース バンドルに自動的に追加されます
+
+外部パッケージはこのプラグインを使用します。
+
+（[21:44](https://developer.apple.com/videos/play/wwdc2022/110401/?time=1304)）
+
+```swift
+// Package.swift
+dependencies: [
+    .package(path: "../GenstringsPlugin"),
+],
+targets: [
+    .target(
+        name: "MyLibrary",
+        dependencies: [],
+        plugins: [
+            .plugin(name: "GenstringsPlugin", package: "GenstringsPlugin"),
+        ]
+    ),
+]
+```
+
+### プラグインの種類選択の決定
+
+|シナリオ |プラグインタイプ |理由 |
+|------|---------|------|
+|貢献者、変更履歴を生成 |コマンドプラグイン |手動でトリガーするため、ビルドごとに実行する必要はありません |
+| Proto/GraphQL から Swift コードを生成する |インビルドビルドツール |入力と出力は明確であり、ビルド システムは再生成が必要かどうかを判断できます。
+|ローカライズされた文字列を抽出する |ビルド前ビルドツール |出力は固定されていないため、ビルドごとにソース ファイルをスキャンする必要があります。
+|コードのフォーマットチェック |コマンドプラグイン |開発者はアクティブにトリガーするため、ビルドされた製品を自動的に変更するのには適していません。
+
+## 重要ポイント
+
+**1.チーム用のコード生成ツール チェーンを構築します**
+
+- **やるべきこと**: Proto、GraphQL、OpenAPI、およびプロジェクト内の他のプロジェクトのコード生成ステップを Makefile から Swift Package Plugin に移行します。
+- **実行する価値がある理由**: プラグインとプロジェクト コードは一緒にバージョン管理されます。新しいメンバーは、リポジトリのクローンを作成した後に追加のツール チェーンをインストールする必要はありません。 Xcode はビルド時にコードを自動的に生成します。
+- **開始方法**: 既存のコード生成ロジックを実行可能ターゲットにカプセル化し、BuildToolPlugin を記述します。`createBuildCommands`これを呼び出し、入力スキーマ ファイルと出力 Swift ファイル パスを宣言します。
+
+**2.自動化されたバージョン番号とリリースプロセス**
+
+- **やるべきこと**: ワンクリックでバージョン番号の更新、CHANGELOG の生成、Git のラベル付けを完了するコマンド プラグインを作成します。
+- **実行する価値がある理由**: リリース プロセスを標準化し、人的エラーを削減します。プラグインは呼び出すことができます`Process`Git コマンドを実行するには、次を使用します。`writeToPackageDirectory`バージョンファイルを変更する権限
+- **開始方法**: 実装`CommandPlugin`、存在する`performCommand`Git タグ履歴を読み取り、CHANGELOG を生成し、更新します`Package.swift`または plist のバージョン番号、実行`git tag`
+
+**3.タイプセーフなリソース参照**
+
+- **やるべきこと**: プロジェクト内の画像、色、フォント、その他のリソースのコンパイル時定数を生成し、文字列のハードコーディングを置き換えます。
+- **実行する価値がある理由**: スペル ミスはコンパイル中に検出され、Xcode はリソース名を自動的に補完し、リファクタリング中にシンボルの名前を変更するだけで済みます。
+- **開始方法**: セッション内の AssetConstants の例を参照し、アセット カタログまたはリソース ディレクトリを調べて、`public let`絶え間ない。 in-build コマンドは、リソースが変更された場合にのみ再構築するようにビルド システムに指示します。
+
+**4.ローカリゼーション ワークフローの自動化**
+
+- **内容**: ビルド、更新のたびにコードを自動的にスキャンして新しい文字列を探します`.strings`テンプレートファイル
+- **実行する価値がある理由**: 開発者は、新しいコピーを追加した後に手動で実行する必要がありません。`genstrings`, CI はビルド時にローカライズされていない文字列があるかどうかを自動的にチェックします。
+- **開始方法**: セッションの GenstringsPlugin 拡張機能に基づいて、欠落文字列チェック ロジックを追加するか、ビルド前コマンドの後に検証のステップを追加します。
+
+## 関連セッション
+
+- [Swift Package プラグインの紹介](/articles/wwdc2022-110359) — Swift Package Plugin の基本概念と使い方の入門
+- [Xcode ビルドの並列化を解明する](/articles/wwdc2022-110364) — Xcode ビルド システムの並列スケジューリングを理解し、ビルド速度に対するプラグインの影響を最適化します。
+- [Swift パッケージの作成](/articles/wwdc2022-10192) — WWDC19 の Swift パッケージ作成の入門。パッケージをまったく初めて使用する開発者に適しています。

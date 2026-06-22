@@ -1,0 +1,282 @@
+---
+title: "Enhance your app with Metal ray tracing"
+description: "Achieve photorealistic 3D scenes in your apps and games through ray tracing, a core part of the Metal graphics framework and shading language. We'll explore the latest improvements in implementing ray tracing."
+date: "2021-06-07"
+tags: ["Metal", "Ray Tracing", "Graphics", "GPU"]
+thumbnail: "/images/sessions/2021/10149.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10149/"
+sessionId: "wwdc2021-10149"
+year: "2021"
+relatedSessions:
+  - title: "Explore hybrid rendering with Metal ray tracing"
+    code: "10150"
+    description: "Light tracing and rasterization hybrid rendering"
+  - title: "Optimize high-end games for Apple GPUs"
+    code: "10148"
+    description: "Apple GPU TBDR architecture game optimization"
+  - title: "Discover Metal debugging, profiling, and asset creation tools"
+    code: "10157"
+    description: "Xcode 13 Metal debugging and profiling tools"
+---
+## Highlight
+
+> Metal ray tracing adds three new capabilities: emitting rays directly from the render pipeline (no compute pass required), intersection query instead of intersector objects for inline intersection, and motion blur and extended limits to support production-level rendering.
+
+## Core Content
+
+You want to add ray tracing effects to your render, such as reflections or shadows. Last year's API required you to create an additional compute pass, write the G-Buffer data out to memory, and then read it back for light tracing. This increases memory bandwidth overhead and interrupts the rendering pipeline.
+
+This year Metal allows you to emit rays directly from the render pipeline without leaving the render pass.
+
+## Detailed Content
+
+### Emit rays from the Render Pipeline
+
+（[02:21](https://developer.apple.com/videos/play/wwdc2021/10149/?time=141)）
+
+Last year’s workflow: render pass → compute pass (ray tracing) → may need to open another render pass. Intermediate data is passed back and forth in memory.
+
+This year’s workflow: emit light directly within a render pass, and the intermediate data remains in tile memory.
+
+Setting method:
+
+```metal
+// Define the intersection function
+[[intersection(triangle, triangle_data, instancing)]]
+bool sphereIntersection(...)
+
+// Link the function in the render pipeline descriptor
+let linkedFunctions = MTLLinkedFunctions()
+linkedFunctions.functions = ["sphereIntersection"]
+renderPipelineDescriptor.fragmentLinkedFunctions = linkedFunctions
+```
+
+```swift
+// Create the intersection function table
+let functionTable = renderPipelineState.makeIntersectionFunctionTable(
+    descriptor: tableDescriptor,
+    stage: .fragment
+)
+
+// Populate the table
+let functionHandle = renderPipelineState.functionHandle(
+    name: "sphereIntersection",
+    stage: .fragment
+)
+functionTable.setFunction(functionHandle, index: 0)
+```
+
+（[04:48](https://developer.apple.com/videos/play/wwdc2021/10149/?time=288)）
+
+**Key points:**
+- linked functions added to the fragment stage of the render pipeline
+- `makeIntersectionFunctionTable`New`stage`parameter
+- function handle is also stage-specific
+-Buffer index bound to render encoder
+
+Emit rays in the fragment shader:
+
+```metal
+fragment float4 rayTracedFragment(...) {
+    // Bind the acceleration structure and intersection function table
+    intersector<instancing, triangle_data> intersector;
+    intersector.set_acceleration_structure(accelerationStructure);
+    intersector.set_intersection_function_table(intersectionFunctionTable);
+
+    // Emit a ray
+    ray ray;
+    ray.origin = worldPosition;
+    ray.direction = reflect(viewDirection, normal);
+
+    auto intersection = intersector.intersect(ray, primitiveAccelerationStructure);
+
+    // Shade using the intersection result
+    return shadeIntersection(intersection);
+}
+```
+
+（[05:57](https://developer.apple.com/videos/play/wwdc2021/10149/?time=357)）
+
+**Key points:**
+- Both acceleration structure and function table are bound to render encoder
+- Used in shader in the same way as compute kernel
+- You can use tile memory optimization to avoid writing out G-Buffer
+
+### Intersection Query: More flexible ray traversal
+
+（[07:23](https://developer.apple.com/videos/play/wwdc2021/10149/?time=443)）
+
+Last year's intersector object encapsulated complete traversal logic. For simple custom intersections (such as alpha test), creating a complete intersection function may be too heavy.
+
+The intersection query allows you to control the traversal process inline in the shader:
+
+```metal
+// Use an intersection query for alpha testing
+intersection_query<instancing, triangle_data> query;
+query.reset(ray, accelerationStructure, intersectionFunctionTable);
+
+while (query.next()) {
+    switch (query.get_candidate_type()) {
+        case intersection_query::candidate_type::triangle: {
+            // Get triangle intersection information
+            float2 barycentrics = query.get_candidate_triangle_barycentric_coord();
+            float distance = query.get_candidate_ray_distance();
+
+            // Sample the alpha texture
+            float alpha = sampleAlphaTexture(barycentrics, distance);
+
+            // If the alpha test passes, commit the intersection
+            if (alpha > 0.5) {
+                query.commit_triangle_intersection();
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// Get the final intersection
+if (query.get_committed_intersection_type() == ...)
+```
+
+（[10:36](https://developer.apple.com/videos/play/wwdc2021/10149/?time=636)）
+
+**Key points:**
+- `query.next()`Traverse all candidate intersection points
+- `get_candidate_type()`Determine intersection type
+- Custom logic determines whether`commit_triangle_intersection()`
+- Query after the traversal is completed`get_committed_intersection_type()`
+
+Choose intersector or intersection query:
+
+| Scenario | Recommended solution |
+|------|----------|
+| Have existing intersector code | Continue to use intersector |
+| Port query code from other APIs | Use intersection query |
+| Simple custom intersection (such as alpha test) | intersection query |
+| Complex custom intersection logic | intersector |
+| Performance sensitive, need to compare | Try both |
+
+（[12:21](https://developer.apple.com/videos/play/wwdc2021/10149/?time=741)）
+
+### User Instance ID and Instance Transform
+
+（[13:52](https://developer.apple.com/videos/play/wwdc2021/10149/?time=832)）
+
+The new API allows you to specify a custom ID for each instance and read the instance's transformation matrix in the intersection.
+
+```swift
+// Set the user instance ID
+let instanceDescriptor = MTLAccelerationStructureMotionInstanceDescriptor()
+instanceDescriptor.userID = 42 // Custom value
+instanceDescriptor.transformationMatrix = transform
+```
+
+```metal
+// Read it in the intersection function
+uint userID = intersection.user_instance_id;
+float4x4 transform = intersection.instance_transform;
+```
+
+（[14:48](https://developer.apple.com/videos/play/wwdc2021/10149/?time=888)）
+
+**Key points:**
+- `user_instance_id`is a 32-bit custom value
+- Can be used to index material tables and encode custom data
+- `instance_transform`Directly read the transformation matrix of instance
+- No need to maintain external mapping tables yourself
+
+### Extended Limits: Larger scenes
+
+（[18:29](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1109)）
+
+Production-grade scenarios may exceed the default acceleration structure limits. extended limits mode adds the following upper limits:
+
+- primitive quantity
+- geometry quantity
+- number of instances
+- mask size
+
+How to enable:
+
+```swift
+// Enable it when building the acceleration structure
+let descriptor = MTLPrimitiveAccelerationStructureDescriptor()
+descriptor.usage = .extendedLimits
+
+// Mark it in the shader
+intersector<extended_limits, instancing> intersector;
+```
+
+（[19:18](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1158)）
+
+**Key points:**
+- extended limits may affect performance
+- Enable only when needed
+- Both acceleration structure and intersector must be marked
+
+### Motion Blur: Motion blur
+
+（[19:39](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1179)）
+
+Real camera exposure is not instantaneous. Blur occurs when objects move during the exposure. Metal now supports simulating this effect in ray tracing.
+
+Principle: Each ray randomly samples a time value, and Metal performs the intersection in the scene state at the corresponding time point.
+
+```metal
+// Generate a random time value within the exposure interval
+float time = randomInRange(exposureStart, exposureEnd);
+
+// Pass the time together with the ray to the intersector
+ray.time = time;
+auto intersection = intersector.intersect(ray, accelerationStructure);
+```
+
+（[22:38](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1358)）
+
+Two animations are supported:
+
+**Instance motion**: Rigid transformation of the entire object. Low cost and suitable for translation/rotation.
+
+```swift
+// Provide keyframe transformation matrices
+let motionDescriptor = MTLAccelerationStructureMotionInstanceDescriptor()
+motionDescriptor.motionTransformsStartIndex = 0
+motionDescriptor.motionTransformsCount = 2
+```
+
+**Primitive motion**: Each vertex moves independently. High cost, suitable for deformation animation (such as character skinning).
+
+```swift
+// Provide a vertex buffer for each keyframe
+let keyframeData = MTLMotionKeyframeData(buffer: vertexBuffer, offset: 0)
+let geometryDescriptor = MTLMotionTriangleGeometryDescriptor()
+geometryDescriptor.vertexBuffers = [keyframeData0, keyframeData1]
+```
+
+（[25:56](https://developer.apple.com/videos/play/wwdc2021/10149/?time=1556)）
+
+**Key points:**
+- instance motion is faster than primitive motion
+- Both animations can be used at the same time
+- Metal automatically interpolates between keyframes
+- mark in shader`instance_motion`or`primitive_motion`
+
+## Core Takeaways
+
+1. **Do light tracing reflection directly from the render pipeline**. No longer need to pass back and forth between compute pass and G-Buffer, taking advantage of tile memory optimization. Entrance API:`renderPipelineDescriptor.fragmentLinkedFunctions` + intersector in fragment shader。
+
+2. **Use intersection query to do alpha test**. A few lines of code replace the complete intersection function, suitable for simple custom intersections. Entrance API:`intersection_query` + `commit_triangle_intersection()`。
+
+3. **Simplify material lookup with user instance ID**. Encode the material index directly into the instance ID and read it directly from the intersection. Entrance API:`MTLAccelerationStructureMotionInstanceDescriptor.userID`。
+
+4. **Enable extended limits** for production rendering. Large scenes require larger acceleration structure constraints. Entrance API:`descriptor.usage = .extendedLimits`。
+
+5. **Use motion blur to enhance realism**. Each ray samples a random time value, and Metal automatically handles the interpolation. Entrance API:`ray.time` + `instance_motion`/`primitive_motion` tag。
+
+## Related Sessions
+
+- [Explore hybrid rendering with Metal ray tracing](/articles/wwdc2021-10150) — Ray tracing and rasterization hybrid rendering
+- [Optimize high-end games for Apple GPUs](/articles/wwdc2021-10148) — Apple GPU TBDR architecture game optimization
+- [Discover Metal debugging, profiling, and asset creation tools](/articles/wwdc2021-10157) — Xcode 13 Metal debugging and performance analysis tools

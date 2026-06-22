@@ -1,0 +1,313 @@
+---
+title: "Protect mutable state with Swift actors"
+description: "Learn how Swift Actors synchronize data access in your code, preventing data races, and how Main Actors ensure that UI code always executes on the main thread."
+date: "2021-06-08"
+tags: ["Swift"]
+thumbnail: "/images/sessions/2021/10133.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10133/"
+sessionId: "wwdc2021-10133"
+year: "2021"
+relatedSessions:
+  - title: "Meet async/await in Swift"
+    code: "10132"
+    description: "async/await basics, the prerequisite for understanding actors"
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "The use of Task, TaskGroup and actors together"
+  - title: "Concurrency in SwiftUI"
+    code: "10019"
+    description: "`@MainActor` in practice in SwiftUI"
+  - title: "ARC in Swift"
+    code: "10216"
+    description: "Reference types and the underlying mechanism of concurrency safety"
+---
+# Protect mutable state with Swift Actor
+
+## Highlight
+
+> Actor automatically isolates the mutable state of the class in the serial execution domain, and external access must pass`await`. The compiler will force check this rule - forget`await`The code fails to compile directly. A counter that originally needs to be locked manually can be used by actor`class`Change to`actor`, thread safety is guaranteed by the language and runtime.
+
+## Core Content
+
+Data race is one of the most hidden bugs in concurrent programming: two threads read and write the same variable memory at the same time, the results are unpredictable, difficult to reproduce, and debugging is even more of a nightmare. The traditional solution is to use a lock (NSLock) or a serial dispatch queue (DispatchQueue) to protect the shared state, but it is easy to miss, difficult to test, and has the risk of deadlock.
+
+The actor type introduced in Swift 5.5 solves this problem at the language level. Actor is a special reference type whose mutable state is isolated inside the actor. When external code accesses an actor's properties or methods, it must pass`await`Explicitly mark this as a potential hanging point. The compiler enforces checking of this rule, turning the data race from a runtime error to a compile-time error.
+
+## Detailed Content
+
+### Data competition problem
+
+A simple counter, using`class`Implementation with data race (00:42):
+
+```swift
+class Counter {
+    var value = 0
+    func increment() -> Int {
+        value = value + 1
+        return value
+    }
+}
+
+let counter = Counter()
+
+Task.detached {
+    print(counter.increment()) // data race!
+}
+Task.detached {
+    print(counter.increment()) // data race!
+}
+```
+
+two`Task`call simultaneously`increment`，`value = value + 1`It is not an atomic operation and the results are unpredictable.
+
+### Limitations of value types
+
+Value types (struct) naturally have no data competition, because every assignment is a copy (02:20):
+
+```swift
+var array1 = [1, 2]
+var array2 = array1
+array1.append(3)
+array2.append(4)
+print(array1) // [1, 2, 3]
+print(array2) // [1, 2, 4]
+```
+
+But value types cannot express shared mutable state. Change Counter to struct (02:59). Each Task gets an independent copy, and the result is always 1:
+
+```swift
+struct Counter {
+    var value = 0
+    mutating func increment() -> Int {
+        value = value + 1
+        return value
+    }
+}
+
+Task.detached {
+    var counter = counter
+    print(counter.increment()) // always prints 1
+}
+```
+
+### Actor isolation
+
+Will`class`Change to`actor`(05:23), the compiler automatically guarantees serial access:
+
+```swift
+actor Counter {
+    var value = 0
+    func increment() -> Int {
+        value = value + 1
+        return value
+    }
+}
+
+let counter = Counter()
+
+Task.detached {
+    print(await counter.increment())
+}
+Task.detached {
+    print(await counter.increment())
+}
+```
+
+Method calls inside an Actor are synchronous (07:51).`resetSlowly`Called multiple times inside a method`increment`,unnecessary`await`：
+
+```swift
+extension Counter {
+    func resetSlowly(to newValue: Int) {
+        value = 0
+        for _ in 0..<newValue {
+            increment()  // Synchronous call, no await needed
+        }
+        assert(value == newValue)
+    }
+}
+```
+
+### State assumptions after suspension
+
+`await`Will suspend the current execution, during which the actor state may be modified by other tasks. ImageDownloader's caching logic has a classic bug (09:02):
+
+```swift
+actor ImageDownloader {
+    private var cache: [URL: Image] = [:]
+
+    func image(from url: URL) async throws -> Image? {
+        if let cached = cache[url] {
+            return cached
+        }
+        let image = try await downloadImage(from: url)
+        // Bug: the cache may have been modified by another task during await
+        cache[url] = image
+        return image
+    }
+}
+```
+
+`await downloadImage`During this time, another task may have completed downloading the same URL and written it to the cache. Solution (11:59): Use`inProgress`Status to prevent repeated downloads:
+
+```swift
+actor ImageDownloader {
+    private enum CacheEntry {
+        case inProgress(Task<Image, Error>)
+        case ready(Image)
+    }
+    private var cache: [URL: CacheEntry] = [:]
+
+    func image(from url: URL) async throws -> Image? {
+        if let cached = cache[url] {
+            switch cached {
+            case .ready(let image):
+                return image
+            case .inProgress(let task):
+                return try await task.value  // Wait for the existing task to complete
+            }
+        }
+
+        let task = Task { try await downloadImage(from: url) }
+        cache[url] = .inProgress(task)
+
+        do {
+            let image = try await task.value
+            cache[url] = .ready(image)
+            return image
+        } catch {
+            cache[url] = nil
+            throw error
+        }
+    }
+}
+```
+
+### Protocol compliance and actor isolation
+
+Static methods are naturally executed outside the actor (13:30):
+
+```swift
+actor LibraryAccount {
+    let idNumber: Int
+    var booksOnLoan: [Book] = []
+}
+
+extension LibraryAccount: Equatable {
+    static func ==(lhs: LibraryAccount, rhs: LibraryAccount) -> Bool {
+        lhs.idNumber == rhs.idNumber  // Static method, no await needed
+    }
+}
+```
+
+Instance methods can be used`nonisolated`Marked for execution outside the actor (14:15), but only accessible`let`constant:
+
+```swift
+extension LibraryAccount: Hashable {
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(idNumber)  // idNumber is let, so it is safe
+    }
+}
+```
+
+### Passing data across Actors
+
+When passing data between actors, value types (structs) are safe because copies are passed (17:15):
+
+```swift
+struct Book {
+    var title: String
+    var authors: [Author]
+}
+
+func visit(_ account: LibraryAccount) async {
+    guard var book = await account.selectRandomBook() else { return }
+    book.title = "\(book.title)!!!"  // OK: modifying a local copy
+}
+```
+
+Reference types (classes) are risky (17:39). For class instances taken out from actors, external modifications will affect the internal state of the actor:
+
+```swift
+class Book {
+    var title: String
+}
+
+func visit(_ account: LibraryAccount) async {
+    guard var book = await account.selectRandomBook() else { return }
+    book.title = "\(book.title)!!!"  // Not OK: modifying a shared reference
+}
+```
+
+### Sendable protocol
+
+`Sendable`Types of protocol markers that can be passed safely across concurrent domains (20:08). struct automatically satisfies Sendable (if all properties are satisfied):
+
+```swift
+struct Book: Sendable {
+    var title: String
+    var authors: [Author]
+}
+```
+
+Generic types can be followed with conditions (20:43):
+
+```swift
+struct Pair<T, U> {
+    var first: T
+    var second: U
+}
+
+extension Pair: Sendable where T: Sendable, U: Sendable { }
+```
+
+### Main Actor
+
+UIKit requires all UI operations to be performed on the main thread. The traditional approach is to use`DispatchQueue.main.async`（24:19）：
+
+```swift
+func checkedOut(_ booksOnLoan: [Book]) {
+    booksView.checkedOutBooks = booksOnLoan
+}
+DispatchQueue.main.async {
+    checkedOut(booksOnLoan)
+}
+```
+
+`@MainActor`Let the compiler guarantee that functions are always executed on the main line (25:01):
+
+```swift
+@MainActor func checkedOut(_ booksOnLoan: [Book]) {
+    booksView.checkedOutBooks = booksOnLoan
+}
+
+await checkedOut(booksOnLoan)  // Swift ensures execution on the main thread
+```
+
+Classes can also be marked as`@MainActor`(26:21), all its methods are implicitly executed on the main thread:
+
+```swift
+@MainActor class MyViewController: UIViewController {
+    func onPress(...) { ... }  // Implicit @MainActor
+
+    nonisolated func fetchLatestAndDisplay() async { ... }  // Explicitly leaves the main thread
+}
+```
+
+## Core Takeaways
+
+1. **Replace manual locks with actors**: New projects can be directly replaced with actors.`NSLock`and Serial DispatchQueue. When migrating old projects, first change the outermost state management object to actor.
+
+2. **Be alert`await`Subsequent state changes**: In the actor method,`await`When re-executing after suspending, the actor state may have been modified. don't assume`await`The previous judgment still holds.
+
+3. **use`inProgress`Pattern to prevent duplication of work**: For time-consuming operations (such as network downloads), mark "in progress" with an enumeration status to let subsequent requests wait for the same task to complete instead of initiating repeated requests.
+
+4. **Prefer using value types to transfer data across actors**: The copy semantics of struct are naturally safe. If you must use a class, make sure it is implemented`Sendable`Or will not be modified outside the actor.
+
+5. **Use`@MainActor`substitute`DispatchQueue.main.async`**：`@MainActor`Thread safety is ensured at compile time and is more reliable than the dispatch queue at runtime. UI-related types such as ViewController and ViewModel can be directly marked as`@MainActor`。
+
+## Related Sessions
+
+- [WWDC2021 10132 - async/await in Swift](https://developer.apple.com/videos/play/wwdc2021/10132/) — async/await basics, the prerequisite for understanding actors
+- [WWDC2021 10134 - Exploring Swift Structured Concurrency](https://developer.apple.com/videos/play/wwdc2021/10134/) — The use of Task, TaskGroup and actors
+- [WWDC2021 10019 - Concurrency in SwiftUI](https://developer.apple.com/videos/play/wwdc2021/10019/) —`@MainActor`Practice in SwiftUI
+- [WWDC2021 10216 - ARC in Swift](https://developer.apple.com/videos/play/wwdc2021/10216/) — The underlying mechanism of reference types and concurrency safety

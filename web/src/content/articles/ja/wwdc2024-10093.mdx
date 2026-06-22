@@ -1,0 +1,298 @@
+---
+title: "Bring your iOS or iPadOS game to visionOS"
+description: "discover how to transform your ios or ipados game into a uniquely visionos experience. increase the immersion (and fun factor!) with a 3d frame or an immersive background. and invite players further i"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10093.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10093/"
+sessionId: "wwdc2024-10093"
+year: "2024"
+relatedSessions:
+  - title: "Create custom environments for your immersive apps in visionOS"
+    code: "10087"
+    description: "discover how to create visually rich and performant customized app environments "
+  - title: "Create enhanced spatial computing experiences with ARKit"
+    code: "10100"
+    description: "learn how to create captivating immersive experiences with arkit"
+  - title: "Design interactive experiences for visionOS"
+    code: "10096"
+    description: "learn how you can design a compelling interactive narrative experience for apple"
+  - title: "Dive deep into volumes and immersive spaces"
+    code: "10153"
+    description: "discover powerful new ways to customize volumes and immersive spaces in visionos"
+---
+
+## ハイライト
+
+> visionOS の 3D レンダリングには 2 つの道があります。RealityKit と Metal です。RealityKit は Swift または Unity PolySpatial 経由で Volume と ImmersiveSpace に適しており、Game Room や LEGO Builder's Journey がこのパターンです。ただし、ゲームに既に成熟した Metal パイプラインがあるなら、Metal で直接レンダリングする方が現実的です。
+
+---
+
+## 主要内容
+
+iOS 上で動く Metal ゲームを Vision Pro でもプレイしたい。最も簡単な方法は iOS SDK でコンパイルし、visionOS のウィンドウ内で Compatible App として実行することです。タッチとコントローラー入力はそのまま使え、体験は iPad とほぼ同じ。しかし Vision Pro の立体表示と空間認識能力を活かせません。
+
+Apple の方案は段階的アップグレードです。Compatible App から出発し、一歩ずつ機能を追加。iOS SDK コンパイルを visionOS SDK に切り替え、少数のコンパイルエラーを解決。レンダリングターゲットを CAMetalLayer から RealityKit の LowLevelTexture に移行。必要に応じて 3D フレーム、ImmersiveSpace 背景、立体レンダリング（Stereoscopy）、ヘッドトラッキング、可変リフレッシュレート（VRR）を追加。各ステップは独立してリリース可能で、一度に全部やる必要はありません。
+
+Wylde Flowers がこのパスの実例です。iPad 版を visionOS 上の Compatible App として実行した後、ゲームシーンに応じて変化する 3D ウィンドウフレーム、タンポポが舞うイマーシブ背景、立体深度レンダリングを段階的に追加し、まったく異なる体験になりました。Cut The Rope 3 も同じ方式でダイナミックフレームを実装。Void-X はウィンドウの後ろに雨、稲妻、3D 弾丸を追加しました。
+
+---
+
+## 詳細
+
+### CAMetalLayer から LowLevelTexture への移行
+
+iOS の Metal ゲームは通常 CAMetalLayer にレンダリングします。visionOS でも続行できますが、Apple は LowLevelTexture への移行を推奨。特に後から立体レンダリングと VRR を追加する場合、より多くの制御が得られます。
+
+CAMetalLayer の書き方（[05:44](https://developer.apple.com/videos/play/wwdc2024/10093/?time=344)）:
+
+```swift
+class CAMetalLayerBackedView: UIView, CAMetalDisplayLinkDelegate {
+
+    var displayLink: CAMetalDisplayLink!
+
+    override class var layerClass : AnyClass { return CAMetalLayer.self }
+
+    func setup(device: MTLDevice) {
+        let displayLink = CAMetalDisplayLink(metalLayer: self.layer as! CAMetalLayer)
+        displayLink.add(to: .current, forMode: .default)
+        self.displayLink.delegate = self
+    }
+
+    func metalDisplayLink(_ link: CAMetalDisplayLink,
+              needsUpdate update: CAMetalDisplayLink.Update) {
+        let drawable = update.drawable
+        renderFunction?(drawable)
+    }
+}
+```
+
+キーポイント:
+
+- `layerClass` が `CAMetalLayer.self` を返し、この UIView が Metal レイヤーを backing layer として使用
+- `CAMetalDisplayLink` は visionOS 新 API で、iOS の `CADisplayLink` を置き換え、フレームごとのレンダリングコールバックを提供
+- コールバックで `drawable` を取得し、レンダリング関数に渡す
+
+LowLevelTexture への移行（[06:20](https://developer.apple.com/videos/play/wwdc2024/10093/?time=380)）:
+
+```swift
+let lowLevelTexture = try! LowLevelTexture(descriptor: .init(
+    pixelFormat: .rgba8Unorm,
+    width: resolutionX,
+    height: resolutionY,
+    depth: 1,
+    mipmapLevelCount: 1,
+    textureUsage: [.renderTarget]
+))
+
+let textureResource = try! TextureResource(
+    from: lowLevelTexture
+)
+// assign textureResource to a material
+
+let commandBuffer: MTLCommandBuffer = queue.makeCommandBuffer()!
+let mtlTexture: MTLTexture = texture.replace(using: commandBuffer)
+// Draw into the mtlTexture
+```
+
+キーポイント:
+
+- `LowLevelTexture` はピクセルフォーマットと解像度で作成し、`.renderTarget` としてマーク
+- `TextureResource(from:)` で RealityKit テクスチャリソースにラップし、任意の Material に割り当て可能
+- `replace(using:)` が `MTLTexture` を返し、そのテクスチャ上で Metal 描画コマンドを実行
+- レンダリング結果は RealityKit シーンに直接表示。追加コピー不要
+
+### 3D フレーム + ImmersiveSpace 背景
+
+ZStack で Metal レンダリングと RealityKit フレームを重ねる（[07:06](https://developer.apple.com/videos/play/wwdc2024/10093/?time=426)）:
+
+```swift
+struct ContentView: View {
+
+    @State var game = Game()
+
+    var body: some View {
+        ZStack {
+           CAMetalLayerView { drawable in
+                             game.render(drawable) }
+
+           RealityView { content in
+                content.add(try! await
+                            Entity(named: "Frame"))
+            }.frame(depth: 0)
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `CAMetalLayerView` がゲームの Metal レンダリングを担当
+- `RealityView` が 3D モデルをフレームとして読み込み、`.frame(depth: 0)` でフレームとゲーム画面を同一平面に
+- フレームは `@State` 変数で動的切り替え可能。Cut The Rope 3 はステージごとにフレームを変更
+
+ImmersiveSpace 背景（[07:45](https://developer.apple.com/videos/play/wwdc2024/10093/?time=465)）:
+
+```swift
+@main
+struct TestApp: App {
+
+    @State private var appModel = AppModel()
+
+    var body: some Scene {
+        WindowGroup {
+            // Metal render
+            ContentView(appModel)
+        }
+
+        ImmersiveSpace(id: "ImmersiveSpace") {
+            // RealityKit background
+            ImmersiveView(appModel)
+        }.immersionStyle(selection: .constant(.progressive),
+                                    in: .progressive)
+    }
+}
+```
+
+キーポイント:
+
+- ゲーム本体は `WindowGroup`、背景は `ImmersiveSpace`。共有 `@State` オブジェクトで通信
+- `.progressive` イマージョンスタイルで背景が徐々に現れ、現実環境を完全に遮らない
+
+### 立体レンダリング（Stereoscopy）
+
+立体レンダリングの核心は左右の目それぞれに 1 枚ずつ描画すること。ゲームループを「1 回レンダリング」から「2 回レンダリング」に変更（[13:11](https://developer.apple.com/videos/play/wwdc2024/10093/?time=791)）:
+
+```swift
+override func draw(provider: DrawableProviding) {
+
+    encodeShadowMapPass()
+
+    for viewIndex in 0..<provider.viewCount {
+        scene.update(viewMatrix: provider.viewMatrix(viewIndex: viewIndex),
+               projectionMatrix: provider.projectionMatrix(viewIndex: viewIndex))
+        var commandBuffer = beginDrawableCommands()
+        if let color = provider.colorTexture(viewIndex: viewIndex, for: commandBuffer),
+           let depthStencil = provider.depthStencilTexture(viewIndex: viewIndex,
+                                                                 for: commandBuffer)
+        {
+            encodePass(into: commandBuffer, color: color, depth: depth)
+        }
+        endFrame(commandBuffer)
+    }
+}
+```
+
+キーポイント:
+
+- Shadow Map は 1 回だけエンコードし、両眼で共有
+- 立体レンダリング有効時 `provider.viewCount` は 2、左右の目に対応
+- 各目は独立した viewMatrix と projectionMatrix で、それぞれの color と depthStencil テクスチャにレンダリング
+- Vertex Amplification で draw call を削減推奨。1 回の draw call で両眼に出力
+
+視差（Parallax）に関する重要な注意：負の視差は物体を画面手前に浮かせ、正の視差は画面奥に沈める。視差が瞳孔間距離を超えると光が発散し、目が焦点を合わせられない——「無限遠を超える」より辛い。Apple は立体画面を無限遠平面上にレンダリングすることを推奨（Spatial Photo の portal 方式に類似）。すべてのコンテンツが無限遠より手前に現れるように。ゲーム設定にスライダーを追加し、プレイヤーが立体感の強度を調節できるようにすることも推奨。
+
+### ヘッドトラッキング（Head Tracking）
+
+ヘッドトラッキングでゲームが別世界への窓のように見える——頭を動かすと視点が変わる。ARKit データ取得には ImmersiveSpace を開く必要がある（[13:55](https://developer.apple.com/videos/play/wwdc2024/10093/?time=835)）:
+
+```swift
+import ARKit
+
+let arSession = ARKitSession()
+let worldTracking = WorldTrackingProvider()
+
+try await arSession.run([worldTracking])
+
+// Every frame
+
+guard let deviceAnchor = worldTracking.queryDeviceAnchor(
+    atTimestamp: CACurrentMediaTime() + presentationTime
+) else { return }
+
+let transform: simd_float4x4 = deviceAnchor
+    .originFromAnchorTransform
+```
+
+キーポイント:
+
+- `WorldTrackingProvider` がデバイス位置を提供。毎フレームクエリ
+- `CACurrentMediaTime() + presentationTime` を渡して予測し、レンダリング遅延を補正。例では 33ms（90fps で 3 フレーム）
+- 返される `originFromAnchorTransform` は ImmersiveSpace 座標系での変換
+
+ARKit の頭部位置は ImmersiveSpace 座標系。ウィンドウ座標系への変換が必要（[14:22](https://developer.apple.com/videos/play/wwdc2024/10093/?time=862)）:
+
+```swift
+let headPositionInImmersiveSpace: SIMD3<Float> = deviceAnchor
+    .originFromAnchorTransform
+    .position
+
+let windowInImmersiveSpace: float4x4 = windowEntity
+    .transformMatrix(relativeTo: .immersiveSpace)
+
+let headPositionInWindow: SIMD3<Float> = windowInImmersiveSpace
+    .inverse
+    .transform(headPositionInImmersiveSpace)
+
+renderer.setCameraPosition(headPositionInWindow)
+```
+
+キーポイント:
+
+- ARKit から ImmersiveSpace 内の頭部位置を取得
+- `transformMatrix(relativeTo: .immersiveSpace)` は visionOS 2.0 新 API。ウィンドウ entity の ImmersiveSpace 内変換行列
+- 逆行列で頭部位置をウィンドウ座標系に変換し、レンダラーに渡す
+
+頭部位置が得られたら、非対称投影行列を構築し、視錐体がウィンドウ境界を正確に通過するようにする（[15:47](https://developer.apple.com/videos/play/wwdc2024/10093/?time=947)）:
+
+```swift
+let cameraPosition: SIMD3<Float>
+let viewportBounds: BoundingBox
+
+// Camera facing -Z
+let cameraTransform = simd_float4x4(AffineTransform3D(translation: Size3D(cameraPosition)))
+
+let zNear: Float = viewportBounds.max.z - cameraPosition.z
+let l /* left */: Float = viewportBounds.min.x - cameraPosition.x
+let r /* right */: Float = viewportBounds.max.x - cameraPosition.x
+let b /* bottom */: Float = viewportBounds.min.y - cameraPosition.y
+let t /* top */: Float = viewportBounds.max.y - cameraPosition.y
+
+let cameraProjection = simd_float4x4(rows: [
+    [2*zNear/(r-l),             0, (r+l)/(r-l),      0],
+    [            0, 2*zNear/(t-b), (t+b)/(t-b),      0],
+    [            0,             0,           1, -zNear],
+    [            0,             0,           1,      0]
+])
+```
+
+キーポイント:
+
+- 近クリップ面をウィンドウ平面に合わせ、物体がウィンドウ端からはみ出すのを防止
+- カメラからウィンドウ四辺までの距離で非対称視錐体を構築し、画面をウィンドウ矩形に正確にマッピング
+- プレイヤーが正面から外れた位置から見ると視錐体が自然に傾き、「窓の横から覗く」効果が生まれる
+
+### 可変ラスタライゼーション率（VRR）
+
+立体レンダリングでフラグメント数が倍増。VRR は周辺領域の解像度を下げ、視野中心に演算力を集中。ヘッドトラッキングがあれば、頭部変換から VRR map を構築可能。Shared Space で頭部位置がない場合は `AdaptiveResolutionComponent` を使用——ゲームビューポート上の 2D グリッドに配置すると、各位置で 1 メートル立方体が画面上で占めるピクセル数を返す。この数値群から水平・垂直 VRR map を抽出し、補間して Metal レンダラーに渡す。レンダリング完了後、VRR map を反転してコンテンツを表示解像度に再マッピングする必要がある。
+
+---
+
+## 重要ポイント
+
+- **やること**：既存 iPad ゲームに 3D フレームを追加。価値がある理由：コスト極小（RealityView + 3D モデル 1 つ）で視覚的差別化が大きい。Cut The Rope 3 はダイナミックフレームで visionOS 版の識別度を最大化。始め方：ZStack で Metal レンダリングビューと RealityView を重ね、USDZ モデルをフレームとして読み込み、@State でゲーム状態間を切り替え。
+
+- **やること**：ゲームウィンドウの後ろに ImmersiveSpace 背景を追加。価値がある理由：ゲームレンダリングコードを変更せず、プレイヤーに「ゲーム世界に包まれた」感覚を与えられる。Void-X は雨と 3D 弾丸で実現。始め方：App の body に ImmersiveSpace を追加し、`.progressive` イマージョンスタイルを使用、@State を共有して背景とゲーム状態を連動。
+
+- **やること**：立体レンダリングとヘッドトラッキングを追加。価値がある理由：両者を組み合わせるとゲームウィンドウが本物の窓のように見え、横から見ると視点が変化。純 2D レンダリングとの没入感に質的飛躍。始め方：レンダリングターゲットを LowLevelTexture に移行、DrawableProviding の viewCount で左右の目をループレンダリング、ImmersiveSpace を開いて ARKit で頭部位置を取得、非対称投影行列を構築。
+
+- **やること**：VRR で立体レンダリングのパフォーマンスコストを相殺。価値がある理由：立体レンダリングでフラグメントが倍増、VRR で周辺解像度を下げればフレームレートを回復でき、プレイヤーはほぼ気づかない。始め方：Shared Space で AdaptiveResolutionComponent から 2D グリッドデータを生成、水平・垂直 VRR map を抽出して Metal レンダラーに渡す。ヘッドトラッキングがある場合は変換行列からより精密な map を構築。
+
+---
+
+## 関連セッション
+
+- [Create custom environments for your immersive apps in visionOS](/articles/wwdc2024-10087) — イマーシブアプリ用カスタム 3D 環境の作成。本 Session の ImmersiveSpace 背景と組み合わせ
+- [Create enhanced spatial computing experiences with ARKit](/articles/wwdc2024-10100) — ARKit の WorldTrackingProvider 詳解。本 Session のヘッドトラッキングが依存
+- [Dive deep into volumes and immersive spaces](/articles/wwdc2024-10153) — Volume と ImmersiveSpace の新機能詳解。本 Session のウィンドウ+背景アーキテクチャの延伸
+- [Discover RealityKit APIs for iOS, macOS and visionOS](/articles/wwdc2024-10088) — portal-crossing API を含む。本 Session で言及したウィンドウ境界を越える物体に使用

@@ -1,0 +1,230 @@
+---
+title: "Streamline local authorization flows"
+description: "discover how you can use the latest authorization-focused apis in localauthentication to protect the privacy and security of people's data. we'll show you how localauthentication can authorize access to secrets, keys, and other sensitive resources in your app, all while reducing complexity and relying on the security and usability of common local authentication methods such as touch id and face id."
+date: 2026-06-10
+tags: ["Privacy & Security", "LocalAuthentication"]
+thumbnail: "/images/sessions/2022/10108.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10108/"
+sessionId: "wwdc2022-10108"
+year: "2022"
+relatedSessions:
+  - title: "Discover Managed Device Attestation"
+    code: "10143"
+    description: "Use Secure Enclave-backed device attestation to prove managed devices to services."
+  - title: "Meet passkeys"
+    code: "10092"
+    description: "Adopt passkeys for phishing-resistant sign-in flows across apps and the web."
+  - title: "Replace CAPTCHAs with Private Access Tokens"
+    code: "10077"
+    description: "Use Private Access Tokens to add confidence to requests while preserving privacy."
+  - title: "Improve DNS security for apps and servers"
+    code: "10079"
+    description: "Use modern DNS security features to protect app and server name resolution."
+---
+## ハイライト
+
+> このセッションでは、iOS 16 および macOS 13 での LocalAuthentication フレームワークの新しい変更について説明します。中心となる概念は、「認証」と「認可」を区別することです。
+
+## 主要内容
+多くのアプリでは、ユーザー情報、秘密キー、ファイル復号化機能、トランザクション確認ボタンなどの機密リソースを保護する必要があります。古い慣例は通常、「ユーザーを認証する」ことから始まります。`LAContext`、システムに Face ID、Touch ID、またはパスワード インターフェイスを表示させ、継続的に使用できるようにこのコンテキストをセキュリティ フレームワークに渡します。
+
+このプロセスは機能しますが、開発者は複数の概念を自分でつなぎ合わせる必要があります。リソースが何であるか、どの操作が許可されるか、アクセス制御リスト (ACL) で必要な認証方法、および認可結果がどのクエリにバインドされるかは、すべてコード内で処理する必要があります。 Secure Enclave 秘密キーを使用してセッションに署名する例: 秘密キーは Secure Enclave にあり、アプリは秘密キーを直接取得せず、Secure Enclave に署名操作の完了を要求するだけです。
+
+Apple は、iOS 16 および macOS 13 の LocalAuthentication に承認用の高レベル API を追加しました。コアの抽象化は次のとおりです。`LARight`: アプリ定義の保護された操作を表す権利。開発者は、質問を「ユーザー認証」から「このユーザーは今この操作を実行できますか?」に押し上げることができます。
+
+`LARight`ユーザーデータ領域へのアクセスなど、アプリの内部リソースの保護に適しています。`LAPersistedRight`ブート全体にわたる認証要件の保存に適しており、Secure Enclave の一意のキーによって裏付けられています。秘密キーの操作は依然として最初に承認される必要がありますが、公開キーの操作は直接実行できるため、二次検証やチャレンジ署名などのプロセスのための低レベルのアセンブリ コードが大幅に節約されます。
+
+## 詳細
+### LAContext を使用して Secure Enclave 署名を承認する ([04:58](https://developer.apple.com/videos/play/wwdc2022/10108/?time=298))
+
+セッションは既存のプラクティスを確認することから始まります。署名する前に、アプリは Secure Enclave 秘密キーに関連付けられたアクセス制御リストを取得する必要があります。これはセキュリティ フレームワークに依存します`SecItemCopyMatching`、クエリで返された属性が必要です。
+
+```swift
+let query: [String: Any] = [
+    kSecClass as String: kSecClassKey,
+    kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+    kSecAttrApplicationTag as String: "com.example.app.key",
+    kSecReturnAttributes as String: true,
+]
+
+var item: CFTypeRef? = nil
+guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let attrs = item as? NSDictionary, let accessControl = attrs[kSecAttrAccessControl] else {
+    throw .aclNotFound
+}
+```
+
+キーポイント:
+
+- `kSecClassKey`クエリのターゲットがキーであることを示します。
+-`kSecAttrTokenIDSecureEnclave`範囲を Secure Enclave 内のキーに制限します。
+-`kSecAttrApplicationTag`安定したタグを使用して、アプリによって作成されたキーを見つけます。
+-`kSecReturnAttributes`key 属性を返す必要があるため、読み取ります`kSecAttrAccessControl`。
+- `SecItemCopyMatching`成功すると、コードは返された属性から ACL を取得します。失敗するとスローされます`aclNotFound`。
+
+ACL取得後は、`LAContext`認証 UI は、アプリによって選択された時間 ([05:15](https://developer.apple.com/videos/play/wwdc2022/10108/?time=315)) にトリガーできます。
+
+```swift
+let context = LAContext()
+try await context.evaluateAccessControl(accessControl as! SecAccessControl, 
+                      operation: .useKeySign, 
+                       localizedReason: "Authentication is required to proceed")
+```
+
+キーポイント:
+
+- `LAContext()`この許可された使用のためのコンテキストを作成します。
+-`evaluateAccessControl`以前に削除された ACL を直接評価します。
+-`operation: .useKeySign`この承認が署名操作を実行することであることを示します。
+-`localizedReason`これは、システム認証インターフェイスでユーザーに表示される理由の説明です。
+
+認可完了後も同様`LAContext`クエリにバインドして秘密キー参照を取得します ([05:44](https://developer.apple.com/videos/play/wwdc2022/10108/?time=344))。
+
+```swift
+let query: [String: Any] = [
+    kSecClass as String: kSecClassKey,
+    kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+    kSecAttrApplicationTag as String: "com.example.app.key",
+    kSecReturnRef as String: true,
+    kSecUseAuthenticationContext as String: context
+]
+
+var item: CFTypeRef? = nil
+guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, item != nil else { 
+    throw .keyNotFound
+}
+```
+
+キーポイント:
+
+- `kSecReturnRef`後続の操作で使用できるキー参照を返す必要があります。
+-`kSecUseAuthenticationContext`認可された`context`クエリのためにセキュリティに渡されます。
+- 同じコンテキストが秘密キー参照にバインドされると、署名時に認証インターフェイスが再度ポップアップしなくなります。
+- 繰り返しのリマインダーを回避するこの効果は、次の期間まで持続します。`LAContext`無効。
+
+最後に、アプリは返された`SecKey`署名を実行します ([06:00](https://developer.apple.com/videos/play/wwdc2022/10108/?time=360))。
+
+```swift
+let privateKey = item as! SecKey
+
+var error: Unmanaged<CFError>?
+guard let sgt = SecKeyCreateSignature(privateKey, self.algorithm, blob, &error) as Data? else {
+    throw .signatureFailure
+}
+```
+
+キーポイント:
+
+- `item`に変換されます`SecKey`、これは秘密キーの参照です。
+-`SecKeyCreateSignature`Secure Enclave に秘密鍵ペアを使用するよう要求する`blob`サイン。
+- 秘密キー自体はアプリに与えられません。アプリは署名結果のみを取得します。
+- 署名が失敗すると、コードがスローされます。`signatureFailure`。
+
+### LARight を使用してアプリ独自の保護された操作を表現します ([08:28](https://developer.apple.com/videos/play/wwdc2022/10108/?time=508))
+
+アプリがユーザー プロフィール ページなどの 1 つのアプリ内リソースのみを保護したい場合は、それを直接使用します`LARight`もっとシンプルに。 Right の要件は、「生体認証が必要で、デバイスのパスワードをフォールバックとして許可する」と書くことができます。
+
+```swift
+// LARight: Basic usage
+
+func login() async {
+   self.loginRight = LARight(requirement: .biometry(fallback: .devicePasscode))
+   do {
+       try await loginRight.checkCanAuthorize()
+   } catch {
+       navigateTo(section: .public)
+       return
+   }
+   do {
+      try await self.loginRight.authorize(localizedReason: self.localizedReason)
+ navigateTo(section: .protected)
+   } catch {
+      showError(.authenticationRequired)
+   }
+}
+```
+
+キーポイント:
+
+- `LARight(requirement:)`保護された認可オブジェクトを作成します。
+-`.biometry(fallback: .devicePasscode)`生体認証が最初に使用され、認証を完了するためにデバイスのパスワードも使用されることを示します。
+-`checkCanAuthorize()`まず現在のユーザーがこの権利を取得できるかどうかを確認し、許可がない場合はパブリックエリアに入ります。
+-`authorize(localizedReason:)`システム主導の認証 UI をトリガーします。
+- 認証成功後に保護領域に入り、失敗した場合は認証に必要なエラーを表示します。
+
+右にはステータスがあります。不明から承認になり、結果に応じて承認または非承認になります。アプリで読める`state`、KVO、結合、またはデフォルトのモニタリングを使用することもできます。`NotificationCenter`で`didBecomeAuthorized`そして`didBecomeUnauthorized`通知 ([09:38](https://developer.apple.com/videos/play/wwdc2022/10108/?time=578))。
+
+ログアウトすると、アプリはこの権利を積極的に取り消します ([11:01](https://developer.apple.com/videos/play/wwdc2022/10108/?time=661))。
+
+```swift
+// LARight: Basic usage
+
+func login() async {
+   self.loginRight = LARight(requirement: .biometry(fallback: .devicePasscode))
+   // ...
+   do {
+       try await self.loginRight.authorize(localizedReason: self.localizedReason)
+  navigateTo(section: .protected)
+   } catch {
+       showError(.authenticationRequired)
+   }
+}
+
+func logout() async {   
+   await self.loginRight.deauthorize()
+}
+```
+
+キーポイント:
+
+- `self.loginRight`強い参照によって保存する必要があります。インスタンスが解放されると、認証ステータスも失われます。
+-`deauthorize()`許可された権利を無許可の状態に戻します。
+- 次回ログインするとき、ユーザーは再度認証プロセスを実行する必要があります。
+- このモデルは、「このアプリの実行中に有効」という保護シナリオに適しています。
+
+### クロスセッションの二次認証に LAPersistedRight を使用する ([13:44](https://developer.apple.com/videos/play/wwdc2022/10108/?time=824))
+
+`LAPersistedRight`ライトストアによって作成されました。保存すると、一意の Secure Enclave キーによって裏付けられ、認証要件は不変のままになります。公開キーは直接エクスポートできます。秘密キーの署名、復号化、キー交換などの操作は、最初に承認される必要があります。
+
+```swift
+// LAPersistedRight: Retrieval and private key usage
+
+func generateClientKeys() async throws -> Data {
+    let login2FA = LARight(requirement: .biometryCurrentSet)
+    let persisted2FA = try await LARightStore.shared.saveRight(login2FA, identifier: "2fa")
+    return try await persisted2FA.key.publicKey.bytes
+}
+
+func signChallenge(_ challenge: Data, algorithm: SecKeyAlgorithm) async throws -> Data {
+    let persisted2FA = try await LARightStore.shared.right(forIdentifier: "2fa")
+    let localizedReason = "Biometric authentication is required to proceed"
+    try await persisted2FA.authorize(localizedReason: localizedReason)
+    return try await persisted2FA.key.sign(challenge, algorithm: algorithm)
+}
+```
+
+キーポイント:
+
+- `.biometryCurrentSet`権利の作成時にデバイスに登録された生体認証セットに関連付けられる承認が必要です。
+-`LARightStore.shared.saveRight`通常の権利を、一意の識別子を持つ永続的な権利として保存します。
+-`persisted2FA.key.publicKey.bytes`バックエンドによる保存または検証に適した公開キーのバイトをエクスポートします。
+-`right(forIdentifier:)`後続のアプリセッションで同じ永続的な権利を取得します。
+-`authorize(localizedReason:)`成功した場合にのみ、秘密キーによって保護された操作の実行が許可されます。
+-`persisted2FA.key.sign`秘密キーを使用して、バックエンドによって発行されたチャレンジに署名します。
+
+この例は、一般的なログイン拡張プロセスに対応しています。デバイスにバインドされた公開キーは登録フェーズ中に生成され、バックエンドは公開キーを保存します。ログインまたは高リスクの操作中に、バックエンドはチャレンジを発行し、ユーザーが生体認証を完了した後、デバイスは秘密キーで署名し、バックエンドは公開キーを使用して署名を検証します。
+
+## 重要ポイント
+- **対処法: 機密ページにローカルのロック解除を追加します。 ** パスワード ライブラリ、健康記録、財務詳細ページなど。実行する価値がある理由:`LARight`「このエリアに入る前に認証が必要です」を直接表現できます。開始方法:`LARight(requirement: .biometry(fallback: .devicePasscode))`、入る前に呼ばれます`checkCanAuthorize()`そして`authorize(localizedReason:)`。
+
+- **何をすべきか: ログアウト ボタンに実際のローカルの取り消しを与えます。 ** 実行する価値がある理由: ユーザーがデバイスを離れた後も保護領域が表示され続けるのを防ぐために、アプリによって Right の認証ステータスを積極的に取り消すことができます。開始方法: ログアウト、アカウントの切り替え、またはバックグラウンド ポリシーの開始がトリガーされたときに呼び出されます。`deauthorize()`, 再度アクセスする際は再認証を行ってください。
+
+- **対処方法: デバイス バインドの二次検証には Secure Enclave を使用します。 **実行する価値がある理由:`LAPersistedRight`その背後にある秘密キーは承認後にのみ使用でき、リスクの高い操作に署名するのに適しています。開始方法: 登録時に保存します`LARight(requirement: .biometryCurrentSet)`そして公開キーをアップロードします。操作中に権利を取得し、承認後にバックエンドチャレンジに署名します。
+
+- **対処方法: 古い LAContext + セキュリティ コードを徐々に統合します。 ** 実行する価値がある理由: アプリのコンテンツを保護したいだけの場合は、`LARight`手書きの ACL クエリ、コンテキスト バインディング、および状態管理を削減できます。開始方法: 基礎となるキー制御を必要とするパスを保持し、通常のコンテンツのロック解除を適切なモデルに変更し、状態監視を使用して UI を更新します。
+
+## 関連セッション
+
+- [管理対象デバイスの構成証明の検出](/articles/wwdc2022-10143) - Secure Enclave の秘密キーとデバイス構成証明がサーバー側の信頼性判断にどのように使用されるかについて引き続き説明します。
+- [パスキーについて](/articles/wwdc2022-10092) — アカウント ログインの観点から、プラットフォーム認証機能とフィッシング対策資格情報の統合について説明します。
+- [CAPTCHA をプライベート アクセス トークンに置き換える](/articles/wwdc2022-10077) — プライバシーを保護しながらリクエストの信頼性を向上させる方法について説明します。
+- [アプリとサーバーの DNS セキュリティを向上する](/articles/wwdc2022-10079) — ネットワーク層のセキュリティ機能について言えば、ローカル認証とともにセキュリティ変換リストに含めるのが適切です。

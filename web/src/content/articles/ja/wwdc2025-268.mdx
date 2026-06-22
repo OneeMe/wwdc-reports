@@ -1,0 +1,184 @@
+---
+title: "Embracing Swift concurrency"
+description: "join us to learn the core swift concurrency concepts. concurrency helps you improve app responsiveness and performance, and swift is designed to make asynchronous and concurrent code easier to write c"
+date: 2026-06-10
+tags: ["UIKit", "Liquid Glass", "iPadOS", "Observable", "HDR"]
+thumbnail: "/images/sessions/2025/268.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/268/"
+sessionId: "wwdc2025-268"
+year: "2025"
+relatedSessions:
+  - title: "Code-along: Cook up a rich text experience in SwiftUI with AttributedString"
+    code: "280"
+    description: "learn how to build a rich text experience with swiftui"
+  - title: "Explore Swift and Java interoperability"
+    code: "307"
+    description: "learn how you can mix swift and java in a single codebase. we"
+  - title: "Improve memory usage and performance with Swift"
+    code: "312"
+    description: "discover ways to improve the performance and memory management of your swift cod"
+  - title: "Optimize SwiftUI performance with Instruments"
+    code: "306"
+    description: "discover the new swiftui instrument. we"
+---
+
+## ハイライト
+
+> Xcode 26 で新規 App プロジェクトを作成すると、デフォルトで Main Actor モードが有効になり、すべてのコードが暗黙的に `@MainActor` を帯びるようになります。バックグラウンドで実行したい場合は `@concurrent` を明示的に付与します。
+
+---
+
+## 主要内容
+
+ネットワークリクエストを書き始めた頃、多くの開発者が同じ落とし穴に踏み込んだ経験があるはずです。メインスレッドで `URLSession.shared.data(from:)` を同期的に呼び出した結果、UI が数秒間フリーズし、アプリが固まったように見えてしまう、というあれです。これは、メインスレッドがタッチイベントへの応答と UI の描画を担っているのに、ネットワーク IO に占有されてしまうと何もできなくなるためです。今回 Swift チームが提示した解決策は、新たな GCD API を追加するのではなく、「どのスレッドで実行するか」を言語レベルでコンパイラが検証できるプロパティに変えるというものです。
+
+iOS 19 / Xcode 26 で新規作成した App プロジェクトでは、デフォルトで Main Actor モードが有効になっています。これはつまり、何のアノテーションも付けないコードが暗黙的に `@MainActor` を帯びる、ということです。コンパイラはそのコードがメインスレッドでしか動かないと知っているので、グローバル変数や singleton にも自由にアクセスできます。ある計算（たとえば画像のデコード）が UI のフレーム落ちを引き起こすようになったら、その関数に `@concurrent` を付けます。すると、コンパイラがメインスレッド専有の状態にアクセスしている箇所をすぐに指摘し、それらの状態を値型もしくは actor で包んでから渡すように促してくれます。マイグレーションのパスは段階的です。シングルスレッドから始めて、まず `async/await` で高レイテンシ処理を扱い、次に `@concurrent` で CPU バウンドなタスクをオフロードし、最後に `actor` でデータ自体をメインスレッドの外に追い出す、という流れになります。
+
+---
+
+## 詳細
+
+セッション全体は、画像読み込みのサンプルを軸に展開していきます。最初のバージョンは同期ブロッキングです。
+
+```swift
+final class ImageModel {
+  var imageCache: [URL: Image] = [:]
+  let view = View()
+
+  func fetchAndDisplayImage(url: URL) throws {
+    let data = try Data(contentsOf: url)
+    let image = decodeImage(data)
+    view.displayImage(image)
+  }
+}
+```
+
+ポイント：
+- `fetchAndDisplayImage` は同期関数で、処理全体がメインスレッド上で一気に走ります。
+- ローカルの小さなファイルを読むぶんには問題ありませんが、ネットワーク URL に切り替えた途端、メインスレッドがネットワーク IO でブロックされ、UI が完全に固まります。
+
+最初のステップは `async` 化して、ネットワーク IO がメインスレッドをブロックしないようにすることです（[06:10](https://developer.apple.com/videos/play/wwdc2025/268/?time=370)）。
+
+```swift
+final class ImageModel {
+  var imageCache: [URL: Image] = [:]
+  let view = View()
+
+  func fetchAndDisplayImage(url: URL) async throws {
+    let (data, _) = try await URLSession.shared.data(from: url)
+    let image = decodeImage(data)
+    view.displayImage(image)
+  }
+}
+```
+
+ポイント：
+- 関数シグネチャに `async` を付け、`URLSession` を呼び出すときは `await` を使います。
+- `await` は suspend point を示し、関数はここでメインスレッドを手放し、データが返ってきてから再開します。
+- 関数自体は依然としてメインスレッド上で動いていますが、ネットワークを待っている間、メインスレッドはタッチイベントの処理や別の UI の描画に使えます。
+- `URLSession` の実装はバックグラウンドスレッドで実際の IO を行うため、アプリのコード自体には並行性が持ち込まれていません。
+
+`async` 関数は task の中で起動する必要があります。ボタンタップ時のコードはこうなります（[07:31](https://developer.apple.com/videos/play/wwdc2025/268/?time=451)）。
+
+```swift
+func onTapEvent() {
+  Task {
+    do {
+      try await fetchAndDisplayImage(url: url)
+    } catch let error {
+      displayError(error)
+    }
+  }
+}
+```
+
+ポイント：
+- `Task { ... }` で新しい task を作り、fetch + display 全体をラップします。
+- task は最初から最後まで順番に実行され、複数の task はメインスレッド上で interleaving しながら交互に走ります。
+- error は task の内部で catch して、例外を握りつぶさないようにします。
+
+実際にメインスレッドの詰まりに遭遇したとき——たとえば `decodeImage` で大きな画像を扱うのが遅すぎるとき——に初めて、その部分をバックグラウンドへ移します。ここで使うのが `@concurrent` です（[11:11](https://developer.apple.com/videos/play/wwdc2025/268/?time=671)）。
+
+```swift
+final class ImageModel {
+  var imageCache: [URL: Image] = [:]
+  let view = View()
+
+  func fetchAndDisplayImage(url: URL) async throws {
+    let (data, _) = try await URLSession.shared.data(from: url)
+    let image = await decodeImage(data, at: url)
+    view.displayImage(image)
+  }
+
+  @concurrent
+  func decodeImage(_ data: Data, at url: URL) async -> Image {
+    Image()
+  }
+}
+```
+
+ポイント：
+- `@concurrent` は、この関数が常にバックグラウンドで動くことを Swift に伝えます。
+- 呼び出し側は `await` で結果を待ち、デコード中のメインスレッドは別の処理を続けられます。
+- この時点で `decodeImage` は main actor の隔離ドメインから外れるため、コンパイラは `imageCache` への直接アクセスを拒否します。これは設計上の意図であり、スレッドをまたいで共有するデータを明示的に扱うように強制しています。
+
+共有可変参照型におけるデータ競合の問題に対しては、actor を使った解決策が示されます（[25:10](https://developer.apple.com/videos/play/wwdc2025/268/?time=1510)）。
+
+```swift
+actor NetworkManager {
+  var openConnections: [URL: Connection] = [:]
+
+  func openConnection(for url: URL) async -> Connection {
+    if let connection = openConnections[url] {
+      return connection
+    }
+    let connection = Connection()
+    openConnections[url] = connection
+    return connection
+  }
+
+  func closeConnection(_ connection: Connection, for url: URL) async {
+    openConnections.removeValue(forKey: url)
+  }
+}
+```
+
+ポイント：
+- `class` を `actor` に変えるだけで、`openConnections` の可変状態が actor によって隔離・保護されます。
+- 外部から `openConnection` / `closeConnection` を呼ぶときは `await` が必須となり、actor は同時に内部で動く呼び出しが 1 つだけになることを保証します。
+- メインスレッドからもバックグラウンドスレッドからも、同一の `NetworkManager` インスタンスを安全に利用でき、ロックを手で書く必要がありません。
+
+値型は別ルートを通ります。`struct` と `enum` はデフォルトで `Sendable` を満たし、task 間で受け渡すときはコピーセマンティクスが共有を自動的に防いでくれます（[16:56](https://developer.apple.com/videos/play/wwdc2025/268/?time=1016)）。まず値型を試し、共有可変状態をどうしても扱えないときに actor を使う、というのが Apple の推奨する優先順位です。
+
+---
+
+## 重要ポイント
+
+- **やるべきこと：新規 iOS 19 プロジェクトでは Main Actor デフォルトモードが有効になっていることを確認する**
+  - なぜやる価値があるか：Xcode 26 の新テンプレートではデフォルトで有効化されており、コンパイラが UI モジュールのコードに自動で `@MainActor` を付けてくれます。明示的なアノテーションを大量に書く必要がなくなり、UI 関連の singleton やグローバル状態へのアクセスで「data race」と怒られることもなくなります。
+  - どこから始めるか：Build Settings で「Default Actor Isolation」を検索し、`MainActor` になっていることを確認します。既存プロジェクトでは UI 関連のモジュールから切り替え、ビジネスロジックのモジュールはいったん現状維持で構いません。
+
+- **やるべきこと：`URLSession.shared.data(...)` の同期呼び出しをすべて `async/await` に置き換える**
+  - なぜやる価値があるか：メインスレッド上での同期ネットワーク IO は、ほぼ確実に UI のフリーズを招きます。`async` 版を使えば並行性を持ち込む必要はなく、`await` を 1 つ書くだけでフリーズ箇所が suspend point に変わります。
+  - どこから始めるか：コード内のすべての `Data(contentsOf:)` や同期版 `URLSession` の使用箇所を検索し、呼び出し元を `async` 関数に書き換え、ボタンのコールバックの中で `Task { }` を使って起動するようにします。
+
+- **やるべきこと：Instruments でメインスレッド上の本当に重い計算を特定してから `@concurrent` を付与する**
+  - なぜやる価値があるか：セッションでも「多くの app は並行性を必要としない」と明言されています。重そうな処理を闇雲にバックグラウンドへ追い出しても、コードが複雑化し、新たなデータ競合を呼び込むだけです。まず profiler でボトルネックを突き止めるべきです。
+  - どこから始めるか：Instruments の Time Profiler を実行し、メインスレッド占有率の高い関数を見つけます。それが本当に CPU バウンドな処理（画像デコード、大きな JSON のパースなど）であれば、その関数に `@concurrent` を付けて、コンパイラに隔離状態へのアクセス箇所を洗い出してもらいます。
+
+- **やるべきこと：スレッド間で共有される可変参照型を actor にリファクタリングする**
+  - なぜやる価値があるか：singleton 的な `class` は複数スレッドからアクセスされるとロックを手で書く必要があり、ミスを誘発します。`actor` は同期プリミティブを言語レベルで内蔵し、外部からの呼び出しは `await` が必須になるため、コンパイラがすべてのデータ競合を未然に止めてくれます。
+  - どこから始めるか：プロジェクト内で複数スレッドからアクセスされる manager / cache 系のクラスを洗い出し、順番に `actor` へ書き換えていきます。外部からの呼び出しはすべて `await` が必要になるため、呼び出しチェーン上の関数も `async` 化が必要になる場合があります。
+
+- **やるべきこと：値型 + `Sendable` で task 間のデータ受け渡しを処理する**
+  - なぜやる価値があるか：`struct` はデフォルトで `Sendable` を満たし、コピーセマンティクスが共有を自然に避けてくれるため、actor よりずっとシンプルです。Apple もセッション内で「値型優先」を第一原則として挙げています。
+  - どこから始めるか：task 間で受け渡しているデータを見直し、`struct` で表現できるなら `class` は使わない方針にします。参照型を渡さざるを得ない場合は、それが不変であることを確認したうえで `Sendable` を付け、そうでなければ値型のスナップショットに変換します。
+
+---
+
+## 関連セッション
+
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — SwiftUI でリッチテキスト編集体験を組み立てつつ、Swift concurrency でデータ更新を扱う
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — Swift と Java を同一コードベースで併用する際、言語をまたぐ呼び出しで並行性の境界をどう扱うか
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Swift のメモリ管理とパフォーマンス最適化のテクニック。`@concurrent` でのオフロードと組み合わせて読むのに最適
+- [Optimize SwiftUI performance with Instruments](/articles/wwdc2025-306) — 新しい SwiftUI Instrument で UI のフリーズを特定し、並行性を導入すべきかを判断する

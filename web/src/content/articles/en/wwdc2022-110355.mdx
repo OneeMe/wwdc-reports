@@ -1,0 +1,283 @@
+---
+title: "Meet Swift Async Algorithms"
+description: "Discover the latest open source Swift package from Apple: Swift Async Algorithms. We'll explore algorithms from this package that you can use with AsyncSequence, including zip, merge, and throttle. Follow along with us as we use these algorithms to build a great messaging app. We'll also share best practices for combining multiple AsyncSequences and using the Swift Clock type to work with values over time."
+date: "2022-06-07"
+tags: ["Swift", "AsyncSequence", "Concurrency", "Algorithms"]
+thumbnail: "/images/sessions/2022/110355.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110355/"
+sessionId: "wwdc2022-110355"
+year: "2022"
+relatedSessions:
+  - title: "What's new in Swift"
+    code: "110354"
+    description: "Overview of new features in Swift 5.7, including Clock API"
+  - title: "Meet distributed actors in Swift"
+    code: "110356"
+    description: "Swift distributed actor model"
+  - title: "Design protocol interfaces in Swift"
+    code: "110353"
+    description: "Swift 5.7 Generics and Protocol Improvements"
+---
+## Highlight
+
+> Swift Async Algorithms is an open source package that provides advanced algorithms such as Zip, Merge, Debounce, and Chunk for AsyncSequence. It also uses the Clock API of Swift 5.7 to implement time-based flow control.
+
+## Core Content
+
+### From callback to AsyncSequence
+
+In your instant messaging app, the arrival of messages is currently driven by callbacks. Each account has its own message callback, and manual coordination is required when there are multiple accounts. The code is full of nested completion handlers, and state management becomes increasingly complex.
+
+([01:15](https://developer.apple.com/videos/play/wwdc2022/110355/?time=75)) Swift’s AsyncSequence turns asynchronous value streaming into`for-await-in`The sequence to traverse. The Swift Async Algorithms package provides more advanced algorithms on this basis.
+
+```swift
+struct Account {
+  var messages: AsyncStream<Message>
+}
+
+actor AccountManager {
+  var primaryAccount: Account
+  var secondaryAccount: Account?
+}
+
+protocol MessagePreview {
+  func displayPreviews(_ manager: AccountManager) async
+}
+```
+
+Key points:
+- `AsyncStream`Convert callbacks to AsyncSequence, preserving message order
+-`for-await-in`Syntax makes asynchronous traversal look like synchronous code
+
+### Zip: Concurrently wait for multiple asynchronous results
+
+([02:16](https://developer.apple.com/videos/play/wwdc2022/110355/?time=136)) When users send videos, you need to generate previews and transcode at the same time. The two operations are performed independently, but they need to appear in pairs when uploading.
+
+The previous approach was to use`TaskGroup`or`async let`Manual coordination. The Zip algorithm directly solves this problem:
+
+```swift
+// upload attachments of videos and previews such that every video has a preview
+// that are created concurrently so that neither blocks each other.
+
+for try await (vid, preview) in zip(videos, previews) {
+  try await upload(vid, preview)
+}
+```
+
+Key points:
+- `zip`Concurrently traverse two AsyncSequences to generate tuples
+- If either party completes first, it will wait for the other party and will not block.
+- If any sequence throws an error, the entire Zip will be rethrow
+
+### Merge: Merge multiple message flows
+
+([04:04](https://developer.apple.com/videos/play/wwdc2022/110355/?time=244)) Your App supports multiple accounts, and each account has its own message flow. Users want to see all messages in one interface, no matter which account they come from.
+
+The Merge algorithm combines multiple AsyncSequences of the same type into one:
+
+```swift
+// Display previews of messages from either the primary or secondary account
+
+for try await message in merge(primaryAccount.messages, secondaryAccount.messages) {
+  displayPreview(message)
+}
+```
+
+Key points:
+- `merge`Requires all input sequences to have elements of the same type
+- The output order depends on which sequence produces the value first
+- When an error occurs in any sequence, iterations of other sequences will be cancelled.
+
+### Clock API: Working with time
+
+([05:43](https://developer.apple.com/videos/play/wwdc2022/110355/?time=343)) Dealing with time in asynchronous code has always been a hassle.`DispatchQueue.asyncAfter`Not flexible enough,`Timer`Requires manual management of lifecycle.
+
+Swift 5.7 introduces three time primitives: Clock, Instant, and Duration:
+
+```swift
+// Sleep until a given deadline
+
+let clock = SuspendingClock()
+var deadline = clock.now + .seconds(3)
+try await clock.sleep(until: deadline)
+```
+
+Key points:
+- `Clock`The protocol defines`now`and`sleep(until:)`two primitives
+-`Duration`support`.seconds()`、`.milliseconds()`etc. construction method
+
+The two built-in Clocks have different behaviors:
+
+```swift
+let clock = SuspendingClock()
+let elapsed = await clock.measure {
+  await someLongRunningWork()
+}
+// Elapsed time reads 00:05.40
+
+let clock = ContinuousClock()
+let elapsed = await clock.measure {
+  await someLongRunningWork()
+}
+// Elapsed time reads 00:19.54
+```
+
+（[06:56](https://developer.apple.com/videos/play/wwdc2022/110355/?time=416)）`SuspendingClock`Pause timing when the machine is sleeping,`ContinuousClock`Keep running like a stopwatch. If your job is suspended for 14 seconds, SuspendingClock only counts 5.4 seconds and ContinuousClock counts 19.54 seconds.
+
+Key points:
+- Used for animation and device-related time logic`SuspendingClock`- For human time measurement`ContinuousClock`
+
+### Debounce: Search input debounce
+
+([08:27](https://developer.apple.com/videos/play/wwdc2022/110355/?time=507)) When users type quickly in the search box, you don’t want every character change to trigger a search request.
+
+The Debounce algorithm waits for a silent period before emitting a value:
+
+```swift
+class SearchController {
+  let searchResults = AsyncChannel<SearchResult>()
+
+  func search<SearchValues: AsyncSequence>(_ searchValues: SearchValues)
+    where SearchValues.Element == String
+  {
+    let queries = searchValues
+      .debounce(for: .milliseconds(300))
+
+    for await query in queries {
+      let results = try await performSearch(query)
+      await channel.send(results)
+    }
+  }
+}
+```
+
+Key points:
+- `debounce(for:)`Used by default`ContinuousClock`- When events are pouring in quickly, the timer will be reset with each new event
+- The last value will only be emitted if there are no new events for 300 milliseconds
+
+### Chunk: Send messages in batches
+
+([09:46](https://developer.apple.com/videos/play/wwdc2022/110355/?time=586)) When users type quickly, instead of sending separate requests for each message, it is better to save a batch and send them together.
+
+The Chunked algorithm divides sequences into chunks by time or quantity:
+
+```swift
+let batches = outboundMessages.chunked(
+  by: .repeating(every: .milliseconds(500))
+)
+
+let encoder = JSONEncoder()
+for await batch in batches {
+  let data = try encoder.encode(batch)
+  try await postToServer(data)
+}
+```
+
+Key points:
+- `chunked(by:)`Supports chunking by time, quantity, and content
+- Errors will be rethrowed, keeping code safe
+- 500 millisecond batch, which not only reduces the number of requests but also prevents users from waiting too long
+
+### Return to collection from AsyncSequence
+
+([10:47](https://developer.apple.com/videos/play/wwdc2022/110355/?time=647)) Sometimes you need to convert an AsyncSequence back to a normal collection. Swift Async Algorithms provides initializers:
+
+```swift
+// Create a message with awaiting attachments to be encoded
+init<Attachments: AsyncSequence>(_ attachments: Attachments) async rethrows {
+  self.attachments = try await Array(attachments)
+}
+```
+
+Key points:
+- `Array(asyncSequence)`、`Set(asyncSequence)`、`Dictionary(asyncSequence)`All supported
+- only works with limited known AsyncSequences
+- Allows you to migrate your code step by step instead of changing it all to asynchronous at once
+
+## Detailed Content
+
+### Concurrency implementation details of Zip
+
+Zip is not a simple sequential traversal. It internally waits concurrently for the next value of each input sequence:
+
+```swift
+// Pseudocode showing Zip's concurrency behavior
+let videoStream = transcodeVideos()      // AsyncSequence<Video>
+let previewStream = generatePreviews()   // AsyncSequence<Preview>
+
+for try await (video, preview) in zip(videoStream, previewStream) {
+  // video and preview come from the same index position
+  // If video is ready first, it waits for preview, and vice versa
+  try await upload(video, preview)
+}
+```
+
+Key points:
+- Zip internally uses structured concurrency to read multiple sequences simultaneously
+- When any sequence ends, Zip also ends (will not wait for remaining elements of other sequences)
+- Error propagation is immediate and does not wait for other sequences of current operations to complete
+
+### Choice of Merge and Zip
+
+```swift
+// Zip: values must be paired, and counts must match
+for try await (a, b) in zip(streamA, streamB) {
+  // a and b are the Nth elements
+}
+
+// Merge: use whichever produces a value first, and counts can differ
+for try await value in merge(streamA, streamB) {
+  // value comes from streamA or streamB, depending on which produces first
+}
+```
+
+([05:08](https://developer.apple.com/videos/play/wwdc2022/110355/?time=308)) Merge requires that the element types of all sequences are the same, and the output is a single element stream. Zip produces tuples, retaining element type information for each sequence.
+
+### Clock’s measure method
+
+```swift
+let clock = ContinuousClock()
+let duration = await clock.measure {
+  // Work to measure
+  await fetchData()
+  await processData()
+}
+print("Elapsed time: \(duration)")
+```
+
+Key points:
+- `measure`Automatically record start and end times
+- returned`Duration`Can be printed or compared directly
+-Exceptions in closures will propagate upward
+
+## Core Takeaways
+
+**1. Replace callback-driven messaging system with AsyncStream**
+
+Migrate existing delegate/callback messaging system to AsyncStream. Each message source becomes an AsyncSequence, and the consumer uses`for-await-in`Traverse. Merge is used for multi-source merging, and Zip is used for pairing operations.
+
+Entrance:`AsyncStream`、`AsyncThrowingStream`
+
+**2. Replace Timer and GCD delay with Debounce + Clock**
+
+All use`Timer.scheduledTimer`or`DispatchQueue.asyncAfter`The implemented anti-shake and throttling logic can be replaced by Debounce/Throttle of Swift Async Algorithms. The code is more concise and the life cycle is automatically managed.
+
+Entrance:`searchQuery.debounce(for: .milliseconds(300))`
+
+**3. Use Chunk to implement message batch processing**
+
+For scenarios such as chat apps, log uploads, and data analysis, high-frequency small requests can be converted into batch requests. The Chunked algorithm supports two strategies: time window and quantity, which is much simpler than manual buffer maintenance.
+
+Entrance:`messages.chunked(by: .repeating(every: .seconds(1)))`
+
+**4. Choose the right Clock**
+
+Check all time-related logic in the project and distinguish between "device-oriented" and "human-oriented" scenarios. SuspendingClock is used for animation and timeout detection; ContinuousClock is used for user waiting time and billing logic.
+
+Entrance:`SuspendingClock()`、`ContinuousClock()`
+
+## Related Sessions
+
+- [What's new in Swift](/articles/wwdc2022-110354) — Overview of new features in Swift 5.7, including the introduction background of the Clock API
+- [Meet distributed actors in Swift](/articles/wwdc2022-110356) — Combining distributed actors with AsyncSequence to build a real-time system
+- [Design protocol interfaces in Swift](/articles/wwdc2022-110353) — Swift 5.7 generics improvements, AsyncSequence benefits from`some`/`any`grammar

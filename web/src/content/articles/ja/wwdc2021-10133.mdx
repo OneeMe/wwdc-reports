@@ -1,0 +1,313 @@
+---
+title: "Swift アクタで可変状態を保護する"
+description: "Swift アクタがコード内のデータ アクセスを同期してデータ競合を防止する方法と、メイン アクタが UI コードが常にメイン スレッドで実行されるようにする方法を学びます。"
+date: "2021-06-08"
+tags: ["Swift"]
+thumbnail: "/images/sessions/2021/10133.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10133/"
+sessionId: "wwdc2021-10133"
+year: "2021"
+relatedSessions:
+  - title: "Swift の async/await"
+    code: "10132"
+    description: "async/await の基本、アクターを理解するための前提条件"
+  - title: "Swift の構造化された同時実行性を探る"
+    code: "10134"
+    description: "Task、TaskGroup、アクターの併用"
+  - title: "SwiftUI の同時実行性"
+    code: "10019"
+    description: "SwiftUI での実際の「@MainActor」"
+  - title: "Swift の ARC"
+    code: "10216"
+    description: "参照型と同時実行の安全性の基礎となるメカニズム"
+---
+# Swift Actor で可変状態を保護する
+
+## ハイライト
+
+> アクターは順次実行ドメイン内のクラスの不定ステータスを自動移動に分離し、外部アクセスはパスをパスする必要があります`await`.コンパイラはこのルールを強制的にチェックします - 無しでください`await`コードを直接コンパイルすることはできません。本来、使用するにはマニュアルがあるカウンターをアクターが使用する必要があります。`class`に変更新します`actor`、スレッドの安全性は语とランタイムによって保証されます。
+
+## 主要内容
+
+データ競合は、同時プログラミングで最も隠れたバグの 1 つです。2 つのスレッドが同じ変数メモリを同時に読み書きし、結果は予測不能で再現が難しく、デバッグはさらに悪夢です。従来の解決策は、ロック (NSLock) またはシリアル ディスパッチ キュー (DispatchQueue) を使用して共有状態を保護することですが、これは見落としやすく、テストが難しく、デッドロックのリスクがあります。
+
+Swift 5.5 で導入されたアクター タイプは、この問題を言語レベルで解決します。アクターは、変更可能な状態がアクター内に分離されている特別な参照タイプです。外部コードがアクターのプロパティまたはメソッドにアクセスするときは、次のコードを渡す必要があります。`await`これを潜在的なハングポイントとして明示的にマークします。コンパイラはこのルールのチェックを強制し、データ競合を実行時エラーからコンパイル時エラーに変えます。
+
+## 詳細
+
+### データ競合の問題
+
+シンプルなカウンターを使用して、`class`データ競合を伴う実装 (00:42):
+
+```swift
+class Counter {
+    var value = 0
+    func increment() -> Int {
+        value = value + 1
+        return value
+    }
+}
+
+let counter = Counter()
+
+Task.detached {
+    print(counter.increment()) // data race!
+}
+Task.detached {
+    print(counter.increment()) // data race!
+}
+```
+
+2 つの `Task` が同時に `increment` を呼び出すと、`value = value + 1` はアトミック操作ではないため、結果は予測できません。
+
+### 値の型の制限
+
+すべての代入はコピーであるため、値型 (struct) には本質的にデータ競合がありません (02:20)。
+
+```swift
+var array1 = [1, 2]
+var array2 = array1
+array1.append(3)
+array2.append(4)
+print(array1) // [1, 2, 3]
+print(array2) // [1, 2, 4]
+```
+
+ただし、値型では共有された可変状態を表現できません。 Counter を struct に変更します (02:59)。各タスクは独立したコピーを取得し、結果は常に 1 になります。
+
+```swift
+struct Counter {
+    var value = 0
+    mutating func increment() -> Int {
+        value = value + 1
+        return value
+    }
+}
+
+Task.detached {
+    var counter = counter
+    print(counter.increment()) // always prints 1
+}
+```
+
+### アクターの分離
+
+意思`class`に変更します`actor`(05:23)、コンパイラはシリアル アクセスを自動的に保証します。
+
+```swift
+actor Counter {
+    var value = 0
+    func increment() -> Int {
+        value = value + 1
+        return value
+    }
+}
+
+let counter = Counter()
+
+Task.detached {
+    print(await counter.increment())
+}
+Task.detached {
+    print(await counter.increment())
+}
+```
+
+アクター内のメソッド呼び出しは同期的です (07:51)。`resetSlowly`メソッド内で複数回呼び出される`increment`、不要`await`：
+
+```swift
+extension Counter {
+    func resetSlowly(to newValue: Int) {
+        value = 0
+        for _ in 0..<newValue {
+            increment()  // 待機なしの同期呼び出し
+        }
+        assert(value == newValue)
+    }
+}
+```
+
+### 一時停止後の状態の仮定
+
+`await`現在の実行を一時停止します。その間、アクターの状態は他のタスクによって変更される可能性があります。 ImageDownloader のキャッシュ ロジックには典型的なバグがあります (09:02)。
+
+```swift
+actor ImageDownloader {
+    private var cache: [URL: Image] = [:]
+
+    func image(from url: URL) async throws -> Image? {
+        if let cached = cache[url] {
+            return cached
+        }
+        let image = try await downloadImage(from: url)
+        // バグ: キャッシュは待機中に他のタスクによって変更された可能性があります
+        cache[url] = image
+        return image
+    }
+}
+```
+
+`await downloadImage`この間に、別のタスクが同じ URL のダウンロードを完了し、キャッシュに書き込んだ可能性があります。解決策 (11:59): 使用する`inProgress`繰り返しダウンロードを防止するためのステータス:
+
+```swift
+actor ImageDownloader {
+    private enum CacheEntry {
+        case inProgress(Task<Image, Error>)
+        case ready(Image)
+    }
+    private var cache: [URL: CacheEntry] = [:]
+
+    func image(from url: URL) async throws -> Image? {
+        if let cached = cache[url] {
+            switch cached {
+            case .ready(let image):
+                return image
+            case .inProgress(let task):
+                return try await task.value  // 既存のタスクが完了するまで待ちます
+            }
+        }
+
+        let task = Task { try await downloadImage(from: url) }
+        cache[url] = .inProgress(task)
+
+        do {
+            let image = try await task.value
+            cache[url] = .ready(image)
+            return image
+        } catch {
+            cache[url] = nil
+            throw error
+        }
+    }
+}
+```
+
+### プロトコルへの準拠とアクターの隔離
+
+静的メソッドはアクターの外部で自然に実行されます (13:30):
+
+```swift
+actor LibraryAccount {
+    let idNumber: Int
+    var booksOnLoan: [Book] = []
+}
+
+extension LibraryAccount: Equatable {
+    static func ==(lhs: LibraryAccount, rhs: LibraryAccount) -> Bool {
+        lhs.idNumber == rhs.idNumber  // 静的メソッドなので待つ必要はありません
+    }
+}
+```
+
+インスタンスメソッドが使える`nonisolated`アクターの外で実行するようにマークされていますが (14:15)、アクセスできるのはのみです`let`絶え間ない：
+
+```swift
+extension LibraryAccount: Hashable {
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(idNumber)  // idNumber は安全です
+    }
+}
+```
+
+### アクター間でのデータの受け渡し
+
+アクター間でデータを渡す場合、コピーが渡されるため、値の型 (構造体) は安全です (17:15)。
+
+```swift
+struct Book {
+    var title: String
+    var authors: [Author]
+}
+
+func visit(_ account: LibraryAccount) async {
+    guard var book = await account.selectRandomBook() else { return }
+    book.title = "\(book.title)!!!"  // OK: 変更はローカル コピーです
+}
+```
+
+参照型 (クラス) は危険です (17:39)。アクターから取り出されたクラス インスタンスの場合、外部変更はアクターの内部状態に影響を与えます。
+
+```swift
+class Book {
+    var title: String
+}
+
+func visit(_ account: LibraryAccount) async {
+    guard var book = await account.selectRandomBook() else { return }
+    book.title = "\(book.title)!!!"  // OK ではありません: 共有参照が変更されました
+}
+```
+
+### 送信可能なプロトコル
+
+`Sendable`同時ドメイン間で安全に渡すことができるプロトコル マーカーの種類 (20:08)。構造体は自動的に Sendable を満たします (すべてのプロパティが満たされている場合)。
+
+```swift
+struct Book: Sendable {
+    var title: String
+    var authors: [Author]
+}
+```
+
+ジェネリック型の後に条件を付けることができます (20:43):
+
+```swift
+struct Pair<T, U> {
+    var first: T
+    var second: U
+}
+
+extension Pair: Sendable where T: Sendable, U: Sendable { }
+```
+
+### Main Actor
+
+UIKit では、すべての UI 操作がメインスレッドで実行される必要があります。従来のアプローチは次のように使用します。`DispatchQueue.main.async`（24:19）：
+
+```swift
+func checkedOut(_ booksOnLoan: [Book]) {
+    booksView.checkedOutBooks = booksOnLoan
+}
+DispatchQueue.main.async {
+    checkedOut(booksOnLoan)
+}
+```
+
+`@MainActor`関数が常にメインライン (25:01) で実行されることをコンパイラに保証させます。
+
+```swift
+@MainActor func checkedOut(_ booksOnLoan: [Book]) {
+    booksView.checkedOutBooks = booksOnLoan
+}
+
+await checkedOut(booksOnLoan)  // Swift はメインスレッドでの実行を保証します
+```
+
+クラスは次のようにマークすることもできます`@MainActor`(26:21)、そのすべてのメソッドはメインスレッドで暗黙的に実行されます。
+
+```swift
+@MainActor class MyViewController: UIViewController {
+    func onPress(...) { ... }  // 隐式 @MainActor
+
+    nonisolated func fetchLatestAndDisplay() async { ... }  // メインスレッドから明示的に離れる
+}
+```
+
+## 重要ポイント
+
+1. **手動ロックをアクターに置き換える**: 新しいプロジェクトをアクターに直接置き換えることができます。`NSLock`およびシリアルディスパッチキュー。古いプロジェクトを移行するときは、最初に最も外側の状態管理オブジェクトをアクターに変更します。
+
+2. **警戒してください`await`その後の状態変化**: アクター メソッドでは、`await`サスペンド後に再実行するとアクターの状態が変更されている可能性があります。仮定しないでください`await`前回の判決は今も有効です。
+
+3. **使用`inProgress`作業の重複を防ぐパターン**: 時間のかかる操作 (ネットワーク ダウンロードなど) の場合は、列挙ステータスで「進行中」のマークを付けて、後続のリクエストが繰り返しのリクエストを開始するのではなく、同じタスクが完了するまで待機できるようにします。
+
+4. **アクター間でデータを渡すときは値型を優先する**: struct のコピーセマンティクスは自然に安全です。クラスを使う必要がある場合は、`Sendable` に準拠しているか、アクターの外部で変更されないことを確認してください。
+
+5. **使用`@MainActor`代わりの`DispatchQueue.main.async`**：`@MainActor`スレッドの安全性はコンパイル時に確保され、実行時のディスパッチ キューよりも信頼性が高くなります。 ViewController や ViewModel などの UI 関連の型は、次のように直接マークできます。`@MainActor`。
+
+## 関連セッション
+
+- [WWDC2021 10132 - Swift の async/await](https://developer.apple.com/videos/play/wwdc2021/10132/) — async/await の基本、アクターを理解するための前提条件
+- [WWDC2021 10134 - Swift Structured Concurrency の探索](https://developer.apple.com/videos/play/wwdc2021/10134/) — タスク、タスクグループ、およびアクターの使用
+- [WWDC2021 10019 - SwiftUI の同時実行性](https://developer.apple.com/videos/play/wwdc2021/10019/) -`@MainActor`SwiftUIの練習
+- [WWDC2021 10216 - Swift の ARC](https://developer.apple.com/videos/play/wwdc2021/10216/) — 参照型と同時実行の安全性の基礎となるメカニズム

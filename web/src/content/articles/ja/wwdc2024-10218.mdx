@@ -1,0 +1,272 @@
+---
+title: "Accelerate machine learning with Metal"
+description: "learn how to accelerate your machine learning transformer models with new features in metal performance shaders graph. we"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10218.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10218/"
+sessionId: "wwdc2024-10218"
+year: "2024"
+relatedSessions:
+  - title: "Bring your machine learning and AI models to Apple silicon"
+    code: "10159"
+    description: "learn how to optimize your machine learning and ai models to leverage the power of apple silicon"
+  - title: "Train your machine learning and AI models on Apple GPUs"
+    code: "10160"
+    description: "learn how to train your models on apple silicon with metal for pytorch, jax and tensorflow"
+  - title: "Deploy machine learning and AI models on-device with Core ML"
+    code: "10161"
+    description: "learn new ways to optimize speed and memory performance when you convert and run machine learning and ai models"
+  - title: "Support real-time ML inference on the CPU"
+    code: "10211"
+    description: "discover how you can use bnnsgraph to accelerate the execution of your machine learning model on the cpu"
+  - title: "Explore machine learning on Apple platforms"
+    code: "10223"
+    description: "get started with an overview of machine learning frameworks on apple platforms"
+---
+
+## ハイライト
+
+> Apple プラットフォームで ML モデルをデプロイする 3 段階：訓練、デプロイ準備、app 統合。この session は推論性能最適化に焦点。
+
+---
+
+## 主要内容
+
+Apple プラットフォームで ML モデルをデプロイする 3 段階：訓練、デプロイ準備、app 統合。この session は推論性能最適化に焦点。
+
+Core ML でモデルをデプロイする app では、MPSGraph が底层で GPU 加速を提供。PyTorch、TensorFlow、JAX 等で訓練も可能——すべて Metal Performance Shaders Graph（MPSGraph）上に構築。app 自体が Metal を使用し ML タスクを他 GPU 作業と並行スケジュールする必要がある場合、または Buffer 等の底层 Metal リソースを共有する必要がある場合、MPSGraph を直接使用する必要がある。
+
+今年の更新は 3 方向。Transformer モデルの計算性能最適化——融合 Scaled Dot-Product Attention（SDPA）オペレータと KV Cache インプレース更新。メモリ帯域最適化——4-bit 整数量子化サポート追加。品質改善——ブロック量子化と Adapters メカニズム。加えて FFT 加速と MPSGraph Viewer 可視化ツール。
+
+---
+
+## 詳細
+
+### 融合された Scaled Dot-Product Attention（SDPA）
+
+Transformer モデルの核心は Multi-Head Attention ブロック。Scaled Dot-Product Attention は一連の操作で構成。MPSGraph は今年融合オペレータを追加、これらを 1 kernel に統合（[03:56](https://developer.apple.com/videos/play/wwdc2024/10218/?time=236)）。
+
+呼び出し方法：
+
+```swift
+let sdpaResult = graph.scaledDotProductAttention(
+    query: queryTensor,
+    key: keyTensor,
+    value: valueTensor
+)
+```
+
+キーポイント:
+- `scaledDotProductAttention` は Q、K、V 3 テンソルをパラメータとして受け取る
+- 複数操作を 1 kernel に融合、中間結果の読み書きオーバーヘッドを削減
+- 手動実装 SDPA を置換するだけで性能向上、コード変更量極小
+
+### KV Cache インプレース更新
+
+自己回帰生成では、新 token ごとに以前の全 token を行列乗算に再送し、K、V 投影が繰り返し再計算される。KV Cache は計算済み K、V 値を保存して再利用、行列-行列乗算を行列-ベクトル乗算に簡略化（[05:00](https://developer.apple.com/videos/play/wwdc2024/10218/?time=300)）。
+
+Variable + sliceUpdate でインプレース更新を実装：
+
+```swift
+// cache を表すプレースホルダーを作成。次元はモデルに依存
+let keyCachePlaceholder = MPSGraphTensor(
+    shape: [batch, heads, maxLength, headDim],
+    dataType: .float32
+)
+
+// cache の現在状態を表す Variable を作成
+let keyCacheVariable = graph.makeVariable(
+    name: "keyCache",
+    shape: [batch, heads, maxLength, headDim],
+    dataType: .float32
+)
+
+// sliceUpdateDataTensor で新しい key 投影を cache に挿入
+let updatedCache = graph.sliceUpdateDataTensor(
+    newKeyProjection,
+    updateTensor: keyCacheVariable,
+    startIndex: [0, 0, currentPosition, 0],
+    endIndex: [batch, heads, currentPosition + 1, headDim],
+    stride: [1, 1, 1, 1],
+    name: "updateKeyCache"
+)
+
+// 更新後の cache を Variable に戻す。MPSGraph はインプレース更新に最適化する
+keyCacheVariable.assign(updatedCache)
+
+// slice 操作で計算済みの部分を取り出す
+let validCache = graph.slice(
+    tensor: keyCacheVariable,
+    startIndex: [0, 0, 0, 0],
+    endIndex: [batch, heads, currentPosition + 1, headDim],
+    stride: [1, 1, 1, 1],
+    name: "extractValidCache"
+)
+```
+
+キーポイント:
+- `makeVariable` で可変テンソル作成——通常のグラフ操作結果と異なり再代入可能
+- `sliceUpdateDataTensor` の start/end 配列で新値挿入位置を指定
+- `updatedCache` を `keyCacheVariable` に再代入すると MPSGraph がインプレース更新に最適化、各イテレーションの新メモリ割り当てを回避
+- `slice` で cache の計算済み有効部分を抽出、SDPA に渡す
+
+### 4-bit 整数量子化
+
+大規模言語モデルの重みは数十 GB に達し、通常 16-bit 浮点で表現。MPS は以前 8-bit 整数量子化をサポート（メモリ半減）、今年 4-bit 形式追加（さらに半減）（[07:46](https://developer.apple.com/videos/play/wwdc2024/10218/?time=466)）。
+
+MPS は 2 量子化方式を提供。線形量子化（affine quantization）は重みが均一分布の場合に適合——8-bit は 256 量子化点、4-bit は 16 点。量子化時に最近点へマッピング。LUT 量子化は重みが異なる領域に集中する場合——データ分布に基づき量子化点を選択しルックアップテーブルに保存。各重みは 4 または 8 bit のインデックスのみ必要。
+
+```swift
+// 線形量子化：逆量子化して浮動小数点に戻す
+let dequantized = graph.dequantize(
+    quantizedTensor: quantizedWeights,
+    scale: scaleValue,
+    zeroPoint: zeroPointValue,
+    dataType: .float32,
+    name: "dequantize"
+)
+
+// LUT 量子化：ルックアップテーブルを渡す
+let dequantizedLUT = graph.dequantize(
+    quantizedTensor: quantizedWeights,
+lut: lookupTable,  // 32-bit 浮動小数点ルックアップテーブル
+    dataType: .float32,
+    name: "dequantizeLUT"
+)
+```
+
+キーポイント:
+- `dequantize` メソッドで量子化値を 32-bit 浮点に戻す
+- 線形量子化は `scale` と `zeroPoint` を渡す。LUT 量子化は `lut` ルックアップテーブルを渡す
+- 反量子化操作の直後に行列乗算が続く場合、MPSGraph が両者を自動融合して量子化行列乗算に——完全反量子化コピーを先に保存せず要素ごと反量子化
+
+### ブロック量子化
+
+全重みに単一 scale と zeroPoint を使用すると精度が制限される。ブロック量子化は重みを小ブロックに分割、各ブロックが独自 scale と zeroPoint を持ち精度向上（[10:45](https://developer.apple.com/videos/play/wwdc2024/10218/?time=645)）。
+
+```swift
+// ブロック量子化：tensor 形式の scale と zeroPoint を渡し、各 block に 1 組ずつ持たせる
+let dequantizedBlocked = graph.dequantize(
+    quantizedTensor: quantizedWeights,
+scale: scalePerBlock,        // tensor、各 block に 1 つの値
+zeroPoint: zeroPointPerBlock, // tensor、各 block に 1 つの値
+    dataType: .float32,
+    name: "dequantizeBlocked"
+)
+```
+
+キーポイント:
+- グローバル量子化と同じコード構造。違いは `scale` と `zeroPoint` がスカラーからテンソルに
+- 各ブロックが独立 scale/zeroPoint、局所重み分布により正確にマッチ
+
+### Adapters（Callables）
+
+Adapters はモデルに挿入する小レイヤー、adapter 内パラメータのみ更新。新タスク適応や量子化誤差補償に使用可能。MPSGraph は callables メカニズムで実装（[11:48](https://developer.apple.com/videos/play/wwdc2024/10218/?time=708)）。
+
+```swift
+// 1. メイングラフで adapter を呼び出す
+let adapterOutput = graph.call(
+    "myAdapter",
+    inputs: [inputTensor],
+    outputTypes: [MPSGraphTensorDataType.float32]
+)
+
+// 2. adapter のサブグラフを作成
+let adapterGraph = MPSGraph()
+let adapterInput = adapterGraph.placeholder(
+    shape: nil,  // unranked
+    dataType: .float32,
+    name: "input"
+)
+let adapterOutputTensor = adapterGraph.multiplication(
+    adapterInput,
+    adapterGraph.constant(2.0, dataType: .float32),
+    name: "output"
+)
+
+// 3. adapter を GraphExecutable にコンパイル
+let adapterExecutable = adapterGraph.compile(
+    device: metalDevice,
+    inputs: [MPSGraphInput(shape: [batch, dim], dataType: .float32)],
+    outputTensor: adapterOutputTensor
+)
+
+// 4. メイングラフのコンパイル時に descriptor で adapter 名を executable にマッピング
+let descriptor = MPSGraphCompilationDescriptor()
+descriptor.callables = ["myAdapter": adapterExecutable]
+let mainExecutable = mainGraph.compile(
+    device: metalDevice,
+    inputs: mainInputs,
+    outputTensors: mainOutputs,
+    descriptor: descriptor
+)
+```
+
+キーポイント:
+- `graph.call` でメイングラフに adapter 呼び出しを宣言。名称、入力、出力型を提供
+- adapter 自体は独立 MPSGraph、`GraphExecutable` としてコンパイル
+- メイングラフコンパイル時 `MPSGraphCompilationDescriptor` の `callables` 辞書で名称を executable にマッピング
+- adapter パラメータのみ微調整で量子化誤差を補償可能
+
+### FFT 高速化
+
+MPSGraph は今年 FFT サポート追加。音声前処理等のシナリオに適合（[13:49](https://developer.apple.com/videos/play/wwdc2024/10218/?time=829)）。strided NDArray API でスライディングウィンドウビューを実装、メモリコピー不要：
+
+```swift
+// スライディングウィンドウビューを作成
+let windowedView = inputTensor.arrayView(
+    shape: [1, numWindows, windowSize],
+    strides: [1, hopSize, 1],
+    name: "stftView"
+)
+
+// 窓関数適用 + FFT
+let windowed = graph.multiplication(windowedData, hannWindow, name: "applyWindow")
+let fftResult = graph.fft(
+    tensor: windowed,
+    axes: [2],
+    name: "computeFFT"
+)
+```
+
+キーポイント:
+- `arrayView` でメモリエイリアスによるビュー作成——ゼロコピー
+- `strides` パラメータでウィンドウホップサイズ制御。例：256 要素ストライドで 50% オーバーラップ
+- まず窓関数（Hann/Gaussian）を乗算、その後 `fft` で各ウィンドウのスペクトル計算
+
+### MPSGraph Viewer
+
+Xcode 16 で MPSGraph Viewer 追加。MPSGraph パッケージファイルを直接開き、計算グラフの接続関係を可視化（[17:25](https://developer.apple.com/videos/play/wwdc2024/10218/?time=1045)）。機能：デバイス別最適化 Stitched Shader 領域表示。Operations Navigator で全オペレータ一覧。Constants Navigator で定数をサイズ順に並べ重みプレビュー。Inspector で変数の作成・使用位置確認。
+
+`MPSGraphExecutable` の `serialize` API でパッケージファイル作成、`mpsgraphtool convert` で CoreML または ONNX モデルから変換も可能。
+
+---
+
+## 重要ポイント
+
+- **何をするか**：手動実装 SDPA を MPSGraph 融合オペレータに置換
+  価値：変更最小、利益最大——複数操作を 1 kernel に融合、中間結果読み書き削減
+  始め方：手書き attention コードを特定、`graph.scaledDotProductAttention(query:key:value:)` に置換、出力一致を検証
+
+- **何をするか**：自己回帰推論に KV Cache + Variable インプレース更新を実装
+  価値：各イテレーションで全 K/V 投影再計算を回避——シーケンスが長いほど加速顕著。インプレース更新で反復メモリ割り当て回避
+  始め方：`makeVariable` で cache 作成、`sliceUpdateDataTensor` で新値挿入、`assign` で変数に再代入、`slice` で有効部分抽出
+
+- **何をするか**：4-bit 量子化がモデル精度に与える影響を評価し、適切な量子化方式を選択
+  価値：8-bit から 4-bit へでメモリ帯域がさらに半減、ただし出力品質が許容可能か検証必要
+  始め方：重み均一分布なら線形量子化、集中分布なら LUT 量子化。ベンチマーク実行後量子化精度比較。MPSGraph Viewer で量子化前後の計算グラフ比較
+
+- **何をするか**：Adapters（Callables）で量子化誤差を補償
+  価値：量子化は帯域節約だが精度損失を導入。adapter は少量パラメータで出力品質を微調整可能
+  始め方：メイングラフで `graph.call` により adapter 呼び出し挿入。コンパイル時 `CompilationDescriptor.callables` で名称を executable にマッピング
+
+---
+
+## 関連セッション
+
+- [Bring your machine learning and AI models to Apple silicon](/articles/wwdc2024-10159) — モデル変換と Apple Silicon 最適化の完全フロー
+- [Train your machine learning and AI models on Apple GPUs](/articles/wwdc2024-10160) — Metal で PyTorch、JAX、TensorFlow モデルを訓練
+- [Deploy machine learning and AI models on-device with Core ML](/articles/wwdc2024-10161) — Core ML 変換とデプロイの性能最適化
+- [Support real-time ML inference on the CPU](/articles/wwdc2024-10211) — BNNSGraph で CPU 上 ML 推論を加速
+- [Explore machine learning on Apple platforms](/articles/wwdc2024-10223) — Apple プラットフォーム ML フレームワーク全览

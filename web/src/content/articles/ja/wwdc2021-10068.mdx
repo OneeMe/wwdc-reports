@@ -1,0 +1,439 @@
+---
+title: "Build a research and care app, part 1: Setup onboarding"
+description: "Learn how ResearchKit and CareKit can work together to take the tedium out of paper surveys. Code along with us and build a working care pilot app. Explore best practices for onboarding and consent with ResearchKit, and find out how your app can require participants to sign consent documents by leveraging CareKit's store and UI components."
+date: "2021-06-08"
+tags: ["ResearchKit", "CareKit", "Health", "Onboarding"]
+thumbnail: "/images/sessions/2021/10068.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10068/"
+sessionId: "wwdc2021-10068"
+year: "2021"
+relatedSessions:
+  - title: "Build a research and care app, part 2: Schedule tasks"
+    code: "10069"
+    description: "ResearchKit と CareKit の組み合わせの第 2 部、タスクのスケジュール設定について説明します"
+  - title: "Build a research and care app, part 3: Visualize progress"
+    code: "10282"
+    description: "パート 3 では、データの視覚化と進捗状況の追跡について説明します。"
+  - title: "What's new in ResearchKit and CareKit"
+    code: "10148"
+    description: "ResearchKit および CareKit の年次更新の概要"
+  - title: "Create charts and insights with CareKit"
+    code: "10283"
+    description: "CareKitのチャート機能の詳しい説明"
+---
+## ハイライト
+
+> ResearchKit と CareKit を併用して、ResearchKit 調査プロセスを CareKit タスク カードに埋め込み、「ケア プランにアクセスするにはインフォームド コンセントが完了する必要がある」というゲート型オンボーディングを実現すると同時に、HealthKit、通知、およびデバイス移動の許可に対する統合リクエストをサポートします。
+
+## 主な内容
+
+ヘルスケア研究アプリケーションの 2 つの主要な要件: 参加者データの収集 (ResearchKit) とケア プランの継続的な管理 (CareKit)。以前は、これら 2 つのフレームワークは別々に使用されることがよくありましたが、iOS 15 では、これらを組み合わせる方法が示され始めています。
+
+具体的なシナリオは次のとおりです。理学療法研究アプリ (Recover と呼ばれます) は、参加者が膝の手術後にリハビリテーションを行うのに役立ちます。新しいユーザーは、特定のリハビリテーション タスクを表示する前に、インフォームド コンセントを完了する必要があります。このプロセスは ResearchKit に実装されていますが、CareKit のインターフェイスに埋め込まれています。
+
+主要な設計ポイント:
+- オンボーディングタスクは完了するまで毎日繰り返し表示されます
+- 他のタスクは完了するまでケア フィードに表示されません
+- 署名と許可リクエストは 1 つのプロセスに統合されます
+
+### CareKit ストアでのオンボーディング タスクの永続化
+
+（[05:39](https://developer.apple.com/videos/play/wwdc2021/10068/?time=339)）
+
+まず AppDelegate で CareKit タスクを作成し、ストアに永続化します。
+
+```swift
+// 毎日繰り返すスケジュールを作成する
+let dailySchedule = OCKSchedule.dailyAtTime(
+    hour: 8, minutes: 0,
+    start: Date(), end: nil,
+    text: "请在每天上午 8 点前完成"
+)
+
+// タスクを作成する
+let onboardingTask = OCKTask(
+    id: TaskID.onboarding,
+    title: "参与同意与引导",
+    carePlanUUID: UUID(),
+    schedule: dailySchedule
+)
+onboardingTask.instructions = "请阅读并同意研究条款"
+onboardingTask.impactsAdherence = false  // 達成度リングには影響しない
+
+// Store に永続化する
+store.addTaskAndWait(onboardingTask) { result in
+    switch result {
+    case .success:
+        print("Onboarding task added successfully")
+    case .failure(let error):
+        print("Failed to add onboarding task: \(error)")
+    }
+}
+```
+
+キーポイント:
+- `OCKSchedule.dailyAtTime`毎日の定期的なスケジュールを作成する
+- `impactsAdherence = false`このタスクは完了としてカウントされないようにします
+- タスク ID は一意である必要があり、後続のクエリに使用されます。
+
+### オンボーディングの完了ステータスを確認する
+
+（[07:20](https://developer.apple.com/videos/play/wwdc2021/10068/?time=440)）
+
+CareFeedViewController で、オンボーディングが完了したかどうかに基づいて、どのタスクを表示するかを決定します。
+
+```swift
+func checkIfOnboardingIsComplete(completion: @escaping (Bool) -> Void) {
+    let query = OCKOutcomeQuery()
+    query.taskIDs = [TaskID.onboarding]
+
+    store.fetchOutcomes(query: query) { outcomes, error in
+        guard error == nil else {
+            completion(false)
+            return
+        }
+
+        // outcome が見つかれば完了済みと判断する
+        completion(!(outcomes?.isEmpty ?? true))
+    }
+}
+
+// prepare メソッド内で使用する
+override func prepareListViewController(
+    _ listViewController: OCKListViewController,
+    for date: Date
+) {
+    checkIfOnboardingIsComplete { [weak self] isComplete in
+        guard let self = self else { return }
+
+        if isComplete {
+            // すべてのタスクを表示する
+            self.appendAllTasks(to: listViewController, for: date)
+        } else {
+            // onboarding タスクだけを表示する
+            self.appendOnboardingTask(to: listViewController)
+        }
+    }
+}
+```
+
+キーポイント:
+- `OCKOutcomeQuery`タスク完了レコードのクエリ
+- 結果がない場合は、ユーザーがまだ終了していないことを意味します
+- クエリは非同期であり、完了ハンドラーで処理する必要があります。
+
+### ResearchKit オンボーディング アンケートを作成する
+
+（[09:31](https://developer.apple.com/videos/play/wwdc2021/10068/?time=571)）
+
+Surveys.swift で 5 段階のオンボーディング プロセスを作成します。
+
+```swift
+func createOnboardingSurvey() -> ORKTask {
+    // ステップ 1: ウェルカムページ
+    let welcomeStep = ORKInstructionStep(
+        identifier: "onboarding.welcome"
+    )
+    welcomeStep.title = "欢迎参与 Recover 研究"
+    welcomeStep.detailText = "本研究的目的是帮助术后康复"
+    welcomeStep.image = UIImage(named: "welcome_header")
+
+    // ステップ 2: インフォームド説明（アイコン付きの要点リスト）
+    let consentStep = ORKInstructionStep(
+        identifier: "onboarding.consent"
+    )
+    consentStep.title = "知情同意"
+    consentStep.detailText = "参与本研究需要您了解以下信息"
+
+    // SF Symbol を箇条書き記号として使用する
+    let healthDataItem = ORKBodyItem(
+        text: "您将被要求分享健康数据",
+        detailText: nil,
+        image: UIImage(systemName: "heart.fill"),
+        learnMoreItem: nil,
+        bulletPoint: true
+    )
+
+    let tasksItem = ORKBodyItem(
+        text: "您需要完成指定的康复任务",
+        detailText: nil,
+        image: UIImage(systemName: "checkmark.circle.fill"),
+        learnMoreItem: nil,
+        bulletPoint: true
+    )
+
+    let signatureItem = ORKBodyItem(
+        text: "您需要提供签名以表示同意",
+        detailText: nil,
+        image: UIImage(systemName: "signature"),
+        learnMoreItem: nil,
+        bulletPoint: true
+    )
+
+    let privacyItem = ORKBodyItem(
+        text: "您的数据将被安全保存",
+        detailText: "所有数据均经过加密处理",
+        image: UIImage(systemName: "lock.fill"),
+        learnMoreItem: nil,
+        bulletPoint: true
+    )
+
+    consentStep.bodyItems = [
+        healthDataItem,
+        tasksItem,
+        signatureItem,
+        privacyItem
+    ]
+
+    // ステップ 3: 署名（HTML のインフォームドコンセント文書）
+    let signatureStep = ORKWebViewStep(
+        identifier: "onboarding.signature",
+        html: getConsentDocumentHTML()
+    )
+    signatureStep.showSignatureAfterContent = true
+
+    // ステップ 4: 権限リクエスト
+    let healthTypesToWrite: Set<HKSampleType> = [
+        HKObjectType.quantityType(forIdentifier: .stepCount)!
+    ]
+    let healthTypesToRead: Set<HKSampleType> = [
+        HKObjectType.quantityType(forIdentifier: .activeEnergyBurned)!
+    ]
+
+    let healthPermission = ORKHealthKitPermissionType(
+        typesToWrite: healthTypesToWrite,
+        typesToRead: healthTypesToRead
+    )
+
+    let notificationPermission = ORKNotificationPermissionType()
+    let motionPermission = ORKMotionActivityPermissionType()
+
+    let permissionsStep = ORKRequestPermissionsStep(
+        identifier: "onboarding.permissions"
+    )
+    permissionsStep.permissionTypes = [
+        healthPermission,
+        notificationPermission,
+        motionPermission
+    ]
+
+    // ステップ 5: 完了ページ
+    let completionStep = ORKCompletionStep(
+        identifier: "onboarding.completion"
+    )
+    completionStep.title = "感谢您的参与"
+    completionStep.detailText = "您现在可以开始使用 Recover App"
+
+    // 順序付きタスクとして組み立てる
+    return ORKOrderedTask(
+        identifier: "onboarding",
+        steps: [
+            welcomeStep,
+            consentStep,
+            signatureStep,
+            permissionsStep,
+            completionStep
+        ]
+    )
+}
+```
+
+キーポイント:
+- `ORKInstructionStep`説明テキストを表示するために使用されます
+- `ORKBodyItem`SFシンボルを箇条書き記号としてサポート
+- `ORKWebViewStep`の`showSignatureAfterContent = true`署名ボックスを表示
+- iOS 15の新機能`ORKNotificationPermissionType`そして`ORKMotionActivityPermissionType`
+
+### ResearchKit アンケートを CareKit に表示する
+
+（[11:59](https://developer.apple.com/videos/play/wwdc2021/10068/?time=719)）
+
+新しく導入されたものを使用してください`OCKSurveyTaskViewController`：
+
+```swift
+func appendOnboardingTask(
+    to listViewController: OCKListViewController
+) {
+    // event query を作成する
+    let eventQuery = OCKEventQuery(
+        for: Date(),
+        taskIDs: [TaskID.onboarding]
+    )
+
+    // 調査タスク用ビューコントローラーを作成する
+    let surveyVC = OCKSurveyTaskViewController(
+        taskID: TaskID.onboarding,
+        eventQuery: eventQuery,
+        storeManager: storeManager,
+        survey: createOnboardingSurvey(),
+        resultHandler: { result in
+            // ResearchKit の結果を CareKit の outcome 値に変換する
+            let dateAnswer = result.results?.first(where: {
+                $0.identifier == "onboarding.completion"
+            }) as? ORKDateQuestionResult
+
+            let outcomeValue = OCKOutcomeValue(
+                dateAnswer?.dateAnswer ?? Date()
+            )
+
+            return [outcomeValue]
+        }
+    )
+
+    surveyVC.delegate = self
+
+    // タスクカードを作成してリストに追加する
+    let card = OCKSimpleTaskView(
+        taskID: TaskID.onboarding,
+        eventQuery: eventQuery,
+        owner: self
+    )
+    card.controller = surveyVC
+
+    listViewController.appendView(card)
+}
+```
+
+キーポイント:
+- `OCKSurveyTaskViewController`CareKit で ResearchKit アンケートを表示するために特別に設計されています
+- `resultHandler`クロージャは、ResearchKit の結果を CareKit の結果に変換する役割を果たします。
+-完了イベントをリッスンするようにデリゲートを設定します
+
+### オンボーディングの完了を処理し、インターフェースを更新します
+
+（[12:49](https://developer.apple.com/videos/play/wwdc2021/10068/?time=769)）
+
+ユーザーがオンボーディングを完了したときにフィードを更新するためのデリゲート メソッドを実装します。
+
+```swift
+extension CareFeedViewController: OCKSurveyTaskViewControllerDelegate {
+    func surveyTaskViewController(
+        _ viewController: OCKSurveyTaskViewController,
+        didFinish task: ORKTask,
+        with result: TaskResult
+    ) {
+        // 正常に完了したか確認する（ユーザーがキャンセルしていない）
+        guard case .success = result else {
+            return
+        }
+
+        // feed を再読み込みして他のタスクを表示する
+        reload()
+    }
+
+    func surveyTaskViewController(
+        _ viewController: OCKSurveyTaskViewController,
+        didCancel task: ORKTask
+    ) {
+        // ユーザーがキャンセルしたため、特別な処理は不要
+    }
+}
+```
+
+キーポイント:
+- `reload()`カレンダー ページ全体を更新する
+- 完了後、オンボーディング カードは表示されなくなり、他のタスクが表示され始めます。
+- ユーザーによるキャンセルは完了したとみなされず、次回開いたときにもオンボーディングが表示されます。
+
+＃＃詳細
+
+### HTML インフォームドコンセントフォームの形式
+
+署名ステップに必要な HTML 文書には、完全な法的テキストが含まれている必要があります。
+
+```swift
+func getConsentDocumentHTML() -> String {
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: -apple-system; padding: 20px; }
+            h1 { color: #007aff; }
+            .section { margin: 20px 0; }
+        </style>
+    </head>
+    <body>
+        <h1>Recover 研究知情同意书</h1>
+
+        <div class="section">
+            <h2>1. 研究目的</h2>
+            <p>本研究旨在评估物理治疗对膝部手术后康复的效果。</p>
+        </div>
+
+        <div class="section">
+            <h2>2. 数据收集</h2>
+            <p>我们将收集您的健康数据，包括每日步数、运动消耗等。</p>
+        </div>
+
+        <div class="section">
+            <h2>3. 隐私保护</h2>
+            <p>所有数据均经过加密，仅研究团队可访问。</p>
+        </div>
+
+        <div class="section">
+            <h2>4. 自愿参与</h2>
+            <p>您可以随时退出研究，不会影响任何医疗服务。</p>
+        </div>
+    </body>
+    </html>
+    """
+}
+```
+
+キーポイント:
+- HTML5標準形式を使用します
+- CSS スタイルをインライン化できます
+- 署名ボックスはコンテンツの下に自動的に表示されます
+
+### HealthKit 権限タイプの説明
+
+HealthKit 権限をリクエストするときは、読み書きしたいタイプを明示的に指定する必要があります。
+
+|カテゴリー |一般的なタイプ |使い方 |
+|------|----------|------|
+|スポーツデータ |`stepCount`、`distanceWalkingRunning`|活動統計 |
+|体力指数 |`activeEnergyBurned`、`basalEnergyBurned`|カロリー消費 |
+|健康指標 |`heartRate`、`bloodPressure`|生理学的指標 |
+|睡眠データ |`sleepAnalysis`|睡眠の質 |
+
+キーポイント:
+- 必要なデータ型のみをリクエストします
+- インフォームドコンセントフォームに各データの使用目的を明確に記載
+- ユーザーは設定でいつでも権限を取り消すことができます
+
+## 重要ポイント
+
+1. **医学研究向けのゲート付きオンボーディング**
+- **やるべきこと**: ユーザーはアプリの主要機能にアクセスするにはインフォームドコンセントを完了する必要があります
+- **実施する価値がある理由**: 医学研究では参加者から明示的な同意を得る必要があり、同意しないと法的リスクが発生します。ゲート付きオンボーディングにより、各ユーザーが同意フォームを読んだことが保証されます
+- **開始方法**: ResearchKit を使用して同意プロセスを作成し、CareKit で結果ステータスをクエリしてコンテンツ表示を制御します
+
+2. **SF シンボルを使用して情報メモの読みやすさを最適化します**
+- **やるべきこと**:`ORKInstructionStep`の`bodyItems`通常の箇条書きの代わりにSFシンボルを使用します。
+- **価値がある理由**: 医学/法律の文章は理解するのが難しいことが多いですが、視覚的な要素は理解を助け、ユーザーの離脱率を減らすことができます。
+- **開始方法**: 作成する`ORKBodyItem`渡されたとき`UIImage(systemName:)`
+
+3. **統合された HealthKit、通知およびモーション許可リクエスト**
+- **やるべきこと**: オンボーディング プロセス中に、必要なすべての権限を一度にリクエストします。
+- **実行する価値がある理由**: 分散したアクセス許可リクエストはユーザー エクスペリエンスを中断しますが、統合されたリクエストはインフォームド コンセントのコンテキストでより意味があります。
+- **開始方法**: を使用します`ORKRequestPermissionsStep`組み合わせ`ORKHealthKitPermissionType`、`ORKNotificationPermissionType`、`ORKMotionActivityPermissionType`
+
+4. **検証可能な電子署名を作成します**
+- **やるべきこと**: を使用します`ORKWebViewStep`ユーザーの署名を収集し、CareKit の結果に保存します
+- **価値がある理由**: 電子署名には法的拘束力があり、単純な「同意する」ボタンよりも正式です
+- **開始方法**:`showSignatureAfterContent = true`+ HTML同意書
+
+5. **個人に合わせたリハビリテーション計画を指導します**
+- **何をすべきか**: オンボーディングの最後にユーザーに回復目標について尋ね、目標に基づいて CareKit タスクをカスタマイズします。
+- **価値がある理由**: パーソナライズされたケア プランにより、ユーザー エンゲージメントと回復の成果が大幅に向上します。
+- **開始方法**: 前に完了ステップを追加します。`ORKFormStep`ユーザー設定を収集し、結果に保存してタスクのスケジュールに使用します。
+
+## 関連セッション
+
+- [研究およびケア アプリの構築、パート 2: タスクのスケジュール設定](/articles/wwdc2021-10069) — パート 2 では、CareKit を使用してリハビリテーション タスクをスケジュールする方法について説明します
+- [研究およびケア アプリの構築、パート 3: 進捗状況の視覚化](/articles/wwdc2021-10282) — パート 3 では、データの視覚化と進捗状況の追跡について説明します
+- [What's new in ResearchKit and CareKit](/articles/wwdc2021-10148) — ResearchKit 和 CareKit 的年度更新总览
+- [CareKit でチャートとインサイトを作成](/articles/wwdc2021-10283) — CareKit のチャート機能の詳細説明

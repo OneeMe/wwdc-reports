@@ -1,0 +1,403 @@
+---
+title: "Bring Core Data concurrency to Swift and SwiftUI"
+description: "Discover how Core Data is adopting the new concurrency capabilities of Swift 5.5, leading to more concise, efficient, and safe asynchronous code. We'll show you how to update Core Data in your apps to work with concurrency, and detail the many other improvements throughout the framework that make working with Swift and SwiftUI more expressive and powerful."
+date: "2021-06-07"
+tags: ["Core Data", "Swift", "SwiftUI", "Concurrency"]
+thumbnail: "/images/sessions/2021/10017.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10017/"
+sessionId: "wwdc2021-10017"
+year: "2021"
+relatedSessions:
+  - title: "Discover concurrency in SwiftUI"
+    code: "10019"
+    description: "Using concurrency features in SwiftUI"
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "Structured concurrency in depth"
+  - title: "What's new in SwiftUI"
+    code: "10018"
+    description: "SwiftUI updates including FetchRequest enhancements"
+---
+
+## Highlight
+
+> Core Data fully embraces Swift 5.5 concurrency in iOS 15. `NSManagedObjectContext` gains async `perform` overloads supporting `try await` returns and thrown errors; SwiftUI's `@FetchRequest` adds dynamic configuration and `@SectionedFetchRequest` for grouped queries—making data-driven UI code more concise and safer.
+
+## Core Content
+
+### Why Core Data Needs Concurrency
+
+Persisting data requires reading and writing external storage—naturally asynchronous. Core Data has focused on concurrent execution from the start, but past APIs (`performAndWait`, `perform`) required manual thread synchronization and result passing.
+
+Swift 5.5's structured concurrency model lets Core Data offer more natural APIs.
+
+### Pain Points of the Old Approach
+
+With `performAndWait`, the calling thread blocks until the closure finishes. If you don't need to wait, use `perform`—but manually pass results and errors via completion handlers.
+
+```swift
+// Past: manually pass errors
+var fetchError: Error?
+context.performAndWait {
+  do {
+    // ... fetch ...
+  } catch {
+    fetchError = error
+  }
+}
+if let error = fetchError {
+  // handle error
+}
+```
+
+Problems:
+- Mutable variables needed to capture results
+- Error handling scattered across locations
+- Hard to read and test
+
+### New async perform API
+
+iOS 15 adds async `perform` overloads to `NSManagedObjectContext`:
+
+```swift
+let count = try await context.perform {
+  let request = Quake.fetchRequest()
+  let fiveHoursAgo = Calendar.current.date(byAdding: .hour, value: -5, to: Date())!
+  request.predicate = NSPredicate(format: "time >= %@", fiveHoursAgo as NSDate)
+  request.resultType = .countResultType
+  return try context.count(for: request)
+}
+```
+
+Key points:
+- `perform` closures can `throw`; callers use `try await`
+- Closures can `return` values directly to the caller
+- Compiler handles thread switching and result routing
+- No manual capture variables
+
+### Scheduling: immediate vs enqueued
+
+New async `perform` supports two scheduling strategies:
+
+**`.immediate` (default)**:
+- From a different execution context: waits for scheduling and runs
+- From the same context: optimistically runs immediately
+
+**`.enqueued`**:
+- Always appends work to the context queue end
+- Regardless of caller context
+
+```swift
+// Using enqueued strategy
+let result = try await context.perform(schedule: .enqueued) {
+  // This code always runs at the end of the current queue
+  return try context.count(for: request)
+}
+```
+
+### Safe Return Value Boundaries
+
+The new API makes returning values easy, but with an important limit: don't return registered `NSManagedObject` across contexts.
+
+```swift
+// Dangerous: returning managed object to another context
+let quake = try await backgroundContext.perform {
+  let request = Quake.fetchRequest()
+  request.sortDescriptors = [NSSortDescriptor(key: "time", ascending: false)]
+  request.fetchLimit = 1
+  return try backgroundContext.fetch(request).first // Don't do this!
+}
+```
+
+Correct approaches:
+- Use `NSManagedObjectID`; re-fetch in the target context
+- Use fetch request dictionary result types
+
+```swift
+// Safe: return object ID
+let objectID = try await backgroundContext.perform {
+  let request = Quake.fetchRequest()
+  request.resultType = .managedObjectIDResultType
+  request.fetchLimit = 1
+  return try backgroundContext.fetch(request).first as? NSManagedObjectID
+}
+// Re-fetch in view context
+if let objectID = objectID {
+  let quake = viewContext.object(with: objectID)
+}
+```
+
+### Refactoring Import Flow
+
+The Earthquakes sample shows async/await import refactoring:
+
+```swift
+func importQuakes(from data: Data) async throws {
+  let quakes = try JSONDecoder().decode([Quake].self, from: data)
+  try await backgroundContext.perform {
+    for quake in quakes {
+      let newQuake = Quake(context: backgroundContext)
+      newQuake.magnitude = quake.magnitude
+      newQuake.place = quake.place
+      newQuake.time = quake.time
+    }
+    try backgroundContext.save()
+  }
+}
+```
+
+Key points:
+- Entire import flow declared `async throws`
+- `perform` handles all Core Data operations inside
+- Errors propagate naturally upward
+- Callers use `try await` to wait for completion
+
+### Swift-Friendly API Improvements
+
+Core Data is more Swift-friendly in iOS 15:
+
+**Persistent store types**
+
+```swift
+// New Swift-style names
+let storeType = NSPersistentStore.StoreType.sqlite
+// Replaces old string "SQLite"
+```
+
+**Attribute types**
+
+```swift
+// New AttributeType enum
+func assertAttribute(named name: String, on entity: NSEntityDescription, hasType type: NSAttributeDescription.AttributeType) {
+  guard let attribute = entity.attributesByName[name] else {
+    XCTFail("No attribute named \(name)")
+    return
+  }
+  XCTAssertEqual(attribute.type, type)
+}
+
+// Usage
+assertAttribute(named: "magnitude", on: quakeEntity, hasType: .double)
+assertAttribute(named: "place", on: quakeEntity, hasType: .string)
+```
+
+### FetchRequest Enhancements in SwiftUI
+
+**Dynamic sorting**
+
+```swift
+// [20:36](https://developer.apple.com/videos/play/wwdc2021/10017/?time=1236)
+private let sorts = [(
+    name: "Time",
+    descriptors: [SortDescriptor(\Quake.time, order: .reverse)]
+), (
+    name: "Time",
+    descriptors: [SortDescriptor(\Quake.time, order: .forward)]
+), (
+    name: "Magnitude",
+    descriptors: [SortDescriptor(\Quake.magnitude, order: .reverse)]
+), (
+    name: "Magnitude",
+    descriptors: [SortDescriptor(\Quake.magnitude, order: .forward)]
+)]
+
+struct ContentView: View {
+  @FetchRequest(sortDescriptors: [SortDescriptor(\Quake.time, order: .reverse)])
+  private var quakes: FetchedResults<Quake>
+
+  @State private var selectedSort = SelectedSort()
+
+  var body: some View {
+    List(quakes) { quake in
+      QuakeRow(quake: quake)
+    }
+    .toolbar {
+      ToolbarItem(placement: .primaryAction) {
+        SortMenu(selection: $selectedSort)
+        .onChange(of: selectedSort) { _ in
+          let sortBy = sorts[selectedSort.index]
+          quakes.sortDescriptors = sortBy.descriptors
+        }
+      }
+    }
+  }
+}
+```
+
+Key points:
+- `@FetchRequest`'s `sortDescriptors` is now mutable
+- Switch sorting via `quakes.sortDescriptors = ...`
+- Swift's `SortDescriptor` type is type-safe
+
+**Dynamic predicates**
+
+```swift
+// [21:33](https://developer.apple.com/videos/play/wwdc2021/10017/?time=1293)
+struct ContentView: View {
+  @FetchRequest(sortDescriptors: [SortDescriptor(\Quake.time, order: .reverse)])
+  private var quakes: FetchedResults<Quake>
+
+  @State private var searchText = ""
+  var query: Binding<String> {
+    Binding {
+      searchText
+    } set: { newValue in
+      searchText = newValue
+      quakes.nsPredicate = newValue.isEmpty
+                             ? nil
+                             : NSPredicate(format: "place CONTAINS %@", newValue)
+    }
+  }
+
+  var body: some View {
+    List(quakes) { quake in
+      QuakeRow(quake: quake)
+    }
+    .searchable(text: query)
+  }
+}
+```
+
+Key points:
+- `quakes.nsPredicate` can be modified dynamically
+- Works with `.searchable` for search
+- Clear predicate when search is empty to show all data
+
+**Grouped queries with SectionedFetchRequest**
+
+```swift
+// [23:26](https://developer.apple.com/videos/play/wwdc2021/10017/?time=1406)
+extension Quake {
+  lazy var dateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "MMMM d, yyyy"
+    return formatter
+  }()
+
+  @objc var day: String {
+    return dateFormatter.string(from: time)
+  }
+}
+
+struct ContentView: View {
+  @SectionedFetchRequest(
+    sectionIdentifier: \.day,
+    sortDescriptors: [SortDescriptor(\Quake.time, order: .reverse)])
+  private var quakes: SectionedFetchResults<String, Quake>
+
+  var body: some View {
+    List {
+      ForEach(quakes) { section in
+        Section(header: Text(section.id)) {
+          ForEach(section) { quake in
+            QuakeRow(quake: quake)
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Key points:
+- `@SectionedFetchRequest` groups automatically by specified property
+- `sectionIdentifier` points to the grouping key path
+- Returns `SectionedFetchResults` supporting `ForEach`
+- Grouping property needs `@objc` because Core Data relies on KVO
+
+**Dynamic grouping switch**
+
+```swift
+// [24:56](https://developer.apple.com/videos/play/wwdc2021/10017/?time=1496)
+private let sorts = [(
+    name: "Time",
+    descriptors: [SortDescriptor(\Quake.time, order: .reverse)],
+    section: \Quake.day
+), (
+    name: "Magnitude",
+    descriptors: [SortDescriptor(\Quake.magnitude, order: .reverse)],
+    section: \Quake.magnitude_str
+)]
+
+// Switch sorting and grouping
+.onChange(of: selectedSort) { _ in
+  let sortBy = sorts[selectedSort.index]
+  let config = quakes
+  config.sectionIdentifier = sortBy.section
+  config.sortDescriptors = sortBy.descriptors
+}
+```
+
+Key points:
+- `sectionIdentifier` can be modified dynamically
+- Switching grouping reorganizes the entire list automatically
+- Combine with animation modifiers for smooth transitions
+
+## Detailed Content
+
+### Debugging Tools
+
+**Sanitizers**
+
+Xcode's Address Sanitizer and Thread Sanitizer help detect concurrency issues:
+- Address Sanitizer: memory usage problems
+- Thread Sanitizer: multithreaded data access problems
+
+Enable in Scheme Editor Run settings.
+
+**Core Data concurrency debugging**
+
+Enable a special runtime flag for Core Data to verify correct lock and type usage:
+
+```swift
+// Add to launch arguments
+-com.apple.CoreData.ConcurrencyDebug 1
+```
+
+### async Support for NSPersistentContainer and NSPersistentStoreCoordinator
+
+Besides `NSManagedObjectContext`, `NSPersistentContainer` and `NSPersistentStoreCoordinator` also gained similar async APIs:
+
+```swift
+// NSPersistentContainer async load
+let container = NSPersistentContainer(name: "Earthquakes")
+try await container.loadPersistentStores()
+```
+
+## Core Takeaways
+
+**1. Refactor all Core Data background work to async/await**
+
+- **What**: Migrate `performAndWait` + manual error handling to new async `perform`
+- **Why**: 50%+ less code; compiler guarantees thread safety; natural error handling
+- **How**: Start with import/export; gradually replace all background context operations
+
+**2. Build sortable, searchable lists in SwiftUI**
+
+- **What**: Use `@FetchRequest` dynamic configuration for sorting and search
+- **Why**: No manual fetched results controller; concise code; automatic data change handling
+- **How**: Use `quakes.sortDescriptors` and `quakes.nsPredicate` to modify query conditions
+
+**3. Build date-grouped data displays**
+
+- **What**: Use `@SectionedFetchRequest` for lists grouped by date, category, etc.
+- **Why**: One line replaces dozens of `NSFetchedResultsController` + section logic
+- **How**: Add `@objc` computed property on entity; pass to `@SectionedFetchRequest`'s `sectionIdentifier`
+
+**4. Establish type-safe model validation tests**
+
+- **What**: Use new `AttributeType` enum in unit tests to verify runtime model matches Xcode model editor
+- **Why**: Catch model-change runtime issues early
+- **How**: Write `assertAttribute` tests per entity checking names and types
+
+**5. Design safe cross-context data passing**
+
+- **What**: In async perform closures, return only `NSManagedObjectID` or dictionaries—not managed objects
+- **Why**: Avoid crashes and inconsistency from cross-context access
+- **How**: Audit all async perform return values; ensure no managed object instances returned
+
+## Related Sessions
+
+- [Discover concurrency in SwiftUI](/articles/wwdc2021-10019) — SwiftUI concurrency including `task` and `refreshable`
+- [Explore structured concurrency in Swift](/articles/wwdc2021-10134) — Structured concurrency: Task, Actor, etc.
+- [What's new in SwiftUI](/articles/wwdc2021-10018) — SwiftUI overview including more `@FetchRequest` and `@SectionedFetchRequest` usage

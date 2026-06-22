@@ -1,0 +1,299 @@
+---
+title: "Meet distributed actors in Swift"
+description: "Discover distributed actors — an extension of Swift's actor model that simplifies development of distributed systems. We'll explore how distributed actor isolation and location transparency can help you avoid the accidental complexity of networking, serialization, and other transport concerns when working with distributed apps and systems."
+date: "2022-06-07"
+tags: ["Swift", "Concurrency", "Distributed", "Actor"]
+thumbnail: "/images/sessions/2022/110356.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110356/"
+sessionId: "wwdc2022-110356"
+year: "2022"
+relatedSessions:
+  - title: "What's new in Swift"
+    code: "110354"
+    description: "Overview of new features in Swift 5.7, including introduction to distributed actors"
+  - title: "Meet Swift Async Algorithms"
+    code: "110355"
+    description: "Swift asynchronous algorithm library that can work with distributed actors to process streaming data"
+  - title: "Design protocol interfaces in Swift"
+    code: "110353"
+    description: "Swift 5.7 protocol and generics improvements, distributed actors benefit from language features"
+---
+## Highlight
+
+> Swift 5.7's distributed actor extends the actor model from single process to multi-process scenarios. Through the serialization requirements and positional transparency checked by the compiler, remote calls and local calls are written in exactly the same way.
+
+## Core Content
+
+### From local actor to distributed actor
+
+Your Tic-Tac-Toe game currently only has a single-player mode. Both the human player and the AI ​​opponent are local actors communicating via asynchronous messages. You want to add a multiplayer feature that allows players on two devices to connect with each other.
+
+The previous approach was to manually handle WebSocket connections, message serialization, and state synchronization. The code is full of`encode`/`decode`, reconnection logic, heartbeat detection, and game logic are overwhelmed by network code.
+
+([00:30](https://developer.apple.com/videos/play/wwdc2022/110356/?time=30)) The core idea of ​​a distributed actor is: the actor already communicates through message passing, why can't these messages be sent to another device?
+
+In Swift actor's "sea of ​​concurrency" model, each actor is an isolated island, exchanging data through asynchronous messages. Distributed actors extend this model into a "distributed sea": each island can be located on a different device, server or process.
+
+### The first step of migration: change Actor into Distributed Actor
+
+([04:47](https://developer.apple.com/videos/play/wwdc2022/110356/?time=287)) First look at the original local actor:
+
+```swift
+public actor BotPlayer: Identifiable {
+    nonisolated public let id: ActorIdentity = .random
+
+    var ai: RandomPlayerBotAI
+    var gameState: GameState
+
+    public init(team: CharacterTeam) {
+        self.gameState = .init()
+        self.ai = RandomPlayerBotAI(playerID: self.id, team: team)
+    }
+
+    public func makeMove() throws -> GameMove {
+        return try ai.decideNextMove(given: &gameState)
+    }
+
+    public func opponentMoved(_ move: GameMove) async throws {
+        try gameState.mark(move)
+    }
+}
+```
+
+([06:11](https://developer.apple.com/videos/play/wwdc2022/110356/?time=371)) Changing to distributed actor only requires a few steps:
+
+```swift
+import Distributed
+
+public distributed actor BotPlayer: Identifiable {
+    typealias ActorSystem = LocalTestingDistributedActorSystem
+
+    var ai: RandomPlayerBotAI
+    var gameState: GameState
+
+    public init(team: CharacterTeam, actorSystem: ActorSystem) {
+        self.actorSystem = actorSystem
+        self.gameState = .init()
+        self.ai = RandomPlayerBotAI(playerID: self.id, team: team)
+    }
+
+    public distributed func makeMove() throws -> GameMove {
+        return try ai.decideNextMove(given: &gameState)
+    }
+
+    public distributed func opponentMoved(_ move: GameMove) async throws {
+        try gameState.mark(move)
+    }
+}
+```
+
+Key points:
+- `distributed actor`substitute`actor`, automatically matches`DistributedActor`protocol
+-`ActorSystem`A type alias declares the distributed system used by this actor
+-`actorSystem`It is a property synthesized by the compiler and must be assigned in the initializer.
+-`id`Properties are automatically assigned by the actor system and cannot be declared manually
+-`distributed func`Mark methods that can be called remotely
+
+### Location transparency
+
+([03:41](https://developer.apple.com/videos/play/wwdc2022/110356/?time=221)) The most important feature of a distributed actor is location transparency. Whether the actor is local or remote, the calling code is exactly the same:
+
+```swift
+// Local actor
+let localBot = BotPlayer(team: .fish, actorSystem: system)
+let move = try await localBot.makeMove()
+
+// Remote actor (get a reference via resolve)
+let remoteBot = try BotPlayer.resolve(id: opponentID, using: webSocketSystem)
+let move = try await remoteBot.makeMove()  // The syntax is exactly the same!
+```
+
+Key points:
+- `resolve(id:using:)`Get a reference to a remote actor, not create an instance
+- The returned reference uses exactly the same API as the local instance
+- Networking, serialization, and transmission details are all handled by the actor system
+
+### Server-side implementation
+
+([13:35](https://developer.apple.com/videos/play/wwdc2022/110356/?time=815)) Move BotPlayer to run on the server, and the client connects through WebSocket:
+
+```swift
+import Distributed
+import TicTacFishShared
+
+@main struct Boot {
+    static func main() {
+        let system = try! SampleWebSocketActorSystem(
+            mode: .serverOnly(host: "localhost", port: 8888)
+        )
+
+        system.registerOnDemandResolveHandler { id in
+            if system.isBotID(id) {
+                return system.makeActorWithID(id) {
+                    OnlineBotPlayer(team: .rodents, actorSystem: system)
+                }
+            }
+            return nil
+        }
+
+        try await server.terminated
+    }
+}
+```
+
+Key points:
+- `registerOnDemandResolveHandler`Create actors on demand
+- The ID pointed to by the message sent by the client may not yet have a corresponding instance.
+- The server determines whether a new BotPlayer needs to be created based on the ID characteristics
+
+### Local network battle: Receptionist mode
+
+([16:32](https://developer.apple.com/videos/play/wwdc2022/110356/?time=992)) In addition to client/server mode, distributed actors also support peer-to-peer communication. In a local Wi-Fi environment, the two devices discover each other directly and establish a game.
+
+Discover the remote actor using receptionist mode:
+
+```swift
+let opponentTeam = model.team == .fish ? CharacterTeam.rodents : CharacterTeam.fish
+
+let listing = await localNetworkSystem.receptionist.listing(
+    of: OpponentPlayer.self,
+    tag: opponentTeam.tag
+)
+
+for try await opponent in listing where opponent.id != self.player.id {
+    model.foundOpponent(opponent, myself: self.player, informOpponent: true)
+    return
+}
+```
+
+Key points:
+- `receptionist.listing(of:tag:)`Returns an AsyncSequence
+- When a new device joins the network, the listing will automatically generate a new value
+- use`for try await`Traverse discovered opponents
+
+([20:23](https://developer.apple.com/videos/play/wwdc2022/110356/?time=1223)) When human players act as distributed actors, they need to handle remote calls to the local UI:
+
+```swift
+public distributed actor LocalNetworkPlayer: GamePlayer {
+    public typealias ActorSystem = SampleLocalNetworkActorSystem
+
+    let team: CharacterTeam
+    let model: GameViewModel
+
+    public distributed func makeMove() async -> GameMove {
+        let field = await model.humanSelectedField()
+        movesMade += 1
+        let move = GameMove(
+            playerID: self.id,
+            position: field,
+            team: team,
+            teamCharacterID: movesMade % 2
+        )
+        return move
+    }
+}
+```
+
+Key points:
+- `makeMove()`When called remotely, it needs to wait for human players to operate on the local UI
+-`await model.humanSelectedField()`Suspend remote call until user clicks
+- returned`GameMove`Automatic serialization back to remote caller via actor system
+
+## Detailed Content
+
+### Compiler checks for Distributed Actors
+
+Distributed actors have three more layers of compiler checks than ordinary actors:
+
+```swift
+// 1. Only distributed methods can be called remotely
+public distributed func makeMove() throws -> GameMove  // OK
+public func helper() { }  // Cannot be called on a remote reference
+
+// 2. Parameters and return values must meet serialization requirements
+distributed func sendMessage(_ text: String)  // OK, String is Codable
+distributed func sendImage(_ image: UIImage)  // Compiler error! UIImage is not Codable
+
+// 3. Actor system types must match
+let bot: BotPlayer  // BotPlayer's ActorSystem is LocalTestingDistributedActorSystem
+let remoteBot = try BotPlayer.resolve(id: id, using: otherSystem)  // Type mismatch causes an error
+```
+
+Key points:
+- `distributed`Keywords explicitly mark remote API boundaries
+- The default serialization requirement is`Codable`, the actor system can be customized
+- The compiler ensures the type safety of remote calls at compile time
+
+### Responsibilities of Actor System
+
+Actor system is the core abstraction of distributed actors and is responsible for:
+
+1. **Assign ID**: Each actor is assigned a globally unique identifier when it is created.
+2. **Serialization/Deserialization**: Encode method calls into network messages
+3. **Routing**: Find the location of the target actor based on the ID
+4. **Transmission**: Send messages over the network
+
+```swift
+// Local testing system built into Swift 5.7
+typealias ActorSystem = LocalTestingDistributedActorSystem
+
+// Custom WebSocket system
+typealias ActorSystem = SampleWebSocketActorSystem
+
+// Open-source cluster system (SwiftNIO implementation)
+// https://github.com/apple/swift-distributed-actors/
+```
+
+### Serialization requirements
+
+([10:21](https://developer.apple.com/videos/play/wwdc2022/110356/?time=621)) All of Distributed actors`distributed func`The parameter and return value types must meet the serialization requirements of the actor system. The default is`Codable`：
+
+```swift
+struct GameMove: Codable {
+    let playerID: ActorIdentity
+    let position: Int
+    let team: CharacterTeam
+    let teamCharacterID: Int
+}
+```
+
+If the actor system uses other serialization schemes (such as Protocol Buffers), different requirements can be declared:
+
+```swift
+distributed actor BotPlayer {
+    typealias ActorSystem = ProtobufActorSystem
+    // At this point, parameters and return values must conform to ProtobufSerializable
+}
+```
+
+## Core Takeaways
+
+**1. Use distributed actors instead of manual network layers**
+
+If you are using WebSockets, URLSession, or third-party libraries for inter-device communication, consider refactoring using distributed actors. It is particularly suitable for scenarios such as game status synchronization, collaborative editing, and real-time chat. from`LocalTestingDistributedActorSystem`Initially, after passing the local test, connect to the real network.
+
+Entrance:`import Distributed`，`distributed actor`
+
+**2. Build a local multiplayer experience**
+
+Leverage the Network framework + distributed actors to implement local multiplayer games with zero server costs. Receptionist mode automatically discovers nearby devices without requiring users to manually enter IP addresses or scan QR codes.
+
+Entrance:`receptionist.listing(of:tag:)`，`SampleLocalNetworkActorSystem`
+
+**3. Use actor system to abstract different deployment modes**
+
+The same set of game logic can be deployed using different actor systems: for local testing`LocalTestingDistributedActorSystem`, the custom Network framework system is used for local area network battles, the WebSocket system is used for online battles, and the Swift Distributed Actors library is used for large-scale clusters. The business code does not need to be changed at all.
+
+Entrance:`typealias ActorSystem = ...`，`resolve(id:using:)`
+
+**4. A new choice for server-side Swift**
+
+Distributed actors provide a type-safe RPC abstraction for server-side Swift. Compared with Vapor's route processor, distributed actors allow clients and servers to share interface definitions, and the compiler ensures that the types on both ends are consistent.
+
+Entrance:`SampleWebSocketActorSystem(mode: .serverOnly)`，`registerOnDemandResolveHandler`
+
+## Related Sessions
+
+- [What's new in Swift](/articles/wwdc2022-110354) — Overview of new features in Swift 5.7, including language-level support for distributed actors
+- [Meet Swift Async Algorithms](/articles/wwdc2022-110355) — an asynchronous algorithm library that can work with distributed actors to process real-time data streams
+- [Design protocol interfaces in Swift](/articles/wwdc2022-110353) — Swift 5.7`some`/`any`Syntax and primary association types, the API design of distributed actors benefits from these improvements

@@ -1,0 +1,182 @@
+---
+title: "Safely mix C, C++, and Swift"
+description: "learn how to mix c, c++, and swift while improving the safety of your apps. we"
+date: 2026-06-10
+tags: ["Swift"]
+thumbnail: "/images/sessions/2025/311.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/311/"
+sessionId: "wwdc2025-311"
+year: "2025"
+relatedSessions:
+  - title: "Improve memory usage and performance with Swift"
+    code: "312"
+    description: "discover ways to improve the performance and memory management of your swift cod"
+  - title: "Explore Swift and Java interoperability"
+    code: "307"
+    description: "learn how you can mix swift and java in a single codebase. we"
+  - title: "Embracing Swift concurrency"
+    code: "268"
+    description: "join us to learn the core swift concurrency concepts. concurrency helps you impr"
+  - title: "What's new in Swift"
+    code: "245"
+    description: "join us for an update on the swift language. we"
+---
+
+## ハイライト
+
+> プロジェクトに C/C++ のレガシーコードやサードパーティの C ライブラリが含まれている場合、`UnsafeMutablePointer` はおなじみの存在でしょう。Swift は安全な言語ですが、C/C++ の領域に足を踏み入れると、buffer overflow や use-after-free が地雷のように潜んでいます。
+
+---
+
+## 主要内容
+
+ペットの写真を共有するアプリを作ると仮定します。メインの実装は Swift ですが、画像フィルタ処理のために古い C/C++ コードを流用しているとします。Swift から `invertImage(&imageData, imageSize)` を呼び出すと、`&imageData` は裏でこっそり `UnsafeMutablePointer` に変換され、`imageSize` は別の独立した引数として渡されます。もし手が滑って size を `1000000000000` と書いてしまっても、コンパイラは黙っており、実行時に即座に領域外書き込みが発生します。このようなバグは、攻撃者にとって格好の侵入口となります。
+
+Swift 6.2 はこの問題に対し、2 段階の解決策を提示します。第 1 段階は Strict Memory Safety コンパイルモードです。build settings で有効にすると、コンパイラはすべての unsafe 呼び出しに対して警告を出します。これには「見た目は Swift っぽいが、実際には unsafe pointer を暗黙的に構築している」ようなコードも含まれます。第 2 段階は、C/C++ のヘッダファイルにアノテーション（`__counted_by`、`__noescape`、`__lifetimebound`、`SWIFT_NONESCAPABLE`、`SWIFT_SHARED_REFERENCE`）を付与することです。これにより、従来暗黙的だった「ポインタのサイズはいくつか」「どれくらいの期間有効か」といった情報を、明示的な契約として記述します。契約が記述されると、Swift コンパイラはそれらの C/C++ 関数を自動的に `Span`/`MutableSpan` を受け取る安全なシグネチャに橋渡しし、領域外アクセスや use-after-free をコンパイル時に防ぎます。
+
+---
+
+## 詳細
+
+**1. Strict Memory Safety を有効にし、隠れた unsafe を浮き彫りにする**（[04:01](https://developer.apple.com/videos/play/wwdc2025/311/?time=241)）
+
+```
+// Swift
+var imageData = [UInt8](repeating: 0, count: imageDataSize)
+filterImage(&imageData, imageData.count)
+//warning: Expression uses unsafe constructs but is not marked with 'unsafe'
+```
+
+ポイント：
+
+- `&imageData` はコンパイル時に `UnsafeMutablePointer` に変換されますが、Swift コードを読んだだけでは見えません。
+- Strict Memory Safety を有効にすると、コンパイラはこの行に対して直接 warning を出し、発生原因も説明してくれます。
+- これは warning のみでビルドを阻害しないため、「セキュリティ監査スキャナー」として段階的に推進するのに適しています。
+
+**2. `__counted_by` で buffer サイズをポインタに紐付ける**（[09:58](https://developer.apple.com/videos/play/wwdc2025/311/?time=598)）
+
+```
+// C/C++
+void invertImage(uint8_t *__counted_by(imageSize) imagePtr __noescape, size_t imageSize);
+```
+
+ポイント：
+
+- `__counted_by(imageSize)` は、コンパイラに対して「`imagePtr` が指す buffer の長さは引数 `imageSize` と等しい」と伝えます。
+- このアノテーションを付けると、Swift 側では「pointer + size」という裸のペアではなく、単一の `MutableSpan<UInt8>` を受け取るようになります。
+- `__noescape` は、関数が return した後にそのポインタが保持されないことを宣言し、これは後述の lifetime チェックの基礎となります。
+- アノテーションは宣言と定義の両方に付与する必要があります。そうでないと、Swift 側では新しいシグネチャとしてインポートされません。
+
+**3. 呼び出し側：裸のポインタから Span へ**（[08:54](https://developer.apple.com/videos/play/wwdc2025/311/?time=534)）
+
+```
+// Swift
+var imageDataSpan = imageData.mutableSpan
+invertImage(&imageDataSpan)
+```
+
+ポイント：
+
+- `&imageData` と size を渡すのではなく、`mutableSpan` を渡すようにします。
+- `MutableSpan` は正しい bounds 情報を持っているため、size を間違えるようなバグは型レベルで発生しなくなります。
+- コンパイラは橋渡し時に、自動的に pointer と size を抽出して底层の C 関数に渡します。
+
+**4. `__noescape` で use-after-free を防ぐ**（[15:18](https://developer.apple.com/videos/play/wwdc2025/311/?time=918)）
+
+```
+// C++
+CxxSpanOfByte cachedView;
+void applyGrayscale(CxxSpanOfByte imageView __noescape) {
+  // Apply effect on image ...
+}
+```
+
+ポイント：
+
+- C++ の `std::span` には lifetime 情報がないため、それをグローバルな `cachedView` に格納すると dangling pointer の原因となります。
+- `__noescape` は、関数の作者がコンパイラに対して立てる契約です。return 後に引数が保持されないことを保証します。
+- アノテーションを付けると、Swift 側ではそれを `MutableSpan` として扱い、外部変数に格納しようとすると `lifetime dependent value escapes its scope` というコンパイルエラーが発生します（[14:08](https://developer.apple.com/videos/play/wwdc2025/311/?time=848)）。
+
+**5. `__lifetimebound` で「返り値が引数に依存する」ことを表現する**（[18:47](https://developer.apple.com/videos/play/wwdc2025/311/?time=1127)）
+
+```
+// C++
+CxxSpanOfByte scanImageRow(CxxSpanOfByte imageView __lifetimebound,
+                           size_t width, size_t rowIndex);
+```
+
+ポイント：
+
+- この関数は `imageView` 内部のある行のビューを返します。そのため、返り値の lifetime は `imageView` を超えてはいけません。
+- `__lifetimebound` はこの依存関係をコンパイラに伝え、Swift 側が返された `MutableSpan` を正しくインポートできるようにします。
+- このアノテーションがない場合、Swift は `a function with a ~Escapable result requires '@lifetime(...)'` というエラーを報告します（[18:06](https://developer.apple.com/videos/play/wwdc2025/311/?time=1086)）。
+
+**6. カスタム C++ 型：`SWIFT_NONESCAPABLE` と `SWIFT_SHARED_REFERENCE`**（[22:29](https://developer.apple.com/videos/play/wwdc2025/311/?time=1349)）
+
+```
+// C++
+struct ImageView {
+  std::span<uint8_t> pixelBytes;
+  int width;
+  int height;
+} SWIFT_NONESCAPABLE;
+
+struct ImageBuffer {
+  std::vector<uint8_t> data;
+  int width;
+  int height;
+  std::atomic<unsigned> refCount;
+} SWIFT_SHARED_REFERENCE(retain_image_buffer, release_image_buffer);
+```
+
+ポイント：
+
+- `SWIFT_NONESCAPABLE` は view 型を Swift の non-escapable としてインポートし、エスケープを禁止します。
+- `SWIFT_SHARED_REFERENCE` は、参照カウントを持つ C++ 型を Swift の ARC に自動的に接続し、retain/release を Swift に任せます。
+- 付随する `SWIFT_RETURNS_RETAINED` / `SWIFT_RETURNS_UNRETAINED` は、返り値がすでに retained されているかどうかをマークするために使い、+1/+0 のミスマッチを防ぎます（[23:57](https://developer.apple.com/videos/play/wwdc2025/311/?time=1437)）。
+
+**7. C++ プロジェクト自体の堅牢化：bounds-safe buffer usage**（[28:59](https://developer.apple.com/videos/play/wwdc2025/311/?time=1739)）
+
+```
+// C++
+void fill_array_with_indices(uint8_t *buffer, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    buffer[i] = i; // error: unsafe buffer access
+  }
+}
+```
+
+ポイント：
+
+- build settings で `Enforce Bounds-Safe Buffer Usage` を Yes に設定すると、コンパイラは裸のポインタによる添字アクセスをエラーとして扱います。
+- `std::span` に書き換えると、`buffer[i]` のアクセスは実行時の bounds チェックによって保護されます。
+- C プロジェクトでは `-fbounds-safety` 拡張を使い、`__counted_by` でアノテートされたポインタに対してコンパイル時 + 実行時の二重チェックを行うことができます（[30:11](https://developer.apple.com/videos/play/wwdc2025/311/?time=1811)）。
+
+---
+
+## 重要ポイント
+
+- **何をすべきか**：セキュリティが重要なアプリ（アカウント、決済、ユーザーファイルを扱うもの）では、すぐに Strict Memory Safety を有効にしましょう。
+  - なぜ価値があるか：warning のみでビルドを阻害せず、すべてのクロス言語呼び出しポイントを一度に洗い出せます。これは無料のセキュリティ監査基線と言えます。
+  - どう始めるか：Xcode → Build Settings → "Strict Memory Safety" を検索 → Yes に設定し、rebuild 後に warning リストを優先順位付けして対処します。
+
+- **何をすべきか**：C/C++ ヘッダファイルに `__counted_by` + `__noescape` のアノテーションを、leaf 関数から始めて付与しましょう。
+  - なぜ価値があるか：leaf 関数には下流の依存がないため、アノテーションを間違えても影響範囲が小さいです。ボトムアップで進めることで、呼び出し側は即座に Span 化の恩恵を受けられます。
+  - どう始めるか：他の C/C++ 関数を呼び出さない小さな関数（例：画像処理の `invert` や `grayscale`）を選び、宣言と定義の両方にアノテーションを付与し、Swift 呼び出し側が `MutableSpan` を渡せることを確認します。
+
+- **何をすべきか**：プロジェクト内の参照カウントを持つ C++ 型を `SWIFT_SHARED_REFERENCE` に移行しましょう。
+  - なぜ価値があるか：手書きの橋渡し層は use-after-free の多発地帯です。ARC に任せれば、retain/release のペアリングはコンパイラが保証します。
+  - どう始めるか：既存の `retain_xxx` / `release_xxx` 関数のペアを探し、型に `SWIFT_SHARED_REFERENCE(retain_xxx, release_xxx)` を付与します。さらに、+1 参照を返すファクトリ関数には `SWIFT_RETURNS_RETAINED` を付与します。
+
+- **何をすべきか**：C++ サブプロジェクトで Standard Library Hardening + Enforce Bounds-Safe Buffer Usage を有効にしましょう。
+  - なぜ価値があるか：「裸のポインタ + size」という古いコードを `std::span` へ強制的に移行させ、越界を根源から防ぎます。
+  - どう始めるか：build settings で `Enforce Bounds-Safe Buffer Usage` を Yes に設定し、コンパイルエラーに従って hot path のインターフェースを順次 `std::span<T>` に置き換えます。
+
+---
+
+## 関連セッション
+
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Span / MutableSpan の設計動機。本記事が橋渡ししている対象です
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — 同シリーズのクロス言語相互運用。考え方を対照できます
+- [Embracing Swift concurrency](/articles/wwdc2025-268) — アノテーション後の Span が並列シナリオで持つ lifetime の意味
+- [What's new in Swift](/articles/wwdc2025-245) — Swift 6.2 の全体的な新機能概要。Strict Memory Safety のエントリポイントを含みます

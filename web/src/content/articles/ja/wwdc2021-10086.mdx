@@ -1,0 +1,296 @@
+---
+title: "What's new in CloudKit"
+description: "cloudkit provides a secure, convenient, and reliable cloud database for your apps — and it's only getting better. discover how you can unravel your threads with support for async/await and convenience api additions. we'll also show you how to encourage collaboration between people using your app through sharing entire record zones of data, and explore how to adopt cloudkit features like encrypted values and help protect sensitive data within your app."
+date: "2021-06-08"
+tags: ["System Services", "Privacy & Security"]
+thumbnail: "/images/sessions/2021/10086.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10086/"
+sessionId: "wwdc2021-10086"
+year: "2021"
+relatedSessions:
+  - title: "Apple's privacy pillars in focus"
+    code: "10085"
+    description: "at apple, we believe that privacy is a fundamental human right. learn about our four privacy pillars and the technical approaches that keep your users' data safe."
+  - title: "Meet CloudKit Console"
+    code: "10087"
+    description: "discover the new cloudkit console, a web-based tool for managing your cloudkit containers and databases."
+  - title: "Build dynamic iOS apps with the Create ML framework"
+    code: "10038"
+    description: "discover how you can use the create ml framework to build dynamic iOS apps that leverage on-device machine learning."
+---
+## ハイライト
+
+> CloudKit は、iOS 15 で 3 つのコア アップグレードを受けました。非同期コードをより線形にする Swift async/await のネイティブ サポート、機密データのエンドサイド暗号化を自動的に有効にする暗号化フィールド (encryptedValues)、およびゾーン全体のデータ共有のためのレコード階層を構築する必要性を排除するゾーン共有です。これらの改善により、CloudKit を使用するための敷居が低くなり、データ セキュリティとコラボレーション機能が向上します。
+
+## 主な内容
+
+### コールバック地獄から async/await へ
+
+（[00:38](https://developer.apple.com/videos/play/wwdc2021/10086/?time=38)）
+
+CloudKit の API は、初心者向けのコンビニエンス API (CKContainer および CKDatabase 上の関数) と運用環境向けのオペレーション API (NSOperation サブクラス) の 2 つのレイヤーに分かれています。Operation API は、バッチ操作、ページング、変更追跡などの高度な機能をサポートしていますが、コードの複雑さも非常に高くなります。
+
+iOS 15 では、コンビニエンス API の async/await バリアントが導入されています。同じ段落でレコードを削除するロジックを比較します。
+
+**古いコード (コールバック スタイル):**
+
+```swift
+func deleteLastPerson(completionHandler: ((Result<Void, Error>) -> Void)? = nil) {
+    database.delete(withRecordID: lastPersonRecordId) { recordId, error in
+        if let recordId = recordId {
+            os_log("Record with ID \(recordId.recordName) was deleted.")
+        }
+        if let error = error {
+            self.reportError(error)
+            completionHandler?(.failure(error))
+        } else {
+            completionHandler?(.success(()))
+        }
+    }
+}
+```
+
+**新しいコード (非同期/待機):**
+
+```swift
+func deleteLastPerson() async throws {
+    do {
+        let recordId = try await database.deleteRecord(with: lastPersonRecordId)
+        os_log("Record with ID \(recordId.recordName) was deleted.")
+    } catch {
+        self.reportError(error)
+        throw error
+    }
+}
+```
+
+キーポイント:
+- 新しい API により、オプションの値のアンパックと条件分岐が排除されます
+- エラー処理のための制御フローが線形になる`try/catch`
+- 各コンビニエンス API 関数には、completeHandler と async の 2 つのバージョンがあります。
+
+### バッチ操作は非同期もサポートします
+
+（[09:14](https://developer.apple.com/videos/play/wwdc2021/10086/?time=554)）
+
+以前のコンビニエンス API は単一行でしか動作できませんでした。iOS 15 では、新しい一括変更機能が追加されています。
+
+```swift
+func deleteLastPeople() async throws {
+    let recordIds = [lastPersonRecordId, penultimatePersonRecordId]
+    let (_, deleteResults) = try await database.modifyRecords(deleting: recordIds)
+
+    for (recordId, deleteResult) in deleteResults {
+        switch deleteResult {
+        case .failure(let error):
+            self.reportError(error, itemId: recordId)
+        case .success:
+            os_log("Record with ID \(recordId.recordName) was deleted.")
+        }
+    }
+}
+```
+
+キーポイント:
+- `modifyRecords(deleting:)`戻る`(saveResults, deleteResults)`2 冊の辞書
+- 結果ごとに使用`Result`成功と失敗を明確に区別するための型ラッパー
+- 機能レベルのエラーは、操作自体の失敗 (ネットワークの利用不能など) のみを表します。単一レコードのエラーは次のとおりです`deleteResults`真ん中
+
+### 結果タイプによりコールバックの責任が明確になります
+
+（[05:39](https://developer.apple.com/videos/play/wwdc2021/10086/?time=339)）
+
+CloudKit Operation API は以前、項目ごとの完了ブロックと操作ごとの完了ブロックという 2 つのコールバック セットでエラーを報告しました。同じエラーが 2 か所で表示される場合があるため、開発者は混乱しやすくなります。
+
+iOS 15 では、Swift.Result 型を使用してコールバックが再設計されています。
+
+```swift
+// 旧 API：错误参数分散在多个可选参数中
+fetchRecordsOp.perRecordCompletionBlock = { record, recordID, error in
+    // error 可能是 CKError.unknownItem
+}
+fetchRecordsOp.fetchRecordsCompletionBlock = { recordsByRecordID, operationError in
+    // operationError 可能是 CKError.partialFailure
+    // 还要从 partialErrorsByItemID 中解析单条错误
+}
+
+// 新 API：Result 类型明确区分 per-item 和 per-operation
+fetchRecordsOp.perRecordResultBlock = { recordID, result in
+    // result 是 .success(record) 或 .failure(CKError.unknownItem)
+}
+fetchRecordsOp.fetchRecordsResultBlock = { result in
+    // result 是 .success，不再重复报告单条错误
+}
+```
+
+キーポイント:
+- `perRecordResultBlock`単一レコードの成功または失敗のみをレポートする
+- `fetchRecordsResultBlock`操作の全体的な成功または失敗のみをレポートします。
+- すべての CKOperations が項目ごとのコールバックを公開するようになりました
+
+＃＃詳細
+
+### 暗号化フィールド: 1 行のコードで機密データを保護
+
+（[13:43](https://developer.apple.com/videos/play/wwdc2021/10086/?time=823)）
+
+CloudKit は以前、CKAsset の自動暗号化のみを提供していました。iOS 15 ではこの機能が拡張され、文字列、数値、日付、CLLocation、配列を暗号化して直接保存できるようになりました。
+
+```swift
+// 设备 1：设置加密值
+let record = CKRecord(recordType: "MedicalData")
+record.encryptedValues["diagnosis"] = "Hypertension"
+record.encryptedValues["bloodPressure"] = 140.0
+
+let modifyOp = CKModifyRecordsOperation(recordsToSave: [record])
+database.add(modifyOp)
+
+// 设备 2：读取后自动解密
+let fetchOp = CKFetchRecordsOperation(recordIDs: [recordID])
+fetchOp.perRecordResultBlock = { recordID, result in
+    switch result {
+    case .success(let record):
+        let diagnosis = record.encryptedValues["diagnosis"] as? String
+        let bp = record.encryptedValues["bloodPressure"] as? Double
+        print("Diagnosis: \(diagnosis ?? ""), BP: \(bp ?? 0)")
+    case .failure(let error):
+        print("Fetch failed: \(error)")
+    }
+}
+database.add(fetchOp)
+```
+
+キーポイント:
+- `encryptedValues`これは CKRecord の新しい属性であり、その使用法は通常のフィールドと同じです。
+- 暗号化はデバイス上で行われ、キーマテリアルは iCloud キーチェーンに保存されます
+- CloudKit共有機能をサポートし、CKShareの参加者のみが関連フィールドを復号化できます
+- CKAsset はデフォルトで暗号化されており、encryptedValue に再度設定することはできません
+- サーバーは参照関係を確認する必要があるため、CKReference は暗号化できません
+
+### アカウントステータスの確認
+
+（[16:35](https://developer.apple.com/videos/play/wwdc2021/10086/?time=995)）
+
+暗号化操作には有効な iCloud アカウントが必要です。iOS 15の新機能`temporarilyUnavailable`州：
+
+```swift
+let container = CKContainer.default()
+
+// 检查账户状态
+let status = try await container.accountStatus()
+
+switch status {
+case .available:
+    // 可以执行加密操作
+    print("Account is available")
+case .noAccount:
+    // 引导用户登录 iCloud
+    print("No iCloud account")
+case .restricted:
+    // 受家长控制或配置限制
+    print("Account is restricted")
+case .temporarilyUnavailable:
+    // 账户已登录但未就绪，引导用户到设置验证
+    print("Account temporarily unavailable")
+case .couldNotDetermine:
+    // 网络问题或系统错误
+    print("Could not determine account status")
+}
+
+// 监听账户状态变化
+NotificationCenter.default.addObserver(
+    forName: .CKAccountChanged,
+    object: nil,
+    queue: .main
+) { _ in
+    print("iCloud account changed")
+}
+```
+
+キーポイント:
+- `temporarilyUnavailable`これは iOS 15 の新しいステータスで、アカウントはログインしているが検証が必要であることを示します。
+- 認証を完了するには、ユーザーは設定アプリに誘導される必要があります
+- 合格`CKAccountChanged`監視ステータスの変化を通知する
+
+### ゾーン共有: ゾーン全体の共有にレベルは必要なくなりました
+
+（[21:10](https://developer.apple.com/videos/play/wwdc2021/10086/?time=1270)）
+
+CloudKit が共有できるようにするには、レコード階層 (親参照) を構築し、ルート レコードを使用して CKShare を作成する必要があります。iOS 15では、録画領域全体を直接共有できるゾーン共有が導入されました。
+
+**古い方法: レコード レベルの共有**
+
+```swift
+// 创建记录层级
+let zone = CKRecordZone(zoneName: "MyZone")
+let fileRecordA = CKRecord(recordType: "File", recordID: CKRecord.ID(zoneID: zone.zoneID))
+let fileRecordB = CKRecord(recordType: "File", recordID: CKRecord.ID(zoneID: zone.zoneID))
+let folderRecord = CKRecord(recordType: "Folder", recordID: CKRecord.ID(zoneID: zone.zoneID))
+
+fileRecordA.setParent(folderRecord)
+fileRecordB.setParent(folderRecord)
+
+// 以 folder 为根记录创建分享
+let share = CKShare(rootRecord: folderRecord)
+let (saveResults, _) = try await database.modifyRecords(saving: [folderRecord, share])
+```
+
+**新しい方法: ゾーン共有**
+
+```swift
+// 直接分享整个 Zone
+let zone = CKRecordZone(zoneName: "MyZone")
+let share = CKShare(recordZoneID: zone.zoneID)
+
+let (saveResults, _) = try await database.modifyRecords(saving: [share])
+for (recordID, saveResult) in saveResults {
+    // 处理每条结果
+}
+```
+
+キーポイント:
+- ゾーン共有には親参照は必要ありません
+- 各ゾーンはゾーン全体の共有を 1 つだけ持つことができます
+- ゾーン全体シェアのレコード名は固定です。`CKRecordNameZoneWideShare`
+- レイヤー共有を使用して同じゾーン内に共存することはできません
+- ゾーンシェアを受け入れる場合、`rootRecord`そして`hierarchicalRootRecordID`ゼロです
+
+### 2 つの共有方法から選択
+
+（[24:59](https://developer.apple.com/videos/play/wwdc2021/10086/?time=1499)）
+
+|シナリオ |推奨される方法 |
+|------|---------|
+|データは自然に階層 (フォルダー - ファイル) を形成します。階層共有 (rootRecord + 親参照) |
+|ゾーンはタイル状に並べられたレコードのコレクションです。ゾーン共有 |
+|同じゾーン内に複数の独立した共有が必要です。階層的な共有 |
+
+Apple 内での使用例:
+- 階層型共有: メモ、リマインダー、iCloud Drive フォルダー
+- ゾーン共有: HomeKit Secure Video、HomePod マルチユーザー
+
+## 重要ポイント
+
+### 1. async/await を使用して CloudKit コードをリファクタリングする
+
+プロジェクトがまだ完了ブロックを使用して CloudKit を呼び出している場合は、async/await に移行することでメンテナンス コストを大幅に削減できます。最も単純な単一操作から始めて、徐々にバッチ操作を置き換えてください。
+
+開始方法: すべてを確認する`database.save()`、`database.fetch()`コールバック呼び出し、次のように置き換えられます`try await database.saveRecord()`そして`try await database.record(for:)`。Xcode のオートコンプリートでは、利用可能な非同期バリアントを入力するよう求められます。
+
+### 2. 機密データの暗号化フィールドを有効にする
+
+CloudKit に保存されている個人を特定できる情報、医療記録、財務データは、次のものを使用する必要があります。`encryptedValues`。コストはほぼゼロですが、プライバシーの確保は桁違いに高くなります。
+
+開始方法: 既存の CloudKit データ モデルを監査して、機密フィールドを特定します。意思`record["field"]`と置き換えます`record.encryptedValues["field"]`。CloudKit コンソールで、フィールド タイプに「暗号化文字列」などのプレフィックスが付いていることを確認します。
+
+### 3. ゾーン共有によるコラボレーションの簡素化
+
+アプリに「共有プロジェクト/共有ワークスペース」要件があり、データ モデルがフラット (明らかな親子関係がない) の場合、ゾーン共有は人工的な階層を構築するよりもはるかに簡単です。
+
+開始方法: カスタム ゾーンを作成し、共有する必要があるすべてのレコードをそこに配置します。初期化`CKShare(recordZoneID:)`そして保存します。受信者は、標準の CloudKit 共有プロセスを通じて参加します。
+
+## 関連セッション
+
+- [Apple のプライバシーの柱に注目](/articles/wwdc2021-10085) — Apple の 4 つのプライバシーの柱の技術実装の詳細
+- [CloudKit コンソールの紹介](/articles/wwdc2021-10087) — CloudKit 管理ツールの新しい Web バージョン
+- [Create ML フレームワークを使用して動的な iOS アプリを構築する](/articles/wwdc2021-10038) — デバイス上でパーソナライズされた機械学習モデルをトレーニングする

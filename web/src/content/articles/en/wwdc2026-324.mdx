@@ -1,0 +1,549 @@
+---
+title: "Meet Core AI"
+description: "Learning"
+date: "2026-06-10"
+tags: ["Core AI", "PyTorch", "Apple Intelligence", "On-device AI", "Swift"]
+thumbnail: "/images/sessions/2026/324.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/324/"
+sessionId: "wwdc2026-324"
+year: "2026"
+relatedSessions:
+  - title: "Dive into Core AI model authoring and optimization"
+    code: "325"
+    description: "A deep dive into model authoring, optimization, and custom kernels with the Core AI Python package"
+  - title: "Integrate Core AI into your app"
+    code: "326"
+    description: "Best practices for integrating Core AI into apps"
+  - title: "Explore MLX Swift"
+    code: "328"
+    description: "Apple's Swift bindings for the MLX framework, a complementary local AI option alongside Core AI"
+  - title: "Bring your model to Apple silicon"
+    code: "330"
+    description: "The lower-level mechanics of Metal tensor operations and model deployment"
+  - title: "Foundation Models on device"
+    code: "241"
+    description: "The Foundation Models framework for on-device large language models"
+---
+
+## Highlight
+
+> Apple introduced Core AI, an end-to-end AI framework covering model conversion, optimization, compilation, and on-device inference. It lets developers deploy models locally on Apple Silicon through a familiar PyTorch workflow, with no server dependency and zero per-token cost.
+
+## Core Ideas
+
+### The pain of on-device AI
+
+Running an AI model inside an app used to require a long path. First you trained the model in Python, then found a tool to convert it into a format the device could run, perhaps passing through an intermediate layer such as ONNX. After conversion, you still had to worry about numerical correctness, performance, and whether the first load would freeze the user. Every step introduced friction.
+
+Apple hit the same problems while running Apple Intelligence. Core ML worked, but it was not ideal for modern workloads such as Transformers. Rather than patching around it, Apple wrote a new framework from the ground up and is now opening it to all developers.
+
+### What Core AI is
+
+Core AI is not just an inference framework. It covers the full model deployment lifecycle ([00:59](https://developer.apple.com/videos/play/wwdc2026/324/?time=59)):
+
+- Use `coreai-torch` on the Python side for model conversion and optimization
+- Use the `CoreAI` framework on the Swift side for inference
+- Use Xcode for AOT compilation, dedicated Instruments, and a visual Debugger
+
+The toolchain has a clear goal: let developers keep the familiar PyTorch workflow while benefiting from full-stack Apple Silicon acceleration across CPU, GPU, and Neural Engine.
+
+### A concrete example: AI plays Snake
+
+The speaker demonstrates Core AI with a two-player Snake game where one snake is driven by an AI model ([03:51](https://developer.apple.com/videos/play/wwdc2026/324/?time=231)). The example is small, but it uses the same tools and APIs as a 70B-parameter large model.
+
+The model is a simple Transformer. Its input is a feature representation of the game board state, and its output is action logits for the four directions. Training data comes from naive simulation: run a few games and record states and actions.
+
+### Model conversion: from PyTorch to .aimodel
+
+The conversion flow is straightforward ([05:08](https://developer.apple.com/videos/play/wwdc2026/324/?time=308)):
+
+```python
+import torch
+import coreai_torch
+
+pt_model = SnakeTransformer().load_checkpoint("snake.pt")
+example = torch.randn(1, 5, 16)
+
+seq_len = torch.export.Dim("seq_len", min=1, max=256)
+exported = torch.export.export(
+    pt_model, args=(example,),
+    dynamic_shapes={"features": {1: seq_len}},
+)
+exported = exported.run_decompositions(coreai_torch.get_decomp_table())
+
+ai_program = coreai_torch.TorchConverter().add_exported_program(
+    exported, input_names=["features"], output_names=["logits"],
+).to_coreai()
+
+ai_program.save_asset("SnakeTransformer.aimodel")
+```
+
+Key points:
+- `torch.export` exports a PyTorch model as a static computation graph
+- `dynamic_shapes` declares that sequence length is dynamic, with a range from 1 to 256
+- `coreai_torch.get_decomp_table()` provides the operator decomposition rules Core AI needs
+- The final output is an `.aimodel` file, which Xcode can open directly to inspect structure
+
+After conversion, you should perform numerical validation ([05:44](https://developer.apple.com/videos/play/wwdc2026/324/?time=344)):
+
+```python
+import torch
+import numpy as np
+from coreai.runtime import AIModel, NDArray
+
+pt_model = SnakeTransformer().load_checkpoint("snake.pt")
+ai_model = await AIModel.load("SnakeTransformer.aimodel")
+function = ai_model.load_function("main")
+
+features = np.array([extract_features(game) for _ in range(10)],
+                    dtype=np.float32)[np.newaxis]
+
+with torch.no_grad():
+    pytorch_logits = pt_model(torch.from_numpy(features)).numpy()[0, -1]
+
+result = await function({"features": NDArray(data=features)})
+coreai_logits = result["logits"].numpy()[0, -1]
+
+max_diff = np.max(np.abs(pytorch_logits - coreai_logits))
+assert max_diff < 0.01
+```
+
+Key points:
+- Run PyTorch and Core AI with the same inputs
+- Compare the maximum difference between output logits
+- Set the threshold according to business needs; this example uses 0.01
+
+### Swift-side inference: basic usage
+
+Core AI's Swift API uses progressive disclosure ([07:41](https://developer.apple.com/videos/play/wwdc2026/324/?time=461)). The simplest usage requires only three types:
+
+```swift
+import CoreAI
+
+let model = try await AIModel(contentsOf: modelURL)
+let mainFunction: InferenceFunction = try model.loadFunction(named: "main")!
+let inputNDArray: NDArray = nextInput()
+var outputs = try await mainFunction.run(inputs: ["input": inputNDArray])
+
+guard let outputNDArray = outputs.remove("output")?.ndArray else {
+    // Handle unexpected missing output
+}
+```
+
+Key points:
+- `AIModel` loads the `.aimodel` file and parses the model structure
+- `InferenceFunction` is the runnable computation graph, usually named "main"
+- `NDArray` carries multidimensional input and output data
+- `run` is asynchronous and does not block the main thread
+
+Wrap it in a game player type ([08:33](https://developer.apple.com/videos/play/wwdc2026/324/?time=513)):
+
+```swift
+struct ModelPlayer {
+    let nextActionFunction: InferenceFunction
+
+    init(modelURL: URL) async throws {
+        let model = try await AIModel(contentsOf: modelURL)
+        self.nextActionFunction = try model.loadFunction(named: "main")!
+    }
+}
+```
+
+The actual decision logic ([08:49](https://developer.apple.com/videos/play/wwdc2026/324/?time=529)):
+
+```swift
+extension ModelPlayer: SnakePlayer {
+    mutating func chooseAction(game: SnakeGame) async throws -> Direction {
+        var inputFeatures = NDArray(
+            shape: [game.stepCount, hiddenDim],
+            scalarType: .float32
+        )
+        writeFeatures(of: game, into: inputFeatures.mutableView())
+
+        var outputs = try await nextActionFunction.run(
+            inputs: ["features": inputFeatures]
+        )
+        guard let logits = outputs.remove("logits")?.ndArray else {
+            throw ModelError.missingOutput
+        }
+
+        return predictedDirection(from: logits.view())
+    }
+}
+```
+
+Key points:
+- `NDArray.MutableView` is a non-escapable type that provides safe and efficient access to underlying storage
+- `mutableView()` gets a writable view, while `view()` gets a read-only view
+- The input feature shape is `[stepCount, hiddenDim]`, and the first dimension grows dynamically
+
+Input features include distance to each wall, relative position of the nearest food, one-hot encoding of the current direction, and the opponent snake's distance and direction ([10:10](https://developer.apple.com/videos/play/wwdc2026/324/?time=610)).
+
+### Performance problem: Transformer's quadratic complexity
+
+After the game starts running, it becomes slower over time ([10:42](https://developer.apple.com/videos/play/wwdc2026/324/?time=642)). Instruments shows that the interval between inferences grows noticeably. The cause is that Transformer complexity is O(n^2) with respect to sequence length, and every Snake step increases the history length.
+
+The solution is a KV Cache ([11:20](https://developer.apple.com/videos/play/wwdc2026/324/?time=680)). On every inference, a Transformer recomputes the key and value embeddings for the whole sequence. If previously computed key/value values are stored, the next inference only needs to compute the new token, reducing complexity from O(n^2) to O(n).
+
+### Implementing KV Cache with State
+
+Core AI's State mechanism makes this simple. State is an input that is both read and updated in place during inference ([11:48](https://developer.apple.com/videos/play/wwdc2026/324/?time=708)).
+
+First, add cache buffers to the PyTorch model ([12:18](https://developer.apple.com/videos/play/wwdc2026/324/?time=738)):
+
+```python
+class SnakeTransformerStateful(nn.Module):
+    def __init__(self, ...):
+        super().__init__()
+        self.register_buffer(
+            "k_cache", torch.zeros(N_LAYERS, 1, MAX_SEQ_LEN, D_MODEL))
+        self.register_buffer(
+            "v_cache", torch.zeros(N_LAYERS, 1, MAX_SEQ_LEN, D_MODEL))
+```
+
+Read and write the cache in `forward` ([12:50](https://developer.apple.com/videos/play/wwdc2026/324/?time=770)):
+
+```python
+def forward(self, features, position_ids):
+    new_k, new_v = [], []
+    for i, block in enumerate(self.blocks):
+        k_prev = self.k_cache[i]
+        v_prev = self.v_cache[i]
+        # ... compute q/k/v for the new token ...
+        new_k.append(k_updated)
+        new_v.append(v_updated)
+
+    self.k_cache.copy_(torch.stack(new_k))
+    self.v_cache.copy_(torch.stack(new_v))
+    return self.action_head(self.ln_final(x))
+```
+
+Declare `state_names` when converting the model again ([12:59](https://developer.apple.com/videos/play/wwdc2026/324/?time=779)):
+
+```python
+ai_program = coreai_torch.TorchConverter().add_exported_program(
+    exported,
+    input_names=["features", "position_ids"],
+    state_names=["keyCache", "valueCache"],
+    output_names=["logits"],
+).to_coreai()
+```
+
+Store and pass the cache on the Swift side ([13:17](https://developer.apple.com/videos/play/wwdc2026/324/?time=797)):
+
+```swift
+struct ModelPlayer {
+    let nextActionFunction: InferenceFunction
+    var keyCache: NDArray
+    var valueCache: NDArray
+
+    init(modelURL: URL) async throws {
+        let model = try await AIModel(contentsOf: modelURL)
+        self.nextActionFunction = try model.loadFunction(named: "main")!
+        self.keyCache = NDArray(
+            shape: [layers, maxContext, hiddenDim],
+            scalarType: .float32
+        )
+        self.valueCache = NDArray(
+            shape: [layers, maxContext, hiddenDim],
+            scalarType: .float32
+        )
+    }
+}
+```
+
+Pass state views during inference ([13:45](https://developer.apple.com/videos/play/wwdc2026/324/?time=825)):
+
+```swift
+mutating func chooseAction(game: SnakeGame, snakeID: Int) async throws -> Direction {
+    // ... prepare inputFeatures ...
+
+    var stateViews = InferenceFunction.MutableViews()
+    stateViews.insert(&keyCache, for: "keyCache")
+    stateViews.insert(&valueCache, for: "valueCache")
+
+    var outputs = try await nextActionFunction.run(
+        inputs: ["features": inputFeatures],
+        states: stateViews
+    )
+    // ...
+}
+```
+
+Key points:
+- `register_buffer` lets PyTorch export the cache as mutable buffers
+- `state_names` tells the converter which buffers should become Core AI state
+- The Swift side wraps multiple state values in a `MutableViews` collection and updates them in place during inference
+- After adding KV Cache, game speed stays stable and no longer slows down over time
+
+### Model specialization and caching
+
+An `.aimodel` file is a source format that can run on any Apple device. Before it actually loads, it must go through specialization, which generates optimized executable code for the specific device's CPU, GPU, and ANE ([15:41](https://developer.apple.com/videos/play/wwdc2026/324/?time=941)).
+
+Specialization can be slow for large models. Core AI provides a caching mechanism ([16:22](https://developer.apple.com/videos/play/wwdc2026/324/?time=982)):
+
+```swift
+let cache = AIModelCache.default
+
+guard let model = try cache.model(for: modelURL, options: .default) else {
+    Task { @MainActor in
+        informUser("Preparing AI features. This may take a while...")
+    }
+}
+```
+
+You can also proactively trigger specialization ([16:42](https://developer.apple.com/videos/play/wwdc2026/324/?time=1002)):
+
+```swift
+try await AIModel.specialize(contentsOf: modelURL)
+```
+
+Apple recommends calling this immediately after the user enables a feature or after the model resource finishes downloading, rather than triggering it in the middle of an interaction flow.
+
+Specialization has two steps ([17:31](https://developer.apple.com/videos/play/wwdc2026/324/?time=1051)): compilation, including graph partitioning, planning, and optimization, and generation of device-specific executable artifacts. Compilation takes most of the time. Xcode supports AOT (Ahead-of-Time) compilation, which precompiles models on the development machine and reduces specialization time on user devices ([17:57](https://developer.apple.com/videos/play/wwdc2026/324/?time=1077)).
+
+### Advanced optimization APIs
+
+For tight loops that need maximum performance, Core AI also provides lower-level APIs ([18:39](https://developer.apple.com/videos/play/wwdc2026/324/?time=1119)):
+
+- Query the optimal memory layout for `NDArray` and preallocate memory to avoid layout conversion during inference
+- Preallocate output values to avoid dynamic memory allocation during inference
+- Use async values to pipeline execution across multiple inference functions
+
+Most scenarios only need the high-level APIs. These lower-level APIs are available when optimizing critical paths.
+
+## Details
+
+### Full PyTorch model conversion flow
+
+From a trained PyTorch model to an `.aimodel` file, the core steps are exporting a static computation graph, applying Core AI operator decompositions, then converting and saving. Here is a complete conversion example:
+
+```python
+import torch
+import coreai_torch
+
+# 1. Load the PyTorch model and prepare an example input
+pt_model = SnakeTransformer().load_checkpoint("snake.pt")
+example = torch.randn(1, 5, 16)
+
+# 2. Define a dynamic dimension, where sequence length can vary
+seq_len = torch.export.Dim("seq_len", min=1, max=256)
+
+# 3. Export as a static computation graph
+exported = torch.export.export(
+    pt_model, args=(example,),
+    dynamic_shapes={"features": {1: seq_len}},
+)
+
+# 4. Apply the operator decompositions Core AI requires
+exported = exported.run_decompositions(coreai_torch.get_decomp_table())
+
+# 5. Convert to a Core AI program and save it
+ai_program = coreai_torch.TorchConverter().add_exported_program(
+    exported, input_names=["features"], output_names=["logits"],
+).to_coreai()
+
+ai_program.save_asset("SnakeTransformer.aimodel")
+```
+
+Key points:
+- `torch.export.export()` captures a PyTorch dynamic graph as a static computation graph, which is the prerequisite for conversion
+- `dynamic_shapes` declares which dimensions are dynamic, avoiding separate conversions for every sequence length
+- `coreai_torch.get_decomp_table()` provides operator decomposition rules supported by Core AI, splitting complex PyTorch operators into primitive operations Core AI can recognize
+- `.aimodel` is a cross-device source format that Xcode can open directly to inspect model structure and tensor shapes
+
+Always perform numerical validation after conversion to ensure accuracy loss is acceptable:
+
+```python
+import torch
+import numpy as np
+from coreai.runtime import AIModel, NDArray
+
+pt_model = SnakeTransformer().load_checkpoint("snake.pt")
+ai_model = await AIModel.load("SnakeTransformer.aimodel")
+function = ai_model.load_function("main")
+
+features = np.array([extract_features(game) for _ in range(10)],
+                    dtype=np.float32)[np.newaxis]
+
+with torch.no_grad():
+    pytorch_logits = pt_model(torch.from_numpy(features)).numpy()[0, -1]
+
+result = await function({"features": NDArray(data=features)})
+coreai_logits = result["logits"].numpy()[0, -1]
+
+max_diff = np.max(np.abs(pytorch_logits - coreai_logits))
+assert max_diff < 0.01
+```
+
+Key points:
+- Run PyTorch and Core AI with the same inputs and compare the final logits
+- Set the threshold according to business needs; classification tasks are often fine within 0.01
+- If the difference is too large, check whether the `dynamic_shapes` range covers the test input and whether any operator decomposition is missing
+
+### Swift-side inference and model wrapping
+
+Core AI's Swift API follows the principle of progressive disclosure. The most basic usage requires only three types:
+
+```swift
+import CoreAI
+
+// 1. Load the model from an .aimodel file
+let model = try await AIModel(contentsOf: modelURL)
+
+// 2. Get the main inference function, usually named "main"
+let mainFunction: InferenceFunction = try model.loadFunction(named: "main")!
+
+// 3. Prepare input and run inference
+let inputNDArray: NDArray = nextInput()
+var outputs = try await mainFunction.run(inputs: ["input": inputNDArray])
+
+guard let outputNDArray = outputs.remove("output")?.ndArray else {
+    // Handle unexpected missing output
+}
+```
+
+Key points:
+- `AIModel` parses the `.aimodel` file structure and does not execute computation itself
+- `InferenceFunction` is the compiled runnable computation graph, and a model can contain multiple functions
+- `NDArray` is Swift's representation of a multidimensional array, supporting scalar types such as `float32` and `int64`
+- `run` is an `async` method that does not block the main thread, making it suitable for UI interactions
+
+In real projects, inference logic is usually wrapped in a business type. Here is a complete game AI player implementation with model loading, feature writing, and action selection:
+
+```swift
+struct ModelPlayer {
+    let nextActionFunction: InferenceFunction
+
+    init(modelURL: URL) async throws {
+        let model = try await AIModel(contentsOf: modelURL)
+        self.nextActionFunction = try model.loadFunction(named: "main")!
+    }
+}
+
+extension ModelPlayer: SnakePlayer {
+    mutating func chooseAction(game: SnakeGame) async throws -> Direction {
+        // 1. Create an input NDArray with shape [current step count, feature dimension]
+        var inputFeatures = NDArray(
+            shape: [game.stepCount, hiddenDim],
+            scalarType: .float32
+        )
+
+        // 2. Safely write feature data through MutableView
+        writeFeatures(of: game, into: inputFeatures.mutableView())
+
+        // 3. Run inference
+        var outputs = try await nextActionFunction.run(
+            inputs: ["features": inputFeatures]
+        )
+
+        // 4. Extract output logits and decode them into an action direction
+        guard let logits = outputs.remove("logits")?.ndArray else {
+            throw ModelError.missingOutput
+        }
+
+        return predictedDirection(from: logits.view())
+    }
+}
+```
+
+Key points:
+- `NDArray.MutableView` is Swift's non-escapable type, providing memory safety with zero overhead
+- `mutableView()` returns a writable view for input preparation, while `view()` returns a read-only view for output reading
+- The first dimension of the input feature shape grows dynamically with the game step count, which is exactly why KV Cache optimization is needed
+- Features include distance to each wall, nearest-food relative position, current-direction one-hot value, and the opponent snake's distance and direction
+
+### Model specialization and caching mechanism
+
+`.aimodel` is a cross-device source format. Before running, it needs specialization: generating optimized executable code for the specific device's CPU, GPU, and ANE. Specialization can be slow for large models, so Core AI provides caching and pre-triggering:
+
+```swift
+// Check whether a specialized model already exists in the cache
+let cache = AIModelCache.default
+
+guard let model = try cache.model(for: modelURL, options: .default) else {
+    // Cache miss: tell the user to wait
+    Task { @MainActor in
+        informUser("Preparing AI features. This may take a while...")
+    }
+}
+
+// Proactively trigger specialization, recommended immediately after the user enables a feature or a model download completes
+try await AIModel.specialize(contentsOf: modelURL)
+```
+
+Key points:
+- `AIModelCache.default` caches specialization results by device model, so the same device can hit the cache on the next load
+- On cache miss, provide clear feedback to avoid unexplained stalls during an interaction flow
+- `specialize()` is asynchronous and should run on a non-critical path, such as after settings are changed or a download completes
+- Specialization has two steps: compilation, including graph partitioning, planning, and optimization, and generation of device-specific executable artifacts. Compilation takes most of the time
+- Xcode supports AOT (Ahead-of-Time) compilation, which can precompile the model on the development machine and reduce waiting on user devices
+
+### Core AI toolchain overview
+
+The Core AI stack can be split into three layers:
+
+**Python layer**: The `coreai-torch` package supports conversion from PyTorch, direct authoring, Apple Silicon optimization, and custom kernels written with Metal 4. Advanced use cases mentioned in the talk are covered in session 325, Dive into Core AI model authoring and optimization.
+
+**Swift layer**: The `CoreAI` framework provides type-safe APIs and uses Swift's non-escapable types to guarantee memory safety without sacrificing performance.
+
+**Tooling layer**: Xcode integration includes AOT compilation, Core AI-specific Instruments, a visual Debugger that can trace tensor values back to Python source lines, and the Xcode Debug Gauge for showing Core AI activity in real time.
+
+### Core AI Models repository
+
+Apple maintains an official model repository ([19:26](https://developer.apple.com/videos/play/wwdc2026/324/?time=1166)) containing:
+
+- One-command conversion recipes for popular models
+- AI skills specialized in Core AI conversion and optimization
+- A Swift package with high-level APIs for specific model families and built-in low-level optimizations
+- APIs for creating a Core AI Language Model that can connect to the Foundation Models framework
+
+## Key Takeaways
+
+**1. Run local image classification inside an app**
+
+What to build: Convert a trained ResNet or ViT into `.aimodel` with `coreai-torch`, then load and run inference from Swift in a few lines.
+
+Why it is worth doing: No network requests, private data stays on device, and there is no API call cost. For high-frequency features such as photo classification or object recognition, on-device inference has clear latency and cost advantages.
+
+How to start: Convert the model with `coreai-torch`, load it on the Swift side with `AIModel(contentsOf:)`, get the inference function with `loadFunction(named: "main")`, and pass an `NDArray` to run it. Entry APIs: `AIModel(contentsOf:)` + `InferenceFunction.run`
+
+**2. Add an AI opponent to a game**
+
+What to build: Like the Snake example in the talk, train a Transformer to learn a game strategy and run real-time inference on device with Core AI.
+
+Why it is worth doing: On-device inference removes network latency, so the AI opponent can respond to game state in real time. KV Cache solves the performance decline caused by growing Transformer sequence length, so long matches do not get slower over time.
+
+How to start: Define k/v cache with `register_buffer` in the PyTorch model, declare it with `state_names` during conversion, then pass and update the cache from Swift with `InferenceFunction.MutableViews`. Entry APIs: `state_names` + `InferenceFunction.MutableViews`
+
+**3. On-device text generation**
+
+What to build: Get a preconverted LLM from the Core AI Models repository and connect it through the Foundation Models framework.
+
+Why it is worth doing: User input is processed locally, with zero token cost and no privacy-sensitive upload. For chat assistants and text summarization, on-device execution removes network and server dependencies.
+
+How to start: Download a preconverted model from the Core AI Models repository, load it with `CoreAILanguageModel`, and create a `LanguageModelSession` for generation. Entry APIs: `CoreAILanguageModel(resourcesAt:)` + `FoundationModels` framework
+
+**4. Real-time audio processing**
+
+What to build: Use a small model for voice activity detection or speaker separation, with Core AI scheduling CPU, GPU, and ANE together for low latency.
+
+Why it is worth doing: Audio processing is extremely latency-sensitive, and on-device inference avoids network round trips. For small models like these, the ANE is far more energy efficient than CPU or GPU and can run continuously in the background without significant battery drain.
+
+How to start: Call `AIModel.specialize(contentsOf:)` when the user first enables the feature, compiling the model ahead of time to avoid stutters during interaction. Tune with Core AI-specific Instruments. Entry APIs: `AIModel.specialize` + Core AI Instruments
+
+**5. Custom vision models**
+
+What to build: Author a Core AI computation graph directly on the Python side, write Metal 4 kernels for custom operators, then integrate the model into the app.
+
+Why it is worth doing: Standard operator libraries do not cover every emerging research model architecture. Custom kernels let you deploy new operators from papers directly to Apple Silicon while benefiting from GPU and ANE hardware acceleration.
+
+How to start: Build the computation graph with the `coreai-torch` authoring API, implement the custom operator with a hand-written Metal Shading Language kernel, and register it during conversion with `register_custom_kernels`. Entry APIs: `coreai-torch` authoring API + Metal 4 custom kernels
+
+## Related Sessions
+
+- [Dive into Core AI model authoring and optimization](/articles/wwdc2026-325) - A deep dive into model authoring, optimization, and custom kernels with the Core AI Python package
+- [Integrate Core AI into your app](/articles/wwdc2026-326) - Best practices for integrating Core AI into apps
+- [Explore MLX Swift](/articles/wwdc2026-328) - Apple's Swift bindings for the MLX framework, a complementary local AI option alongside Core AI
+- [Bring your model to Apple silicon](/articles/wwdc2026-330) - The lower-level mechanics of Metal tensor operations and model deployment
+- [Foundation Models on device](/articles/wwdc2026-241) - The Foundation Models framework for on-device large language models

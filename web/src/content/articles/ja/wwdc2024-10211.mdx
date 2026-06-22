@@ -1,0 +1,195 @@
+---
+title: "Support real-time ML inference on the CPU"
+description: "discover how you can use bnnsgraph to accelerate the execution of your machine learning model on the cpu. we will show you how to use bnnsgraph to compile and execute a machine learning model on the c"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10211.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10211/"
+sessionId: "wwdc2024-10211"
+year: "2024"
+relatedSessions:
+  - title: "Bring your machine learning and AI models to Apple silicon"
+    code: "10159"
+    description: "learn how to optimize your machine learning and ai models to leverage the power "
+  - title: "Deploy machine learning and AI models on-device with Core ML"
+    code: "10161"
+    description: "learn new ways to optimize speed and memory performance when you convert and run"
+  - title: "Explore the Accelerate framework"
+    code: "10187"
+    description: "learn how to use the accelerate framework to get the best performance out of your"
+---
+
+## ハイライト
+
+> BNNS Graph は Accelerate フレームワークの新しいグラフレベル ML 推論 API。Core ML モデル全体を消費し、数学変換、レイヤー融合、コピー排除、重み再配置などの最適化を自動実行。従来の BNNS プリミティブ比で平均 2 倍以上の性能。
+
+---
+
+## 主要内容
+
+従来の BNNS API はレイヤー単位の操作です。各畳み込み、活性化、正規化ごとに、入力/出力/重み/バイアスの n 次元配列記述子を手動作成し、パラメータ構造体を組み立て、レイヤーオブジェクトを作成し、レイヤーごとに推論を実行。完全なモデルの実装は各レイヤーでこのフローを繰り返し、中間テンソルのメモリも自分で管理。コード量が多く、レイヤー間最適化も不可能。
+
+BNNS Graph はこのパターンを変えます。コンパイル済み `.mlmodelc` ファイルを直接提供し、`BNNSGraphCompileFromFile` がモデル全体を最適化されたグラフオブジェクトにコンパイル——推論に必要な kernel リストと中間テンソルのメモリレイアウトを含む。グラフオブジェクトを 1 回作成し、`BNNSGraphContextMake` で可変 context にラップすれば、推論を繰り返し実行可能。BNNS Graph は完全な計算グラフを見るため、従来の逐層 API では不可能な最適化を実行：末尾の slice 操作を前に移動（数学変換）、畳み込みと活性化を 1 kernel に融合（レイヤー融合）、データコピーをウィンドウビューで代替（コピー排除）、重みを行優先からブロック反復順序に再配置してキャッシュヒット率を向上（重み再配置）。Apple はこれらの最適化が平均 2 倍以上の性能向上をもたらし、追加コード不要と主張。
+
+セッションは BNNS Graph のリアルタイムオーディオシーンでの使用も重点デモ——Audio Unit のレンダリングコールバックはゼロメモリ割り当て、シングルスレッド実行を要求。違反するとカーネルコンテキストスイッチが発生しリアルタイムデッドライン違反。BNNS Graph はこれらの制約を満たす細かい制御を提供：コンパイル時のシングルスレッドターゲット指定、page-aligned workspace の事前割り当て、動的形状宣言、直接ポインタ引数渡し。
+
+---
+
+## 詳細
+
+### グラフオブジェクトのコンパイル
+
+`.mlmodelc` ファイルからグラフオブジェクトをコンパイルするのが第一歩。コンパイルオプションでシングルスレッド実行、最適化の好み（性能 vs サイズ）などを制御。（[00:44](https://developer.apple.com/videos/play/wwdc2024/10211/?time=44)）
+
+```cpp
+// Get the path to the mlmodelc.
+NSBundle *main = [NSBundle mainBundle];
+NSString *mlmodelc_path = [main pathForResource:@"bitcrusher"
+                                         ofType:@"mlmodelc"];
+
+// Specify single-threaded execution.
+bnns_graph_compile_options_t options = BNNSGraphCompileOptionsMakeDefault();
+BNNSGraphCompileOptionsSetTargetSingleThread(options, true);
+
+// Compile the BNNSGraph.
+bnns_graph_t graph = BNNSGraphCompileFromFile(mlmodelc_path.UTF8String,
+                                              NULL, options);
+assert(graph.data);
+BNNSGraphCompileOptionsDestroy(options);
+```
+
+キーポイント:
+
+- `BNNSGraphCompileFromFile` は `.mlmodelc` パスを受け取り、不変のグラフオブジェクトを返す
+- 第 2 引数に `NULL` を渡すとソースモデルのすべての関数をコンパイル。複数関数がある場合は関数名を指定
+- `BNNSGraphCompileOptionsSetTargetSingleThread` でマルチスレッド実行をオフ——リアルタイムオーディオに必須
+- コンパイルオプション使用後は `BNNSGraphCompileOptionsDestroy` で解放
+
+### Context と Workspace の作成
+
+グラフオブジェクトは不変。推論には動的形状と実行オプションをサポートする可変 context が必要。リアルタイムシーンでは実行段階のメモリ割り当てを避けるため workspace も事前割り当て。（[10:41](https://developer.apple.com/videos/play/wwdc2024/10211/?time=641)）
+
+```cpp
+// Create the context.
+context = BNNSGraphContextMake(graph);
+assert(context.data);
+
+// Set the argument type.
+BNNSGraphContextSetArgumentType(context, BNNSGraphArgumentTypePointer);
+
+// Specify the dynamic shape.
+uint64_t shape[] = {mMaxFramesToRender, 1, 1};
+bnns_graph_shape_t shapes[] = {
+    (bnns_graph_shape_t) {.rank = 3, .shape = shape},
+    (bnns_graph_shape_t) {.rank = 3, .shape = shape}
+};
+BNNSGraphContextSetDynamicShapes(context, NULL, 2, shapes);
+
+// Create the workspace.
+workspace_size = BNNSGraphContextGetWorkspaceSize(context, NULL) + NSPageSize();
+workspace = (char *)aligned_alloc(NSPageSize(), workspace_size);
+```
+
+キーポイント:
+
+- `BNNSGraphContextMake` で不変グラフを可変 context にラップ
+- `BNNSGraphArgumentTypePointer` でパラメータをテンソル構造体ではなく裸ポインタで直接渡す——オーディオ buffer との直接接続に適する
+- `BNNSGraphContextSetDynamicShapes` で入力/出力の最大形状を宣言。オーディオユニットの最大フレーム数に基づく
+- workspace は page-aligned 必須。サイズは `BNNSGraphContextGetWorkspaceSize` が返す
+- `NSPageSize()` を加算はアライメント余裕のため
+
+### 引数インデックスの計算
+
+モデル内のパラメータ順序は元の Python コードと異なる可能性あり。`BNNSGraphGetArgumentPosition` でクエリ必須。（[11:58](https://developer.apple.com/videos/play/wwdc2024/10211/?time=718)）
+
+```cpp
+// Calculate indices into the arguments array.
+dst_index = BNNSGraphGetArgumentPosition(graph, NULL, "dst");
+src_index = BNNSGraphGetArgumentPosition(graph, NULL, "src");
+resolution_index = BNNSGraphGetArgumentPosition(graph, NULL, "resolution");
+saturationGain_index = BNNSGraphGetArgumentPosition(graph, NULL, "saturationGain");
+dryWet_index = BNNSGraphGetArgumentPosition(graph, NULL, "dryWet");
+```
+
+キーポイント:
+
+- パラメータ名（"dst"、"src" など）はモデル定義の名称に対応
+- インデックス値は `arguments` 配列内の各パラメータ位置
+- このクエリは初期化時に 1 回だけ実行
+
+### 推論の実行
+
+オーディオレンダリングコールバック内で、事前割り当て workspace とインデックスを使って推論を実行。（[13:29](https://developer.apple.com/videos/play/wwdc2024/10211/?time=809)）
+
+```cpp
+// Set the size of the first dimension.
+BNNSGraphContextSetBatchSize(context, NULL, frameCount);
+
+// Specify the direct pointer to the output buffer.
+arguments[dst_index] = {
+    .data_ptr = outputBuffers[channel],
+    .data_ptr_size = frameCount * sizeof(outputBuffers[channel][0])
+};
+
+// Specify the direct pointer to the input buffer.
+arguments[src_index] = {
+    .data_ptr = (float *)inputBuffers[channel],
+    .data_ptr_size = frameCount * sizeof(inputBuffers[channel][0])
+};
+
+// Specify the direct pointer to the resolution scalar parameter.
+arguments[resolution_index] = {
+    .data_ptr = &mResolution,
+    .data_ptr_size = sizeof(float)
+};
+
+// Specify the direct pointer to the saturation gain scalar parameter.
+arguments[saturationGain_index] = {
+    .data_ptr = &mSaturationGain,
+    .data_ptr_size = sizeof(float)
+};
+
+// Specify the direct pointer to the mix scalar parameter.
+arguments[dryWet_index] = {
+    .data_ptr = &mMix,
+    .data_ptr_size = sizeof(float)
+};
+
+// Execute the function.
+BNNSGraphContextExecute(context, NULL,
+                        5, arguments,
+                        workspace_size, workspace);
+```
+
+キーポイント:
+
+- `BNNSGraphContextSetBatchSize` で現在フレームのサンプル数を動的設定——フレームごとに異なる可能性
+- 各パラメータは `data_ptr` と `data_ptr_size` でメモリ位置とサイズを指定
+- スカラーパラメータ（resolution、dryWet など）は UI slider の値を直接指す
+- `BNNSGraphContextExecute` で推論実行。結果は outputBuffers に直接書き込み
+- 実行全体がゼロメモリ割り当て、ゼロマルチスレッド——リアルタイムオーディオ要件を満たす
+
+### コンパイルオプション補足
+
+コンパイルオプションで注目すべき 2 つの設定：（[12:24](https://developer.apple.com/videos/play/wwdc2024/10211/?time=744)）
+
+- **最適化の好み**：デフォルトは性能最適化（グラフオブジェクトサイズ増加の可能性）。App サイズが敏感ならサイズ最適化に切り替え可能だが、実行性能は低下する可能性
+- **NaNAndInfinityChecks**：デバッグ用 NaN/無限大チェック。16 ビットアキュムレータオーバーフローなどの発見に有用だが、リリース版では有効にしない
+
+---
+
+## 重要ポイント
+
+- **やること**：CPU 推論に BNNS Graph を使い Core ML を置換してレイテンシを低減。**理由**：BNNS Graph のグラフレベル最適化（レイヤー融合、数学変換、コピー排除）は逐層 BNNS 比で平均 2 倍以上高速。モデル学習フロー変更不要。同じ `.mlmodelc` がそのまま使える。**始め方**：既存 Core ML 推論呼び出しを `BNNSGraphCompileFromFile` + `BNNSGraphContextExecute` フローに置換。
+
+- **やること**：オーディオ処理 App に ML モデルを統合してリアルタイムエフェクトを実現。**理由**：BNNS Graph のシングルスレッドモード、事前割り当て workspace、直接ポインタ引数渡しは Audio Unit レンダリングコールバックのリアルタイム制約——ゼロ割り当て、ゼロコンテキストスイッチ——を自然に満たす。**始め方**：Xcode の Audio Unit Extension App テンプレートでプロジェクト作成。`.mlpackage` をドラッグ。DSP Kernel の初期化段階でグラフをコンパイルし workspace を作成。レンダリングコールバックでは `BNNSGraphContextExecute` のみ。
+
+- **やること**：SwiftUI 界面で ML 処理効果を同期表示。**理由**：同じモデルで複数 context をオーディオスレッドと UI スレッドにそれぞれ割り当て可能。UI でリアルタイムプレビューで UX 向上。**始め方**：UI コンポーネント用に独立 graph context を作成（context は同一時刻に 1 スレッドのみ）。Swift 版 BNNS Graph API で推論実行。出力 buffer を Swift Charts に渡して波形描画。
+
+---
+
+## 関連セッション
+
+- [Bring your machine learning and AI models to Apple silicon](/articles/wwdc2024-10159) — ML/AI モデルを Apple シリコン上で最適化する方法
+- [Deploy machine learning and AI models on-device with Core ML](/articles/wwdc2024-10161) — Core ML のモデル変換とデバイス上デプロイ最適化の新手法
+- [Explore the Accelerate framework](/articles/wwdc2024-10187) — Accelerate フレームワーク全体概覧。BNNS はそのサブライブラリ

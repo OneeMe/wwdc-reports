@@ -1,0 +1,192 @@
+---
+title: "Meet the Foundation Models framework"
+description: "learn how to tap into the on-device large language model behind apple intelligence! this high-level overview covers everything from guided generation for generating swift data structures and streaming"
+date: 2026-06-10
+tags: ["Machine Learning"]
+thumbnail: "/images/sessions/2025/286.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/286/"
+sessionId: "wwdc2025-286"
+year: "2025"
+relatedSessions:
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Explore prompt design & safety for on-device foundation models"
+    code: "248"
+    description: "design generative ai experiences that leverage the strengths of the systemlanguagemodel"
+  - title: "Get started with MLX for Apple silicon"
+    code: "315"
+    description: "mlx is a flexible and efficient array framework for numerical computing and machine learning"
+---
+
+## Highlight
+
+> The Foundation Models framework ships a Swift API for a 3-billion-parameter, 2-bit-per-parameter on-device large model across macOS, iOS, iPadOS, and visionOS. It works offline.
+
+---
+
+## Main Content
+
+Until now, calling a large model from an app meant one of two things. Hit a cloud API and pay the cost in privacy, latency, and money. Or bundle an open-source model into the app and watch the binary balloon by several gigabytes. Model output is also unstructured text, so developers had to write "please return JSON" in the prompt and add piles of fallback parsing — one wrong word order and the parser breaks.
+
+WWDC25 introduced the Foundation Models framework, which exposes the on-device model behind Apple Intelligence to developers. The model has 3 billion parameters and 2-bit-per-parameter quantization. It ships with the system, so apps do not bundle it. All data stays on the device, and it works offline. It targets device-level tasks like summarization, extraction, classification, and content generation. It is not meant for world knowledge or complex reasoning ([02:57](https://developer.apple.com/videos/play/wwdc2025/286/?time=177)).
+
+The framework solves four problems. **Guided Generation** lets you mark a Swift struct with `@Generable`; the model returns a type-safe object directly, and constrained decoding underneath guarantees a valid structure mathematically. **Snapshot Streaming** turns streaming increments into a sequence of `PartiallyGenerated` snapshots; every property is Optional, so a SwiftUI state binding can reveal text token by token. **Tool Calling** lets the model decide which Swift function to call, with arguments also driven by `@Generable`. **Stateful Session** keeps a multi-turn transcript and offers dedicated adapters such as `contentTagging`.
+
+---
+
+## Details
+
+### Guided Generation: macros instead of prompt engineering
+
+Define the type you want the model to generate, then add `@Generable` and `@Guide` ([05:32](https://developer.apple.com/videos/play/wwdc2025/286/?time=332)):
+
+```swift
+@Generable
+struct SearchSuggestions {
+    @Guide(description: "A list of suggested search terms", .count(4))
+    var searchTerms: [String]
+}
+```
+
+**Key points:**
+- The `@Generable` macro tells the framework this struct is a generation target, and it derives the encoding protocol and a `PartiallyGenerated` mirror type.
+- `@Guide(description:)` writes the field's meaning in natural language right next to the type definition; the model uses it to understand each field.
+- `.count(4)` is a structural constraint that forces the array length to exactly 4, enforced at the token level by constrained decoding.
+
+When you call the session, just tell it which type to generate ([05:51](https://developer.apple.com/videos/play/wwdc2025/286/?time=351)):
+
+```swift
+let response = try await session.respond(
+    to: prompt,
+    generating: SearchSuggestions.self
+)
+print(response.content)
+```
+
+**Key points:**
+- The prompt no longer needs to describe the output format, only the intent.
+- The `generating:` argument passes the type as a schema to the underlying decoder.
+- `response.content` is a strongly typed `SearchSuggestions`, ready to hand to a SwiftUI view.
+
+### Snapshot Streaming: a complete snapshot per frame
+
+Traditional delta streaming makes developers stitch tokens themselves, which fits structured output poorly. The framework switches to snapshot mode ([09:40](https://developer.apple.com/videos/play/wwdc2025/286/?time=580)):
+
+```swift
+let stream = session.streamResponse(
+    to: "Craft a 3-day itinerary to Mt. Fuji.",
+    generating: Itinerary.self
+)
+
+for try await partial in stream {
+    print(partial)
+}
+```
+
+**Key points:**
+- `streamResponse` returns an `AsyncSequence`; each element is an `Itinerary.PartiallyGenerated`.
+- All properties on `PartiallyGenerated` are Optional and fill in as generation progresses.
+- In SwiftUI, store `partial` in `@State` and the view refreshes as generation runs ([10:05](https://developer.apple.com/videos/play/wwdc2025/286/?time=605)).
+- The order of fields in the struct is the order of generation. Putting summary last often yields a higher-quality summary ([11:00](https://developer.apple.com/videos/play/wwdc2025/286/?time=660)).
+
+### Tool Calling: let the model call your Swift functions
+
+Define a type that conforms to the `Tool` protocol ([13:42](https://developer.apple.com/videos/play/wwdc2025/286/?time=822)):
+
+```swift
+struct GetWeatherTool: Tool {
+    let name = "getWeather"
+    let description = "Retrieve the latest weather information for a city"
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "The city to fetch the weather for")
+        var city: String
+    }
+
+    func call(arguments: Arguments) async throws -> ToolOutput {
+        let places = try await CLGeocoder().geocodeAddressString(arguments.city)
+        let weather = try await WeatherService.shared.weather(for: places.first!.location!)
+        let temperature = weather.currentWeather.temperature.value
+
+        let content = GeneratedContent(properties: ["temperature": temperature])
+        return ToolOutput(content)
+    }
+}
+```
+
+**Key points:**
+- `name` and `description` are how the model decides when to call this tool. Write them so the model can read them.
+- `Arguments` must be `@Generable`. The arguments the model produces are type-safe, with no string-stitching.
+- `call` is the developer's Swift code. It can reach into system services like WeatherKit or CoreLocation.
+- `ToolOutput` carries either structured `GeneratedContent` or a natural-language string.
+
+Attach the tool to a session ([15:03](https://developer.apple.com/videos/play/wwdc2025/286/?time=903)):
+
+```swift
+let session = LanguageModelSession(
+    tools: [GetWeatherTool()],
+    instructions: "Help the user with weather forecasts."
+)
+let response = try await session.respond(to: "What is the temperature in Cupertino?")
+```
+
+**Key points:**
+- The model decides on its own whether to call `getWeather` and which city to pass.
+- The tool's output is spliced back into the transcript, and the model uses it to produce the final natural-language reply.
+
+### Stateful Session and availability checks
+
+A session keeps a transcript internally, so multi-turn calls carry history automatically ([17:46](https://developer.apple.com/videos/play/wwdc2025/286/?time=1066)). Always check availability before running ([19:56](https://developer.apple.com/videos/play/wwdc2025/286/?time=1196)):
+
+```swift
+struct AvailabilityExample: View {
+    private let model = SystemLanguageModel.default
+
+    var body: some View {
+        switch model.availability {
+        case .available:
+            Text("Model is available")
+        case .unavailable(let reason):
+            Text("Reason: \(reason)")
+        }
+    }
+}
+```
+
+**Key points:**
+- The model is only available on devices that have Apple Intelligence enabled and run in a supported region.
+- `.unavailable(reason)` reports why it's down, and the UI should fall back to a non-AI path accordingly.
+
+---
+
+## Takeaways
+
+- **What to do**: Replace every "JSON parsing + regex patching" path in your app with a `@Generable` type.
+  - Why it's worth it: Constrained decoding rules out malformed model output by construction and saves a lot of fallback code.
+  - How to start: Pick the LLM parsing site that breaks most often, mark its target type with `@Generable`, delete every "please return JSON…" instruction from the prompt, and verify the output in an Xcode Playground.
+
+- **What to do**: Use snapshot streaming to turn "wait 5 seconds" into a SwiftUI animation that reveals text token by token.
+  - Why it's worth it: Perceived latency moves retention more than real latency. Snapshots fit `@State` naturally, and a few lines of code make generation visible.
+  - How to start: Replace the existing `respond(to:)` call with `streamResponse`, store state in `Itinerary.PartiallyGenerated?`, and add `.transition(.opacity)` to the fields.
+
+- **What to do**: Wrap the Swift functions you already have in your app as `Tool`s and let the model act as the router.
+  - Why it's worth it: You no longer pile "if the user asks about weather, then…" branches into the prompt. The model decides whether to call, the logic stays clean, and you can reach local capabilities like WeatherKit and CoreLocation.
+  - How to start: Pick a side-effect-free pure query function (weather, exchange rate, inventory), implement the `Tool` protocol, plug it into the session's `tools:` array, and let the prompt describe only the user's intent.
+
+- **What to do**: For content-tagging scenarios, use the dedicated adapter `SystemLanguageModel(useCase: .contentTagging)`.
+  - Why it's worth it: Dedicated adapters beat the general model on tags, sentiment, and action extraction by a clear margin, and the call site is identical.
+  - How to start: Run inputs like notes, comments, and chat logs through `Top3ActionEmotionResult` and compare against a generic prompt.
+
+---
+
+## Related Sessions
+
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — A deep dive into the inner workings of guided generation, dynamic schemas, and transcript management
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — Follow along with Apple to wire Foundation Models into a SwiftUI app
+- [Explore prompt design & safety for on-device foundation models](/articles/wwdc2025-248) — Prompt design principles and safety guardrails for on-device models
+- [Get started with MLX for Apple silicon](/articles/wwdc2025-315) — An introduction to MLX, the numerical computing and machine learning framework for Apple silicon

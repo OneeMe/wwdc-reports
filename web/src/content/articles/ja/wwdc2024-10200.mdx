@@ -1,0 +1,195 @@
+---
+title: "Extend your Xcode Cloud workflows"
+description: "discover how xcode cloud can adapt to your development needs. we"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10200.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10200/"
+sessionId: "wwdc2024-10200"
+year: "2024"
+relatedSessions:
+  - title: "Meet Xcode Cloud"
+    code: "10234"
+    description: "introducing xcode cloud and how to get started with continuous integration for your app"
+  - title: "Create practical workflows in Xcode Cloud"
+    code: "10201"
+    description: "learn how to create and configure workflows for real-world development scenarios"
+  - title: "Customize your advanced Xcode Cloud workflows"
+    code: "10203"
+    description: "deep dive into custom scripts and advanced workflow configuration"
+  - title: "Meet Swift OpenAPI Generator"
+    code: "10156"
+    description: "generate swift code from openapi specifications to call rest apis"
+---
+
+## ハイライト
+
+> Xcode Cloud に手動トリガー条件、カスタムエイリアス、Webhook が追加され、コードプッシュから本番デプロイまでワークフローを自動化できます。
+
+---
+
+## 主要内容
+
+多くのチームの Xcode Cloud ワークフローは 1 つのことだけをします：main にプッシュ、テスト実行、TestFlight 配信。プロジェクト初期には十分ですが、アプリがバックエンドサービスに依存し始めると統合テストが必要になります——統合テストはテストサーバーに依存し、時間がかかり、ネットワーク問題で失敗することもあります。毎回の push で実行したくはない一方、サーバー側の変更時には互換性を検証する必要があります。
+
+Apple は Xcode 15.1 で Manual Start Conditions（手動トリガー条件）を導入し、必要なときだけ実行するワークフローを作成できるようにしました。例えばサーバー側デプロイ後に手動トリガーする統合テスト専用ワークフロー。続いて Xcode 15.3 で Custom Aliases（カスタムエイリアス）が登場——「Team Preference」のようなチームレベルの Xcode/macOS バージョンエイリアスを定義し、すべてのワークフローがそのエイリアスを参照。ツールチェーンのアップグレードは 1 箇所の変更で全ワークフローが同期更新。ci_scripts カスタムスクリプトと組み合わせ、テスト前にサーバーがオンラインか確認し、オフラインならビルドを早期終了。
+
+これで「いつ実行するか」は解決。サーバーコード変更後も、誰かが統合テストワークフローを手動トリガーする必要がありました。セッション後半では App Store Connect API でビルドを自動トリガーし、Webhook でテスト結果をデプロイサービスに渡す方法を示し、コードプッシュから本番デプロイまでの完全自動化チェーンを実現します。
+
+---
+
+## 詳細
+
+### ワークフローの 4 要素
+
+各ワークフローは 4 部分で構成：Environment（環境変数と Xcode/macOS バージョン）、Start Conditions（ブランチ/PR/Tag イベント、スケジュール、手動トリガー）、Build Actions（ビルド、テスト、分析、アーカイブ）、Post Actions（Slack 通知、TestFlight 配信など）。
+
+### カスタムスクリプト（ci_scripts）
+
+カスタムスクリプトはプロジェクトルートの `ci_scripts` フォルダに配置し、ファイル名で実行タイミングが決まります。`ci_pre_xcodebuild.sh` は xcodebuild 実行前に走り、事前チェックに適しています。スクリプトでは `CI_XCODEBUILD_ACTION` や `CI_WORKFLOW_ID` などのワークフロー環境変数を使用できます（[10:02](https://developer.apple.com/videos/play/wwdc2024/10200/?time=602)）。
+
+```sh
+#!/bin/sh
+
+set -e
+
+if [[ $CI_XCODEBUILD_ACTION == "test-without-building" && $CI_WORKFLOW_ID == "82D89C93-B69C-46B5-A794-A2BCFD3EE487" ]]
+then
+    curl https://example.com/health --fail
+fi
+```
+
+キーポイント:
+
+- `set -e` でエラー時にスクリプトが即終了し、ワークフローも停止——サーバー到達不能時に望ましい動作
+- `$CI_XCODEBUILD_ACTION` は Xcode Cloud の環境変数。`test-without-building` は現在のアクションがテストであることを示す
+- `$CI_WORKFLOW_ID` で特定ワークフローにのみスクリプトを限定。Xcode の Cloud reports navigator でワークフローを右クリックし Copy Workflow ID で取得
+- `curl --fail` は 2xx 以外の HTTP ステータスで非ゼロ終了コードを返し、`set -e` をトリガー
+
+### App Store Connect API によるビルドトリガー
+
+App Store Connect API の `CiBuildRuns` エンドポイントでリモートからビルドを開始。3 回の API 呼び出しが必要：workflowID で repositoryID を取得、repositoryID で対象ブランチの gitReferenceID を取得、両方でビルドを作成（[14:01](https://developer.apple.com/videos/play/wwdc2024/10200/?time=841)）。
+
+```swift
+extension Client {
+    func repoID(workflowID: String) async throws -> String {
+        return try await ciWorkflowsGetInstance(
+            path: .init(id: workflowID),
+            query: .init(include: [.repository])
+        ).ok.body.json.data.relationships!.repository!.data!.id
+    }
+
+    func branchID(repoID: String, name: String) async throws -> String {
+        return try await scmRepositoriesGitReferencesGetToManyRelated(
+            path: .init(id: repoID)
+        )
+        .ok.body.json.data
+        .filter { $0.attributes!.kind == .BRANCH && $0.attributes!.name == name }
+        .first!.id
+    }
+
+    func startBuild(workflowID: String, gitReferenceID: String) async throws {
+        _ = try await ciBuildRunsCreateInstance(
+            body: .json(.init(
+                data: .init(
+                    _type: .ciBuildRuns,
+                    relationships: .init(
+                        workflow: .init(data: .init(
+                            _type: .ciWorkflows,
+                            id: workflowID
+                        )),
+                        sourceBranchOrTag: .init(data: .init(
+                            _type: .scmGitReferences,
+                            id: gitReferenceID
+                        ))
+                    )
+                )
+            ))
+        ).created
+    }
+}
+```
+
+キーポイント:
+
+- `ciWorkflowsGetInstance` でワークフロー詳細を取得。`include: [.repository]` で関連リポジトリを同梱し `repositoryID` を取得
+- `scmRepositoriesGitReferencesGetToManyRelated` で全 Git 参照を取得。`kind == .BRANCH` と `name` で対象ブランチをフィルタ
+- `ciBuildRunsCreateInstance` でビルド実行を作成。workflow と sourceBranchOrTag の 2 つの関連が必要
+- API は OpenAPI 仕様で定義。Swift OpenAPI Generator で型安全クライアントを生成可能
+
+メイン関数で 3 ステップを連結（[14:43](https://developer.apple.com/videos/play/wwdc2024/10200/?time=883)）：
+
+```swift
+static func main() async throws {
+    let client = try Client(
+        serverURL: Servers.server1(),
+        configuration: .init(dateTranscoder: .iso8601WithFractionalSeconds),
+        transport: URLSessionTransport(),
+        middlewares: [AuthMiddleware(token: ProcessInfo.processInfo.environment["TOKEN"]!)]
+    )
+
+    let workflowID = "82D89C93-B69C-46B5-A794-A2BCFD3EE487"
+    let repoID = try await client.repoID(workflowID: workflowID)
+
+    let branchName = "main"
+    let branchID = try await client.branchID(repoID: repoID, name: branchName)
+
+    try await client.startBuild(workflowID: workflowID, gitReferenceID: branchID)
+}
+```
+
+キーポイント:
+
+- `AuthMiddleware` で API Token を注入。Token は環境変数 `TOKEN` から読み取り、ハードコードを避ける
+- API 経由で起動したビルドは手動トリガーとみなされるため、ワークフローに該当 Git 参照に一致する手動トリガー条件が必要
+
+### Webhook によるビルド結果受信
+
+Webhook で外部サービスがビルドイベント発生時に通知を受け取れます。Xcode Cloud は設定した HTTP エンドポイントにビルド詳細を含む JSON を送信（[17:09](https://developer.apple.com/videos/play/wwdc2024/10200/?time=1029)）。
+
+```swift
+struct WebhookPayload: Content {
+    let ciWorkflow: CiWorkflow
+    let ciBuildRun: CiBuildRun
+
+    struct CiWorkflow: Content {
+        let id: String
+    }
+
+    struct CiBuildRun: Content {
+        let id: String
+        let executionProgress: String
+        let completionStatus: String
+    }
+}
+```
+
+キーポイント:
+
+- `executionProgress` はビルドが進行中か完了か（`RUNNING` または `COMPLETE`）
+- `completionStatus` は成功か失敗か（`SUCCEEDED` または `FAILED`）
+- `ciWorkflow.id` と対象ワークフロー ID を比較し、特定ワークフローのイベントのみに応答
+- App Store Connect の Settings > Webhooks でエンドポイント URL を設定
+
+完全なチェーン：サーバーコードをテスト環境にデプロイ後、API で統合テストワークフローをトリガー → テスト完了後 Webhook がデプロイサービスに通知 → 成功なら本番へ自動デプロイ、失敗ならデプロイをブロック。
+
+---
+
+## 重要ポイント
+
+1. **統合テスト用の独立ワークフローを構築**：外部サービスに依存するテストをメインワークフローから分離し、手動トリガー条件で実行タイミングを制御。**なぜ価値があるか**：毎回の push で遅く脆い統合テストを走らせず、ビルド時間を節約し、ネットワーク揺らぎによる誤検知を減らせる。**始め方**：既存ワークフローを複製、自動トリガー条件を削除して Manual Start に変更、Test Action を統合テストの Test Plan に切り替え。
+
+2. **カスタムエイリアスでツールチェーンバージョンを統一**：「Team Preference」のような Xcode と macOS エイリアスを定義し、全ワークフローが参照。**なぜ価値があるか**：Xcode バージョンアップは 1 箇所の変更で済み、更新漏れワークフローによる不整合ビルドを防げる。**始め方**：Xcode の Manage Custom Aliases でエイリアスを作成し、各ワークフローの Environment を更新。
+
+3. **ci_scripts で事前ヘルスチェック**：`ci_pre_xcodebuild.sh` で依存サービスのヘルスチェックエンドポイントを curl し、到達不能なら早期終了。**なぜ価値があるか**：サーバー停止中にフルテストを走らせるのはビルド時間の無駄。**始め方**：プロジェクトルートに `ci_scripts/ci_pre_xcodebuild.sh` を作成。`CI_WORKFLOW_ID` で特定ワークフローに限定。`set -e` と `curl --fail` を追加。
+
+4. **API + Webhook で上下游自動化を接続**：サーバーデプロイ後に App Store Connect API でクライアント統合テストをトリガー、Webhook で結果をデプロイサービスに返しリリース可否を判断。**なぜ価値があるか**：手動連携を排除し、クライアントとサーバーのリリースフローを自動で閉ループ。**始め方**：Swift OpenAPI Generator で API クライアントを生成、3 ステップスクリプト（repo → branch → ビルド開始）を作成、Vapor で Webhook リスナーを構築。
+
+---
+
+## 関連セッション
+
+- [Create practical workflows in Xcode Cloud](/articles/wwdc2024-10201) — 実際のシナリオで Xcode Cloud ワークフローを作成・設定する方法
+- [Customize your advanced Xcode Cloud workflows](/articles/wwdc2024-10203) — カスタムスクリプトと高度なワークフロー設定の詳細
+- [Meet Swift OpenAPI Generator](/articles/wwdc2024-10156) — OpenAPI 仕様から Swift コードを生成。セッションの API クライアント生成ツール
+- [Meet Xcode Cloud](/articles/wwdc2024-10234) — Xcode Cloud 入門：基本概念とクイックスタート

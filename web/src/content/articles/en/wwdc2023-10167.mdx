@@ -1,0 +1,394 @@
+---
+title: "Expand on Swift macros"
+description: "Discover how Swift macros can help you reduce boilerplate in your codebase and adopt complex features more easily. Learn how macros can analyze code, emit rich compiler errors to guide developers towards correct usage, and generate new code that is automatically incorporated back into your project. We'll also take you through important concepts like macro roles, compiler plugins, and syntax trees."
+date: "2023-06-06"
+tags: ["Swift", "Developer Tools"]
+thumbnail: "/images/sessions/2023/10167.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10167/"
+sessionId: "wwdc2023-10167"
+year: "2023"
+relatedSessions:
+  - title: "Write Swift macros"
+    code: "10166"
+    description: "Hands-on: write your first Swift macro"
+  - title: "Generalize APIs with parameter packs"
+    code: "10168"
+    description: "Advanced features of Swift generic programming"
+  - title: "Swift concurrency: Behind the scenes"
+    code: "10170"
+    description: "The underlying principles of Swift structured concurrency"
+---
+## Highlight
+
+> Swift macros constrain the capabilities of macros through the role system and provide independent macros (`#`) and subsidiary macros (`@`) There are seven roles in two categories, allowing developers to safely generate code during compilation while maintaining input type checking, predictable expansion, and debuggable results.
+
+## Core Content
+
+Swift already has many features for automatically generating code: Codable automatic synthesis`CodingKeys`and encoding and decoding methods, Result Builder expands declarative syntax into imperative code. However, these features are hard-coded in the compiler, and if you want to add similar capabilities, you must modify the compiler source code.
+
+Acer opens this capability to developers. You can create your own "language features" and distribute them as Swift Packages without forking the compiler.
+
+（[00:50](https://developer.apple.com/videos/play/wwdc2023/10167/?time=50)）
+
+### Four design principles
+
+Swift macros are designed with four core goals:
+
+**Explicit identification**. Standalone macro with`#`Beginning with`@`beginning. If you don't see these two symbols, you can be sure that no macro is involved. This gives code readers clear expectations.
+
+**Type safety**. The parameters passed into the macro must be complete expressions of the correct type.`#unwrap(1 + )`Syntax errors will be reported directly.`@AddCompletionHandler(parameterName: 42)`Report type does not match. The macro's input and output are fully type checked.
+
+**Predictable expansion**. Macros can only add code and cannot delete or modify existing code. You don't need to worry about a macro secretly deleting your function calls.
+
+**Transparently debuggable**. Xcode supports right-clicking to view macro expansion results, setting breakpoints in the expansion code, and single-step debugging. These tools still work even if the macro is from a closed source library.
+
+（[03:16](https://developer.apple.com/videos/play/wwdc2023/10167/?time=196)）
+
+### Independent macro
+
+Standalone macro use`#`Calling has two roles:
+
+**expression macro**(`@freestanding(expression)`) expands into an expression.`#stringify(a + b)`expand into`(a + b, "a + b")`, can be used anywhere an expression is required.
+
+**Declare Macro**(`@freestanding(declaration, names: arbitrary)`) expands into one or more statements. for example`#makeArrayND(n: 5)`can be expanded into`Array5D`Complete definition of the structure.
+
+（[04:51](https://developer.apple.com/videos/play/wwdc2023/10167/?time=291)）
+
+### Subsidiary macros
+
+Auxiliary macro`@`Marked on the statement, there are five roles:
+
+**peer**（`@attached(peer, names: overloaded)`) to add a new declaration next to the target declaration.`@AddCompletionHandler`can be`async`The function automatically generates an overloaded version with a completion handler.
+
+```swift
+@AddCompletionHandler(parameterName: "onCompletion")
+func fetchAvatar(_ username: String) async -> Image? {
+    // ...
+}
+
+// Automatically generated after macro expansion:
+func fetchAvatar(
+    _ username: String,
+    onCompletion: @escaping (Image?) -> Void
+) {
+    Task.detached {
+        onCompletion(await fetchAvatar(username))
+    }
+}
+```
+
+**accessor**（`@attached(accessor)`) to add getters/setters for stored properties.`@DictionaryStorage`The reading and writing of attributes can be automatically delegated to the dictionary.
+
+**memberAttribute**（`@attached(memberAttribute)`) to add properties to members of a type.`@DictionaryStorage`When annotated on a structure, each attribute will automatically be added`@DictionaryStorage`。
+
+**member**（`@attached(member, names: named(dictionary), named(init(dictionary:)))`) to add new members to the type.`@DictionaryStorage`will be automatically generated`dictionary`attributes and`init(dictionary:)`Constructor.
+
+**conformance**（`@attached(conformance)`) to add protocol compliance to the type.`@DictionaryStorage`will automatically let the structure follow`DictionaryRepresentable`protocol.
+
+A macro can have multiple roles at the same time.`@DictionaryStorage`It implements the four roles of accessor, memberAttribute, member and conformance at the same time, compressing dozens of lines of boilerplate code into a single line of annotation.
+
+（[11:23](https://developer.apple.com/videos/play/wwdc2023/10167/?time=683)）
+
+### Implementation mechanism
+
+The implementation of the macro is written in a separate compiler plug-in. For declaration`#externalMacro`Related to implementation:
+
+```swift
+@freestanding(expression)
+macro stringify<T>(_ expr: T) -> (T, String) = #externalMacro(
+    module: "MyLibMacros",
+    type: "StringifyMacro"
+)
+```
+
+The implementation requires importing SwiftSyntax, SwiftSyntaxMacros, and SwiftSyntaxBuilder:
+
+```swift
+import SwiftSyntax
+import SwiftSyntaxMacros
+import SwiftSyntaxBuilder
+
+struct DictionaryStorageMacro: MemberMacro {
+    static func expansion(
+        of attribute: AttributeSyntax,
+        providingMembersOf declaration: some DeclGroupSyntax,
+        in context: some MacroExpansionContext
+    ) throws -> [DeclSyntax] {
+        return [
+           "init(dictionary: [String: Any]) { self.dictionary = dictionary }",
+           "var dictionary: [String: Any]"
+        ]
+    }
+}
+```
+
+（[18:01](https://developer.apple.com/videos/play/wwdc2023/10167/?time=1081)）
+
+### Error reporting
+
+Macros can be passed`context.diagnose()`Report errors to the compiler:
+
+```swift
+struct DictionaryStorageMacro: MemberMacro {
+    static func expansion(
+        of attribute: AttributeSyntax,
+        providingMembersOf declaration: some DeclGroupSyntax,
+        in context: some MacroExpansionContext
+    ) throws -> [DeclSyntax] {
+        guard declaration.is(StructDeclSyntax.self) else {
+            let structError = Diagnostic(
+                node: attribute,
+                message: MyLibDiagnostic.notAStruct
+            )
+            context.diagnose(structError)
+            return []
+        }
+        return [
+            "init(dictionary: [String: Any]) { self.dictionary = dictionary }",
+            "var dictionary: [String: Any]"
+        ]
+    }
+}
+
+enum MyLibDiagnostic: String, DiagnosticMessage {
+    case notAStruct
+
+    var severity: DiagnosticSeverity { return .error }
+
+    var message: String {
+        switch self {
+        case .notAStruct:
+            return "'@DictionaryStorage' can only be applied to a 'struct'"
+        }
+    }
+
+    var diagnosticID: MessageID {
+        MessageID(domain: "MyLibMacros", id: rawValue)
+    }
+}
+```
+
+In this way, as a developer`@DictionaryStorage`When used on enumerations, Xcode will directly display an error message.
+
+（[25:17](https://developer.apple.com/videos/play/wwdc2023/10167/?time=1517)）
+
+### Naming declaration
+
+New declarations generated during macro expansion need to be included in the macro's`names:`Predicted in parameters. This helps the compiler understand the program structure before macro expansion:
+
+- `named(xxx)`— Generate a statement named xxx
+-`overloaded`— Generate an overload declaration with the same name as the target
+-`arbitrary`— Generate declarations of arbitrary names (requires explicit declaration)
+
+```swift
+@attached(conformance)
+@attached(member, names: named(dictionary), named(init(dictionary:)))
+@attached(memberAttribute)
+@attached(accessor)
+macro DictionaryStorage(key: String? = nil)
+
+@attached(peer, names: overloaded)
+macro AddCompletionHandler(parameterName: String = "completionHandler")
+
+@freestanding(declaration, names: arbitrary)
+macro makeArrayND(n: Int)
+```
+
+（[35:44](https://developer.apple.com/videos/play/wwdc2023/10167/?time=2144)）
+
+## Detailed Content
+
+### #unwrap macro implementation
+
+`#unwrap`is a practical expression macro that converts dangerous`!`Force unpacking and replace it with detailed error information`preconditionFailure`：
+
+```swift
+let image = #unwrap(downloadedImage, message: "was already checked")
+
+// After expansion:
+{ [downloadedImage] in
+    guard let downloadedImage else {
+        preconditionFailure(
+            "Unexpectedly found nil: 'downloadedImage' was already checked",
+            file: "main/ImageLoader.swift",
+            line: 42
+        )
+    }
+    return downloadedImage
+}()
+```
+
+Several details need to be dealt with during implementation:
+
+1. The capture variable name may conflict with the external scope, so you need to use`context.makeUniqueName()`Generate unique name
+2. The error message should include a description of the original expression, using`originalWrapped.description`3. File and line number passed`context.location(of:)`get
+
+```swift
+static func makeGuardStmt(
+    wrapped: TokenSyntax,
+    originalWrapped: ExprSyntax,
+    message: ExprSyntax,
+    in context: some MacroExpansionContext
+) -> StmtSyntax {
+    let messagePrefix = "Unexpectedly found nil: '\(originalWrapped.description)' "
+    let originalLoc = context.location(of: originalWrapped)!
+
+    return """
+        guard let \(wrapped) else {
+            preconditionFailure(
+                \(literal: messagePrefix) + \(message),
+                file: \(originalLoc.file),
+                line: \(originalLoc.line)
+            )
+        }
+    """
+}
+```
+
+Key points:
+- `\(literal: messagePrefix)`Insert strings as literals to avoid escaping problems
+-`context.location(of:)`Returns the source code location of the original expression
+-`context.makeUniqueName()`Generate unique identifiers that will not conflict with external variables
+
+（[30:17](https://developer.apple.com/videos/play/wwdc2023/10167/?time=1817)）
+
+### The complete evolution of @DictionaryStorage
+
+`@DictionaryStorage`Shows how to combine multiple roles to gradually simplify your code.
+
+Original code:
+
+```swift
+struct Person: DictionaryRepresentable {
+    init(dictionary: [String: Any]) { self.dictionary = dictionary }
+    var dictionary: [String: Any]
+
+    var name: String {
+        get { dictionary["name"]! as! String }
+        set { dictionary["name"] = newValue }
+    }
+    var height: Measurement<UnitLength> {
+        get { dictionary["height"]! as! Measurement<UnitLength> }
+        set { dictionary["height"] = newValue }
+    }
+    var birthDate: Date? {
+        get { dictionary["birth_date"] as! Date? }
+        set { dictionary["birth_date"] = newValue as Any? }
+    }
+}
+```
+
+Step 1: Add getters/setters for each property using the accessor role:
+
+```swift
+struct Person: DictionaryRepresentable {
+    init(dictionary: [String: Any]) { self.dictionary = dictionary }
+    var dictionary: [String: Any]
+
+    @DictionaryStorage var name: String
+    @DictionaryStorage var height: Measurement<UnitLength>
+    @DictionaryStorage(key: "birth_date") var birthDate: Date?
+}
+```
+
+Step 2: Add the memberAttribute role so that the`@DictionaryStorage`Automatically added for each property`@DictionaryStorage`：
+
+```swift
+@DictionaryStorage
+struct Person: DictionaryRepresentable {
+    init(dictionary: [String: Any]) { self.dictionary = dictionary }
+    var dictionary: [String: Any]
+
+    var name: String
+    var height: Measurement<UnitLength>
+    @DictionaryStorage(key: "birth_date") var birthDate: Date?
+}
+```
+
+Step 3: Add the member role and automatically generate it`init(dictionary:)`and`dictionary`property:
+
+```swift
+@DictionaryStorage
+struct Person {
+    var name: String
+    var height: Measurement<UnitLength>
+    @DictionaryStorage(key: "birth_date") var birthDate: Date?
+}
+```
+
+Step 4: Add conformance role to automatically follow`DictionaryRepresentable`：
+
+```swift
+@DictionaryStorage
+struct Person {
+    var name: String
+    var height: Measurement<UnitLength>
+    @DictionaryStorage(key: "birth_date") var birthDate: Date?
+}
+```
+
+The original boilerplate code of more than 20 lines was finally compressed into 5 lines.
+
+（[17:28](https://developer.apple.com/videos/play/wwdc2023/10167/?time=1048)）
+
+### Test macro
+
+SwiftSyntaxMacrosTestSupport provides`assertMacroExpansion`：
+
+```swift
+import MyLibMacros
+import XCTest
+import SwiftSyntaxMacrosTestSupport
+
+final class MyLibTests: XCTestCase {
+    func testMacro() {
+        assertMacroExpansion(
+            """
+            @DictionaryStorage var name: String
+            """,
+            expandedSource: """
+            var name: String {
+                get { dictionary["name"]! as! String }
+                set { dictionary["name"] = newValue }
+            }
+            """,
+            macros: ["DictionaryStorage": DictionaryStorageMacro.self]
+        )
+    }
+}
+```
+
+（[38:28](https://developer.apple.com/videos/play/wwdc2023/10167/?time=2308)）
+
+## Core Takeaways
+
+**Automatically generate callback versions for asynchronous functions**
+
+`@AddCompletionHandler`The idea can be expanded. Many projects need to be maintained at the same time`async`version and callback version. Write a macro to automatically start from`async`The function generates a completion handler version, which can eliminate a lot of duplicate code.
+
+Entrance:`@attached(peer, names: overloaded)`. Read the parameters and return type of the function, generate a new function that calls the original function and awaits the result in the Task.
+
+**Automatically generate custom implementations of Equatable/Hashable**
+
+Swift automatically synthesizes`Equatable`Sometimes it's not enough. You can write one`@CustomEquatable`Macro, which determines which fields participate in comparison and how to compare based on attribute tags.
+
+Entrance:`@attached(member)` + `MemberMacro`. Traverse the attributes and mark them`@CompareBy`The attributes generate corresponding comparison logic.
+
+**Generate preview code for SwiftUI**
+
+write a`@PreviewVariants`Macros, marked on the View, automatically generate multiple preview variations (different sizes, different color modes, different dynamic fonts).
+
+Entrance:`@attached(member)`. Read the View type and generate multiple`PreviewProvider`accomplish.
+
+**Automatically generate Builder mode code**
+
+Many classes require the Builder pattern to construct complex objects. write a`@Builder`Macros automatically generate corresponding Builder classes and chained calling methods for classes.
+
+Entrance:`@attached(peer)`. Read all attributes of the class and generate a Builder class with the same name, each attribute corresponds to a`withXxx()`method and a`build()`method.
+
+## Related Sessions
+
+- [Write Swift macros](/articles/wwdc2023-10166) — Write your first Swift macro
+- [Generalize APIs with parameter packs](/articles/wwdc2023-10168) — Advanced features of generic programming in Swift
+- [Swift concurrency: Behind the scenes](/articles/wwdc2023-10170) — The underlying principles of Swift structured concurrency
+- [Meet Swift OpenAPI Generator](/articles/wwdc2023-10171) — Use code generation to simplify server-side API calls

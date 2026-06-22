@@ -1,0 +1,220 @@
+---
+title: "Deliver reliable streams with HLS Content Steering"
+description: "HLS Content Steering dynamically guides clients to choose the best CDN path, Pathway Cloning lets you introduce new CDNs without resending the master playlist, and bucket-based rules enable stateless global traffic scheduling."
+date: 2026-06-10
+tags: ["Audio & Video"]
+thumbnail: "/images/sessions/2022/10144.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10144/"
+sessionId: "wwdc2022-10144"
+year: "2022"
+relatedSessions:
+  - title: "Create a great video playback experience"
+    code: "10147"
+    description: "Create an excellent video playback experience, covering best practices in player UI design, picture-in-picture, system player integration, etc."
+  - title: "Explore media metadata publishing and playback interactions"
+    code: "110338"
+    description: "Dive into media metadata publishing and playback interactions and learn about the latest capabilities of NowPlaying and MPNowPlayingInfoCenter."
+  - title: "Display EDR content with Core Image, Metal, and SwiftUI"
+    code: "10114"
+    description: "Unleash the full color and brightness range of modern displays by displaying EDR content with Core Image, Metal, and SwiftUI."
+  - title: "Improve DNS security for apps and servers"
+    code: "10079"
+    description: "Improve DNS security for apps and servers, covering DNSSEC, DNS-over-HTTPS, and service discovery best practices."
+  - title: "Create a more responsive media app"
+    code: "110379"
+    description: "Use AVFoundation to build smooth media apps, reduce playback interruptions and delays, and improve user immersion."
+---
+## Highlight
+
+> HLS Content Steering will add Pathway Cloning capability in 2022 - Steering Server can dynamically announce new CDNs to existing clients without re-issuing the main playlist; with bucket-based stateless rules, 12 uniform random buckets can be used to achieve precise global traffic scheduling, allowing streaming media operation and maintenance to evolve from "changing the playlist and restarting the push" to "changing the JSON rules to take effect in real time".
+
+---
+
+## Core Content
+
+There’s an old problem with streaming media distribution: What do you do when your CDN goes down? The traditional approach is to change the main playlist (multivariant playlist), delete the problematic CDN line, add a spare one, and then wait for the next client request to take effect. This process is slow, requires client reloading, and cannot do fine-grained traffic scheduling - such as "directing 30% of US users to the new CDN for grayscale verification." ([02:15](https://developer.apple.com/videos/play/wwdc2022/10144/?time=135))
+
+HLS Content Steering solves this problem. Its core idea is to abstract CDN into Pathways - each Pathway corresponds to a set of variant flows with the same structure and the same content. The client does not need to care about the physical address of the CDN. It only needs to get the Pathway priority list from the Steering Server and try them in order. ([04:30](https://developer.apple.com/videos/play/wwdc2022/10144/?time=270))
+
+Zheng Naiwei talked about two things in this session: one is how the Content Steering infrastructure introduced in 2021 works, and the other is the two new capabilities in 2022-Pathway Cloning and bucket-based rules. The former solves "how to add a new CDN without changing the main playlist", and the latter solves "how to use a stateless method for global traffic scheduling". ([06:00](https://developer.apple.com/videos/play/wwdc2022/10144/?time=360))
+
+Pathway Cloning is cleverly designed. When a CDN is dynamically created (for example, an edge node in a certain region has just come online), all clients that have already obtained the old playlist do not know its existence. The traditional approach is to wait for the new CDN to be added the next time the client requests the main playlist - but this means that all existing users will have to go through a reload. Pathway Cloning allows Steering Server to declare cloning rules in the Steering Manifest: based on an existing Pathway (BASE-ID), modify the HOST and parameters to generate a new Pathway (ID). After receiving it, the client completes the URI replacement and seamlessly switches to the new CDN. ([12:30](https://developer.apple.com/videos/play/wwdc2022/10144/?time=750))
+
+Bucket-based rules are another important point. Steering Server needs to decide "which clients go to which CDN", but it cannot maintain the state of each client - that is not scalable. The method is to embed a random integer from 1 to 12 as the bucket number in the RELOAD-URI. Each client is randomly assigned a bucket on its first request, and all subsequent Steering Manifest requests carry this number. The server only needs to return different Pathway priority lists based on bucket numbers to achieve any proportion of traffic distribution. 50/50 means 1-6 goes to CDN1, 7-12 goes to CDN2; 10/30/60 means 1 goes to CDN1, 2-4 goes to CDN2, 5-12 goes to CDN3. Completely stateless and horizontally scalable. ([18:00](https://developer.apple.com/videos/play/wwdc2022/10144/?time=1080))
+
+---
+
+## Detailed Content
+
+### Content Steering Infrastructure Review
+
+([03:00](https://developer.apple.com/videos/play/wwdc2022/10144/?time=180)) Content Steering has only three core concepts: Pathway, Steering Server, and Steering Manifest.
+
+**Pathway** is a logical grouping of a set of variant flows with the same structure, usually corresponding to a CDN. Used in main playlist`PATHWAY-ID`Mark which Pathway each variant flow belongs to:
+
+```m3u8
+#EXT-X-CONTENT-STEERING: SERVER-URI="/steering", PATHWAY-ID="CDN1"
+#EXT-X-STREAM-INF: PATHWAY-ID="CDN1", BANDWIDTH=6000000
+https://cdn1.example.com/high.m3u8
+#EXT-X-STREAM-INF: PATHWAY-ID="CDN1", BANDWIDTH=3000000
+https://cdn1.example.com/low.m3u8
+#EXT-X-STREAM-INF: PATHWAY-ID="CDN2", BANDWIDTH=6000000
+https://cdn2.example.com/high.m3u8
+#EXT-X-STREAM-INF: PATHWAY-ID="CDN2", BANDWIDTH=3000000
+https://cdn2.example.com/low.m3u8
+```
+
+`SERVER-URI`Address pointing to the Steering Server that clients periodically (default every 300 seconds or based on`RELOAD-URI`parameters in ) to request the Steering Manifest from this address.
+
+**Steering Manifest** is a JSON document returned by Server. The structure is very simple:
+
+```json
+{
+  "VERSION": 1,
+  "TTL": 300,
+  "RELOAD-URI": "https://steering.example.com/api/v1/steering?bucket=3",
+  "PATHWAY-PRIORITY": ["CDN1", "CDN2"]
+}
+```
+
+Client press`PATHWAY-PRIORITY`Connection attempts are made in the order: CDN1 is tried first, automatically downgrading to CDN2 when CDN1 is unavailable. The entire process is transparent to the player layer - AVPlayer will not interrupt playback when switching Pathways because the variant stream content of different Pathways is exactly the same. ([07:45](https://developer.apple.com/videos/play/wwdc2022/10144/?time=465))
+
+### Pathway Cloning: Dynamically introducing new CDNs
+
+([11:00](https://developer.apple.com/videos/play/wwdc2022/10144/?time=660)) The premise of Pathway Cloning is that the structure of the old and new Pathways is exactly the same (the same number of variant streams, the same codec and resolution combination), but the URI is different. Under this premise, the server only needs to tell the client "modify the URI of CDN1 according to the following rules to get the URI of CDN3."
+
+Clone declaration in Steering Manifest:
+
+```json
+{
+  "VERSION": 1,
+  "PATHWAY-PRIORITY": ["CDN3", "CDN1", "CDN2"],
+  "PATHWAY-CLONES": [
+    {
+      "BASE-ID": "CDN1",
+      "ID": "CDN3",
+      "URI-REPLACEMENT": {
+        "HOST": "cdn3.example.com",
+        "PARAMS": { "token": "abc123" }
+      }
+    }
+  ]
+}
+```
+
+`BASE-ID`is a Pathway known to the client,`ID`is the name of the new Pathway,`URI-REPLACEMENT`Replacement rules are defined. The client replaces the HOST of all variant streams of CDN1 with`cdn3.example.com`, plus`?token=abc123`parameters, you will get the complete URI set of CDN3. ([14:20](https://developer.apple.com/videos/play/wwdc2022/10144/?time=860))
+
+For finer control you can use`PER-VARIANT-URIS`and`PER-RENDITION-URIS`. The former points to a different server for a specific variant stream (such as a 4K DV stream), the latter for a specific rendition (such as an English AC-3 audio track):
+
+```json
+{
+  "BASE-ID": "CDN1",
+  "ID": "CDN3",
+  "URI-REPLACEMENT": {
+    "HOST": "cdn3.example.com",
+    "PER-VARIANT-URIS": {
+      "video-4k-dv": "https://faster.example.com/4k.m3u8"
+    },
+    "PER-RENDITION-URIS": {
+      "audio-en-ac3": "https://faster.example.com/ac3.m3u8"
+    }
+  }
+}
+```
+
+Used here`STABLE-VARIANT-ID`and`STABLE-RENDITION-ID`- Assign a stable identifier to each variation stream and rendition in the main playlist, and Steering Server uses this ID to locate the specific URI. ([16:10](https://developer.apple.com/videos/play/wwdc2022/10144/?time=970))
+
+### Bucket-Based global traffic scheduling
+
+([17:30](https://developer.apple.com/videos/play/wwdc2022/10144/?time=1050)) The core design goal of the Bucket mechanism is: the server side is completely stateless, and all scheduling decisions are based only on bucket numbers.
+
+Workflow:
+1. The client requests Steering Manifest for the first time, and the Server`RELOAD-URI`Embed a random bucket number (1-12) in
+2. Subsequent requests from the client will carry this bucket number.
+3. Server looks up the table according to the bucket number and returns the corresponding Pathway priority.
+
+Implementation example:
+
+```python
+# Steering Server pseudocode
+BUCKET_MAP = {
+    # 50/50 traffic split
+    "cdn_split_50_50": {
+        range(1, 7):  ["CDN1", "CDN2"],   # buckets 1-6 prefer CDN1
+        range(7, 13): ["CDN2", "CDN1"],   # buckets 7-12 prefer CDN2
+    },
+    # 10/30/60 three-way split
+    "cdn_split_10_30_60": {
+        range(1, 3):  ["CDN1", "CDN2", "CDN3"],   # buckets 1-2: about 17%
+        range(3, 6):  ["CDN2", "CDN3", "CDN1"],   # buckets 3-5: about 25%
+        range(6, 13): ["CDN3", "CDN1", "CDN2"],   # buckets 6-12: about 58%
+    }
+}
+
+def handle_steering_request(bucket, known_pathways):
+    rules = get_current_rules()
+    priority = rules.lookup(bucket)
+
+    # Determine which Pathways need to be cloned
+    clones = compute_clones(known_pathways, priority)
+
+    return {
+        "PATHWAY-PRIORITY": priority,
+        "PATHWAY-CLONES": clones
+    }
+```
+
+The granularity of 12 buckets is sufficient for most scenarios. If you need more granular control (such as 1% grayscale), you can combine client attributes (geographic location, device type) to make additional judgments on the server side, but the bucket itself remains unchanged. ([20:30](https://developer.apple.com/videos/play/wwdc2022/10144/?time=1230))
+
+### Decision logic of Steering Server
+
+([22:00](https://developer.apple.com/videos/play/wwdc2022/10144/?time=1320)) Server needs to answer two questions when generating Steering Manifest:
+
+1. **Which Pathway should the client of this bucket take first? **——Check the bucket mapping table.
+2. **Which Pathways need to be cloned? ** - The client will bring a list of Pathways it knows (via`SERVER-URI`Query parameters), the Server subtracts all currently available Pathways from those known to the client, and the difference is what needs to be cloned.
+
+```python
+def compute_clones(known_pathways, desired_priority):
+    needed = set(desired_priority)
+    known = set(known_pathways)
+    to_clone = needed - known
+
+    clones = []
+    for pathway_id in to_clone:
+        # Choose BASE-ID: find a Pathway with the same structure in known
+        base = find_matching_base(pathway_id, known)
+        clones.append({
+            "BASE-ID": base,
+            "ID": pathway_id,
+            "URI-REPLACEMENT": get_replacement_rules(base, pathway_id)
+        })
+    return clones
+```
+
+The advantage of this design is that the server never needs to know the specific contents of the client's playlist - it only operates on the set operation of the Pathway ID, and the URI replacement rules are preconfigured. ([24:00](https://developer.apple.com/videos/play/wwdc2022/10144/?time=1440))
+
+---
+
+## Core Takeaways
+
+- **What to do**: Introduce Content Steering to your HLS streaming service, replacing hard-coded CDN addresses with Pathway abstractions.  
+  **Why it’s worth it**: In the event of a CDN failure, Steering Server can switch traffic paths for all clients in real time, without the need to modify the master playlist or wait for clients to reload. For live and on-demand services with SLA requirements, this is an architectural-level reliability improvement.  
+  **How ​​to start**: Add to main playlist`#EXT-X-CONTENT-STEERING`tag, deploy an HTTP endpoint that returns the Steering Manifest, first use the static`PATHWAY-PRIORITY`Verify that the client can switch Pathways correctly, and then gradually introduce dynamic rules.
+
+- **What to do**: Use Pathway Cloning to implement dynamic online and offline CDN, especially the rapid deployment of edge nodes.  
+  **Why it’s worth doing**: Adding a CDN in the traditional way requires modifying the main playlist, waiting for the CDN cache to be refreshed, and waiting for all clients to re-request - the entire process may take dozens of minutes. Pathway Cloning shortens this step to a single response from the Steering Manifest, and the client can sense the new CDN in the next reload cycle.  
+  **How ​​to start**: Ensure that the variant stream structure on the old and new CDN is exactly the same (same codec, resolution, bitrate combination), configure the URI-REPLACEMENT rule for the new CDN in Steering Server, pass`PATHWAY-CLONES`Field delivery.
+
+- **What to do**: Use bucket-based rules to replace stateful traffic scheduling and make Steering Server a pure function.  
+  **Why it’s worth doing**: Stateful scheduling requires storing and synchronizing the state of each client, which brings consistency and scalability issues. The Bucket mechanism encodes the status in the URL, and the server can be scaled horizontally without the need for shared storage. 12 buckets provide about 8.3% scheduling granularity, which is sufficient for most scenarios.  
+  **How ​​to get started**: In the Steering Manifest`RELOAD-URI`A random bucket number (1-12) is embedded in the bucket. The server maintains a mapping table from bucket to Pathway priority, and configures mapping rules according to business requirements (gray scale, regional distribution, CDN capacity).
+
+---
+
+## Related Sessions
+
+- [Create a great video playback experience](/articles/wwdc2022-10147) — Create a great video playback experience, covering best practices in player UI design, picture-in-picture, system player integration, etc.
+- [Explore media metadata publishing and playback interactions](/articles/wwdc2022-110338) — Explore media metadata publishing and playback interactions to learn about the latest capabilities of NowPlaying and MPNowPlayingInfoCenter.
+- [Display EDR content with Core Image, Metal, and SwiftUI](/articles/wwdc2022-10114) — Display EDR content with Core Image, Metal, and SwiftUI to unleash the full color and brightness range of modern displays.
+- [Improve DNS security for apps and servers](/articles/wwdc2022-10079) — Improve DNS security for apps and servers, covering DNSSEC, DNS-over-HTTPS, and service discovery best practices.
+- [Create a more responsive media app](/articles/wwdc2022-110379) — Use AVFoundation to build a smooth media app, reduce playback interruptions and delays, and improve user immersion.

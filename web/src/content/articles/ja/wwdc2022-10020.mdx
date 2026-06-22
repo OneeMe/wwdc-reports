@@ -1,0 +1,257 @@
+---
+title: "Compose advanced models with Create ML Components"
+description: "take your custom machine learning models to the next level with create ml components. we'll show you how to work with temporal data like video or audio and compose models that can count repetitive human actions or provide advanced sound classification. we'll also share best practices on using incremental fitting to speed up model training with new data."
+date: 2026-06-10
+tags: ["WWDC 2022", "Create ML", "Machine Learning"]
+thumbnail: "/images/sessions/2022/10020.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10020/"
+sessionId: "wwdc2022-10020"
+year: "2022"
+relatedSessions:
+  - title: "Get to know Create ML Components"
+    code: "10019"
+    description: "Learn the Transformer and Estimator building blocks behind custom Create ML tasks."
+  - title: "Explore the machine learning development experience"
+    code: "10017"
+    description: "Walk through model discovery, conversion, evaluation, integration, and performance tuning."
+  - title: "Optimize your Core ML usage"
+    code: "10027"
+    description: "Understand Core ML performance on CPU, GPU, and Neural Engine for on-device ML."
+  - title: "Meet AsyncSequence"
+    code: "10058"
+    description: "Use Swift AsyncSequence to iterate over values that arrive over time."
+---
+
+## ハイライト
+
+> これは Create ML Components の上級 Session です。基礎（Transformer、Estimator の概念）は「Get to know Create ML Components」で紹介されています。本場は 2 つの上級テーマ、時系列データ処理と増分学習に焦点を当てます。
+
+---
+
+## 主要内容
+
+動作分類では、モデルは動画クリップ内で jumping jack をしていると教えてくれます。実際のフィットネス App は別の質問にも答える必要があります。何回行ったかです。1 回の jumping jack は連続フレームにまたがり、単一フレームでは完全な答えは得られません。
+
+Create ML Components はここで temporal transformer（時系列変換器）を導入します。`AsyncSequence` を受け取り、新しい `AsyncSequence` を出力します。動画フレーム、カメラフレーム、オーディオ buffer は時間とともに流れ、ウィンドウ化、ダウンサンプリング、モデル投入ができます。
+
+Session の第 1 の例は動作繰り返しカウンターです。動画またはカメラフレームから始め、人体姿勢を抽出し、1 人を選び、姿勢をウィンドウに分け、動作回数を累積します。カウントは浮動小数点です。モデルは未完了の一部動作も含めるためです。
+
+第 2 の例は音声分類器の学習です。従来の再学習は毎回すべての音声特徴を再抽出します。Create ML Components では feature extractor と classifier を分離し、前処理済み特徴をキャッシュできます。新データが来たら新規分だけ処理し、分類器パラメータ調整時も古い特徴を再利用できます。
+
+## 詳細
+
+### AsyncSequence で動画と音声を表現する
+
+（[01:55](https://developer.apple.com/videos/play/wwdc2022/10020/?time=115)）発表者はまず問題を分解します。動画は時間とともに到着するフレームの列であり、Swift の `AsyncSequence` がこの入力にぴったりです。フレーム単位処理は `map` を使います。複数フレームを一度に扱うときは temporal transformer を使います。
+
+概念コード（トランスクリプトのコンポーネント名から整理。実際の初期化パラメータは省略）：
+
+```swift
+let frames = videoReader.read(videoURL)
+
+let transformedFrames = frames.map { frame in
+    preprocess(frame)
+}
+
+let windows = SlidingWindowTransformer(
+    length: 90,
+    stride: 90
+).applied(to: transformedFrames)
+```
+
+キーポイント:
+
+- `videoReader.read(videoURL)` は動画を時間順フレーム列として読み込みます。トランスクリプトでは video reader が frames の async sequence を返すと明記されています。
+- `map` は非同期にフレーム単位で変換し、1 フレームずつ処理する場面に適しています。
+- `SlidingWindowTransformer` は時系列コンポーネントで、入力は async sequence、出力は window 化された async sequence です。
+- `length: 90` は各ウィンドウに 90 フレームまたは 90 姿勢を含みます。
+- `stride: 90` はウィンドウが重ならないことを意味します。後のライブカメラ例では stride を小さくします。
+
+### 動作繰り返しカウンターを組み立てる
+
+（[03:42](https://developer.apple.com/videos/play/wwdc2022/10020/?time=222)）動作カウントパイプラインは 4 段階です。`HumanBodyPoseExtractor`、`PoseSelector`、`SlidingWindowTransformer`、`HumanBodyActionCounter`。
+
+概念コード（コンポーネント名はトランスクリプト由来。呼び出し形式は組み立て順を示す）：
+
+```swift
+let poseExtractor = HumanBodyPoseExtractor()
+let poseSelector = PoseSelector(strategy: .rightMostJointLocation)
+let slidingWindow = SlidingWindowTransformer(length: 90, stride: 90)
+let actionCounter = HumanBodyActionCounter()
+
+let repetitionCounter = poseExtractor
+    .appending(poseSelector)
+    .appending(slidingWindow)
+    .appending(actionCounter)
+```
+
+キーポイント:
+
+- `HumanBodyPoseExtractor` の入力は image、出力は人体姿勢の配列です。トランスクリプトでは Vision framework を使うと述べられています。
+- 出力は配列です。1 枚に複数人が写ることがあり、グループ学習シーンでよくあります。
+- `PoseSelector(strategy: .rightMostJointLocation)` は配列から 1 姿勢を選びます。例では right-most joint location 戦略を使います。
+- `SlidingWindowTransformer(length: 90, stride: 90)` は連続姿勢を 90 個ずつのウィンドウに分けます。
+- `HumanBodyActionCounter` はウィンドウ化された姿勢列を消費し、これまでの累積繰り返し回数を出力します。
+
+### オフライン動画をライブカメラに切り替える
+
+（[05:38](https://developer.apple.com/videos/play/wwdc2022/10020/?time=338)）オフライン動画は 90 フレームごとにカウントを更新できます。ライブフィットネス App はそれを待てません。Session の変更は小さく、入力を `readCamera` に替え、stride を 90 から 15 に下げます。
+
+概念コード（トランスクリプトの `readCamera` と stride パラメータから整理）：
+
+```swift
+let cameraFrames = readCamera(configuration)
+
+let liveWindow = SlidingWindowTransformer(
+    length: 90,
+    stride: 15
+)
+
+let liveCounter = poseExtractor
+    .appending(poseSelector)
+    .appending(liveWindow)
+    .appending(actionCounter)
+```
+
+キーポイント:
+
+- `readCamera(configuration)` はカメラフレームを読み込みます。トランスクリプトでは camera configuration を受け取り camera frames の async sequence を返すと説明されています。
+- `length: 90` は 90 フレームウィンドウを維持し、カウンターが完全な動作片を見られるようにします。
+- `stride: 15` はウィンドウを 15 フレームごとにスライドします。
+- カメラが 30fps なら 15 フレームは 0.5 秒で、カウントは 0.5 秒ごとに更新されます。
+- stride が大きすぎるとフィードバックが遅くなります。小さくすると計算頻度が上がるため、App の目標に応じて取舍します。
+
+### 音声分類器の特徴抽出と学習を分離する
+
+（[06:30](https://developer.apple.com/videos/play/wwdc2022/10020/?time=390)）Create ML の `MLSoundClassifier` は音声分類器学習の最も簡単な入口のままです。より細かい制御が必要なら、底层コンポーネントに分解できます。`AudioFeaturePrint` feature extractor と classifier です。
+
+（[08:04](https://developer.apple.com/videos/play/wwdc2022/10020/?time=484)）重要な手順はまず `preprocess` を呼ぶことです。入力を estimator 手前まで transformer で処理し、前処理済み features で学習します。
+
+概念コード（トランスクリプトの `AudioFeaturePrint`、logistic regression classifier、`preprocess` を示す）：
+
+```swift
+let featureExtractor = AudioFeaturePrint()
+let classifier = LogisticRegressionClassifier()
+
+let soundClassifier = featureExtractor.appending(classifier)
+
+let features = try await soundClassifier.preprocess(trainingData)
+let model = try await soundClassifier.fitted(to: features)
+```
+
+キーポイント:
+
+- `AudioFeaturePrint` は temporal transformer で、audio buffers の async sequence から音声特徴を抽出します。
+- `LogisticRegressionClassifier` は例で選ばれた分類器です。
+- `featureExtractor.appending(classifier)` は特徴抽出と分類器を音声分類タスクにまとめます。
+- `preprocess(trainingData)` は学習データを features に処理し、後で再利用できます。
+- `fitted(to: features)` はすでに抽出済みの特徴で学習し、再学習のたびに特徴抽出を繰り返しません。
+
+### 新データとハイパーパラメータ調整で古い特徴を再利用する
+
+（[08:38](https://developer.apple.com/videos/play/wwdc2022/10020/?time=518)）新しい学習データが来たら、新規データだけ特徴抽出し、supplemental features を古い features の後に追加します。分類器パラメータ調整時も古い features を再利用できます。
+
+概念コード（データフローを強調。完全 API ではない）：
+
+```swift
+let originalFeatures = try await soundClassifier.preprocess(originalData)
+let supplementalFeatures = try await soundClassifier.preprocess(newData)
+
+let allFeatures = originalFeatures + supplementalFeatures
+
+let tunedClassifier = LogisticRegressionClassifier(l2Penalty: newPenalty)
+let tunedSoundClassifier = featureExtractor.appending(tunedClassifier)
+let tunedModel = try await tunedSoundClassifier.fitted(to: allFeatures)
+```
+
+キーポイント:
+
+- `originalFeatures` は古いデータの前処理結果で、すでにキャッシュされています。
+- `supplementalFeatures` は新規データのみから来て、古いデータの再特徴抽出時間を節約します。
+- `allFeatures` は古い features と新規 features をマージして学習します。
+- `l2Penalty` はトランスクリプトで言及された分類器パラメータです。
+- 調整時に feature extractor を変えてはいけません。発表者は変更すると古い features が無効になると警告します。
+
+### バッチ増分学習、早期停止、checkpoint
+
+（[09:43](https://developer.apple.com/videos/play/wwdc2022/10020/?time=583)）大規模データセットはメモリに入らないことがあります。Session では logistic regression classifier を updatable classifier（例：fully connected neural network classifier）に替え、バッチごとにモデルを更新します。
+
+（[10:53](https://developer.apple.com/videos/play/wwdc2022/10020/?time=653)）発表者は Swift Algorithms package も導入し、`chunks` で features をバッチ化します。
+
+概念コード（トランスクリプトの default model、`chunks`、`update`、`mapFeatures`、checkpoint を示す）：
+
+```swift
+var model = classifier.defaultModel()
+let features = try await soundClassifier.preprocess(trainingData)
+
+for iteration in 0..<maxIterations {
+    for batch in features.chunks(ofCount: batchSize) {
+        model = try await classifier.update(model, with: batch)
+    }
+
+    let validationPredictions = try await model.mapFeatures(validationFeatures)
+    let accuracy = Metrics.classificationAccuracy(
+        validationPredictions,
+        validationAnnotations
+    )
+
+    if accuracy >= 0.95 {
+        break
+    }
+
+    if iteration.isMultiple(of: checkpointInterval) {
+        try model.write(to: checkpointURL)
+    }
+}
+
+try model.write(to: finalModelURL)
+```
+
+キーポイント:
+
+- `defaultModel()` はトランスクリプトの default initialized model に対応し、学習の出発点で、まだ有効な予測には使えません。
+- `preprocess(trainingData)` は学習ループの前に置き、各 iteration で特徴を再抽出しないようにします。
+- `features.chunks(ofCount: batchSize)` は Swift Algorithms のグループ化で、一度にメモリへ載せる学習データ量を制御します。
+- `classifier.update(model, with: batch)` は増分学習の核心で、各バッチごとにモデルを更新します。
+- `mapFeatures(validationFeatures)` は検証セットの予測を生成し、annotations とペアで評価します。
+- `accuracy >= 0.95` は早期停止の例で、精度 95% で学習を止めます。
+- `model.write(to: checkpointURL)` をループ内に置き、学習進捗を保存します。長時間学習は checkpoint から再開できます。
+
+## 重要ポイント
+
+### 1. フィットネス動作カウンター
+
+- **やること**：カメラで jumping jack、squat、lunge の回数を数える。
+- **価値がある理由**：Session はすでに姿勢抽出、姿勢選択、スライディングウィンドウ、動作カウントの 4 コンポーネントを示しており、リアルタイムフィードバックに適しています。
+- **始め方**：`readCamera` でフレーム列を取得し、stride を 15 前後に設定し、まず単人画面でカウント遅延と精度を検証する。
+
+### 2. トレーニング動画再生分析ツール
+
+- **やること**：トレーニング動画をインポートし、ウィンドウごとに動作回数を自動集計し、動作変化の時間帯をマークする。
+- **価値がある理由**：オフライン動画は 90 フレーム、stride 90 の非重複ウィンドウを使え、リアルタイムより計算負荷が低いです。
+- **始め方**：video reader でフレームを読み、`HumanBodyPoseExtractor`、`PoseSelector`、`SlidingWindowTransformer`、`HumanBodyActionCounter` を接続する。
+
+### 3. 継続更新可能な音声分類器
+
+- **やること**：環境音、デバイス音、アラート音の分類器を学習し、新しい録音を継続的に追加する。
+- **価値がある理由**：`preprocess` により古い音声特徴を再利用でき、新データは supplemental features だけ追加します。
+- **始め方**：まず `AudioFeaturePrint` で features を抽出してキャッシュし、分類器を学習する。新データが来たら新規サンプルの特徴抽出だけ実行する。
+
+### 4. 大規模データセットの低メモリ学習
+
+- **やること**：メモリ制約のある Mac や CI マシンで音声分類モデルを学習する。
+- **価値がある理由**：updatable classifier はバッチ更新をサポートし、全学習データを一度に読み込む必要がありません。
+- **始め方**：分類器を fully connected neural network classifier に替え、Swift Algorithms の `chunks` でバッチ化し、ループ内で `update` を呼ぶ。
+
+### 5. 再開可能な長時間学習タスク
+
+- **やること**：学習フローに早期停止と checkpoint を追加し、無駄な学習時間を減らす。
+- **価値がある理由**：発表者の曲線は約 10 iteration で 95% に達し横ばいになり、それ以降の学習効果は低いです。
+- **始め方**：各ラウンドで検証セットの accuracy を計算し、目標閾値で `break` する。数ラウンドごとに model をディスクへ書き出す。
+
+## 関連セッション
+
+- [Get to know Create ML Components](/articles/wwdc2022-10019) — Transformer、Estimator、`appending` を理解してから、本場の時系列コンポーネントと増分学習を読む。
+- [Explore the machine learning development experience](/articles/wwdc2022-10017) — モデル選択、変換、評価から性能チューニングまで、オンデバイス ML の完全な実装フローを補完する。
+- [Optimize your Core ML usage](/articles/wwdc2022-10027) — デプロイ後のデバイス性能に焦点を当て、本場の学習フローと前後でつなぐ。
+- [Meet AsyncSequence](/articles/wwdc2021-10058) — 本場の時系列 transformer の入出力は AsyncSequence 中心。理解するとデータフローが読みやすくなる。

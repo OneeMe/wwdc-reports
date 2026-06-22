@@ -1,0 +1,246 @@
+---
+title: "Meet async/await in Swift"
+description: "Learn about the async/await syntax introduced in Swift 5.5, learn how to write more readable asynchronous code, and how to migrate existing completion handlers to async functions."
+date: "2021-06-08"
+tags: ["Swift"]
+thumbnail: "/images/sessions/2021/10132.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10132/"
+sessionId: "wwdc2021-10132"
+year: "2021"
+relatedSessions:
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "An in-depth explanation of Tasks, TaskGroups, and structured concurrency"
+  - title: "Concurrency in SwiftUI"
+    code: "10019"
+    description: "The specific application of async/await in SwiftUI"
+  - title: "Bring Core Data concurrency to Swift and SwiftUI"
+    code: "10017"
+    description: "How Core Data adapts to new concurrency models"
+  - title: "ARC in Swift"
+    code: "10216"
+    description: "Object life cycle and concurrency safety"
+---
+# async/await in Swift
+
+## Highlight
+
+> async/await makes writing asynchronous code as intuitive as synchronous code. A thumbnail acquisition function that originally required 20 lines of nested closures only requires 6 lines of linear code using async/await, and error handling is passed`throws`Natural communication, no longer need to judge at all levels`error != nil`。
+
+## Core Content
+
+Asynchronous programming is an unavoidable topic in daily development, but writing methods based on completion handlers have a common problem: the code expands exponentially as the number of asynchronous steps increases. A network request, an image decoding, and a round of thumbnail generation - three steps of operations are nested. The indentation is bottomless, error handling is scattered in every corner, and a branch may be missed if you are not careful.
+
+The introduction of async/await in Swift 5.5 fundamentally changes this situation. The core idea is simple: use`async`Mark asynchronous functions with`await`Suspend the current execution flow to wait for the result, and the compiler is responsible for managing thread switching and state saving. The code reads like synchronous logic but executes non-blockingly.
+
+## Detailed Content
+
+### From Completion Handler to async/await
+
+Take a function that gets thumbnails as an example. Traditional completion handler writing (03:43):
+
+```swift
+func fetchThumbnail(for id: String, completion: @escaping (UIImage?, Error?) -> Void) {
+    let request = thumbnailURLRequest(for: id)
+    let task = URLSession.shared.dataTask(with: request) { data, response, error in
+        if let error = error {
+            completion(nil, error)
+        } else if (response as? HTTPURLResponse)?.statusCode != 200 {
+            completion(nil, FetchError.badID)
+        } else {
+            guard let image = UIImage(data: data!) else {
+                completion(nil, FetchError.badImage)
+                return
+            }
+            image.prepareThumbnail(of: CGSize(width: 40, height: 40)) { thumbnail in
+                guard let thumbnail = thumbnail else {
+                    completion(nil, FetchError.badImage)
+                    return
+                }
+                completion(thumbnail, nil)
+            }
+        }
+    }
+    task.resume()
+}
+```
+
+This code has 20 lines, error handling is scattered in three places, and each branch must be called manually`completion`. Use instead`Result`Although types (08:00) make error handling more standardized, the amount of code has not been reduced:
+
+```swift
+func fetchThumbnail(for id: String, completion: @escaping (Result<UIImage, Error>) -> Void) {
+    // ... same nested structure, except completion(.failure(error)) replaces completion(nil, error)
+}
+```
+
+The async/await version (08:30) condenses the same logic into 6 lines:
+
+```swift
+func fetchThumbnail(for id: String) async throws -> UIImage {
+    let request = thumbnailURLRequest(for: id)
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw FetchError.badID }
+    let maybeImage = UIImage(data: data)
+    guard let thumbnail = await maybeImage?.thumbnail else { throw FetchError.badImage }
+    return thumbnail
+}
+```
+
+Key changes:
+- `async`Mark the function as asynchronous,`throws`and`async`natural combination
+- `await`Suspends the current execution and the thread is released to do other work
+- Error passed`throws`Propagating upwards eliminates the need to manually handle each branch
+- The execution order of the code is the reading order, from left to right, top to bottom
+
+### Asynchronous properties
+
+UIKit`prepareThumbnail`There are two versions: synchronous and asynchronous. can be`UIImage`Define an asynchronous computed property (13:15):
+
+```swift
+extension UIImage {
+    var thumbnail: UIImage? {
+        get async {
+            let size = CGSize(width: 40, height: 40)
+            return await self.byPreparingThumbnail(ofSize: size)
+        }
+    }
+}
+```
+
+Use directly`await image.thumbnail`, as natural as accessing normal properties.
+
+### Asynchronous sequence
+
+When processing batch data, async/await and`for`Loops combined to form asynchronous sequences (14:17):
+
+```swift
+for await id in staticImageIDsURL.lines {
+    let thumbnail = await fetchThumbnail(for: id)
+    collage.add(thumbnail)
+}
+let result = await collage.draw()
+```
+
+`staticImageIDsURL.lines`is a`AsyncSequence`, each iteration`await`Read the next line. The entire loop is executed sequentially, but each time`await`The thread will be released.
+
+### Test asynchronous code
+
+Testing completion handler style code requires`XCTestExpectation`（21:22）：
+
+```swift
+func testFetchThumbnails() throws {
+    let expectation = XCTestExpectation(description: "mock thumbnails completion")
+    self.mockViewModel.fetchThumbnail(for: mockID) { result, error in
+        XCTAssertNil(error)
+        expectation.fulfill()
+    }
+    wait(for: [expectation], timeout: 5.0)
+}
+```
+
+The async/await version (21:56) can be called directly:
+
+```swift
+func testFetchThumbnails() async throws {
+    XCTAssertNoThrow(try await self.mockViewModel.fetchThumbnail(for: mockID))
+}
+```
+
+### Calling asynchronous functions from synchronous code
+
+SwiftUI`onAppear`Is the synchronization context and needs to be created`Task`to call an asynchronous function (22:30):
+
+```swift
+struct ThumbnailView: View {
+    @ObservedObject var viewModel: ViewModel
+    var post: Post
+    @State private var image: UIImage?
+
+    var body: some View {
+        Image(uiImage: self.image ?? placeholder)
+            .onAppear {
+                Task {
+                    self.image = try? await self.viewModel.fetchThumbnail(for: post.id)
+                }
+            }
+    }
+}
+```
+
+### Bridging existing API: CheckedContinuation
+
+For third-party APIs that do not yet provide an async version, use`withCheckedThrowingContinuation`Packaging (26:59):
+
+```swift
+// Existing completion handler API
+func getPersistentPosts(completion: @escaping ([Post], Error?) -> Void) { ... }
+
+// Wrap as an async version
+func persistentPosts() async throws -> [Post] {
+    return try await withCheckedThrowingContinuation { continuation in
+        self.getPersistentPosts { posts, error in
+            if let error = error {
+                continuation.resume(throwing: error)
+            } else {
+                continuation.resume(returning: posts)
+            }
+        }
+    }
+}
+```
+
+For delegate callback mode, store the continuation as an instance variable (31:44):
+
+```swift
+class ViewController: UIViewController {
+    private var activeContinuation: CheckedContinuation<[Post], Error>?
+
+    func sharedPostsFromPeer() async throws -> [Post] {
+        try await withCheckedThrowingContinuation { continuation in
+            self.activeContinuation = continuation
+            self.peerManager.syncSharedPosts()
+        }
+    }
+}
+
+extension ViewController: PeerSyncDelegate {
+    func peerManager(_ manager: PeerManager, received posts: [Post]) {
+        self.activeContinuation?.resume(returning: posts)
+        self.activeContinuation = nil  // Prevent calling resume multiple times
+    }
+}
+```
+
+### Asynchronous API in SDK
+
+The iOS 15 SDK provides async alternatives for a number of existing APIs (25:56). For example, ClockKit’s complication data source:
+
+```swift
+extension ComplicationController: CLKComplicationDataSource {
+    func currentTimelineEntry(for complication: CLKComplication) async -> CLKComplicationTimelineEntry? {
+        let date = Date()
+        let thumbnail = try? await self.viewModel.fetchThumbnail(for: post.id)
+        guard let thumbnail = thumbnail else { return nil }
+        return self.createTimelineEntry(for: thumbnail, date: date)
+    }
+}
+```
+
+## Core Takeaways
+
+1. **Prioritize migration of "assembly logic"**: First change the top-level function that calls multiple asynchronous operations to async/await, and the underlying tool functions can gradually follow. This way the scope of changes is minimal and the benefits are maximal.
+
+2. **use`withCheckedContinuation`Wrapping legacy APIs**: For third-party libraries or internal APIs that have not yet been updated, use continuations to bridge them. Note that the callback is called immediately`resume`, don't insert extra logic in the middle.
+
+3. **Test code directly benefits**: async/await makes asynchronous test code and synchronous test code written in the same way, no longer needed`XCTestExpectation`and`wait(for:timeout:)`。
+
+4. **Pay attention to the async alternative version of the SDK**: Starting from iOS 15, URLSession, Core Data, ClockKit, etc. all provide async APIs. When migrating, give priority to using the native async version instead of packaging it yourself.
+
+5. **`Task`It is a bridge from synchronization to asynchronous**: in`onAppear`、`IBAction`In other synchronization contexts, use`Task { }`Create an asynchronous execution environment.`Task.init`Inheriting the current actor context is the correct choice in most cases.
+
+## Related Sessions
+
+- [WWDC2021 10134 - Exploring Structured Concurrency in Swift](https://developer.apple.com/videos/play/wwdc2021/10134/) — An in-depth explanation of Tasks, TaskGroups, and structured concurrency
+- [WWDC2021 10019 - Concurrency in SwiftUI](https://developer.apple.com/videos/play/wwdc2021/10019/) — Specific application of async/await in SwiftUI
+- [WWDC2021 10017 - Core Data Concurrency and Swift](https://developer.apple.com/videos/play/wwdc2021/10017/) — How Core Data adapts to the new concurrency model
+- [WWDC2021 10216 - ARC in Swift](https://developer.apple.com/videos/play/wwdc2021/10216/) — Object Lifecycle and Concurrency Safety

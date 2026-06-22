@@ -1,0 +1,209 @@
+---
+title: "Debug Swift debugging with LLDB"
+description: "Learn how you can set up complex Swift projects for debugging. We'll take you on a deep dive into the internals of LLDB and debug info. We'll also share best practices for complex scenarios such as debugging code built on build servers or code from custom build systems."
+date: "2022-06-06"
+tags: ["Developer Tools", "Swift", "LLDB", "Debugging"]
+thumbnail: "/images/sessions/2022/110370.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110370/"
+sessionId: "wwdc2022-110370"
+year: "2022"
+relatedSessions:
+  - title: "Discover breakpoint improvements"
+    code: "10132"
+    description: "LLDB breakpoint improvements for WWDC21"
+  - title: "LLDB: Beyond 'po'"
+    code: "10209"
+    description: "Deep understanding of LLDB expression evaluation"
+  - title: "Advanced Debugging with Xcode and LLDB"
+    code: "10412"
+    description: "Advanced debugging tips for Xcode and LLDB"
+  - title: "Symbolication: Beyond the basics"
+    code: "10068"
+    description: "In-depth analysis of symbolization"
+---
+## Highlight
+
+> LLDB has the dual roles of debugger and compiler: the debugger side relies on debug info and Swift reflection metadata to provide variable viewing capabilities, and the compiler side relies on Swift module to provide expression evaluation capabilities; when`po`When it fails but the variable view is normal, the problem lies in the module import step.
+
+## Core Content
+
+You are integrating a third-party framework. This framework is built nightly by the CI system. You downloaded the debug version, but encountered a strange problem during debugging: the breakpoint can be hit, but`po`The command reports an error, and even the single-step trace only shows assembly code.
+
+([02:30](https://developer.apple.com/videos/play/wwdc2022/110370/?time=150)) This is the actual scene in session. The speaker, Adrian, wrote a text adventure game. After integrating the TerminalInterface framework, the debugger suddenly "failed".
+
+### Why can’t I see the source code?
+
+([03:54](https://developer.apple.com/videos/play/wwdc2022/110370/?time=234)) When the compiler generates machine code, it will also generate debug info and map the code address to the source file and line number. These debug info are eventually packaged into .dSYM bundle. LLDB locates .dSYM via Spotlight, so it doesn't matter where the file is placed.
+
+The problem is: the framework is built on the CI server, and the debug info records the source file path on the server.`/Volumes/BUILD_SERVER/projects/...`, while your local path is completely different.
+
+([05:48](https://developer.apple.com/videos/play/wwdc2022/110370/?time=348)) LLDB provides a source map mechanism to solve this problem. You can configure a project-level `.lldbinit` file in the Scheme editor to automatically remap paths:
+
+```
+settings set target.source-map /Volumes/BUILD_SERVER/projects /Users/demo/Desktop/Adventure/3rdparty
+```
+
+After the configuration is completed, you can see the source code by running it again.
+
+### Why`po`An error is reported but the variable view is normal
+
+([08:33](https://developer.apple.com/videos/play/wwdc2022/110370/?time=513)) This is a deeper problem.`po`、`p`Commands such as LLDB rely on LLDB's expression evaluator, which is essentially a complete Swift compiler. It requires importing the Swift module to understand type information.
+
+([11:12](https://developer.apple.com/videos/play/wwdc2022/110370/?time=672)) Starting with Xcode 14, there is a clear separation between the debugger side and the compiler side of LLDB:
+- Debugger side: Get types from debug info and Swift reflection metadata, drive variable views and`v`command
+- Compiler side: Get type from Swift module, driver`expr`、`p`、`po`Order
+
+This is where the variable view works but`po`The reason for the error - module import failed.
+
+([11:38](https://developer.apple.com/videos/play/wwdc2022/110370/?time=698)) New in Xcode 14`swift-healthcheck`command to diagnose configuration problems with the expression evaluator. After running, it was found that LLDB cannot import the "TerminalUI" module, which is an internal implementation detail of the TerminalInterface framework.
+
+### Static library and Swift module
+
+([14:53](https://developer.apple.com/videos/play/wwdc2022/110370/?time=893)) The root of the problem is: the framework uses a static library, and the Swift module of the static library is not registered with the linker. Dynamic libraries and executable files will complete this registration automatically, but static libraries are just collections of object files and need to be manually registered by the target that links them.
+
+When using Apple linker, you need to pass`-add_ast_path`Option to register Swift module:
+
+```
+ld … -add_ast_path /path/to/My.swiftmodule
+```
+
+([15:57](https://developer.apple.com/videos/play/wwdc2022/110370/?time=957)) Verify whether the registration is successful:
+
+```
+dsymutil -s MyApp | grep .swiftmodule
+```
+
+([16:08](https://developer.apple.com/videos/play/wwdc2022/110370/?time=968)) On the Linux platform, you can use`-modulewrap`Convert the Swift module to an object file and then link into the binary:
+
+```
+swiftc -modulewrap My.swiftmodule -o My.swiftmodule.o
+```
+
+The repaired framework re-registered this module,`po`and single-step tracking are back to normal.
+
+## Detailed Content
+
+### Source Path Remapping
+
+([06:37](https://developer.apple.com/videos/play/wwdc2022/110370/?time=397)) When the code is built on a remote server or CI system, the source file path in debug info is inconsistent with the local path. LLDB's`target.source-map`Settings can remap these paths.
+
+Configure in Xcode`.lldbinit`：
+
+1. Open Product > Scheme > Edit Scheme
+2. Specify the LLDB Init File path in the Diagnostics tab
+3. Write in the file:
+
+```lldb
+settings set target.source-map /Volumes/BUILD_SERVER/projects /Users/demo/Desktop/Adventure/3rdparty
+```
+
+Key points:
+- `settings set target.source-map`Accepts two parameters: old path prefix and new path prefix
+- Configuration saved in project`.lldbinit`file, each debugging automatically takes effect
+- Also supports configuring the path mapping dictionary in the plist file of the .dSYM bundle
+
+([08:13](https://developer.apple.com/videos/play/wwdc2022/110370/?time=493)) A more thorough approach is to use`-debug-prefix-map`, replacing machine-dependent path prefixes with uniform placeholders:
+
+```bash
+swiftc -debug-prefix-map $PWD=/BUILDROOT ...
+```
+
+This way all build machines use the same placeholder path and the mapping only needs to be configured once in LLDB.
+
+### LLDB expression evaluator diagnostics
+
+([11:59](https://developer.apple.com/videos/play/wwdc2022/110370/?time=719))`po`or`p`When the command fails, run:
+
+```lldb
+swift-healthcheck
+```
+
+This command will output the configuration log of the Swift expression evaluator to help you locate problems such as module import failure.
+
+### Differences in variable viewing commands
+
+([08:32](https://developer.apple.com/videos/play/wwdc2022/110370/?time=512)) LLDB provides multiple commands to view variables, and the mechanisms behind them are different:
+
+```lldb
+# Print object description (calls description/debugDescription)
+po words
+expr -O -- words
+
+# Evaluate expression (compiler side)
+p words
+expr words
+
+# Inspect variable (debugger side, no compilation)
+v words
+frame variable words
+```
+
+Key points:
+- `po`and`p`Relies on the expression evaluator on the compiler side, requiring the complete Swift module
+-`v`Read variable values directly from debug info without relying on module import
+- when`po`failed but`v`Normally, the problem must lie in the module import link
+
+### Swift module registration of static library
+
+([15:47](https://developer.apple.com/videos/play/wwdc2022/110370/?time=947)) For custom build systems, ensure that the Swift module of the static library is correctly registered:
+
+```bash
+# Register Swift module at link time
+ld -o MyApp main.o -add_ast_path /path/to/My.swiftmodule
+
+# Verify registration succeeded
+dsymutil -s MyApp | grep .swiftmodule
+```
+
+Key points:
+- The build system for dynamic libraries and executable files will automatically register the Swift module
+- The static library will not go through the linker, and the target to link it needs to be manually registered
+- Xcode usually handles this automatically, but custom build rules require attention
+
+### Avoid serialization debugging options
+
+([18:23](https://developer.apple.com/videos/play/wwdc2022/110370/?time=1103)) The Swift compiler serializes the Clang header search path into the binary .swiftmodule file. This can cause problems when debugging across machines.
+
+Command line disable:
+
+```bash
+swiftc -no-serialize-debugging-options ...
+```
+
+Set in Xcode:
+
+```
+SWIFT_SERIALIZE_DEBUGGING_OPTIONS=NO
+```
+
+When disabled, the search path can be configured manually in LLDB:
+
+```lldb
+settings set target.swift-extra-clang-flags ...
+settings set target.swift-framework-search-paths ...
+settings set target.swift-module-search-paths ...
+```
+
+## Core Takeaways
+
+- **What**: Configure automated debug product distribution for the CI/CD build process
+- **Why it’s worth it**: Development teams can directly debug CI-built products without the need to recompile locally.
+- **How to start**: Use in build script`-debug-prefix-map`unified path, coordination`.lldbinit`of`target.source-map`set up
+
+- **What**: Build an LLDB debugging aid that automatically detects and fixes module import issues
+- **Why it’s worth doing**:`swift-healthcheck`Provides diagnostic information on which a more friendly diagnostic interface can be built
+- **How to start**: Analysis`swift-healthcheck`The output detects common module path problems and automatically recommends repair solutions.
+
+- **What**: Provides a complete debugging support package for third-party binary frameworks
+- **Why it’s worth doing**: Enable developers who integrate your framework to step through tracing and expression evaluation
+- **How to start**: Make sure the Swift module of the static library passes`-add_ast_path`register, provide`.swiftinterface`as an alternative
+
+- **What to do**: Configure team sharing in an Xcode project`.lldbinit`- **Why it’s worth doing**: Unify the team’s debugging environment configuration to avoid everyone manually setting the source map
+- **How to start**: Specify the project-level LLDB Init File in the Diagnostics tab of Scheme
+
+## Related Sessions
+
+- [Discover breakpoint improvements](/articles/wwdc2021-10132) — LLDB breakpoint improvements for WWDC21
+- [LLDB: Beyond 'po'](/articles/wwdc2019-10209) — In-depth understanding of LLDB expression evaluation
+- [Advanced Debugging with Xcode and LLDB](/articles/wwdc2018-10412) — Advanced debugging skills with Xcode and LLDB
+- [Symbolication: Beyond the basics](/articles/wwdc2021-10068) — In-depth analysis of symbolization

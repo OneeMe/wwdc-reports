@@ -1,0 +1,279 @@
+---
+title: "Explore the Swift on Server ecosystem"
+description: "swift is a great language for writing your server applications, and powers critical services across apple"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10216.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10216/"
+sessionId: "wwdc2024-10216"
+year: "2024"
+relatedSessions:
+  - title: "Analyze heap memory"
+    code: "10173"
+    description: "dive into the basis for your app"
+  - title: "Consume noncopyable types in Swift"
+    code: "10170"
+    description: "get started with noncopyable types in swift. discover what copying means in swif"
+  - title: "Explore Swift performance"
+    code: "10217"
+    description: "discover how swift balances abstraction and performance. learn what elements of "
+  - title: "Go further with Swift Testing"
+    code: "10195"
+    description: "learn how to write a sweet set of (test) suites using swift testing"
+---
+
+## ハイライト
+
+> この session は Swift のサーバー側利用現状とエコシステムを包括的に紹介。冒頭で説得力あるデータ：Apple 内部の iCloud Keychain、Photos、Notes、App Store 処理パイプライン、SharePlay ファイル共有、新 Private Cloud Compute サービスがすべて Swift で秒間百万リクエスト級を処理。
+
+## 主要内容
+
+サーバー app を書く際、言語選定が最初の壁。Go は goroutine、Java は成熟エコシステム、Rust はゼロコスト抽象——Swift の強みは？session 冒頭で回答：Swift は GC ではなく ARC でメモリ管理。メモリ使用量が予測可能、起動が速い——クラウドコールドスタートとリソーススケジューリングに重要。コンパイル時型安全がランタイムエラーの大クラスを排除。第一級並行（async/await + structured concurrency）がデータ競合を排除。Apple 自身が最大ユーザー——iCloud Keychain、Photos、Notes、App Store 処理パイプライン、SharePlay ファイル共有、新 Private Cloud Compute が Swift で秒間百万リクエスト級を処理。
+
+次は実践：Swift OpenAPI Generator + Vapor + PostgresNIO でイベント管理サービスをゼロから構築。OpenAPI YAML 定義から型安全 server/client コードを自動生成、Postgres で永続化、ログと分散トレーシングで可観測性追加。全体フローは 30 分未満、各ステップに既製パッケージあり。session 末尾で Swift Server Workgroup 孵化プロセス紹介——Sandbox → Incubating → Graduated で本番利用可能パッケージを選別。
+
+## 詳細
+
+### OpenAPI Generator で API 層を自動生成（[03:23](https://developer.apple.com/videos/play/wwdc2024/10216/?time=203)）
+
+Package.swift で 2 target 設定：EventAPI（OpenAPIGenerator プラグイン付き）と EventService（実行可能 target）。OpenAPIGenerator プラグインがコンパイル時に openapi.yaml を読み、`APIProtocol` と対応 request/response 型を自動生成。
+
+```yaml
+openapi: "3.1.0"
+info:
+  title: "EventService"
+  version: "1.0.0"
+servers:
+  - url: "https://localhost:8080/api"
+    description: "Example service deployment."
+paths:
+  /events:
+    get:
+      operationId: "listEvents"
+      responses:
+        "200":
+          description: "A success response with all events."
+          content:
+            application/json:
+              schema:
+                type: "array"
+                items:
+                  $ref: "#/components/schemas/Event"
+    post:
+      operationId: "createEvent"
+      requestBody:
+        description: "The event to create."
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Event'
+      responses:
+        '201':
+          description: "A success indicating the event was created."
+        '400':
+          description: "A failure indicating the event wasn't created."
+components:
+  schemas:
+    Event:
+      type: "object"
+      description: "An event."
+      properties:
+        name:
+          type: "string"
+          description: "The event's name."
+        date:
+          type: "string"
+          format: "date"
+          description: "The day of the event."
+        attendee:
+          type: "string"
+          description: "The name of the person attending the event."
+      required:
+        - "name"
+        - "date"
+        - "attendee"
+```
+
+キーポイント:
+
+- `operationId` が生成コードのメソッド名を決定（`listEvents`、`createEvent`）
+- `$ref` が `components/schemas/Event` を参照。生成コードは `Components.Schemas.Event` 型を出力
+- `required` フィールドが必須属性を标注。生成コードの対応型は non-Optional
+
+### APIProtocol 実装 + PostgresNIO 接続（[07:08](https://developer.apple.com/videos/play/wwdc2024/10216/?time=428)）
+
+```swift
+import OpenAPIRuntime
+import OpenAPIVapor
+import Vapor
+import EventAPI
+import PostgresNIO
+
+@main
+struct Service {
+  let postgresClient: PostgresClient
+
+  static func main() async throws {
+    let application = try await Vapor.Application.make()
+    let transport = VaporTransport(routesBuilder: application)
+
+    let postgresClient = PostgresClient(
+      configuration: .init(
+        host: "localhost",
+        username: "postgres",
+        password: nil,
+        database: nil,
+        tls: .disable
+      )
+    )
+    let service = Service(postgresClient: postgresClient)
+    try service.registerHandlers(
+      on: transport,
+      serverURL: URL(string: "/api")!
+    )
+
+    try await withThrowingDiscardingTaskGroup { group in
+      group.addTask {
+        await postgresClient.run()
+      }
+
+      group.addTask {
+        try await application.execute()
+      }
+    }
+  }
+}
+
+extension Service: APIProtocol {
+  func listEvents(
+    _ input: Operations.listEvents.Input
+  ) async throws -> Operations.listEvents.Output {
+    let rows = try await self.postgresClient.query("SELECT name, date, attendee FROM events")
+
+    var events = [Components.Schemas.Event]()
+    for try await (name, date, attendee) in rows.decode((String, String, String).self) {
+      events.append(.init(name: name, date: date, attendee: attendee))
+    }
+
+    return .ok(.init(body: .json(events)))
+  }
+
+  func createEvent(
+    _ input: Operations.createEvent.Input
+  ) async throws -> Operations.createEvent.Output {
+    return .undocumented(statusCode: 501, .init())
+  }
+}
+```
+
+キーポイント:
+
+- `PostgresClient` は PostgresNIO 1.21 の新 async インターフェース。組み込み接続プール、structured concurrency でネットワーク障害時に自動復旧
+- `registerHandlers(on:serverURL:)` で APIProtocol 実装を Vapor ルートに登録
+- `withThrowingDiscardingTaskGroup` で PostgresClient と Vapor app を並行実行。どちらか失敗で他方もキャンセル
+- `rows.decode((String, String, String).self)` で行を直接タプルにデコード。AsyncSequence が行をプリフェッチして性能向上
+
+### 文字列補間で SQL インジェクション防止（[09:02](https://developer.apple.com/videos/play/wwdc2024/10216/?time=542)）
+
+```swift
+func createEvent(
+  _ input: Operations.createEvent.Input
+) async throws -> Operations.createEvent.Output {
+  switch input.body {
+  case .json(let event):
+    try await self.postgresClient.query(
+      """
+      INSERT INTO events (name, date, attendee)
+      VALUES (\(event.name), \(event.date), \(event.attendee))
+      """
+    )
+    return .created(.init())
+  }
+}
+```
+
+キーポイント:
+
+- 文字列連結に見えるが、PostgresNIO が String interpolation をオーバーロードし、コンパイル時に補間をパラメータ化クエリ + 値バインドに変換
+- SQL インジェクション完全免疫、コード可読性維持——Swift の「ergonomic but safe」
+
+### 可観測性三件套：ログ + メトリクス + トレーシング（[11:34](https://developer.apple.com/videos/play/wwdc2024/10216/?time=694)）
+
+```swift
+func listEvents(
+  _ input: Operations.listEvents.Input
+) async throws -> Operations.listEvents.Output {
+  let logger = Logger(label: "ListEvents")
+  logger.info("Handling request", metadata: ["operation": "\(Operations.listEvents.id)"])
+
+  Counter(label: "list.events.counter").increment()
+
+  return try await withSpan("database query") { span in
+    let rows = try await postgresClient.query("SELECT name, date, attendee FROM events")
+    return try await .ok(.init(body: .json(decodeEvents(rows))))
+  }
+}
+```
+
+キーポイント:
+
+- `swift-log` は構造化ログをサポート。`metadata` 辞書で追加コンテキスト
+- `swift-metrics` の `Counter` でリクエスト数追跡。バックエンド非依存——Prometheus 等に接続可能
+- `swift-distributed-tracing` の `withSpan` で DB クエリ外側に span を包み、リクエスト端到端パスをトレース
+- Bootstrap 順序：LoggingSystem → MetricsSystem → InstrumentationSystem——後 2 つはログ出力が必要な場合あり
+
+### エラー処理で PSQLError 詳細を抽出（[13:38](https://developer.apple.com/videos/play/wwdc2024/10216/?time=818)）
+
+```swift
+func createEvent(
+  _ input: Operations.createEvent.Input
+) async throws -> Operations.createEvent.Output {
+  switch input.body {
+  case .json(let event):
+    do {
+      try await self.postgresClient.query(
+        """
+        INSERT INTO events (name, date, attendee)
+        VALUES (\(event.name), \(event.date), \(event.attendee))
+        """
+      )
+      return .created(.init())
+    } catch let error as PSQLError {
+      let logger = Logger(label: "CreateEvent")
+
+      if let message = error.serverInfo?[.message] {
+        logger.info(
+          "Failed to create event",
+          metadata: ["error.message": "\(message)"]
+        )
+      }
+
+      return .badRequest(.init())
+    }
+  }
+}
+```
+
+キーポイント:
+
+- `PSQLError` の description は意図的に詳細を省略——DB schema の偶発漏洩を防止
+- `serverInfo` 属性でサーバー返却詳細エラー（duplicate key violation 等）を抽出
+- catch 後 `.badRequest` を返し、ログに具体原因を記録——本番デバッグの重要情報
+
+## 重要ポイント
+
+- **何をするか**：OpenAPI Generator + Vapor で Swift サーバープロジェクト骨格を迅速構築。**価値**：OpenAPI YAML が API ドキュメントとコード生成入力の両方。1 定義から型安全 server/client コード、手書きルーティングとシリアライズのエラー確率低減。**始め方**：Package.swift に `swift-openapi-generator` と `swift-openapi-vapor` 依存追加、openapi.yaml 作成、プラグインで `APIProtocol` 自動生成、メソッド実装。
+
+- **何をするか**：既存 Swift サーバープロジェクトに可観測性追加。**価値**：PSQLError デフォルト description は詳細非表示。ログとトレーシングなしでは本番調査は暗闇。三件套（swift-log + swift-metrics + swift-distributed-tracing）はバックエンド非依存——ターミナル/Prometheus/OpenTelemetry から開始、後期バックエンド変更でビジネスコード不変。**始め方**：LoggingSystem → MetricsSystem → InstrumentationSystem 順で bootstrap。重要パスに `Logger.info`、`Counter.increment`、`withSpan` 追加。
+
+- **何をするか**：パッケージ選定時 Swift Server Workgroup 孵化リストを優先。**価値**：孵化プロセス（Sandbox → Incubating → Graduated）が API 互換性、ドキュメント品質、長期メンテナンスに明確要件。Graduated レベルは本番環境でより信頼。**始め方**：swift.org/sswg で孵化リスト確認、Graduated 優先。既存需要未カバーなら swift.org/packages と Swift Package Index の server カテゴリで検索。
+
+- **何をするか**：PostgresNIO の PostgresClient で手書き DB 接続管理を置換。**価値**：PostgresClient は組み込み接続プール、接続自動ウォーム、クエリ分散、structured concurrency でネットワーク障害時自動復旧——手書き接続管理より信頼。**始め方**：PostgresNIO を 1.21+ にアップグレード、`PostgresClient(configuration:)` 作成、`withThrowingDiscardingTaskGroup` で実行。
+
+## 関連セッション
+
+- [Analyze heap memory](/articles/wwdc2024-10173) — Swift ヒープメモリ割り当て分析、サーバーメモリ使用量最適化
+- [Consume noncopyable types in Swift](/articles/wwdc2024-10170) — Swift 非コピー型理解、サーバーリソース管理の基礎
+- [Explore Swift performance](/articles/wwdc2024-10217) — Swift が抽象と性能のバランスをどう取るか
+- [Go further with Swift Testing](/articles/wwdc2024-10195) — Swift Testing でサーバーテストスイート作成

@@ -1,0 +1,302 @@
+---
+title: "Handle trackpad and mouse input"
+description: "provide a more versatile experience when you optimize your ipad or mac catalyst app for indirect input from trackpads and mice. discover how to make your app responsive to new events from these devices. learn how to work with pointer movement, enable pointer locking, handle scroll input and trackpad gestures, and accept or reject events on your gesture recognizers. we'll also show you how to implement advanced features like changing gesture behaviors with keyboard modifiers or pointing device buttons to delight pro users and bring a richer experience to your app."
+date: 2020-06-10
+tags: ["WWDC 2020", "UIKit", "iPadOS", "Mac Catalyst"]
+thumbnail: "/images/sessions/2020/10094.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10094/"
+sessionId: "wwdc2020-10094"
+year: "2020"
+relatedSessions:
+  - title: "Build for the iPadOS pointer"
+    code: "10093"
+    description: "Customize pointer effects, regions, and shapes with UIPointerInteraction so iPad controls respond to hover."
+  - title: "Design for the iPadOS pointer"
+    code: "10640"
+    description: "Apply iPadOS pointer design principles, effects, shapes, gestures, and keyboard modifiers to app workflows."
+  - title: "Bring keyboard and mouse gaming to iPad"
+    code: "10617"
+    description: "Use Game Controller keyboard and mouse events, pointer lock, and full-screen behavior for iPad games."
+  - title: "Support hardware keyboards in your app"
+    code: "10109"
+    description: "Use the responder chain, UIKeyCommand, modifier flags, and raw keyboard events in iPad and Mac Catalyst apps."
+---
+## Highlight
+
+> UIKit can accurately handle trackpad, mouse wheel, extra keys, and keyboard modifier input in iPad and Mac Catalyst Apps using UIHoverGestureRecognizer, prefersPointerLocked, allowedScrollTypesMask, buttonMask, modifierFlags, and UIApplicationSupportsIndirectInputEvents.
+
+---
+
+## Core Content
+
+iPadOS 13.4 brings the mouse and trackpad into the daily operation of ordinary iPad apps.When users move the pointer to the edge of the video player, they expect the control bar to appear automatically; when they slide the drawer with two fingers, they expect the content to move with it; when they right-click, they expect more direct contextual operations to open.These behaviors cannot be guaranteed by touch paths alone. UIKit provides separate event and gesture entrances for indirect input.
+
+The main thread of this session is clear: let each app handle common inputs first, and then add advanced controls for heavy users.Common inputs include pointer movement, pointer lock, scroll input, pinch, and rotate.Advanced controls include mouse buttons, keyboard modifiers, gesture reception filtering, and switching from compatibility mode to the new indirect input event model.
+
+The key difference is the event source.Finger touch still goes traditional`UITouch`path; trackpad scrolling drives`EventType.scroll`;Precise pinching and rotating will go`EventType.transform`;mouse buttons and keyboard modifier keys will hang on`UIEvent`and`UIGestureRecognizer`superior.Apps need to read this information at the correct level to avoid pushing all interactions back`touchesBegan`a path.
+
+---
+
+## Detailed Content
+
+### 1. Use UIHoverGestureRecognizer to respond to pointer movement
+
+（[01:49](https://developer.apple.com/videos/play/wwdc2020/10094/?time=109)）`UIHoverGestureRecognizer`Introduced in Catalina for Mac Catalyst and available in iPadOS.It is suitable for responding to the pointer entering or leaving the bounds of a view, such as showing or hiding the video playback control bar.When modifying pointer appearance or hover effects, you should use`UIPointerInteraction`。
+
+```swift
+let controlsHover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover))
+
+@objc func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+    switch recognizer.state {
+    case .began:
+        // Pointer entered our view - show controls
+        self.showsPlaybackControls = true
+    case .ended:
+        // Pointer exited our view - hide controls
+        self.showsPlaybackControls = false
+    default:
+        break
+    }
+}
+```
+
+Key points:
+- `UIHoverGestureRecognizer`Like other gesture recognizers, works via target-action.
+- `.began`The corresponding pointer enters the bounds of the current gesture view.
+- `.ended`The corresponding pointer leaves the bounds of the current gesture view.
+- The transcript clearly differentiates between gesture state and window-level pointer phases, e.g.`RegionEntered`、`RegionMoved`、`RegionExited`。
+
+### 2. Use prefersPointerLocked to apply for pointer lock
+
+([05:33](https://developer.apple.com/videos/play/wwdc2020/10094/?time=333)) iPadOS 14 and Mac Catalyst Big Sur add APIs for locking pointers.A typical scenario is a game: the user does not want the pointer to move on the screen, but wants the relative displacement to directly drive the perspective or character.App expresses preferences through the view controller, and whether to lock or not is ultimately determined by the system based on the scene state.
+
+```swift
+class GameViewController: UIViewController {
+
+    var shouldLockPointer: Bool = true
+
+    override var prefersPointerLocked: Bool {
+        return self.shouldLockPointer
+    }
+
+    func disablePointerLock() {
+        self.shouldLockPointer = false
+        self.setNeedsUpdateOfPrefersPointerLocked()
+    }
+}
+```
+
+Key points:
+- `prefersPointerLocked`The default value is`false`。
+- View controllers that require a locked pointer override this property and return the current preference.
+- Called after status changes`setNeedsUpdateOfPrefersPointerLocked()`to let the system reread the preferences.
+- scene on iPadOS needs to be full screen and in`foregroundActive`;App on Mac Catalyst needs to be the frontmost application.
+
+([05:53](https://developer.apple.com/videos/play/wwdc2020/10094/?time=353)) If the business logic relies on the real lock state, read the scene's`pointerLockState`, and observe`UIPointerLockState.didChangeNotification`.session emphasizes that the App cannot assume that preferences will be satisfied.
+
+```swift
+if let pointerLockState = self.window.windowScene?.pointerLockState {
+    self.observer = notificationCenter.addObserver(forName: UIPointerLockState.didChangeNotification,
+                                                   object: pointerLockState,
+                                                   queue: OperationQueue.main) { (note) in
+        guard let lockState = note.object as? UIPointerLockState else { return }
+        gameEngine.performExpensiveOperationWhile(lockState.isLocked)
+    }
+}
+```
+
+Key points:
+- `pointerLockState`may be`nil`, indicating that the current scene does not support pointer lock.
+- `isLocked`It is the real state after system analysis.
+- Notifications are triggered when Slide Over, Control Center, Notification Center, or foreground App state changes affect lock conditions.
+
+### 3. Open scroll input for UIPanGestureRecognizer
+
+（[09:54](https://developer.apple.com/videos/play/wwdc2020/10094/?time=594)）`UIScrollView`The pan gesture recognizer will handle all scroll inputs, but ordinary`UIPanGestureRecognizer`There is no scroll mask by default.Interactions such as custom drawers, pull-to-refresh, and canvas dragging need to be set according to the scene.`allowedScrollTypesMask`。
+
+```swift
+// Enable scroll input for touch surface devices
+
+self.drawerPan.allowedScrollTypesMask = [.continuous]
+
+
+// Enable scroll input for scroll wheel devices as well
+
+self.pullToRefreshPan.allowedScrollTypesMask = [.all]
+```
+
+Key points:
+- `.continuous`Used for continuous scrolling on touch surfaces such as trackpads.
+- `.all`Receives both continuous scrolling and mouse wheel input.
+- The drawer example in the session only accepts continuous scrolling because the designer judged that it is unnatural for the scroll wheel to open the side content.
+- Custom pull-to-refresh can be selected`.all`, so that both the trackpad and scroll wheel can be triggered.
+
+### 4. Let pinch and rotate use precise transform events
+
+（[10:41](https://developer.apple.com/videos/play/wwdc2020/10094/?time=641)）`UIPinchGestureRecognizer`and`UIRotationGestureRecognizer`Pinch and rotate on the trackpad are automatically handled.Old projects are in compatibility mode by default, and UIKit will simulate a two-finger touch.join in`UIApplicationSupportsIndirectInputEvents`After that, the App will receive the`EventType.transform`, gesture accuracy is higher.
+
+```xml
+<key>UIApplicationSupportsIndirectInputEvents</key>
+<true/>
+```
+
+Key points:
+- This Info.plist key is not a prerequisite for enabling pointer interaction, clicks, scroll input or trackpad gestures.
+- it will be enabled`TouchType.indirectPointer`and`EventType.transform`。
+- Driven by the transform event,`numberOfTouches`will return`0`，`locationOfTouch:inView`May throw an exception.
+- deal with`UIPanGestureRecognizer`、`UIPinchGestureRecognizer`、`UIRotationGestureRecognizer`When, it is necessary to migrate the judgment of dependent events to the new`shouldReceive`method.
+
+### 5. Use buttonMaskRequired to receive the specified mouse button
+
+（[14:48](https://developer.apple.com/videos/play/wwdc2020/10094/?time=888)）`UIEvent.ButtonMask`Represents the pointing device button that was pressed when clicked.`UITapGestureRecognizer`added`buttonMaskRequired`, you can directly require a certain button to trigger the gesture.
+
+```swift
+self.thirdMouseButtonTap.buttonMaskRequired = .button(3)
+```
+
+Key points:
+- `.button(3)`Returns the mask corresponding to the third mouse button.
+- This writing method is suitable for adding additional operations to professional users, such as binding the third key to a temporary tool in the editor.
+- `buttonMask`exist simultaneously in`UIEvent`and`UIGestureRecognizer`, but the reading timing is different.
+
+([15:07](https://developer.apple.com/videos/play/wwdc2020/10094/?time=907)) Keyboard modifier keys passed`UIKeyModifierFlags`expressed, and exposed as`modifierFlags`.In gesture callback, the response mode can be changed according to the modifier keys.
+
+```swift
+func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+
+    // Show chapter controls if alt is pressed
+    let showChapterControls = recognizer.modifierFlags.contains(.alternate)
+
+    // ...
+}
+```
+
+Key points:
+- `.alternate`Corresponds to the Option/Alt modifier key.
+- The same hover gesture in the example can show playback controls on normal hover and chapter controls on option hold.
+- This type of advanced interaction is suitable for hidden less frequent but very efficient functions.
+
+### 6. Filter events in shouldReceive(_ event:)
+
+([16:38](https://developer.apple.com/videos/play/wwdc2020/10094/?time=998)) New`UIGestureRecognizer`and`UIGestureRecognizerDelegate`Method allows the gesture to be accepted or rejected before processing`UIEvent`.Special reminder for session: These methods occur before gesture completely handles the event, so you need to read`UIEvent`attribute on the`UIGestureRecognizer`hysteresis property on.
+
+```swift
+class SecondaryClickGesture: UIGestureRecognizer {
+
+    override func shouldReceive(_ event: UIEvent) -> Bool {
+        // Must look at the event’s mask, not the gesture’s
+        return event.buttonMask == .secondary
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        // Touch handling code ...
+    }
+}
+```
+
+Key points:
+- `shouldReceive(_ event:)`You can have a custom gesture receive only secondary clicks.
+- this stage`event.buttonMask`is the latest value.
+- `gestureRecognizer(shouldReceive touch:)`Non-touch events such as scroll or transform are not overridden.
+
+([17:36](https://developer.apple.com/videos/play/wwdc2020/10094/?time=1056)) If you want Control + primary key click to be equivalent to secondary click, you can check both`buttonMask`and`modifierFlags`。
+
+```swift
+class SecondaryClickGesture: UIGestureRecognizer {
+
+    override func shouldReceive(_ event: UIEvent) -> Bool {
+        // Must look at the event’s properties, not the gesture’s
+        let secondaryClick = event.buttonMask == .secondary
+
+        let controlClick = event.buttonMask == .primary && event.modifierFlags == .control
+
+        return secondaryClick || controlClick
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        // Touch handling code ...
+    }
+}
+```
+
+Key points:
+- `secondaryClick`Override right-click or two-finger click.
+- `controlClick`Override the main button plus the Control modifier key.
+- This mode is suitable for operations such as context menus, inspectors, professional editing tools, etc.
+
+([18:10](https://developer.apple.com/videos/play/wwdc2020/10094/?time=1090)) The delegate method can also filter hover events.The example below only receives closed caption hover while holding down Option/Alt.
+
+```swift
+let ccHover = UIHoverGestureRecognizer(target: self,
+                                       action: #selector(handleClosedCaptionHover))
+
+ccHover.delegate = self
+
+func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                       shouldReceive event: UIEvent) -> Bool {
+
+    if gestureRecognizer == self.closedCaptionHover {
+        return event.modifierFlags.contains(.alternate)
+    }
+
+    return true
+}
+```
+
+Key points:
+- The gesture delegate can define different filter conditions for different gestures.
+- `event.modifierFlags.contains(.alternate)`Is the only condition to receive closed caption hover.
+- Other gestures return`true`, maintain the original event flow.
+
+---
+
+## Core Takeaways
+
+### 1. Pointer floating layer of video player
+
+**What it does**: Display the control bar when the pointer enters the playback area, and display the chapter or subtitle entry when holding down Option/Alt.
+
+**Why it’s worth doing**: The session hover example and the modifier flags example cover exactly these two interaction levels.
+
+**How ​​to start**: Add player view`UIHoverGestureRecognizer`, read in callback`recognizer.state`and`recognizer.modifierFlags`。
+
+### 2. Pointer lock mode for games or 3D views
+
+**What to do**: Use relative mouse displacement for perspective control in full-screen gaming, 3D modeling, or map roaming scenarios.
+
+**Why it’s worth doing**:`prefersPointerLocked`and`UIPointerLockState.isLocked`Allows apps to express locking preferences and adjust rendering or input logic based on system-parsed state.
+
+**How ​​to start**: Override in the main view controller`prefersPointerLocked`,observe`UIPointerLockState.didChangeNotification`,exist`isLocked`When true enables relative displacement control.
+
+### 3. Customize the touchpad scrolling of drawers and canvases
+
+**What to do**: Make the side drawer, timeline, canvas pan, pull-to-refresh support trackpad two-finger sliding and mouse wheel.
+
+**Why it’s worth doing**: Average`UIPanGestureRecognizer`By default, scroll input is not accepted. Users will encounter the problem that the touchpad can scroll the list but cannot drag the custom area.
+
+**How ​​to get started**: Custom pan gesture settings for each`allowedScrollTypesMask`, used when continuous scrolling of the touchpad is required.`.continuous`, used when roller support is needed`.all`。
+
+### 4. Multi-button quick operation of professional tools
+
+**What to do**: In drawing, editing, IDE, and spreadsheet apps, map the third mouse button, right button, and Control + click to different tools or contextual operations.
+
+**Why it’s worth doing**:`buttonMaskRequired`、`event.buttonMask`and`event.modifierFlags`It can hand over precise input to the corresponding gesture and reduce mode switching.
+
+**How ​​to start**: Simple tap use`UITapGestureRecognizer.buttonMaskRequired`;Complex filtering is written in`shouldReceive(_ event:)`or delegate's`gestureRecognizer(_:shouldReceive:)`middle.
+
+### 5. Migrate from touch compatibility mode to indirect input
+
+**What to do**: Let the trackpad pinch and rotate go straight away`EventType.transform`, and use`TouchType.indirectPointer`Distinguish between mouse clicks and finger clicks.
+
+**Why it’s worth doing**: The old compatibility mode will simulate touch, and precise gestures may accidentally touch other recognizers; the new indirect input path can make gesture semantics clearer.
+
+**How ​​to start**: Add in Info.plist`UIApplicationSupportsIndirectInputEvents`, check dependencies`numberOfTouches`、`locationOfTouch:inView`and`gestureRecognizer(shouldReceive touch:)`code.
+
+---
+
+## Related Sessions
+
+- [Build for the iPadOS pointer](/articles/wwdc2020-10093) — Customize pointer effects, regions, and shapes with UIPointerInteraction so iPad controls respond to hover.
+- [Design for the iPadOS pointer](/articles/wwdc2020-10640) — Apply iPadOS pointer design principles, effects, shapes, gestures, and keyboard modifiers to app workflows.
+- [Bring keyboard and mouse gaming to iPad](/articles/wwdc2020-10617) — Use Game Controller keyboard and mouse events, pointer lock, and full-screen behavior for iPad games.
+- [Support hardware keyboards in your app](/articles/wwdc2020-10109) — Use the responder chain, UIKeyCommand, modifier flags, and raw keyboard events in iPad and Mac Catalyst apps.

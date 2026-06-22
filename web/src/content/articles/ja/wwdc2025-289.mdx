@@ -1,0 +1,206 @@
+---
+title: "Explore spatial accessory input on visionOS"
+description: "learn how you can integrate spatial accessories into your app. display virtual content, interact with your app, track them in space, and get information on interactions for enhanced virtual experience"
+date: 2026-06-10
+tags: ["グラフィックスとゲーム", "空間コンピューティング"]
+thumbnail: "/images/sessions/2025/289.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/289/"
+sessionId: "wwdc2025-289"
+year: "2025"
+relatedSessions:
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Engage players with the Apple Games app"
+    code: "215"
+    description: "meet the games app – a new destination for players to keep up with what"
+---
+
+## ハイライト
+
+> Amanda Han がデジタル彫刻アプリを題材に、spatial accessory の開発フロー全体をデモしています。
+
+---
+
+## 主要内容
+
+visionOS は当初から「目 + 両手」という入力パラダイムを貫いてきました。しかし、彫刻、CAD、ペイント、空中で球を打つといったシーンでは、ピンチジェスチャだけでは常にあと一歩足りません。ボタンがなく、筆圧がなく、触覚フィードバックもなく、何より「ペン先」のような明確な物理的境界が存在しないのです。精緻な創作ツールを作りたい開発者は、ジェスチャ API がミリ単位の精度で取りこぼすのをただ眺めるしかありませんでした。
+
+WWDC25 はその答えを提示しました。visionOS 26 は 2 つの spatial accessory を正式サポートします。1 つは PlayStation VR2 Sense コントローラ、もう 1 つは Logitech Muse です。前者はボタン・スティック・トリガーを備え、ゲーム用途に向いています(Resolution Games の Pickle Pro はすでに空間内でピックルボールができるレベルに到達しています)。後者はペン先と側面ボタンに圧力センサを内蔵し、触覚フィードバックも備え、生産性とクリエイティブな用途に特化しています([01:22](https://developer.apple.com/videos/play/wwdc2025/289/?time=82))。どちらの accessory も shared space と full space の両方で利用でき、Apple Vision Pro のカメラと accessory 内蔵の慣性センサが連携してトラッキングを行います。
+
+Amanda Han はセッションの中で、デジタル彫刻アプリを使って一連のフローを通しで見せてくれます。GameController フレームワークで接続を確立し、RealityKit の `AnchorEntity` で仮想の刃をペン先にアンカーし、`SpatialTrackingSession` で transform を取得して仮想の粘土を削り、haptics engine で一刀一刀の触覚フィードバックを再生し、最後に ARKit の `AccessoryAnchor` から「左手か右手か」といった付加情報を取得して、ツールバーが握っている手を自動的に避けるように配置する、という流れです。
+
+---
+
+## 詳細
+
+### プロジェクト設定
+
+最初のステップとして、Xcode の capabilities editor で **Spatial Gamepad** にチェックを入れ、plist の `Accessory Tracking Usage` フィールドに利用目的の説明(例: 「Tracking accessory movements to carve into virtual clay」)を記述します。ユーザーが初回起動した際、この説明文を含む許可ダイアログが表示されます([03:11](https://developer.apple.com/videos/play/wwdc2025/289/?time=191))。
+
+### accessory の接続を検出する
+
+GameController フレームワークで spatial tracking 機能を持つクラスは `GCController` と `GCStylus` の 2 つで、いずれも `GCDevice` プロトコルに準拠しています。接続通知を購読したあと、必ず `productCategory` で spatial accessory かどうかを再度確認します([04:56](https://developer.apple.com/videos/play/wwdc2025/289/?time=296))。
+
+```swift
+// Check spatial accessory support
+
+NotificationCenter.default.addObserver(forName: NSNotification.Name.GCControllerDidConnect, object: nil, queue: nil) {
+  notification in
+    if let controller = notification.object as? GCController,
+       controller.productCategory == GCProductCategorySpatialController {
+
+    }
+}
+```
+
+ポイント:
+
+- `GCControllerDidConnect`: コントローラの接続イベントを購読します。ペン型 accessory は `GCStylusDidConnect` を使います。
+- `notification.object as? GCController`: 通知に含まれるオブジェクトを具体的なデバイス型にキャストします。
+- `productCategory == GCProductCategorySpatialController`: その controller が spatial tracking をサポートするかを判定します。すべての game controller がサポートするわけではありません。Stylus の場合は `GCProductCategorySpatialStylus` を使います。
+- 切断時は対称な `GCControllerDidDisconnect` / `GCStylusDidDisconnect` を使い、コールバック内で仮想コンテンツをクリーンアップして「ゴーストの刃」が残らないようにします。
+
+### accessory に仮想コンテンツをアンカーする
+
+各 accessory はそれぞれ名前付きのアンカーポイントを公開します。PS VR2 Sense は `aim`、`grip`、`grip surface` を、Logitech Muse は `aim` のみを公開します。彫刻アプリでは `aim` を使います([06:34](https://developer.apple.com/videos/play/wwdc2025/289/?time=394))。
+
+```swift
+// Anchor virtual content to an accessory
+
+func setupSpatialAccessory(device: GCDevice) async throws {
+
+    let source = try await AnchoringComponent.AccessoryAnchoringSource(device: device)
+
+    guard let location = source.locationName(named: "aim") else {
+        return
+    }
+
+    let sculptingEntity = AnchorEntity(.accessory(from: source, location: location),
+                                       trackingMode: .predicted)
+
+}
+```
+
+ポイント:
+
+- `AccessoryAnchoringSource(device:)`: `GCDevice` からアンカー可能なソースを取り出します。
+- `locationName(named: "aim")`: accessory が公開するアンカーポイントを取得します。サポートされていない位置を指定すると nil が返るので、その場で return します。
+- `AnchorEntity(.accessory(from:location:), trackingMode:)`: `AnchorEntity` を該当アンカーポイントに固定します。
+- `trackingMode: .predicted`: 予測モデルでレンダリング遅延を補正します。激しい動きではオーバーシュートする可能性があります(動画の 4 フレーム目で紫色の予測ボックスが灰色の実測ボックスから外れています)。座標精度が要求される場面では `.continuous` に切り替えると、遅延は増えますがオーバーシュートはしません([07:46](https://developer.apple.com/videos/play/wwdc2025/289/?time=466))。
+
+### transform を取得する: SpatialTrackingSession + .accessory
+
+昨年の `SpatialTrackingSession` は設定済みの AnchorEntity に対して transform を提供できましたが、今年は `.accessory` 設定が追加されました([09:01](https://developer.apple.com/videos/play/wwdc2025/289/?time=541))。
+
+```swift
+// Get in-app transforms
+
+let session = SpatialTrackingSession()
+
+let configuration = SpatialTrackingSession.Configuration(tracking: [.accessory])
+
+await session.run(configuration)
+```
+
+ポイント:
+
+- `SpatialTrackingSession()`: トラッキングセッションを作成します。
+- `Configuration(tracking: [.accessory])`: 追跡対象として spatial accessory を宣言します。他の種類と組み合わせることもできます。
+- `await session.run(configuration)`: セッションを起動します。実行が始まると、彫刻アプリは毎フレーム anchor entity からペン先のワールド座標を読み出し、仮想の粘土に切り込んでいるかを判定できるようになります。
+
+### 彫刻に触覚を加える
+
+粘土を削るタイミングで触覚フィードバックを同期再生すると、没入感が一気に変わります([09:48](https://developer.apple.com/videos/play/wwdc2025/289/?time=588))。
+
+```swift
+// Add haptics to an accessory
+
+let stylus: GCStylus = ...
+
+guard let haptics = stylus.haptics else {
+    return
+}
+
+guard let hapticsEngine: CHHapticEngine = haptics.createEngine(withLocality: .default) else {
+    return
+}
+
+try? hapticsEngine.start()
+```
+
+ポイント:
+
+- `stylus.haptics`: すべての accessory が触覚を備えるわけではないので、まず nil チェックします。
+- `createEngine(withLocality: .default)`: ベースは `CHHapticEngine` です。触覚パターンの設計については Advancements in Game Controllers セッションが参考になります。
+- `try? hapticsEngine.start()`: 起動後、削るコールバック内で haptic pattern を発火できます。
+
+### RealityKit から ARKit AccessoryAnchor へのブリッジ
+
+RealityKit の AnchorEntity からは「左手か右手か」「相対運動」「トラッキング品質」といった状態を取得できません。今年は `ARKitAnchorComponent` が公開され、`SpatialTrackingSession` が動作している限り、entity から対応する ARKit anchor を取得できるようになりました([11:54](https://developer.apple.com/videos/play/wwdc2025/289/?time=714))。
+
+```swift
+// Access ARKit anchors from AnchorEntity
+
+func getAccessoryAnchor(entity: AnchorEntity) -> AccessoryAnchor? {
+    if let component = entity.components[ARKitAnchorComponent.self],
+       let accessoryAnchor = component.anchor as? AccessoryAnchor {
+        return accessoryAnchor
+    }
+    return nil
+}
+```
+
+ポイント:
+
+- `entity.components[ARKitAnchorComponent.self]`: entity からブリッジ用コンポーネントを取り出します。
+- `component.anchor as? AccessoryAnchor`: `AccessoryAnchor` にキャストします。`heldChirality` (どちらの手か)、相対運動、相対回転、トラッキング状態の 4 つのプロパティを持ちます([10:43](https://developer.apple.com/videos/play/wwdc2025/289/?time=643))。
+- 彫刻アプリでは `heldChirality` を活用して、左手で握っているならツールバーを正の x 方向に、右手ならその反対側に配置し、握っていなければオフセットしない、という挙動を実現しています([12:35](https://developer.apple.com/videos/play/wwdc2025/289/?time=755))。
+
+### 純粋な ARKit ルートを使う
+
+カスタムレンダリングを行うアプリでは、RealityKit を経由せずに済ませることもできます。`GCStylus` または `GCController` から `Accessory` を生成し、accessory tracking provider で anchor の更新を購読する流れです。accessory が接続・切断されるタイミングで新しい設定を使って ARKit session を re-run しないと、無効化された anchor を握り続けることになるので注意してください([14:06](https://developer.apple.com/videos/play/wwdc2025/289/?time=846))。
+
+---
+
+## 重要ポイント
+
+**1. 創作系アプリに「spatial accessory モード」を追加する**
+
+なぜやる価値があるか: visionOS 26 のペン型 accessory である Logitech Muse は圧力センサと触覚を標準装備しており、デジタルペイント・3D 彫刻・CAD アノテーションにとって理想的な入力デバイスです。ジェスチャより 1 桁高い精度を持ち、物理的に握れることで長時間の操作でも疲労が少なく済みます。
+
+着手方法: まず `Spatial Gamepad` capability を有効にするところから始めます。`GCStylusDidConnect` を購読し、現在のジェスチャツールの hit-test エントリを anchor entity の transform に置き換えます。最初は仮想のペン先が実物のペンに追従するだけの実装にとどめ、その後に圧力をブラシの太さにマッピングする処理を重ねていきましょう。
+
+**2. ゲームに「両手 controller」用ブランチを用意する**
+
+なぜやる価値があるか: PS VR2 Sense controller は visionOS 上で sport racket のようにトラッキングできます。既存の visionOS ゲームも、両手の controller anchor をサポートするだけで、「ピンチでタップ」から「実体ラケットで打つ」レベルの体験へとアップグレードできます。
+
+着手方法: `productCategory == GCProductCategorySpatialController` の分岐を実装し、`AnchorEntity` を 2 つ `aim` アンカーに取り付けます。従来のピンチ入力は fallback として残すことで、accessory を持っていないプレイヤーも引き続きプレイできるようにします。App Store には「Spatial game controller support」バッジを併せて掲示しましょう。
+
+**3. full space の没入アプリで上肢とシステム UI を非表示にする**
+
+なぜやる価値があるか: accessory を使う画面では、プレイヤーは自分の手首や実物のペンではなく仮想ツールを見たいはずです。同時に home indicator が表示されると没入感が損なわれます。
+
+着手方法: `.persistentSystemOverlays(.hidden)` で home indicator を隠し、`.upperLimbVisibility(.hidden)` で上肢と accessory 本体を隠します。SwiftUI view に `.receivesEventsInView` を付与すれば、同じ view が spatial event gesture と game controller イベントを同時に受け取れるようになり、ボタンとジェスチャで 2 系統の処理を書き分ける必要がなくなります([15:54](https://developer.apple.com/videos/play/wwdc2025/289/?time=954))。
+
+**4. 計測系の用途では Continuous モードか metric anchor を使う**
+
+なぜやる価値があるか: `.predicted` モードは速い動作でオーバーシュートします。CAD アノテーション、空間計測、医療向け図示といった用途では、オーバーシュートはそのまま誤差になります。
+
+着手方法: レンダリングや「ざっくりしたヒット判定」では引き続き `.predicted` を使い、座標を実際に書き込むストロークや計測値だけを `.continuous` に切り替えます。あるいは ARKit の metric anchor API を直接使う方法もあります(Coordinate spaces のドキュメントを参照してください)。
+
+---
+
+## 関連セッション
+
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — SceneKit が deprecate されたあと、既存の 3D プロジェクトを RealityKit に移行する実践的な手順を解説しています。
+- [What's new in RealityKit](/articles/wwdc2025-274) — 本記事で取り上げた `ARKitAnchorComponent` のブリッジ機能について、こちらのセッションで詳しく説明されています。
+- [Build a SwiftUI app with the new design](/articles/wwdc2025-323) — visionOS 26 の SwiftUI 新デザインとシステムオーバーレイ API の全体像を把握できます。
+- [Set the scene with SwiftUI in visionOS](/articles/wwdc2025-208) — SwiftUI で shared / full space のシーンをどう構成するか、spatial accessory アプリのウィンドウ配置と組み合わせて理解できます。
+- [Engage players with the Apple Games app](/articles/wwdc2025-215) — Apple Games アプリのエントリポイントとバッジシステムを扱っており、spatial accessory のサポートをストア上でどう見せるかを決める材料になります。

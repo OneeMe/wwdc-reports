@@ -1,0 +1,192 @@
+---
+title: "Meet the Foundation Models framework"
+description: "learn how to tap into the on-device large language model behind apple intelligence! this high-level overview covers everything from guided generation for generating swift data structures and streaming"
+date: 2026-06-10
+tags: ["機械学習"]
+thumbnail: "/images/sessions/2025/286.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/286/"
+sessionId: "wwdc2025-286"
+year: "2025"
+relatedSessions:
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Explore prompt design & safety for on-device foundation models"
+    code: "248"
+    description: "design generative ai experiences that leverage the strengths of the systemlanguagemodel"
+  - title: "Get started with MLX for Apple silicon"
+    code: "315"
+    description: "mlx is a flexible and efficient array framework for numerical computing and machine learning"
+---
+
+## ハイライト
+
+> Foundation Models framework は 30 億パラメータ・1 パラメータあたり 2 bit 量子化のオンデバイス LLM を Swift API として提供し、macOS、iOS、iPadOS、visionOS をカバー。オフラインでも利用できます。
+
+---
+
+## 主要内容
+
+これまで App から LLM を呼び出すには、クラウド API を叩く（プライバシー、レイテンシ、課金がいずれも課題）か、OSS モデルを App に同梱する（バンドルサイズが数 GB 単位で膨らむ）かの二択でした。さらに、モデル出力は非構造化テキストなので、開発者は prompt 内に「JSON で返してください」と書き、その上で大量のフォールバック解析を実装する必要があり、モデルが少しでもフォーマットを崩すと一気に破綻していました。
+
+WWDC25 で発表された Foundation Models framework は、Apple Intelligence を支えるオンデバイスモデルを開発者にそのまま開放するものです。30 億パラメータ・1 パラメータ 2 bit 量子化のモデルがシステムに組み込まれており、App 側で同梱する必要はありません。データはすべてデバイス上に留まり、オフラインでも動作します。要約、抽出、分類、コンテンツ生成といったデバイススケールのタスク向けで、世界知識の問い合わせや複雑な推論には向きません（[02:57](https://developer.apple.com/videos/play/wwdc2025/286/?time=177)）。
+
+framework は次の 4 つの仕組みで実用上の課題を解決しています。**Guided Generation** は `@Generable` を付けた Swift struct を渡すと、モデルが型安全なオブジェクトを直接出力します。内部では constrained decoding により構造の妥当性が数学的に保証されます。**Snapshot Streaming** はストリーミング出力を `PartiallyGenerated` のスナップショット列として表現し、各プロパティを Optional とすることで SwiftUI の状態バインディングと組み合わせれば文字が徐々に浮かび上がる UI を実現できます。**Tool Calling** はモデルが自律的にどの Swift 関数を呼ぶかを判断する仕組みで、引数も `@Generable` で型安全になります。**Stateful Session** はマルチターンの transcript を保持し、`contentTagging` のような専用 adapter も提供します。
+
+---
+
+## 詳細
+
+### Guided Generation：マクロで prompt エンジニアリングを置き換える
+
+モデルに生成させたい型を定義し、`@Generable` と `@Guide` を付けます（[05:32](https://developer.apple.com/videos/play/wwdc2025/286/?time=332)）。
+
+```swift
+@Generable
+struct SearchSuggestions {
+    @Guide(description: "A list of suggested search terms", .count(4))
+    var searchTerms: [String]
+}
+```
+
+**ポイント:**
+- `@Generable` マクロは、その struct が生成対象であることを framework に伝え、エンコード用プロトコルや `PartiallyGenerated` ミラー型を自動生成します。
+- `@Guide(description:)` はフィールドの意味を自然言語で型定義のそばに書ける仕組みで、モデルはこれを手がかりにフィールドの意味を理解します。
+- `.count(4)` は構造的な制約で、配列長をちょうど 4 に強制します。constrained decoding によってトークンレベルで保証されます。
+
+呼び出し側では、生成したい型を session に直接伝えるだけです（[05:51](https://developer.apple.com/videos/play/wwdc2025/286/?time=351)）。
+
+```swift
+let response = try await session.respond(
+    to: prompt,
+    generating: SearchSuggestions.self
+)
+print(response.content)
+```
+
+**ポイント:**
+- prompt で出力フォーマットを説明する必要がなくなり、意図だけを記述すれば済みます。
+- `generating:` 引数は型をスキーマとして内部のデコーダに渡します。
+- `response.content` は強く型付けされた `SearchSuggestions` で、そのまま SwiftUI ビューに渡せます。
+
+### Snapshot Streaming：1 フレームごとに完全なスナップショット
+
+従来の delta streaming はトークンを開発者自身で連結する必要があり、構造化出力との相性は最悪でした。framework ではこれをスナップショット方式に置き換えています（[09:40](https://developer.apple.com/videos/play/wwdc2025/286/?time=580)）。
+
+```swift
+let stream = session.streamResponse(
+    to: "Craft a 3-day itinerary to Mt. Fuji.",
+    generating: Itinerary.self
+)
+
+for try await partial in stream {
+    print(partial)
+}
+```
+
+**ポイント:**
+- `streamResponse` は `AsyncSequence` を返し、各要素は `Itinerary.PartiallyGenerated` です。
+- `PartiallyGenerated` のすべてのプロパティは Optional になっており、生成の進行に応じて埋まっていきます。
+- SwiftUI 側では `partial` を `@State` に保持するだけで、ビューが生成に合わせて自動更新されます（[10:05](https://developer.apple.com/videos/play/wwdc2025/286/?time=605)）。
+- struct 内のフィールド宣言順がそのまま生成順になります。summary を最後に置くと、より質の高い要約が得られる傾向があります（[11:00](https://developer.apple.com/videos/play/wwdc2025/286/?time=660)）。
+
+### Tool Calling：モデルから自分の Swift 関数を呼ばせる
+
+`Tool` プロトコルに準拠する型を定義します（[13:42](https://developer.apple.com/videos/play/wwdc2025/286/?time=822)）。
+
+```swift
+struct GetWeatherTool: Tool {
+    let name = "getWeather"
+    let description = "Retrieve the latest weather information for a city"
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "The city to fetch the weather for")
+        var city: String
+    }
+
+    func call(arguments: Arguments) async throws -> ToolOutput {
+        let places = try await CLGeocoder().geocodeAddressString(arguments.city)
+        let weather = try await WeatherService.shared.weather(for: places.first!.location!)
+        let temperature = weather.currentWeather.temperature.value
+
+        let content = GeneratedContent(properties: ["temperature": temperature])
+        return ToolOutput(content)
+    }
+}
+```
+
+**ポイント:**
+- `name` と `description` はモデルがツールを呼ぶか否かを判断する材料なので、モデルにとって読みやすい記述にします。
+- `Arguments` は `@Generable` 必須で、モデルが生成する引数も型安全になり、文字列を雑に組み立てるリスクを排除できます。
+- `call` は開発者が書く Swift コードで、WeatherKit や CoreLocation などのシステムサービスを叩くこともできます。
+- `ToolOutput` は構造化された `GeneratedContent` でも、自然言語の文字列でも返せます。
+
+session にツールを登録するだけで利用できます（[15:03](https://developer.apple.com/videos/play/wwdc2025/286/?time=903)）。
+
+```swift
+let session = LanguageModelSession(
+    tools: [GetWeatherTool()],
+    instructions: "Help the user with weather forecasts."
+)
+let response = try await session.respond(to: "What is the temperature in Cupertino?")
+```
+
+**ポイント:**
+- `getWeather` を呼ぶか、どの都市を渡すかはモデルが自律的に判断します。
+- ツールの出力は framework によって transcript に挿入され、モデルはそれを踏まえて最終的な自然言語の応答を生成します。
+
+### Stateful Session と可用性チェック
+
+session は内部で transcript を保持し、マルチターンの呼び出しでは履歴コンテキストを自動的に引き回します（[17:46](https://developer.apple.com/videos/play/wwdc2025/286/?time=1066)）。実行前には必ず可用性をチェックする必要があります（[19:56](https://developer.apple.com/videos/play/wwdc2025/286/?time=1196)）。
+
+```swift
+struct AvailabilityExample: View {
+    private let model = SystemLanguageModel.default
+
+    var body: some View {
+        switch model.availability {
+        case .available:
+            Text("Model is available")
+        case .unavailable(let reason):
+            Text("Reason: \(reason)")
+        }
+    }
+}
+```
+
+**ポイント:**
+- Apple Intelligence が有効で、対応地域のデバイスでのみモデルが利用可能です。
+- `.unavailable(reason)` は利用不可の理由を返すので、UI 側はそれを参照して非 AI のフォールバック経路に切り替える必要があります。
+
+---
+
+## 重要ポイント
+
+- **何をやるか**: 既存 App にある「JSON parsing + 正規表現でのリカバリ」をすべて `@Generable` 型に置き換えます。
+  - なぜ取り組む価値があるか: constrained decoding によりモデルの出力フォーマット崩れが構造的に発生しなくなり、フォールバック処理を大量に削れるからです。
+  - どう着手するか: 一番壊れやすかった LLM パース箇所を 1 つ選び、対象の型に `@Generable` を付け、prompt から「JSON で返してください…」という指示を全削除した上で、Xcode Playground で出力を検証します。
+
+- **何をやるか**: snapshot streaming を活用し、「5 秒待たされる」体験を SwiftUI で「文字がじわっと浮かぶ」体験に作り変えます。
+  - なぜ取り組む価値があるか: 体感レイテンシは実レイテンシ以上に継続率に影響します。snapshot は SwiftUI の `@State` と相性が良く、わずかな行数で生成過程を可視化できるからです。
+  - どう着手するか: 既存の `respond(to:)` 呼び出しを `streamResponse` に置き換え、`Itinerary.PartiallyGenerated?` を state として保持し、フィールドに `.transition(.opacity)` を付けます。
+
+- **何をやるか**: App 内部の既存 Swift 関数を `Tool` でラップし、モデルをルーターとして機能させます。
+  - なぜ取り組む価値があるか: prompt に「ユーザーが天気を聞いたら……」とハードコードする必要がなくなり、モデル自身が呼び出し可否を判断するため、ロジックがすっきりします。WeatherKit、CoreLocation などのローカル機能も呼び出せます。
+  - どう着手するか: まずは副作用のない参照系関数（天気、為替、在庫など）を 1 つ選び、`Tool` プロトコルに準拠させて session の `tools:` 配列に登録し、prompt はユーザーの意図のみを記述します。
+
+- **何をやるか**: コンテンツタグ付けのユースケースには専用 adapter `SystemLanguageModel(useCase: .contentTagging)` を直接利用します。
+  - なぜ取り組む価値があるか: 専用 adapter はタグ、感情、アクション抽出の精度が汎用モデルより一段高く、呼び出し方法は汎用モデルと同じだからです。
+  - どう着手するか: ノート、レビュー、チャットログのような入力を `Top3ActionEmotionResult` で一度処理し、汎用 prompt の結果と比較します。
+
+---
+
+## 関連セッション
+
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — guided generation、動的スキーマ、transcript 管理の内部機構を深掘り
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — Foundation Models を SwiftUI App に組み込む手順を公式と一緒に進めるセッション
+- [Explore prompt design & safety for on-device foundation models](/articles/wwdc2025-248) — オンデバイスモデル向けの prompt 設計原則と安全策
+- [Get started with MLX for Apple silicon](/articles/wwdc2025-315) — Apple silicon 上の数値計算・機械学習 framework である MLX の入門

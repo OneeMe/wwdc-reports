@@ -1,0 +1,189 @@
+---
+title: "Learn about Apple Immersive Video technologies"
+description: "explore the capabilities of apple immersive video and apple spatial audio format technologies to create truly immersive experiences. meet the new immersivemediasupport framework, which offers function"
+date: 2026-06-10
+tags: ["Audio & Video", "Spatial Computing"]
+thumbnail: "/images/sessions/2025/403.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/403/"
+sessionId: "wwdc2025-403"
+year: "2025"
+relatedSessions:
+  - title: "Explore video experiences for visionOS"
+    code: "304"
+    description: "Overview of visionOS 26 video profiles; prerequisite knowledge for this session"
+  - title: "Learn about the Apple Projected Media Profile"
+    code: "297"
+    description: "Deep dive into the 180/360-degree projection format APMP"
+  - title: "Support immersive video playback in visionOS apps"
+    code: "296"
+    description: "Playing AIVU/HLS immersive video in your own visionOS app"
+  - title: "Create a seamless multiview playback experience"
+    code: "302"
+    description: "How to build a multiview playback experience"
+---
+
+## Highlight
+
+> macOS and visionOS 26 add the ImmersiveMediaSupport framework. Together with the AIVU file container and ASAF/APAC audio formats, third-party tools can now read and write Apple Immersive Video metadata.
+
+---
+
+## Core Content
+
+Apple Immersive Video (AIV) is the highest-quality immersive video format on Apple Vision Pro, designed for cameras like the Blackmagic URSA Cine Immersive. These cameras are factory-calibrated before shipping, writing the curvature parameters of each stereo lens into the video file. During playback, the renderer uses these parameters for parametric projection. The problem was that this metadata could only be processed by Apple's internal tools. When third-party NLEs, transcoders, or streaming platforms received AIV footage, they couldn't read or write the critical information: camera calibration, shot flop, fades, and more. The entire production pipeline was stuck.
+
+Blake announced the solution to unblock this pipeline. macOS and visionOS 26 add the ImmersiveMediaSupport framework, providing two data types: `VenueDescriptor` (multi-camera rig + edge blend masks + background environment) and `PresentationDescriptor` (per-frame calibration switches, shot flop, fade, and other dynamic commands). It also defines AIVU (Apple Immersive Video Universal) as a single-file container that packages the video track, PresentationDescriptor, and VenueDescriptor. AIVU files can be previewed directly in the visionOS Files app via Quick Look. Reading and writing go through AVFoundation: use the `quickTimeMetadataAIMEData` identifier to filter metadata for VenueDescriptor, and `quickTimeMetadataPresentationImmersiveMedia` for PresentationDescriptor. To write, set the projection type to `AppleImmersiveVideo` and mux the metadata with AVAssetWriter. On the audio side, Apple introduced ASAF (Apple Spatial Audio Format) as the production format and APAC (Apple Positional Audio Codec) as the distribution format. APAC is mandatory for the AIV experience.
+
+---
+
+## Detailed Content
+
+**Read VenueDescriptor from AIVU file** ([06:23](https://developer.apple.com/videos/play/wwdc2025/403/?time=383)):
+
+```swift
+func readAIMEData(from aivuFile: URL) async throws -> VenueDescriptor? {
+    let avAsset = AVURLAsset(url: aivuFile)
+    let metadata = try await avAsset.load(.metadata)
+    let aimeData = metadata.filter({ $0.identifier == .quickTimeMetadataAIMEData }).first
+    if let dataValue = try await aimeData.load(.value) as? NSData {
+        return try await VenueDescriptor(aimeData: dataValue as Data)
+    }
+    return nil
+}
+```
+
+Key points:
+- `AVURLAsset(url:)` loads the AIVU as a regular QuickTime asset.
+- `load(.metadata)` asynchronously fetches all asset-level metadata.
+- `quickTimeMetadataAIMEData` is a new identifier in ImmersiveMediaSupport, used specifically to filter AIME (Apple Immersive Media Embedded) data.
+- `VenueDescriptor(aimeData:)` deserializes the raw `Data` into a camera rig description.
+
+**Read per-frame PresentationDescriptor** ([06:50](https://developer.apple.com/videos/play/wwdc2025/403/?time=410)):
+
+```swift
+func presentation(timedMetadata: [AVTimedMetadataGroup]) async throws ->
+[PresentationDescriptor] {
+    var presentations: [PresentationDescriptor] =
+    for group in timedMetadata {
+        for metadata in group.items {
+            if metadata.identifier == .quickTimeMetadataPresentationImmersiveMedia {
+                let data = try await metadata.load(.dataValue) {
+                    presentations.append(
+                        try JSONDecoder().decode(PresentationDescriptor.self, from: data)
+                    )
+                }
+            }
+        }
+    }
+    return presentations
+}
+```
+
+Key points:
+- The input is an array of `AVTimedMetadataGroup`, each group corresponding to a PTS range of video frames.
+- Filter Presentation commands by the `quickTimeMetadataPresentationImmersiveMedia` identifier.
+- Commands are JSON-encoded. Decode with `JSONDecoder` to get `PresentationDescriptor`, which contains calibration switches, shot flop, fade, and other commands for that timestamp.
+- For detailed timed metadata retrieval, refer to `AVPlayerItemMetadataOutput`.
+
+**Write VenueDescriptor to AVMetadataItem** ([07:52](https://developer.apple.com/videos/play/wwdc2025/403/?time=472)):
+
+```swift
+func getMetadataItem(from metadata: VenueDescriptor) async throws -> AVMetadataItem {
+    let aimeData = try await metadata.aimeData
+    let aimeMetadataItem = AVMutableMetadataItem()
+    aimeMetadataItem.identifier = .quickTimeMetadataAIMEData
+    aimeMetadataItem.dataType = String(kCMMetadataBaseDataType_RawData)
+    aimeMetadataItem.value = aimeData as NSData
+
+    return aimeMetadataItem
+}
+```
+
+Key points:
+- `metadata.aimeData` serializes VenueDescriptor into raw bytes.
+- `dataType = kCMMetadataBaseDataType_RawData` tells the container this is raw binary, preventing mishandling as a string.
+- Write this as asset-level metadata. Combined with AVAssetWriter, you get a playable AIVU.
+
+**Write frame-timed PresentationDescriptor** ([08:02](https://developer.apple.com/videos/play/wwdc2025/403/?time=482)):
+
+```swift
+func getMetadataItem(reader: PresentationDescriptorReader,
+                     time: CMTime, frameDuration: CMTime) -> AVMetadataItem? {
+    let commands = reader.outputPresentationCommands(for: time) ?? []
+    if commands.isEmpty { return nil }
+
+    let descriptor = PresentationDescriptor(commands: commands)
+    let encodedData = try JSONEncoder().encode(descriptor)
+    let presentationMetadata = AVMutableMetadataItem()
+    presentationMetadata.identifier = .quickTimeMetadataPresentationImmersiveMedia
+    presentationMetadata.dataType = String(kCMMetadataBaseDataType_RawData)
+    presentationMetadata.value = encodedData as NSData
+    presentationMetadata.time = time
+    presentationMetadata.duration = frameDuration
+
+    return presentationMetadata
+}
+```
+
+Key points:
+- `PresentationDescriptorReader.outputPresentationCommands(for:)` fetches the command sequence for that frame at a given time.
+- Return nil when commands are empty to avoid writing redundant metadata entries.
+- `time` and `duration` must align with the video frame buffer's PTS and frame duration. The player uses these to trigger calibration switches or shot flop.
+- Encoding stays JSON, symmetric between write and read sides.
+
+**Validate AIVU file** ([08:20](https://developer.apple.com/videos/play/wwdc2025/403/?time=500)):
+
+```swift
+func validAIVU(file aivuFile: URL) async throws -> Bool {
+    return try await AIVUValidator.validate(url: aivuFile)
+}
+```
+
+Key points:
+- Run `AIVUValidator.validate(url:)` at the end of the write pipeline to catch missing or inconsistent metadata early.
+- Fails with an error on validation failure; returns true when valid.
+
+**HLS publishing points** (from [09:31](https://developer.apple.com/videos/play/wwdc2025/403/?time=571)):
+
+- Recommended specs: 4320×4320 per eye, 90fps, P3-D65-PQ color space, MV-HEVC.
+- Bitrate: 25–100 Mbps average, 50–150 Mbps peak. When tiering, keep resolution and frame rate consistent; vary only bitrate.
+- Use `venueDescriptor.save(to:)` to export a separate `.aime` file, placed alongside the HLS playlist.
+- Multivariant playlist requires HLS version ≥ 12, with venue description data ID, `content type=fully immersive`, stereo video layout, `AppleImmersiveVideo` projection, and APAC audio.
+- When segmenting, preserve the timed metadata track that contains PresentationDescriptor. Otherwise, the player cannot switch calibration at the frame level.
+
+**Preview pipeline**: `ImmersiveMediaRemotePreviewSender` and `ImmersiveMediaRemotePreviewReceiver` push low-bitrate frames from Mac to Vision Pro. Combined with a custom compositor in a visionOS app, this enables real-time preview during editing.
+
+**Audio section** (from [11:21](https://developer.apple.com/videos/play/wwdc2025/403/?time=681)): ASAF is based on broadcast WAV + linear PCM + metadata. Rendering is fully adaptive, calculated in real time based on object and listener positions, with no baking. APAC is the mp4 distribution codec for ASAF, starting at 64 kbps. It supports Channels, Objects, HOA, Dialogue, Binaural, and interactive elements. Playable on all platforms except watchOS. Authoring tools are the Apple Pro Tools plugin and DaVinci Resolve Studio Editor. For HLS, write audio channel info in the media tag and specify the APAC codec in the stream info tag.
+
+---
+
+## Core Takeaways
+
+- **What to do**: Add an AIVU direct-read pipeline to your photo or video management app.
+  - Why it's worth doing: Since visionOS 26, AIVU is Apple's recommended single-file delivery format. Files + Quick Look already support it natively. Treat it as a first-class citizen so users can consume AIVU files directly from colleagues or NLEs.
+  - How to start: `AVURLAsset` load → filter `quickTimeMetadataAIMEData` for VenueDescriptor → listen to timed metadata groups for PresentationDescriptor → render with the system playback stack. The read/write code fits within a hundred lines.
+
+- **What to do**: Add an "Export as AIVU" button to your NLE or transcoder.
+  - Why it's worth doing: Once AIV metadata is lost in the middle of the pipeline, downstream tools can't get the correct camera calibration and the image distorts. Using AIVU as the unified intermediate format preserves the metadata.
+  - How to start: Use AVAssetWriter, set projection type to `AppleImmersiveVideo`, put VenueDescriptor in asset-level metadata and PresentationDescriptor in timed metadata, then call `AIVUValidator.validate(url:)` to self-check.
+
+- **What to do**: Build a real-time preview pipeline from Mac to Vision Pro.
+  - Why it's worth doing: Footage during editing isn't fully encoded. Developers used to have to export and import again, making feedback loops too long. `ImmersiveMediaRemotePreviewSender/Receiver` compress this to frame-level latency.
+  - How to start: On Mac, use Sender to push low-bitrate frames. On Vision Pro, write a visionOS app with a custom compositor to receive from Receiver. Trade preview quality for low latency.
+
+- **What to do**: Add AIV fields to HLS on your streaming backend.
+  - Why it's worth doing: Apple Vision Pro has strict requirements for AIV HLS (version 12, AIME sidecar file, fully immersive content type, APAC audio). Missing any of these causes the player to reject playback.
+  - How to start: Segment at the recommended tiers (25/50/100 Mbps average, 50/100/150 Mbps peak), preserve the timed metadata track, place the `.aime` file from `venueDescriptor.save(to:)` in the playlist directory, then add the corresponding tags to the multivariant playlist.
+
+- **What to do**: Complete the ASAF→APAC workflow on the audio side.
+  - Why it's worth doing: APAC is mandatory for the AIV experience. It runs immersive spatial audio from just 64 kbps, which is bandwidth-friendly.
+  - How to start: On the authoring side, use the Apple Pro Tools plugin or DaVinci Resolve Studio Editor to output ASAF (broadcast WAV + metadata), then encode to mp4 APAC. On the HLS side, annotate channel info in the media tag and specify APAC codec in the stream info tag.
+
+---
+
+## Related Sessions
+
+- [Explore video experiences for visionOS](/articles/wwdc2025-304) — Overview of visionOS 26 video profiles; prerequisite knowledge for this session
+- [Learn about the Apple Projected Media Profile](/articles/wwdc2025-297) — Deep dive into the 180/360-degree projection format APMP
+- [Support immersive video playback in visionOS apps](/articles/wwdc2025-296) — Playing AIVU/HLS immersive video in your own visionOS app
+- [Create a seamless multiview playback experience](/articles/wwdc2025-302) — How to build a multiview playback experience

@@ -1,0 +1,267 @@
+---
+title: "Optimize CPU performance with Instruments"
+description: "learn how to optimize your app for apple silicon with two new hardware-assisted tools in instruments. we"
+date: 2026-06-10
+tags: ["グラフィックスとゲーム", "機械学習", "開発ツール"]
+thumbnail: "/images/sessions/2025/308.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/308/"
+sessionId: "wwdc2025-308"
+year: "2025"
+relatedSessions:
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Engage players with the Apple Games app"
+    code: "215"
+    description: "meet the games app – a new destination for players to keep up with what"
+---
+
+## ハイライト
+
+> 本セッションでは、二分探索の性能最適化を一貫した事例として、Instruments の3段階の性能分析ツールを紹介します。CPU Profiler（サンプリング方式の分析、ソフトウェアレベルのオーバーヘッド特定）、Processor Trace（完全な命令トレース、1%のオーバーヘッドでサンプリングバイアスなしの分析）、CPU Counters（ハードウェアカウンタ、CPU マイクロアーキテクチャのボトルネック分析）です。
+
+---
+
+## 主要内容
+
+性能最適化の最大の悩みは、どこが遅いかわからないことです。Swift のソースコードは、コンパイラ、Swift runtime、システムフレームワーク、カーネルなどの多層的な抽象化を経て、ようやく CPU の命令パイプライン上で実行されます。それぞれの層にオーバーヘッドが潜んでいる可能性があります。ジェネリクスの特殊化が行われていない、プロトコルディスパッチ、暗黙的な Array のボクシング、分岐予測の失敗、キャッシュミスなどです。Time Profiler で見える「ホット関数」はあくまで表層で、実際に CPU を消費しているのは、見えない部分であることが多いです。
+
+Apple は今回、Instruments に2つのハードウェア支援の新ツールを導入し、この問題を根本から解決します。Processor Trace（Instruments 16.3 で導入）は、M4 および A18 のハードウェア機能を利用し、1% のオーバーヘッドでユーザースペースの実行されたすべての命令を記録します。サンプリングバイアスがなく、各ソフトウェア抽象化層の cycles コストを正確に定量化できます。CPU Counters は今年、preset モードを追加しました。ハードウェア性能カウンタを「Instruction Delivery」「Instruction Processing」「Discarded」「Retired」の4つのボトルネックに抽象化し、Guided Methodology（誘導型ワークフロー）で次にどのモードに切り替えてサンプリングすべきかを示します。セッションでは、二分探索を元のバージョンから25倍高速化するまでの過程を、ソフトウェア層の特定から命令層の検証、マイクロアーキテクチャのチューニングまでの完全な流れとして紹介しています。
+
+---
+
+## 詳細
+
+### スループットテストを書く——最適化の定規
+
+最適化の第一歩は、再現性のある測定基準を確立することです。コードの変更はその後に行います。セッションでは、ベンチマークフレームワークを一切使わないシンプルな書き方を紹介しています（[07:49](https://developer.apple.com/videos/play/wwdc2025/308/?time=469)）。
+
+```swift
+import Testing
+import OSLog
+
+let signposter = OSSignposter(
+    subsystem: "com.example.apple-samplecode.MyBinarySearch",
+    category: .pointsOfInterest
+)
+
+func search(
+    name: StaticString,
+    duration: Duration,
+    _ search: () -> Void
+) {
+    var now = ContinuousClock.now
+    var outerIterations = 0
+
+    let interval = signposter.beginInterval(name)
+    let start = ContinuousClock.now
+    repeat {
+        search()
+        outerIterations += 1
+        now = .now
+    } while (start.duration(to: now) < duration)
+    let elapsed = start.duration(to: now)
+    let seconds = Double(elapsed.components.seconds) +
+            Double(elapsed.components.attoseconds) / 1e18
+    let throughput = Double(outerIterations) / seconds
+    signposter.endInterval(name, interval, "\(throughput) ops/s")
+    print("\(name): \(throughput) ops/s")
+}
+```
+
+ポイント：
+
+- `OSSignposter` は `.pointsOfInterest` カテゴリを使用します。これは Instruments でデフォルトで表示されるトラックであり、追加の設定は不要です。
+- `signposter.beginInterval` / `endInterval` は、Instruments のタイムライン上にクリック可能な区間を描画します。後続の「Set Inspection Range and Zoom」で分析範囲を検索処理そのものに絞り込み、テスト起動時のノイズをスキップできます。
+- `ContinuousClock` を `Date` の代わりに使用します。システム時刻の巻き戻しによる負値の発生を防ぎ、かつオーバーヘッドが低いです。
+- `duration`（デフォルト1秒）を満たすまでイテレーション回数を累積し、最後に `outerIterations / seconds` で throughput を算出します。粗い方法ですが、「変更前 vs 変更後」の比較には十分です。
+
+### 第一層：CPU Profiler でソフトウェアレベルのオーバーヘッドを特定
+
+セッションの冒頭で紹介された二分探索は、フレームワーク内に実装されており、シグネチャは `<E: Comparable, C: Collection<E>>` です（[06:37](https://developer.apple.com/videos/play/wwdc2025/308/?time=397)）。CPU Profiler を deferred モードでサンプリングすると、コールツリーの1/4のサンプルが protocol witness、Array の Objective-C 型チェック、メモリ割り当てに割り当てられていました。
+
+なぜ CPU Profiler を使い、Time Profiler を使わないのか？（[09:02](https://developer.apple.com/videos/play/wwdc2025/308/?time=542)）Time Profiler はタイマーによるサンプリングであり、システムの定期的なタスクと aliasing（エイリアシング歪み）が発生する可能性があります。一方、CPU Profiler は各 CPU のサイクルカウンタ（cycle counter）でサンプリングするため、Apple Silicon の非対称な性能コア・効率コアに対してより公平です。周波数の高いコアがより多くサンプリングされ、実際の負荷を正確に反映します。
+
+解決策は、コンテナを `Span` に置き換えることです（[13:46](https://developer.apple.com/videos/play/wwdc2025/308/?time=826)）。
+
+```swift
+public func binarySearch<E: Comparable>(
+    needle: E,
+    haystack: Span<E>
+) -> Span<E>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let half = length / 2
+        let middle = haystack.indices.index(start, offsetBy: half)
+        let middleValue = haystack[middle]
+        if needle < middleValue {
+            length = half
+        } else if needle == middleValue {
+            return middle
+        } else {
+            start = haystack.indices.index(after: middle)
+            length -= half + 1
+        }
+    }
+
+    return start
+}
+```
+
+ポイント：
+
+- `Span<E>` は連続メモリのスライスを表し、本質的にはベースアドレス + 長度です。関数スコープ外へのエスケープが禁止されているため、Array の参照カウントや ObjC ブリッジングのコストが発生しません。
+- アルゴリズムのロジックは一切変更せず、コンテナ型を置き換えただけで、スループットは約4倍に向上しました（[13:52](https://developer.apple.com/videos/play/wwdc2025/308/?time=832)）。
+
+### 第二層：Processor Trace でジェネリクスの未特殊化を暴く
+
+CPU Profiler ではこれ以上問題が見えなくなったため、Processor Trace に切り替えます（[14:09](https://developer.apple.com/videos/play/wwdc2025/308/?time=849)）。これは M4 および A18 でのみ使用可能で、「プライバシーとセキュリティ → 開発者ツール」で権限を有効化する必要があります。トレース時間は数秒以内に抑えることを推奨しています（データ量は GB/s 規模に達する可能性があります）。
+
+Processor Trace のフレームグラフは、サンプリング型ツールとは異なります。幅は実際の実行時間を表し、色はバイナリのソースで区別されます（茶色 = システムフレームワーク、マゼンタ = Swift runtime / 標準ライブラリ、青 = あなたのアプリまたはカスタムフレームワーク）。10回のイテレーションの中から任意の二分探索の呼び出しを選び、Function Calls テーブルを cycles でソートすると、実際のボトルネックは Comparable のジェネリックディスパッチにあり、当初想定していた bounds check ではないことが判明しました。関数がフレームワーク内にあるため、コンパイラはモジュールをまたいで特殊化できないのです（[18:39](https://developer.apple.com/videos/play/wwdc2025/308/?time=1119)）。
+
+解決策は2つから選びます。フレームワーク関数に `@inlinable` を付与するか、あるいは `Int` に特化したバージョンを直接手書きするかです（[19:17](https://developer.apple.com/videos/play/wwdc2025/308/?time=1157)）。
+
+```swift
+public func binarySearchInt(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let half = length / 2
+        let middle = haystack.indices.index(start, offsetBy: half)
+        let middleValue = haystack[middle]
+        if needle < middleValue {
+            length = half
+        } else if needle == middleValue {
+            return middle
+        } else {
+            start = haystack.indices.index(after: middle)
+            length -= half + 1
+        }
+    }
+    return start
+}
+```
+
+ポイント：
+
+- 関数名を `binarySearchInt` に変更し、`<E: Comparable>` を `Int` に固定することで、コンパイラが比較命令を直接 inline 展開します。
+- 汎用性を犠牲にして、1.7倍の高速化を実現しました（[19:23](https://developer.apple.com/videos/play/wwdc2025/308/?time=1163)）。
+- 性能がクリティカルなパス上の少数の関数に限定して適用すべきで、コードベース全体に展開するのは避けてください。
+
+### 第三層：CPU Counters でマイクロアーキテクチャをチューニング
+
+ソフトウェア層のボトルネックは解消され、残るは CPU 内部のボトルネックです。CPU Counters は今年、preset モードを追加しました（[22:35](https://developer.apple.com/videos/play/wwdc2025/308/?time=1355)）。最初は「CPU Bottlenecks」モードを使用し、cycles を Instruction Delivery、Instruction Processing、Discarded、Retired の4つに分類します。
+
+セッションの Span+Int バージョンは、このモードで Discarded（投機実行後に破棄された命令）の比率が高いことを示しました。Instruments は直接 remark を出し、次に「Discarded Sampling」モードに切り替えることを推奨します。具体的な命令に絞り込むと、needle と middleValue の比較が分岐予測器に誤って予測されていることが判明しました（[25:20](https://developer.apple.com/videos/play/wwdc2025/308/?time=1520)）。原因は、探索対象の要素がランダムであり、分岐結果に規則性がないことです。
+
+修正手段は、分岐なしバージョンを書くことです（[26:34](https://developer.apple.com/videos/play/wwdc2025/308/?time=1594)）。
+
+```swift
+public func binarySearchBranchless(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex
+    var length = haystack.count
+
+    while length > 0 {
+        let remainder = length % 2
+        length /= 2
+        let middle = start &+ length
+        let middleValue = haystack[middle]
+        if needle > middleValue {
+            start = middle &+ remainder
+        }
+    }
+
+    return start
+}
+```
+
+ポイント：
+
+- ループ本体には `if` が1つだけあり、かつ代入のみで制御フローを変更しません。Swift コンパイラは conditional move 命令（cmov）を発行し、予測が困難な分岐を排除します。
+- `needle == middleValue` の早期リターンを削除しました。早期リターンは分岐を使って実装する必要があるためです。
+- `&+` などのオーバーフローチェックなしの演算子を使用し、コンパイラがオーバーフローチェックの分岐を挿入するのを防ぎます。
+- Span+Int バージョンに比べてさらに2倍高速です。ボトルネックは Discarded から Instruction Processing に移行しました（[27:24](https://developer.apple.com/videos/play/wwdc2025/308/?time=1644)）。
+
+Instruction Processing モードに切り替えると、remark が L1D Cache Miss Sampling の使用を示唆し、haystack へのメモリアクセスがボトルネックであることが判明しました。背景知識（[27:57](https://developer.apple.com/videos/play/wwdc2025/308/?time=1677)）：L1 cache は CPU 内にあり最速ですが最小です。L2 は CPU 外にあります。miss 後のメインメモリアクセスは L1 より50倍遅いです。キャッシュは 64/128 バイトの cache line 単位でデータを取得します。二分探索のアクセスパターンはキャッシュに極めて不利で、毎回アクセスする中点要素はほぼ異なる cache line 上に存在します。
+
+最後の手段は Eytzinger レイアウト（16世紀のオーストリアの系譜学者にちなんで命名）です。配列を二分木の幅優先順に再配置し、探索の最初の数ステップが同じ cache line 上に収まるようにします（[29:27](https://developer.apple.com/videos/play/wwdc2025/308/?time=1767)）。
+
+```swift
+public func binarySearchEytzinger(
+    needle: Int,
+    haystack: Span<Int>
+) -> Span<Int>.Index {
+    var start = haystack.indices.startIndex.advanced(by: 1)
+    let length = haystack.count
+
+    while start < length {
+        let value = haystack[start]
+        start *= 2
+        if value < needle {
+            start += 1
+        }
+    }
+
+    return start >> ((~start).trailingZeroBitCount + 1)
+}
+```
+
+ポイント：
+
+- 配列のインデックスは1から始まり、左の子は `2*i`、右の子は `2*i+1` で、ヒープのインデックス方式と類似しています。
+- ループ終了時には `start` が範囲外になりますが、最後に `~start` の末尾ゼロビット数を使ってポインタを「巻き戻し」、最後にアクセスされた有効なノードに戻します。
+- 配列の再配置の代償として、順次走査はキャッシュに不利になります。したがって、これはトレードオフであり、無闇な最適化ではありません。
+- 分岐なしバージョンに比べてさらに2倍高速です。総加速倍率は約25倍です（[31:04](https://developer.apple.com/videos/play/wwdc2025/308/?time=1864)）。
+
+---
+
+## 重要ポイント
+
+**1. クリティカルパスに throughput harness を構築する**
+
+なぜ価値があるか：CPU Profiler、Processor Trace、CPU Counters の3つのツールセットは、ホットスポットを安定して再現できるテストエントリポイントが必要です。再現性のある基準がなければ、どんなに優れたツールも推測に過ぎません。
+
+どう始めるか：セッションで紹介されたテンプレートを再利用し、`OSSignposter` + `ContinuousClock` + 1秒程度の `repeat-while` ループを組み合わせます。Xcode 内で `@Test` でアノテートし、テスト名を secondary-click すると直接 Profile できます。クリティカルなアルゴリズムごとに1つずつ作成し、長期的に保持してください。
+
+**2. Processor Trace でジェネリクス/プロトコルが本当に特殊化されているか検証する**
+
+なぜ価値があるか：モジュールをまたいだジェネリック関数は、大概率で特殊化されていません。しかし、CPU Profiler では具体的な「protocol witness」のフレームバーがないため、直接確認するのは困難です。Processor Trace は各 cycles を正確に表示し、この隠れたオーバーヘッドを浮き彫りにします。
+
+どう始めるか：M4 Mac または A18 iPhone で「開発者ツール」の Processor Trace 権限を有効化し、テストを10回のイテレーションに縮小します。Function Calls テーブルを cycles でソートします。フレームワーク内の generic 関数が inline 展開されていない場合、`@inlinable` を付与するか、性能がクリティカルな箇所で型特化バージョンを手書きしてください。
+
+**3. CPU Counters の誘導型ワークフローをデフォルトの入り口にする**
+
+なぜ価値があるか：今年の CPU Counters の preset モード + Suggested Next Mode 列により、「どのカウンタを見るべきか」というハードルが下がりました。CPU Bottlenecks から始めて、remark に従って Discarded Sampling、Instruction Processing、L1D Cache Miss Sampling などのモードを進めば、《Apple Silicon CPU Optimization Guide》を読み終えることなく、ほとんどのマイクロアーキテクチャ問題を特定できます。
+
+どう始めるか：テンプレート選択時に CPU Counters → CPU Bottlenecks を選び、1回実行して主要なボトルネックを確認します。「Suggested Next Mode」を secondary-click して次のモードに進み、Profile を再実行します。コードを変更するたびに CPU Bottlenecks に戻り、ボトルネックが移動したかどうかを検証してください。
+
+**4. 最適化の前に「この処理を省略できないか」と問う**
+
+なぜ価値があるか：セッションでは繰り返し強調されていますが、最も安価な最適化はコードの削除、実行の遅延、事前計算、またはキャッシュの追加です（[04:36](https://developer.apple.com/videos/play/wwdc2025/308/?time=276)）。マイクロ最適化はコードを脆くし、保守性を低下させ、かつコンパイラの特定の動作（auto-vectorization、ARC elision）に依存します。
+
+どう始めるか：性能レビュー時に、まず3つの質問を列挙してください。「ユーザーは本当にこの結果を必要としているか」「初回アクセス時まで lazy に計算できないか」「コンパイル時にベイクできないか」。この3つの関門をクリアできない場合に、Span / 特化 / 分岐なし / キャッシュフレンドリーなレイアウトなどの手段を検討してください。
+
+---
+
+## 関連セッション
+
+- [Visualize and optimize Swift concurrency](/articles/wwdc2025-266) — Instruments でタスクのブロッキングとスレッド切り替えを分析し、CPU 性能分析と補完させます。
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Span、Inline Array などの連続メモリ型を詳解。本セッションで Collection を Span に置き換えるための前提知識です。
+- [Analyze hangs with Instruments](/articles/wwdc2025-248) — Hangs ツールで問題が本当に CPU にあるかを確認し、本セッションの CPU 最適化パスを進めるかどうかを判断します。
+- [What's new in Swift](/articles/wwdc2025-245) — `@inlinable`、Span、Testing フレームワークなど、本セッションで使用された言語特性の更新が含まれます。
+- [Discover Metal 4](/articles/wwdc2025-205) — CPU ボトルネックを解決した後、重い計算ワークロードを GPU に移行することを検討できます。

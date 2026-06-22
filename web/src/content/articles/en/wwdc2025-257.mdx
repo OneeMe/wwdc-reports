@@ -1,0 +1,260 @@
+---
+title: "Optimize home electricity usage with EnergyKit"
+description: "learn how to support energykit in your app so people can optimize electricity usage at home. this can help people run appliances or charge evs during times when electricity is cleaner and cheaper. get"
+date: 2026-06-10
+tags: ["EnergyKit", "HomeKit", "EV", "Renewable Energy", "Swift Concurrency"]
+thumbnail: "/images/sessions/2025/257.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/257/"
+sessionId: "wwdc2025-257"
+year: "2025"
+relatedSessions:
+  - title: "Finish tasks in the background"
+    code: "227"
+    description: "Continuously refresh ElectricityGuidance in background tasks"
+  - title: "Demystify concurrency in SwiftUI"
+    code: "266"
+    description: "Understand how to consume EnergyKit AsyncSequence values in SwiftUI"
+  - title: "Meet the Smart Home"
+    code: "242"
+    description: "The broader capabilities of the Home app and HomeKit Home"
+  - title: "Build a UIKit document-based app"
+    code: "260"
+    description: "Another system-integration pattern from the same year's system services frameworks"
+---
+
+## Highlight
+
+> EnergyKit exposes real-time forecasts of grid cleanliness and electricity prices to apps as an AsyncSequence, so EVs and smart thermostats can shift load to times when power is cleaner and cheaper.
+
+---
+
+## Core Content
+
+Plug an EV in at 6:30 PM and the car starts charging right away. That is what most apps do by default. The problem is that 6:30 to 9:00 PM is the peak demand window in most US time zones. Electricity is most expensive then, and coal and natural gas plants supply most of the load. By the time wind power comes online overnight and demand drops, the car is already full. The user pays more and uses dirtier electricity. Last year the Home app's Grid Forecast feature showed users this problem, but third-party apps had no way to plug a "when is power cleaner" signal into their own charging schedulers.
+
+WWDC25's EnergyKit exposes the same data that drives Grid Forecast as a framework. The core abstractions are `EnergyVenue` (a physical charging location bound to a HomeKit Home) and `ElectricityGuidance` (a 0 to 1 forecast value, where lower means cleaner and cheaper). EV vendors and thermostat vendors can now pull a 24-hour window of guidance values and replace "start charging now" with "charge during the hours with the lowest guidance values." The companion `LoadEvent` feedback channel writes actual charging behavior back to EnergyKit, which then produces insights like "how much of this charging session came from clean hours" and surfaces them to the user. The data lives in Core Data on-device and syncs end-to-end encrypted to CloudKit, shared with members of the HomeKit Home.
+
+---
+
+## Detailed Content
+
+EnergyKit integration has four steps: pick a venue, subscribe to guidance, report LoadEvents, and query insights.
+
+Step one is onboarding ([03:13](https://developer.apple.com/videos/play/wwdc2025/257/?time=193)). The user enables Clean Energy Charging in your app for a charging location. The app fetches the list of nearby `EnergyVenue` objects, lets the user pick one, and persists the venue's UUID. Each launch re-validates that the venue still exists:
+
+```swift
+// Retrieve an EnergyVenue
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+
+    let venue: EnergyVenue
+
+    init?(venueID: UUID) async {
+        guard let energyVenue = await EnergyVenue.venue(for: venueID) else {
+            return nil
+        }
+        venue = energyVenue
+    }
+}
+```
+
+Key points:
+
+- `EnergyVenue.venue(for:)` is async because the venue metadata may need to be read from a system service.
+- It returns an optional. The venue can become invalid if the user deletes it from the Home app, so the initializer is failable.
+- Persist the `UUID`, not the venue object itself. Re-resolve the venue at every launch.
+
+Step two is subscribing to guidance ([06:03](https://developer.apple.com/videos/play/wwdc2025/257/?time=363)). `ElectricityGuidance.Query` picks an action type. EVs use `.shift` (move the same load to a better time slot); thermostats use `.reduce` (use less directly). `sharedService.guidance(...)` returns an AsyncSequence that pushes a new value every time the grid forecast refreshes:
+
+```swift
+// Fetch ElectricityGuidance
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+    // The current active guidance.
+    var guidance: ElectricityGuidance?
+
+    fileprivate func streamGuidance(
+        venueID: UUID,
+        update: (_ guidance: ElectricityGuidance) -> Void
+    ) async throws {
+        let query = ElectricityGuidance.Query(suggestedAction: .shift)
+        for try await currentGuidance in ElectricityGuidance.sharedService.guidance(
+            using: query,
+            at: venueID
+        ) {
+            update(currentGuidance)
+          	break
+        }
+    }
+}
+```
+
+Key points:
+
+- `Query(suggestedAction: .shift)` tells the system that this is a shiftable load (an EV). The system tunes its forecast around that semantic.
+- `for try await` is the standard way to consume an AsyncSequence, with `throws` handling network and permission failures.
+- The `break` makes this a one-shot read. The code grabs the latest guidance once to drive a schedule, instead of monitoring continuously.
+- `update` uses a callback rather than writing to a property directly, which makes it easier for the caller to update an observable object across an actor boundary.
+
+For long-running tracking (for example, re-scheduling mid-charge when the grid forecast changes), drop the `break`. Background refresh scenarios must be wrapped in a BackgroundTask ([07:00](https://developer.apple.com/videos/play/wwdc2025/257/?time=420)):
+
+```swift
+// Fetch ElectricityGuidance
+
+import EnergyKit
+import Foundation
+
+@Observable final class EnergyVenueManager  {
+    // The task used to stream guidance.
+    private var streamGuidanceTask: Task<(), Error>?
+
+    ///Start streaming guidance and store the value in the observed property 'guidance'.
+    func startGuidanceMonitoring() {
+       streamGuidanceTask?.cancel()
+        streamGuidanceTask = Task.detached { [weak self] in
+            if let venueID = self?.venue.id {
+                try? await self?.streamGuidance(venueID: venueID) { guidance in
+                    self?.guidance = guidance
+                    if Task.isCancelled {
+                        return
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Key points:
+
+- `streamGuidanceTask?.cancel()` cancels the old stream before starting a new one, which avoids leaking concurrent tasks.
+- `Task.detached` with `[weak self]` makes sure the task does not block the manager from being deallocated.
+- The `Task.isCancelled` check inside the update closure makes sure the cancel signal can exit the callback chain promptly.
+
+Step three is LoadEvent feedback (starting at [11:30](https://developer.apple.com/videos/play/wwdc2025/257/?time=690)). One charging session has three states: `begin / active / end`. Apple recommends generating an active event every 15 minutes during steady-state charging, plus events on pause, schedule change, or sudden power changes:
+
+```swift
+// Start a session
+
+import EnergyKit
+
+// A controller that handles an electric vehicle
+@Observable class ElectricVehicleController {
+    // The session
+    var session: ElectricVehicleLoadEvent.Session?
+
+    // The current guidance stored at the EV
+    var currentGuidance: ElectricityGuidance
+
+    // Whether the EV is following guidance
+    var isFollowingGuidance: Bool = true
+
+    fileprivate func beginSession() {
+        session = ElectricVehicleLoadEvent.Session(
+            id: UUID(),
+            state: .begin,
+            guidanceState: .init(
+                wasFollowingGuidance: isFollowingGuidance,
+                guidanceToken: currentGuidance.guidanceToken
+            )
+        )
+    }
+}
+```
+
+Key points:
+
+- A single session uses one `UUID` across begin/active/end. All three events share the same id.
+- The `guidanceToken` comes from the guidance you fetched earlier, and it is only valid on the device that fetched it.
+- `wasFollowingGuidance` lets EnergyKit tell the difference between "user override" and "followed guidance."
+
+Measurements use Foundation's `Measurement<UnitPower>` and `Measurement<UnitEnergy>`, in milliwatts and milliwatt-hours ([11:30](https://developer.apple.com/videos/play/wwdc2025/257/?time=690)). Submit events in a batch:
+
+```swift
+// Submit events
+
+import EnergyKit
+
+// A controller that handles an electric vehicle
+@Observable class ElectricVehicleController {
+    // EnergyVenue
+    // The venue at which the EV uses energy
+    var currentVenue: EnergyVenue
+
+    // Electric EV Events
+    // The list of generated EV load events
+    var events = [ElectricVehicleLoadEvent]()
+    
+    func submitEvents() async throws {
+        try await currentVenue.submitEvents(events)
+    }
+}
+```
+
+Key points:
+
+- `submitEvents` hangs off the venue directly. The charging location an event belongs to is fixed, so you do not pass it again.
+- Apple explicitly recommends batching to cut IPC overhead, and **forbids** submitting events between two charging sessions.
+- Submitted data flows through CloudKit end-to-end encryption and is shared with members of the HomeKit Home.
+
+Step four is querying insights ([13:25](https://developer.apple.com/videos/play/wwdc2025/257/?time=805)). `ElectricityInsightQuery` uses an OptionSet of `.cleanliness` and `.tariff` to pick the dimensions you want. With granularity `.daily`, it returns daily aggregates:
+
+```swift
+// Create an insight query
+
+import EnergyKit
+
+@Observable final class EnergyVenueManager  {
+    func createInsightsQuery(on date: Date) -> ElectricityInsightQuery {
+        return ElectricityInsightQuery(
+            options: .cleanliness.union(.tariff),
+            range: self.dayInterval(date: date),
+            granularity: .daily,
+            flowDirection: .imported
+        )
+    }
+}
+```
+
+Key points:
+
+- `flowDirection: .imported` means drawing power from the grid (charging). Switch to `exported` if you do V2G discharging.
+- `.cleanliness` buckets energy into three tiers: clean / reduce / avoid. `.tariff` buckets it into five tiers from super off peak to critical peak.
+- The tariff dimension only has data when the user has linked an electricity account in the Home app and is on a time-of-use plan.
+
+End-to-end, your app moves from "is there power" to "where does the power come from, when is the cheapest hour to use it, and how did the user actually use it."
+
+---
+
+## Key Takeaways
+
+- **What to do**: Add a Clean Energy Charging switch to your EV or storage app
+  - Why it is worth doing: Instant charging by default makes users buy the most expensive and dirtiest power during peak hours. Once EnergyKit is on, the system computes the window for you, and the app only needs to start charging at the better times. This is a difference users can feel.
+  - How to start: First build an onboarding flow that lets the user pick an `EnergyVenue` for each charging location and store the UUID. Then drop a `streamGuidance` call into your existing charging trigger logic, and use the returned value to decide whether to start now.
+
+- **What to do**: Treat LoadEvents as product analytics data
+  - Why it is worth doing: LoadEvents are not just for EnergyKit's insights. They are themselves a fine-grained charging log with power, energy, and timestamps. Back in your app you can build a "clean charging share this week" card, a year-end review, or a community leaderboard.
+  - How to start: Add an event cache layer to your charging controller. Append on a 15-minute window or on a power change. At session end, call `submitEvents` once, and copy the cache aside for local analysis.
+
+- **What to do**: Wire smart thermostats and water heaters to `.reduce` guidance
+  - Why it is worth doing: EVs shift (move time slots), but thermostats reduce (use less directly). EnergyKit covers both semantics in the same framework. For users in regions with tight grids, dropping a couple of degrees during critical hours is real money.
+  - How to start: Switch the query's suggestedAction to `.reduce`. When guidance is high, widen the target temperature by 1–2°C and tell the user why. Pair it with the critical peak tag for a more aggressive policy.
+
+- **What to do**: Use BackgroundTask to keep guidance fresh through long charges
+  - Why it is worth doing: A Level 2 charge can run 6–8 hours. The app cannot stay in the foreground that long. When guidance refreshes mid-charge, the car needs to follow.
+  - How to start: Wrap `streamGuidanceTask` in a `BGAppRefreshTask` or in a widget's update callback. When guidance changes past a threshold, re-plan the charging schedule and write a fresh `guidanceToken` into the next batch of LoadEvents.
+
+---
+
+## Related Sessions
+
+- [Finish tasks in the background](/articles/wwdc2025-227) — the official recommended way to keep refreshing ElectricityGuidance from a background task
+- [Demystify concurrency in SwiftUI](/articles/wwdc2025-266) — how to consume the EnergyKit AsyncSequence inside SwiftUI
+- [Meet the Smart Home](/articles/wwdc2025-242) — background on the Home app and HomeKit Home as a whole
+- [Build a UIKit document-based app](/articles/wwdc2025-260) — another integration pattern for the same generation of system services frameworks

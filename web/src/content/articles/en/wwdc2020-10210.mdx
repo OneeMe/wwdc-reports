@@ -1,0 +1,323 @@
+---
+title: "Modernize PCI and SCSI drivers with DriverKit"
+description: "keep code out of the kernel and give your customers a more secure and reliable experience with accessories using driverkit. discover how to create low-level drivers that support pci devices or scsi controllers. and find out how you can achieve great performance with driverkit on macos big sur."
+date: "2020-06-10"
+tags: ["System Services", "DriverKit", "macOS"]
+thumbnail: "/images/sessions/2020/10210.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10210/"
+sessionId: "wwdc2020-10210"
+year: "2020"
+relatedSessions:
+  - title: "Build an Endpoint Security app"
+    code: "10159"
+    description: "Also use macOS System Extension to move the security capabilities originally entered into the kernel to user space."
+  - title: "Create audio drivers with DriverKit"
+    code: "10190"
+    description: "Let’s talk about how AudioDriverKit packages the audio driver and DriverKit extension into an App."
+  - title: "Bring your driver to iPad with DriverKit"
+    code: "110373"
+    description: "Continuing the DriverKit migration route, we will talk about how to extend the existing Mac DriverKit driver to iPad."
+  - title: "Create camera extensions with Core Media IO"
+    code: "10022"
+    description: "Introducing the camera-related macOS system extension, another example of modernizing hardware extensions."
+---
+## Highlight
+
+> macOS Big Sur adds PCIDriverKit and SCSIControllerDriverKit to DriverKit. PCI and SCSI controller drivers can be rewritten as System Extension in user space, and the corresponding kext will enter the abandoned path in alternative scenarios.
+
+## Core Content
+
+Writing a PCI or SCSI controller driver used to usually mean getting into the kernel. kext can access the resources of the entire machine, and a bug may cause a kernel panic. Debugging is also slow: it often requires two machines to cooperate, and it has to be restarted after the driver crashes.
+
+DriverKit moves this work to user space. Driver extensions can still get the permissions required for specific hardware or kernel interfaces, but the permissions are limited by entitlement and the resources are isolated from the rest of the system. When the driver process crashes, the kernel and other processes continue to run. The installation method has also changed: dext remains in the App bundle, and the App initiates an activationRequest through the SystemExtensions framework, and then waits for administrator approval.
+
+This session addresses DriverKit’s coverage gap on low-level hardware. macOS Catalina already supports USB, Serial, Network Interface Controller, and HID. To macOS Big Sur, Apple added PCI and SCSI controller driver support and made it clear that when System Extension can complete the same job, PCI and SCSI controller kext will enter the abandoned path.
+
+The speech is divided into two lines. The first line is PCIDriverKit: how to authorize PCI devices, open devices, access configuration space, handle interrupts and DMA. The second line is SCSIControllerDriverKit: How to use`IOUserSCSIParallelInterfaceController`Write a SCSI dext and have the storage I/O driven by userspace still run full of real workloads.
+
+## Detailed Content
+
+### DriverKit installation and authorization boundaries
+
+([02:28](https://developer.apple.com/videos/play/wwdc2020/10210/?time=148)) Driver extension should not be copied to the system directory. It remains in the App bundle, and the App creates an activationRequest at the appropriate lifecycle node. A common practice is to request activation when the app starts, or you can wait until the user accepts the license agreement or completes the purchase.
+
+```text
+DriverKit distribution workflow:
+1. Keep the driver extension inside the app bundle.
+2. Use the SystemExtensions framework to create an activationRequest.
+3. Ask the system to make the extension available.
+4. Wait for administrator approval.
+5. Sign the dext locally and include all required entitlements during development.
+```
+
+Key points:
+
+- The distribution entry of dext is App, not the system directory.
+- activationRequest is created by SystemExtensions framework.
+- Administrator approval is part of loading System Extension.
+- During the development phase, you can first run the local signature, but it must include the entitlement required by the driver.
+
+([05:39](https://developer.apple.com/videos/play/wwdc2020/10210/?time=339)) PCIDriverKit also requires PCI entitlement. This entitlement uses the same IOPCIFamily matching criteria as Info.plist, which can be accurate to vendor ID and device ID. Mask can also be used to support multiple devices under the same vendor.
+
+```text
+PCI entitlement shape:
+- A list of PCI matching dictionaries.
+- Matching criteria follow IOPCIFamily categories.
+- A primary match compares primary vendor ID and device ID.
+- A mask can remove the device ID part and match all devices from one vendor.
+```
+
+Key points:
+
+- entitlement determines whether this dext has access to the target PCI device.
+- Device matching rules and IOPCIFamily use the same set of criteria.
+- When using mask to broaden the matching range, the authorization range will become larger and needs to be controlled by product line.
+- If the PCI device needs to be connected to other DriverKit families, such as a custom Ethernet NIC, the corresponding family entitlement must also be added.
+
+### Device model for PCIDriverKit
+
+([07:15](https://developer.apple.com/videos/play/wwdc2020/10210/?time=435)) The only class in PCIDriverKit is`IOPCIDevice`. It is not used for subclasses. The driver treats it as a PCI provider and accesses PCI resources through it. Apple also emphasizes that a successful call to`Open`, to be called during the stop phase`Close`。
+
+```text
+PCI driver extension model:
+1. Use IOPCIDevice as the PCI provider.
+2. Call Open before accessing PCI resources.
+3. Treat Open success as exclusive access to the PCI device.
+4. Route shared access through one PCI resource manager when multiple clients exist.
+5. Call Close in the driver stop routine.
+```
+
+Key points:
+
+- `IOPCIDevice`It is a resource entrance, not a business-driven parent class.
+- `Open`Establish exclusive access; PCI resources should not be read or written without opening the device.
+- When multiple clients share resources, the driver needs to design a resource management layer by itself.
+- `Close`On success, device state cannot be assumed to be preserved; the PCI stack disables bus mastering and memory space.
+
+### Configuration space, memoryIndex and device memory access
+
+([09:25](https://developer.apple.com/videos/play/wwdc2020/10210/?time=565)) PCIDriverKit uniformly takes over device mapping. Memory access API usage`memoryIndex`and offset. In 32-bit BAR,`memoryIndex`Same as BAR index; 64-bit BAR will combine two BARs into one memory entry, so`memoryIndex`Counting starts from 0 by memory entry.
+
+```text
+Memory access model:
+- 32-bit BAR2 -> memoryIndex 2.
+- 64-bit BAR0 + BAR1 -> memoryIndex 0.
+- 64-bit BAR2 + BAR3 -> memoryIndex 1.
+- Access device memory by memoryIndex plus offset.
+```
+
+Key points:
+
+- `memoryIndex`Indicates the memory entry number, not always BAR index.
+- 64-bit BAR will change the index mapping relationship.
+- The unified entrance allows Apple to optimize device access in the future, and also facilitates observation of memory access with dtrace.
+- Configuration space reading and writing is basically a one-to-one migration, but it also requires an open session first.
+
+([11:02](https://developer.apple.com/videos/play/wwdc2020/10210/?time=662)) When bus mastering and memory space are enabled, PCIDriverKit no longer provides explicit kernel APIs for each operation. The driver needs to read the PCI command register, set the bus master and memory enable bit, and then write it back to the device.
+
+```text
+Start routine for a typical PCI driver:
+1. Open a session with the PCI provider.
+2. Read the PCI command register.
+3. Set the bus master bit.
+4. Set the memory space enable bit.
+5. Write the command register back.
+6. Perform memory reads or writes only after these bits are set.
+```
+
+Key points:
+
+- The command register is the key entry point to enable device memory access and I/O.
+- These offsets and definitions are located in PCIDriverKit framework headers.
+- The process is the same when disabling bus mastering, except that the corresponding bit mask is removed.
+- Called in stop routine`Close`, indicating that the driver ends the session with the PCI device.
+
+### User space processes of interrupt and DMA
+
+([12:06](https://developer.apple.com/videos/play/wwdc2020/10210/?time=726)) The interrupt handler must first be`.iig`declared in the header file. The driver then enumerates the interrupt index of the PCI device, finds the required interrupt type, such as MSI, and then connects the interrupt source to a DispatchQueue.
+
+```text
+Interrupt setup:
+1. Declare InterruptOccurred in the .iig header.
+2. Iterate through interrupt indexes for the PCI device.
+3. Pick the index whose interruptType matches MSI.
+4. Choose a DispatchQueue.
+5. Create the dispatch source for that interrupt index.
+6. Create the interrupt action.
+7. Enable the source so the handler is called on interrupt.
+```
+
+Key points:
+
+- interrupt type determines which interrupt index the driver should bind to.
+- You can use the default DispatchQueue or create a separate queue for interrupt.
+- interrupt action connects dispatch source and processing function.
+- In the handler, the interrupt can be cleared by writing to the device register through MMIO.
+
+([13:43](https://developer.apple.com/videos/play/wwdc2020/10210/?time=823)) DMA transfer needs to create the buffer memory descriptor first, and then create`IODMACommand`. Apple clearly says,`IODMACommand`Specify that this is for the PCI device so the system can select the correct memory mapper.
+
+```text
+DMA transfer workflow:
+1. Create a buffer memory descriptor.
+2. Set the buffer length before writing into it.
+3. Create the DMA specification for the hardware.
+4. Create an IODMACommand for the PCI device.
+5. Prepare the buffer memory descriptor with the DMA command.
+6. Use physicalAddressSegment to get the address for the PCI device.
+7. Call Complete on the DMA command after the transfer.
+```
+
+Key points:
+
+- buffer memory descriptor describes the memory to be accessed by the device.
+- `IODMACommand`Bind to PCI device to avoid going to the wrong memory mapper.
+- `physicalAddressSegment`The output address will be written to the hardware.
+- Called after the transfer is completed`Complete`, allowing physical memory to be reused by other processes or devices.
+
+### Classes and queue models of SCSIControllerDriverKit
+
+([16:18](https://developer.apple.com/videos/play/wwdc2020/10210/?time=978)) SCSI dext requires subclass`IOUserSCSIParallelInterfaceController`. Apple retains the API structure close to the kernel class, adding`User`prefix. dext requires override functions marked pure virtual, e.g.`UserProcessParallelTask`、`UserDoesHBAPerformAutoSense`、`UserInitializeController`。
+
+```text
+SCSI dext skeleton:
+1. Subclass IOUserSCSIParallelInterfaceController.
+2. Override pure virtual functions.
+3. Use UserProcessParallelTask to submit I/O requests to hardware.
+4. Use UserDoesHBAPerformAutoSense to report auto-sense support.
+5. Use UserInitializeController to initialize controller and dext data structures.
+6. Add generic DriverKit, transport-specific, and SCSI controller entitlements.
+```
+
+Key points:
+
+- Pure virtual functions are the entry point for the framework to call dext.
+- Non-pure virtual functions are called by dext to create a SCSI target or set a target property.
+- SCSI controller family entitlement is a prerequisite for accessing the framework.
+- SCSI controller devices are usually based on PCIe, so it is compatible with PCIDriverKit.
+
+([20:49](https://developer.apple.com/videos/play/wwdc2020/10210/?time=1249)) Apple recommends that SCSI dext use three DispatchQueue: Default Queue, Interrupt Queue, and Auxiliary Queue. Default Queue handles calls from the kernel; Interrupt Queue specifically handles interrupts and I/O timeout; Auxiliary Queue is used to create SCSI targets.
+
+```text
+Recommended SCSI queues:
+- Default Queue: UserInitializeController, UserProcessParallelTask, and other kernel-originated calls.
+- Interrupt Queue: hardware interrupts and IOTimeoutHandlers.
+- Auxiliary Queue: SCSI target creation.
+```
+
+Key points:
+
+- DriverKit's dispatch queue is serial.
+- Put interrupt and I/O in different queues to reduce waiting for each other.
+- Creating a target will trigger multiple kernel callbacks to dext, so it should not be blocked on the Default Queue.
+- `UserMapHBAData`It is suitable to create controller-specific taskData in advance to avoid preprocessing in the I/O path.
+
+### SCSI I/O path, power and termination
+
+([23:44](https://developer.apple.com/videos/play/wwdc2020/10210/?time=1424)) SCSIControllerDriverKit changes the division of responsibilities for I/O paths. kernel call`UserProcessParallelTask`Submit I/O and put`SCSIUserParallelTask`The copy is sent to dext. The kernel is responsible for preparing`IODMACommand`and generate physical segments, dext does not need to initiate these IPCs to the kernel on the performance path.
+
+```text
+SCSI I/O path:
+1. Kernel calls UserProcessParallelTask.
+2. Dext receives a SCSIUserParallelTask copy.
+3. Kernel has already prepared IODMACommand and physical segments.
+4. Dext uses fBufferIOVMAddr as the start physical address.
+5. Dext posts the request to hardware.
+6. Interrupt handler processes completion.
+7. Dext calls ParallelTaskCompletion with SCSIUserParallelResponse.
+```
+
+Key points:
+
+- dext cannot be obtained`SCSIParallelTask`object, what you get is`SCSIUserParallelTask`。
+- `fBufferIOVMAddr`It is the starting address of the continuous physical segment generated by the kernel.
+- If the hardware requires multiple segments, dext can prepare the ScatterGatherList by itself.
+- `ParallelTaskCompletion`Is the I/O completion callback, and the response contains status, bytes transferred and sense data.
+
+([28:15](https://developer.apple.com/videos/play/wwdc2020/10210/?time=1695)) power management via override`SetPowerState`Finish. DriverKit supports three power states: off, on, and low-power. PCIe devices mainly handle off and on: off corresponds to sleep or PCI pause, and on corresponds to system wake.
+
+```text
+SCSI dext lifecycle:
+1. Override SetPowerState for hardware-specific power transitions.
+2. Use delayed acknowledgement when hardware reset or rescan needs time.
+3. Override Stop for termination.
+4. Close outstanding PCI session in Stop.
+5. Cancel dispatch queues and sources.
+6. Let the kernel handle outstanding I/O requests during termination.
+```
+
+Key points:
+
+- `SetPowerState`You can return first, and then complete the acknowledgment through super dispatch after the hardware is restored.
+- In the example, on transition will initiate a hard reset and trigger SCSI target rescan.
+- `Stop`Close the PCI session, cancel the queue and source.
+- Dext is not responsible for completing outstanding I/O. This part is handled by the kernel during termination.
+
+### Performance Boundary
+
+([31:55](https://developer.apple.com/videos/play/wwdc2020/10210/?time=1915)) Apple uses a 4Gbps Fiber Channel host bus adapter to connect the RAID disk array to the MacBook Pro via Thunderbolt 3. In the demonstration, Final Cut Pro played Apple ProRes video from this external SCSI disk and achieved disk throughput of nearly 350 MB/s without triggering the dropped frames warning.
+
+```text
+Demo setup:
+- 4 Gbps Fibre Channel host bus adapter.
+- RAID disk array.
+- Thunderbolt 3 connection to a MacBook Pro.
+- ExampleSCSIDext running as a user-space DriverKit extension.
+- Final Cut Pro library stored on the external SCSI disk.
+- ProRes playback at around 350 MB/s disk throughput.
+```
+
+Key points:
+
+- The demonstration goal is to verify whether the user space dext can bear the pro workload.
+- This SCSI dext works through a PCIe-based controller.
+- The performance demonstration of session relies on the specific demo, not an abstract promise.
+- Apple focuses on performance path optimization on kernel preprocessing DMA and reducing I/O path IPC.
+
+## Core Takeaways
+
+**1. Make a DriverKit migration template for PCIe devices**
+
+What to do: Pick an existing PCIe kext, match the device,`Open` / `Close`, command register, and memory access are first moved to PCIDriverKit.
+
+Why it's worth doing: The session clearly states that PCI kext enters the obsolete path when it can be replaced by System Extension. Early migration can detect entitlement, BAR mapping and DMA differences in advance.
+
+How to start: First sort out the vendor ID and device ID, write out the PCI matching dictionaries, and then change the Start routine to open`IOPCIDevice`, enable bus mastering and memory space, pass`memoryIndex`Visit MMIO.
+
+**2. Make a SCSI controller dext prototype**
+
+What to do: use`IOUserSCSIParallelInterfaceController`Build a minimal SCSI dext, run through initialization, I/O submit, interrupt completion and Stop.
+
+Why it’s worth doing: SCSIControllerDriverKit is responsible for replacing the past`IOSCSIParallelInterfaceController`kext route, suitable for devices such as Fiber Channel, RAID controller, Serial Attached SCSI, etc.
+
+How to start: first override pure virtual functions and create three queues: Default, Interrupt, and Auxiliary;`UserProcessParallelTask`Read in`SCSIUserParallelTask`, called after the hardware is completed`ParallelTaskCompletion`。
+
+**3. Make a driver installation and recovery console**
+
+What to do: Package dext into an app, providing activation status, admin approval status, error logs, and reactivation portal.
+
+Why it’s worth doing: DriverKit’s installation action changes from copying the system directory to the App initiating an activationRequest. Users and administrators need to know whether the extension is available.
+
+How to start: Use the SystemExtensions framework to create an activationRequest when the App starts, and record each approval, failure, and retry; after the driver crashes, the user is prompted to reconnect the device or reactivate the extension.
+
+**4. Make a DMA and interrupt diagnostic tool**
+
+What to do: Document in the development dext`memoryIndex`, interrupt type, DMA prepare/Complete timing and completion status.
+
+Why it’s worth doing: PCIDriverKit receives device memory access under a unified API. Apple also mentioned that this can help use dtrace to observe PCI problems in multi-threaded environments.
+
+How to start: First put the interrupt into an independent DispatchQueue, then record the buffer length, physicalAddressSegment and completion time for each DMA transfer, and align it with the hardware log.
+
+**5. Make a kext fungibility checklist**
+
+What to do: Make a table of the team's existing kernel extensions and indicate whether they belong to the USB, Serial, Network Interface Controller, HID, PCI, or SCSI controller families that DriverKit already supports.
+
+Why it’s worth doing: Apple has bound the DriverKit support range to kext deprecation; drivers belonging to supported families should be prioritized in the migration plan.
+
+How to start: Group by device family, check entitlement, provider class, I/O path and installation method one by one, and list points that still rely on kernel-only behavior as migration risks.
+
+## Related Sessions
+
+- [Build an Endpoint Security app](/articles/wwdc2020-10159) — Also around macOS System Extension, security capabilities that originally relied on the kernel are moved to user space.
+- [Create audio drivers with DriverKit](/articles/wwdc2021-10190) — Continue to talk about the implementation of DriverKit on audio drivers, including App packaging and Core Audio HAL interaction.
+- [Bring your driver to iPad with DriverKit](/articles/wwdc2022-110373) — Talk about the extension of DriverKit to iPad, and multi-platform migration of existing Mac DriverKit drivers.
+- [Create camera extensions with Core Media IO](/articles/wwdc2022-10022) — Introducing the camera system extension, suitable for comparing how different hardware extensions are migrated from legacy plug-ins to user space.

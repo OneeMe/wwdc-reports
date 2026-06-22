@@ -1,0 +1,338 @@
+---
+title: "Deep dive into the Foundation Models framework"
+description: "level up with the foundation models framework. learn how guided generation works under the hood, and use guides, regexes, and generation schemas to get custom structured responses. we"
+date: 2026-06-10
+tags: ["機械学習"]
+thumbnail: "/images/sessions/2025/301.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/301/"
+sessionId: "wwdc2025-301"
+year: "2025"
+relatedSessions:
+  - title: "Bring advanced speech-to-text to your app with SpeechAnalyzer"
+    code: "277"
+    description: "discover the new speechanalyzer api for speech to text. we"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+  - title: "Develop for Shortcuts and Spotlight with App Intents"
+    code: "260"
+    description: "learn about how building app intents that make actions available and work best w"
+---
+
+## ハイライト
+
+> Foundation Models は constrained decoding（制約付きデコーディング）によって token レベルで schema に合わない候補を排除し、デバイス上の LLM 出力をそのまま Swift の型としてパースできるようにします。
+
+---
+
+## 主要内容
+
+LLM に構造化データを出力させるのは古くからの難題です。一般的なやり方では、prompt にフィールドを記述し、さらにパース処理を山ほど書くことになります。脆く、エラーが起きやすく、フィールド名がひとつ違うだけで全体が崩れてしまいます。Session のプレゼンターである Louis 氏も、ピクセルアートのコーヒーショップゲームを開発する中で同じ問題に直面しました。barista との会話はテキストだけでも成立しますが、いざ NPC に名前、コーヒーの注文、レベル、属性配列といった構造化データを持たせようとすると、prompt の文字列連結だけでは破綻してしまいます。
+
+Foundation Models の答えが `@Generable` マクロです。Swift の struct や enum にこのマクロを付けるだけで、コンパイル時に対応する schema が生成されます。推論時はモデルが schema に従って constrained decoding を行います。token をひとつ生成するたびに、framework が schema に適合しない候補 token の確率分布をマスクし、モデルは合法な token の中からしか選べなくなります（[09:21](https://developer.apple.com/videos/play/wwdc2025/301/?time=561)）。これは `firstName` のような幻覚フィールドが物理的に出現し得ないということを意味します。schema が実行時にしか分からない場合（たとえばゲーム内でプレイヤーが自作するステージのエンティティなど）も、`DynamicGenerationSchema` を使って実行時に組み立てられます。さらにその上には Tool Calling があります。モデルが自律的に関数を呼ぶタイミングを判断し、引数も Generable なので、framework が常に合法な入力を保証してくれます。
+
+---
+
+## 詳細
+
+### Session: ステートフルな会話と transcript
+
+`respond(to:)` を呼ぶたびに、その内容は session の transcript に記録され、すべての prompt と response が保持されます。これがコンテキスト記憶を持つことの代償です。token は積み上がり続け、最終的にはコンテキストウィンドウに突き当たります（[03:07](https://developer.apple.com/videos/play/wwdc2025/301/?time=187)）。
+
+```swift
+import FoundationModels
+
+func respond(userInput: String) async throws -> String {
+  let session = LanguageModelSession(instructions: """
+    You are a friendly barista in a world full of pixels.
+    Respond to the player's question.
+    """
+  )
+  let response = try await session.respond(to: userInput)
+  return response.content
+}
+```
+
+ポイント:
+
+- `LanguageModelSession(instructions:)` では複数行文字列を使ってシステムレベルの指示を注入し、その session におけるモデルの役割と目的を伝えます。
+- `session.respond(to:)` は async throws です。呼び出し時に instructions と prompt が token に変換され、モデルが token を生成し、framework が detoken して文字列に戻します。
+- `response.content` から最終的なテキストを取得できます。すべての処理はデバイス上で完結し、ネットワーク通信は発生しません。
+
+### コンテキスト超過: instructions と直近の応答だけを残す
+
+`exceededContextWindowSize` に当たったとき、transcript を丸ごと捨ててしまうとキャラクターが「瞬時に記憶喪失」になってしまいます。Louis 氏のアプローチは、最初の 1 件（instructions）と最後の 1 件（直近の成功応答）だけを残すというものです（[03:55](https://developer.apple.com/videos/play/wwdc2025/301/?time=235)）。
+
+```swift
+var session = LanguageModelSession()
+
+do {
+  let answer = try await session.respond(to: prompt)
+  print(answer.content)
+} catch LanguageModelSession.GenerationError.exceededContextWindowSize {
+  session = newSession(previousSession: session)
+}
+
+private func newSession(previousSession: LanguageModelSession) -> LanguageModelSession {
+  let allEntries = previousSession.transcript.entries
+  var condensedEntries = [Transcript.Entry]()
+  if let firstEntry = allEntries.first {
+    condensedEntries.append(firstEntry)
+    if allEntries.count > 1, let lastEntry = allEntries.last {
+      condensedEntries.append(lastEntry)
+    }
+  }
+  let condensedTranscript = Transcript(entries: condensedEntries)
+  return LanguageModelSession(transcript: condensedTranscript)
+}
+```
+
+ポイント:
+
+- `previousSession.transcript.entries` で旧 session の全エントリを取得できます。先頭は常に instructions です。
+- `condensedEntries` には先頭と末尾だけを残し、コンテキストを安全な token サイズまで圧縮します。
+- `Transcript(entries:)` で新しい transcript にラップし、新しい session に渡します。キャラクター設定と直近の記憶は残り、それ以外は自然に忘却される形です。
+
+1〜2 件では足りない場合は、Foundation Models 自身に途中の transcript を要約させてから繋ぐといった方法も検討できます。
+
+### Sampling: ランダム性と再現性
+
+モデルは token をひとつずつ生成し、各ステップで確率分布が決まります。デフォルトのランダムサンプリングはゲーム内会話にバリエーションを与えますが、デモのときは greedy に切り替えて安定した出力を得ます（[06:14](https://developer.apple.com/videos/play/wwdc2025/301/?time=374)）。
+
+```swift
+// Deterministic output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(sampling: .greedy)
+)
+
+// Low-variance output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(temperature: 0.5)
+)
+
+// High-variance output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(temperature: 2.0)
+)
+```
+
+ポイント:
+
+- `sampling: .greedy` は各ステップで最も確率の高い token を選びます。同じ prompt と session state なら出力は一致します。ただし OS アップデートでモデルのバージョンが変わるとこの保証は失われます。
+- `temperature: 0.5` は出力の揺れが小さく、「基本的には安定しているが機械的すぎない」シーンに向きます。
+- `temperature: 2.0` は分散の大きい出力で、創造的な穴埋めに適します。ただし高すぎると構造が崩れやすくなります。
+
+### Generable: 構造化出力の王道
+
+`@Generable` マクロはコンパイル時に schema と initializer を生成し、`respond(generating:)` を呼ぶと framework がモデル出力を自動的に Swift のインスタンスへパースしてくれます（[08:14](https://developer.apple.com/videos/play/wwdc2025/301/?time=494)）。
+
+```swift
+@Generable
+struct NPC {
+  @Guide(description: "A full name")
+  let name: String
+  @Guide(.range(1...10))
+  let level: Int
+  @Guide(.count(3))
+  let attributes: [Attribute]
+  let encounter: Encounter
+
+  @Generable
+  enum Attribute {
+    case sassy
+    case tired
+    case hungry
+  }
+  @Generable
+  enum Encounter {
+    case orderCoffee(String)
+    case wantToTalkToManager(complaint: String)
+  }
+}
+```
+
+ポイント:
+
+- `@Generable` は struct と enum の両方に対応し、enum case には associated value を持たせられるので、NPC の「遭遇イベント」を分岐表現にできます。
+- `@Guide(description:)` は自然言語でプロパティの意味を制約します。フィールドの説明を prompt に埋め込むのと等価ですが、バインドが強固になります。
+- `@Guide(.range(1...10))` は constrained decoding を通じて、数値 token を 1〜10 の整数に限定します。
+- `@Guide(.count(3))` は配列長を 3 に固定します。
+- プロパティは宣言順に生成されます: `name → level → attributes → encounter`。依存される側のプロパティを前に書く必要があります（[12:00](https://developer.apple.com/videos/play/wwdc2025/301/?time=720)）。
+
+正規表現の guide も使えます。文字列構造をそのまま regex builder に委ねる形です。
+
+```swift
+@Generable
+struct NPC {
+  @Guide(Regex {
+    Capture {
+      ChoiceOf {
+        "Mr"
+        "Mrs"
+      }
+    }
+    ". "
+    OneOrMore(.word)
+  })
+  let name: String
+}
+```
+
+ポイント: モデルは string token 列を正規表現の状態機械に沿って進めるので、生成される名前は常に `Mr. Brewster` か `Mrs. Brewster` の形をとります。
+
+### DynamicGenerationSchema: 実行時に schema を組み立てる
+
+ゲーム内でプレイヤーが独自エンティティを作る場合、たとえば「謎かけ」（質問 1 つと候補回答 N 個からなる構造）をプレイヤー側で定義するようなケースは、コンパイル時には型を確定できません。そんなときに使うのが `DynamicGenerationSchema` です（[15:10](https://developer.apple.com/videos/play/wwdc2025/301/?time=910)）。
+
+```swift
+struct LevelObjectCreator {
+  var properties: [DynamicGenerationSchema.Property] = []
+
+  mutating func addStringProperty(name: String) {
+    let property = DynamicGenerationSchema.Property(
+      name: name,
+      schema: DynamicGenerationSchema(type: String.self)
+    )
+    properties.append(property)
+  }
+
+  mutating func addArrayProperty(name: String, customType: String) {
+    let property = DynamicGenerationSchema.Property(
+      name: name,
+      schema: DynamicGenerationSchema(
+        arrayOf: DynamicGenerationSchema(referenceTo: customType)
+      )
+    )
+    properties.append(property)
+  }
+}
+
+var riddleBuilder = LevelObjectCreator(name: "Riddle")
+riddleBuilder.addStringProperty(name: "question")
+riddleBuilder.addArrayProperty(name: "answers", customType: "Answer")
+
+var answerBuilder = LevelObjectCreator(name: "Answer")
+answerBuilder.addStringProperty(name: "text")
+answerBuilder.addBoolProperty(name: "isCorrect")
+
+let schema = try GenerationSchema(
+  root: riddleBuilder.root,
+  dependencies: [answerBuilder.root]
+)
+
+let session = LanguageModelSession()
+let response = try await session.respond(
+  to: "Generate a fun riddle about coffee",
+  schema: schema
+)
+let generatedContent = response.content
+let question = try generatedContent.value(String.self, forProperty: "question")
+let answers = try generatedContent.value([GeneratedContent].self, forProperty: "answers")
+```
+
+ポイント:
+
+- `DynamicGenerationSchema(type: String.self)` で組み込み型を参照し、`DynamicGenerationSchema(referenceTo: "Answer")` で別の動的 schema を参照できます。
+- 各動的 schema は互いに独立しており、最終的に `GenerationSchema(root:dependencies:)` で組み立てて検証します。存在しない型を参照していればこの段階でエラーになります。
+- 出力型は `GeneratedContent` になり、`value(_:forProperty:)` でプロパティ名から値を取り出します。型は呼び出し側で指定します。constrained decoding は引き続き機能し、フィールドが捏造されることはありません。
+
+### Tool Calling: モデルが能動的に関数を呼ぶ
+
+Tool を使うと、モデルが生成の途中で自分のコードを呼び出してデータを取得できるようになります。Louis 氏は連絡先を活用して、NPC にプレイヤーの contact の名前を使わせようとしました（[18:47](https://developer.apple.com/videos/play/wwdc2025/301/?time=1127)）。
+
+```swift
+import FoundationModels
+import Contacts
+
+struct FindContactTool: Tool {
+  let name = "findContact"
+  let description = "Finds a contact from a specified age generation."
+
+  @Generable
+  struct Arguments {
+    let generation: Generation
+
+    @Generable
+    enum Generation {
+      case babyBoomers
+      case genX
+      case millennial
+      case genZ
+    }
+  }
+
+  func call(arguments: Arguments) async throws -> ToolOutput {
+    let store = CNContactStore()
+    let keysToFetch = [CNContactGivenNameKey, CNContactBirthdayKey] as [CNKeyDescriptor]
+    let request = CNContactFetchRequest(keysToFetch: keysToFetch)
+
+    var contacts: [CNContact] = []
+    try store.enumerateContacts(with: request) { contact, stop in
+      if let year = contact.birthday?.year {
+        if arguments.generation.yearRange.contains(year) {
+          contacts.append(contact)
+        }
+      }
+    }
+    guard let pickedContact = contacts.randomElement() else {
+      return ToolOutput("Could not find a contact.")
+    }
+    return ToolOutput(pickedContact.givenName)
+  }
+}
+```
+
+ポイント:
+
+- `name` は `findContact` のように動詞句を使い、`description` は 1 文に収めます。この 2 つは prompt にそのまま埋め込まれるため、長くするほど latency が増します（[19:08](https://developer.apple.com/videos/play/wwdc2025/301/?time=1148)）。
+- `Arguments` は必ず `@Generable` にします。モデルが引数を生成する際にも constrained decoding が働き、`genAlpha` のような未定義 case が紛れ込むことはありません。
+- `call(arguments:)` は async throws です。連絡先アクセスはシステムの権限ダイアログを伴うので、プレイヤーが拒否した場合でも framework がパーソナライズなしの経路を確保してくれます。
+
+tool インスタンスを session に渡します。
+
+```swift
+let session = LanguageModelSession(
+  tools: [FindContactTool()],
+  instructions: "Generate fun NPCs"
+)
+```
+
+ポイント: session は tool のインスタンスを保持し、会話のライフサイクル全体で共有します。すでに使った連絡先を重複させたくない場合は、`FindContactTool` を class に変更し、`call` の中で `pickedContacts: Set<String>` のような状態を管理すれば対応できます（[21:55](https://developer.apple.com/videos/play/wwdc2025/301/?time=1315)）。
+
+Tool 呼び出しの流れ（[23:03](https://developer.apple.com/videos/play/wwdc2025/301/?time=1383)）: モデルが prompt を分析 → tool を呼ぶか判断 → `Arguments` を生成（constrained decoding により合法性が保証される）→ framework がユーザー定義の `call` を実行 → `ToolOutput` が transcript に書き戻される → モデルがそれを踏まえて応答を続ける。**1 回のリクエスト中に tool が複数回呼ばれることがあり、しかも並列に実行されます**。`call` 内で共有状態にアクセスする際はロックを忘れないでください。
+
+---
+
+## 重要ポイント
+
+- **何をやるか**: 既存 App に `@Generable` ベースの構造化出力レイヤーを追加する。
+  - なぜ価値があるか: これまでは cloud 上の LLM に JSON Schema を組み合わせるか、自分で脆いパーサーを書くしかありませんでした。Foundation Models ならデバイス上で型安全な出力を得られ、ネットワーク不要・コストゼロ・プライバシーは端末から出ません。
+  - どこから始めるか: 既存の「自然言語入力 → 固定構造出力」機能（メモの要約、メールの分類、リスト生成など）をひとつ選び、ターゲット型に `@Generable` を付け、enum 値には `@Guide` で範囲を絞り、まずは greedy サンプリングで schema のヒット率を確認します。
+
+- **何をやるか**: ゲームやツール内の「設定エディタ」を `DynamicGenerationSchema` に接続する。
+  - なぜ価値があるか: ユーザー定義の構造は LLM が苦手とする領域で、ハードコードした schema ではカバーしきれません。動的 schema があれば、プレイヤーや運用担当が実行時にエンティティを定義しても、constrained decoding がモデル側を守ってくれます。
+  - どこから始めるか: 既存の「ユーザーカスタムフィールド」UI を `DynamicGenerationSchema.Property` のリストにマッピングし、ルートフィールドの参照は `referenceTo:` で繋ぎ、保存時に `GenerationSchema(root:dependencies:)` を呼んで合法性を検証します。
+
+- **何をやるか**: Tool Calling 経由でデバイス内のプライベートデータ（Contacts、Calendar、HealthKit、Photos）を LLM に接続する。
+  - なぜ価値があるか: これらのデータをクラウド LLM に流すとコンプライアンスリスクが伴いますが、ローカル tool の呼び出しならプライバシーを保ちつつ、モデル自身が取得タイミングを判断できます。
+  - どこから始めるか: 最小構成の `Tool`（name は動詞 1 つ、description は 1 文、Arguments は Generable）から書き始め、`call` の中でシステム API を呼びます。tool を session に渡し、誘導用の prompt でモデルが能動的に呼んでくれるか確認したうえで、class 化や並列安全性を追加していきます。
+
+- **何をやるか**: 長い会話のために transcript 圧縮のフォールバックを用意する。
+  - なぜ価値があるか: オンデバイスのモデルはクラウドモデルよりコンテキストが大幅に小さく、長い会話では必ず `exceededContextWindowSize` に当たります。ユーザー視点では「AI が突然記憶喪失になる」体験になってしまいます。
+  - どこから始めるか: `exceededContextWindowSize` を catch し、まずは「先頭 1 件 + 直近 1 件を残す」シンプルな戦略を実装します。中間部分への依存が大きいシナリオでは、Foundation Models に中間 transcript を要約させてから繋ぎ直す対応を加えます。
+
+---
+
+## 関連セッション
+
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — Foundation Models を SwiftUI App に組み込む手順をコードと共に追体験できます。
+- [Meet the Foundation Models framework](/articles/wwdc2025-286) — Foundation Models の入門 Session。本 Session の前に視聴しておくのがおすすめです。
+- [Explore prompt design & safety for on-device foundation models](/articles/wwdc2025-248) — オンデバイスモデルにおける prompt エンジニアリングと安全設計の要点。
+- [Design interactive snippets](/articles/wwdc2025-281) — App Intents の snippet ビュー。Generable 出力と組み合わせて軽量なインタラクティブカードを作れます。
+- [Develop for Shortcuts and Spotlight with App Intents](/articles/wwdc2025-260) — App Intents は Foundation Models の機能をシステムレベルの入口に公開するための鍵となるパスです。

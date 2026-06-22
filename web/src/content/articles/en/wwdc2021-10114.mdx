@@ -1,0 +1,267 @@
+---
+title: "Meet StoreKit 2"
+description: "StoreKit 2 delivers powerful, Swift-native APIs for in-app purchases and auto-renewable subscriptions. Learn how you can easily implement in-app purchases and subscriptions with async/await."
+date: "2021-06-08"
+tags: ["StoreKit", "In-App Purchase", "Subscriptions", "Swift", "async/await"]
+thumbnail: "/images/sessions/2021/10114.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10114/"
+sessionId: "wwdc2021-10114"
+year: "2021"
+relatedSessions:
+  - title: "Support customers and handle refunds"
+    code: "10115"
+    description: "StoreKit 2 customer support and refund processing"
+  - title: "In-app purchases on the server"
+    code: "10174"
+    description: "Server-side in-app purchase verification and App Store Server API"
+  - title: "What's new in Wallet and Apple Pay"
+    code: "10092"
+    description: "New Apple Pay features and payment sheet improvements"
+  - title: "Meet StoreKit for SwiftUI"
+    code: "10114"
+    description: "StoreKit integration in SwiftUI"
+---
+## Highlight
+
+> StoreKit 2 rewrites the entire in-app purchase process with Swift async/await:`Product.products(for:)`One line of code to get the product,`product.purchase()`One line of code initiates a purchase, each transaction comes with a JWS signature and is automatically verified, and the subscription status is passed`currentEntitlements`Inquire directly.
+
+## Core Content
+
+You are building an in-app purchase system.StoreKit 1 code you wrote: Create`SKProductsRequest`, implement agent method, processing`SKPaymentTransaction`The long code of state machine, switching back and forth between sandbox and formal environment for testing, and receipt parsing will give you a headache.
+
+StoreKit 2 says: These can all be simpler.
+
+New product requests a line of code.One line of code for the new purchase process.Transaction verification is done automatically.Query subscription status directly.All APIs are Swift-native async/await, and the code reads like synchronous logic.
+
+And StoreKit 2 and StoreKit 1 are fully compatible.Old transactions are automatically synced to the new API, and you can migrate incrementally.
+
+## Detailed Content
+
+### Get product information
+
+（[03:13](https://developer.apple.com/videos/play/wwdc2021/10114/?time=193)）
+
+StoreKit 2`Product`type replaced`SKProduct`, added fields such as product type and subscription information:
+
+```swift
+let products = try await Product.products(for: ["fuel.small", "car.sports", "nav.pro"])
+
+// Group by type
+let consumables = products.filter { $0.type == .consumable }
+let nonConsumables = products.filter { $0.type == .nonConsumable }
+let subscriptions = products.filter { $0.type == .autoRenewable }
+```
+
+**Key points:**
+- `Product.products(for:)`Is a static method, passing in the product ID collection
+- returned`Product`Include`type`Attributes, automatically identify consumable / non-consumable / subscription
+- support`BackingValue`Packaging type, new fields added in the future can also be accessed on the old SDK
+
+### Initiate purchase
+
+（[03:31](https://developer.apple.com/videos/play/wwdc2021/10114/?time=211)）
+
+Purchase becomes`Product`instance method, the result is`PurchaseResult`enumerate:
+
+```swift
+let result = try await product.purchase()
+
+switch result {
+case .success(let verification):
+    // Purchase succeeded; verification contains the signed transaction
+    let transaction = try checkVerified(verification)
+    await deliverContent(for: transaction)
+    await transaction.finish()
+
+case .userCancelled:
+    // User cancelled
+    break
+
+case .pending:
+    // Pending approval, such as parental approval or bank verification
+    break
+
+case .unverified(_, let error):
+    // Verification failed
+    print("Purchase failed: \(error)")
+}
+```
+
+**Key points:**
+- `purchase()`return`PurchaseResult`, covering four states: success, cancellation, waiting, and failure.
+- Returned on success`verification`Contains automatic verification results
+- must be called last`transaction.finish()`, otherwise the transaction will remain in the queue
+
+### Automatic transaction verification
+
+（[11:19](https://developer.apple.com/videos/play/wwdc2021/10114/?time=679)）
+
+Every transaction in StoreKit 2 is signed with JWS (JSON Web Signature).The system automatically verifies that the signature comes from the App Store:
+
+```swift
+func checkVerified<T>(_ result: VerificationResult<T>) throws -> T {
+    switch result {
+    case .verified(let safe):
+        return safe
+    case .unverified(_, let error):
+        throw error
+    }
+}
+```
+
+**Key points:**
+- `VerificationResult`have`.verified`and`.unverified`two cases
+- The system has verified that the signature is from Apple, matches your bundle ID, and was generated on the current device
+- You can also choose to verify JWS yourself, using CryptoKit and a certificate chain
+
+### App Account Token: Associate your user system
+
+（[04:20](https://developer.apple.com/videos/play/wwdc2021/10114/?time=260)）
+
+If your App has its own account system, you can use`appAccountToken`Associate StoreKit transactions with your users:
+
+```swift
+let accountToken = UUID(uuidString: user.id)!
+let result = try await product.purchase(options: [.appAccountToken(accountToken)])
+```
+
+**Key points:**
+- `appAccountToken`is in UUID format, generated by you
+- After the purchase is completed, the token will appear in the transaction`appAccountToken`in field
+- Cross-device synchronization, you can track the purchase records of the same account even if you change devices
+
+### Monitor transaction updates
+
+（[15:22](https://developer.apple.com/videos/play/wwdc2021/10114/?time=922)）
+
+use`Transaction.updates`Listen for all transaction updates (including purchases on other devices, completions with parent approval, refunds, etc.):
+
+```swift
+Task {
+    for await result in Transaction.updates {
+        guard let transaction = try? checkVerified(result) else { continue }
+
+        if transaction.revocationDate == nil {
+            await deliverContent(for: transaction)
+        }
+        await transaction.finish()
+    }
+}
+```
+
+**Key points:**
+- `Transaction.updates`It is an infinite asynchronous sequence, and it will start listening after the App is started.
+- Process refunds (`revocationDate`non-nil) and upgrade (`isUpgraded`is true)
+- You must start monitoring when the app is launched, otherwise you may miss updates
+
+### Query transaction history and current equity
+
+（[19:36](https://developer.apple.com/videos/play/wwdc2021/10114/?time=1176)）
+
+StoreKit 2 provides three query methods:
+
+```swift
+// 1. Get all historical transactions
+for await result in Transaction.all {
+    let transaction = try checkVerified(result)
+    // Process each historical transaction
+}
+
+// 2. Get the latest transaction for a product
+if let result = await Transaction.latest(for: "nav.pro") {
+    let transaction = try checkVerified(result)
+    // Check whether it is still valid
+}
+
+// 3. Get current active entitlements (most common)
+for await result in Transaction.currentEntitlements {
+    let transaction = try checkVerified(result)
+    // Unlock the corresponding content
+}
+```
+
+**Key points:**
+- `currentEntitlements`Only currently valid non-consumables and active subscriptions are returned
+- Refunded transactions will not appear in`currentEntitlements`middle
+- Consumables are not included as they are not a lasting benefit
+- Users can automatically obtain the benefits when they open the app for the first time after changing devices, without manual recovery.
+
+### Subscription status query
+
+（[22:47](https://developer.apple.com/videos/play/wwdc2021/10114/?time=1367)）
+
+Subscription status consists of three parts: latest transaction, renewal status, and renewal information:
+
+```swift
+let statuses = await product.subscription?.status
+
+for status in statuses {
+    // 1. Latest transaction
+    let latestTransaction = try checkVerified(status.transaction)
+
+    // 2. Renewal state: subscribed / expired / inGracePeriod / inBillingRetryPeriod / revoked
+    switch status.state {
+    case .subscribed:
+        // Active subscription
+    case .expired:
+        // Expired
+    case .inGracePeriod:
+        // In grace period
+    default:
+        break
+    }
+
+    // 3. Renewal information (also JWS-signed)
+    let renewalInfo = try checkVerified(status.renewalInfo)
+    if renewalInfo.autoRenewStatus == .off {
+        // The user turned off auto-renewal; show a win-back offer
+    }
+    if renewalInfo.autoRenewProductID != product.id {
+        // The user downgraded their subscription tier
+    }
+}
+```
+
+**Key points:**
+- `status`Returns an array because the user may have both an own subscription and a Family Sharing subscription
+- The highest level service in the array should be taken
+- `renewalInfo`Include`autoRenewStatus`、`autoRenewProductID`、`expirationReason`and other key fields
+- The renewal information is also signed by JWS and the system automatically verifies it
+
+### JWS signature structure
+
+（[34:03](https://developer.apple.com/videos/play/wwdc2021/10114/?time=2043)）
+
+StoreKit 2 uses the JSON Web Signature standard, which consists of three parts:
+
+1. **Header**: Contains algorithm (ECDSA) and certificate chain (x5c)
+2. **Payload**: core data such as transaction ID, product ID, purchase date, etc.
+3. **Signature**: Signature generated using header and payload
+
+Additional checks when self-verifying:
+- Confirm that the bundle ID in the payload matches your app
+- use`AppStore.deviceVerificationID`Do device verification: concatenate the nonce and device ID and make a SHA384 hash, and compare it with the device verification field in the payload.
+
+**Key points:**
+- The certificate chain is included in the JWS data, and verification does not require an Internet connection
+- StoreKit 2 has automatically completed verification, and most scenarios do not need to be implemented by yourself.
+- Server-side verification reference App Store Server API
+
+## Core Takeaways
+
+1. **New projects directly use StoreKit 2 for in-app purchases**.async/await allows the purchase process code to be compressed from dozens of lines of proxy methods to a few lines of sequential code.Automatic verification takes the hassle out of receipt parsing.Entrance API:`Product.products(for:)` + `product.purchase()`。
+
+2. **use`currentEntitlements`Alternative to manually restoring purchases**.When users open the app for the first time after changing devices, they can automatically obtain all valid rights and interests without clicking the "Resume Purchase" button.Excludes consumables.Entrance API:`Transaction.currentEntitlements`。
+
+3. **Retain the subscription before it expires**.pass`renewalInfo.autoRenewStatus`Detect if the user has auto-renewal turned off, and if so, show a win-back offer before expiration.Entrance API:`Product.subscription?.status` + `.renewalInfo`。
+
+4. **use`appAccountToken`Link your own account system**.If your app has a separate login system, generate a UUID as`appAccountToken`It is sent with the purchase, and the specific user can be tracked later in the transaction record.Entrance API:`.appAccountToken(UUID)` purchase option。
+
+5. **Start transaction monitoring immediately after the App is launched**.`Transaction.updates`It is an infinite asynchronous sequence and must be monitored when the app is started. Otherwise, events such as purchase completion, parent approval, and refund on other devices may be missed.Entrance API:`Task { for await result in Transaction.updates { ... } }`。
+
+## Related Sessions
+
+- [Support customers and handle refunds](/articles/wwdc2021-10115) — StoreKit 2 customer support, refund handling, and subscription management
+- [In-app purchases on the server](/articles/wwdc2021-10174) — App Store Server API and server-side verification
+- [What's new in Wallet and Apple Pay](/articles/wwdc2021-10092) — Apple Pay new features and payment sheet improvements
+- [Meet StoreKit for SwiftUI](/articles/wwdc2021-10114) — StoreKit integration in SwiftUI

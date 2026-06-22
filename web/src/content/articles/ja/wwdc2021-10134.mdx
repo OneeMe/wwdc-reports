@@ -1,0 +1,238 @@
+---
+title: "Swift の構造化された同時実行性を探る"
+description: "Swift のさまざまな種類の同時タスクについて学び、タスク グループの作成方法、進行中のタスクのキャンセル方法、および非構造化タスクをいつ使用するかを学びます。"
+date: "2021-06-08"
+tags: ["Swift"]
+thumbnail: "/images/sessions/2021/10134.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10134/"
+sessionId: "wwdc2021-10134"
+year: "2021"
+relatedSessions:
+  - title: "Swift の async/await"
+    code: "10132"
+    description: "async/await 構文の基本"
+  - title: "Swift アクタで可変状態を保護する"
+    code: "10133"
+    description: "アクターと構造化された同時実行の協力"
+  - title: "SwiftUI の同時実行性"
+    code: "10019"
+    description: "SwiftUI でのタスクと async/await の使用"
+  - title: "AsyncSequence を理解する"
+    code: "10058"
+    description: "非同期シーケンスと構造化された同時実行性の組み合わせ"
+---
+# Swift の構造化された同時実行性を探る
+
+## ハイライト
+
+> 構造化同時実行では、「タスク ツリー」を使用して同時実行のライフ サイクルを管理します。親タスクは、終了する前にすべてのサブタスクが完了するまで待機する必要があり、サブタスクのエラーは上方に伝播し、キャンセル操作は親から子へカスケード的に有効になります。`async let`一定量の同時実行を処理します。`TaskGroup`動的量の同時実行の処理は、両方ともスレッドを手動で管理するよりも安全で、推論が簡単です。
+
+## 主要内容
+
+並行コードには、開発者を悩ませている長年の問題があります。それは、制御フローがあちこちに分散していることです。ネストされた完了ハンドラー、さまざまなメソッドに散在する GCD 呼び出し、スレッドのライフサイクルの手動管理 - これらの非構造化同時実行パターンにより、コードの理解と保守が困難になります。
+
+Swift 5.5 の構造化同時実行性は、構造化プログラミングのアイデアを活用しています。のように`goto`これはコード構造を破壊するため削除され、非構造化同時実行性もより明確な抽象化に置き換える必要があります。中心的なメカニズムは「タスク ツリー」です。各タスクには明確な親タスクがあり、サブタスクのライフ サイクルは親タスクによって管理され、エラーとキャンセルはツリー構造に沿って伝播されます。
+
+## 詳細
+
+### 非構造化から構造化へ
+
+従来の完了ハンドラー コードは構造化されていません (01:57)。サムネイル取得関数はそれ自体を再帰的に呼び出し、エラー処理は複数のクロージャに分散されます。
+
+```swift
+func fetchThumbnails(for ids: [String], completion handler: @escaping ([String: UIImage]?, Error?) -> Void) {
+    guard let id = ids.first else { return handler([:], nil) }
+    let request = thumbnailURLRequest(for: id)
+    let dataTask = URLSession.shared.dataTask(with: request) { data, response, error in
+        guard let response = response, let data = data else {
+            return handler(nil, error)
+        }
+        UIImage(data: data)?.prepareThumbnail(of: thumbSize) { image in
+            guard let image = image else {
+                return handler(nil, ThumbnailFailedError())
+            }
+            fetchThumbnails(for: Array(ids.dropFirst())) { thumbnails, error in
+                // 残りの ID を再帰的に処理します...
+            }
+        }
+    }
+    dataTask.resume()
+}
+```
+
+async/await バージョンは構造化されています (02:56)。コードの実行順序は読み取り順序であり、エラーはパスします。`throws`統合コミュニケーション:
+
+```swift
+func fetchThumbnails(for ids: [String]) async throws -> [String: UIImage] {
+    var thumbnails: [String: UIImage] = [:]
+    for id in ids {
+        let request = thumbnailURLRequest(for: id)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateResponse(response)
+        guard let image = await UIImage(data: data)?.byPreparingThumbnail(ofSize: thumbSize) else {
+            throw ThumbnailFailedError()
+        }
+        thumbnails[id] = image
+    }
+    return thumbnails
+}
+```
+
+### async let: 固定幅の同時実行
+
+複数の独立した非同期リクエストを同時に開始する必要がある場合は、次を使用します。`async let`(07:59)。同時サブタスクが作成されますが、サブタスクの数はコンパイル時に決定されます。
+
+```swift
+func fetchOneThumbnail(withID id: String) async throws -> UIImage {
+    let imageReq = imageRequest(for: id)
+    let metadataReq = metadataRequest(for: id)
+
+    async let (data, _) = URLSession.shared.data(for: imageReq)
+    async let (metadata, _) = URLSession.shared.data(for: metadataReq)
+
+    guard let size = parseSize(from: try await metadata),
+          let image = try await UIImage(data: data)?.byPreparingThumbnail(ofSize: size)
+    else {
+        throw ThumbnailFailedError()
+    }
+    return image
+}
+```
+
+二`async let`ステートメントは同時に実行を開始します。`try await metadata`そして`await data`が問題点ですが、2 つのリクエストは並行して開始されます。`async let`同時実行数が固定 (13:13) のシナリオに適しています。
+
+### TaskGroup: 動的幅の同時実行性
+
+実行時に同時実行数を決定できない場合は、次を使用します。`TaskGroup`(13:58)。たとえば、バッチでサムネイルを取得します。
+
+```swift
+func fetchThumbnails(for ids: [String]) async throws -> [String: UIImage] {
+    var thumbnails: [String: UIImage] = [:]
+    try await withThrowingTaskGroup(of: (String, UIImage).self) { group in
+        for id in ids {
+            group.async {
+                return (id, try await fetchOneThumbnail(withID: id))
+            }
+        }
+        // 完了した順に結果を取得する
+        for try await (id, thumbnail) in group {
+            thumbnails[id] = thumbnail
+        }
+    }
+    return thumbnails
+}
+```
+
+知らせ`withThrowingTaskGroup`クロージャーが戻った後は、すべてのサブタスクが完了している必要があります。`for try await`結果は提出順ではなく、完了順に消費されます。
+
+### タスクがキャンセルされました
+
+構造化された同時実行でのキャンセルは協調的です。サブタスクは 2 つの方法でキャンセルに応答します (11:46)。
+
+キャンセルエラーをスローする API の呼び出し:
+
+```swift
+func fetchThumbnails(for ids: [String]) async throws -> [String: UIImage] {
+    var thumbnails: [String: UIImage] = [:]
+    for id in ids {
+        try Task.checkCancellation()  // キャンセルされた場合は、CancelError がスローされます
+        thumbnails[id] = try await fetchOneThumbnail(withID: id)
+    }
+    return thumbnails
+}
+```
+
+または、キャンセル ステータスを手動で確認します (12:16)。
+
+```swift
+func fetchThumbnails(for ids: [String]) async throws -> [String: UIImage] {
+    var thumbnails: [String: UIImage] = [:]
+    for id in ids {
+        if Task.isCancelled { break }
+        thumbnails[id] = try await fetchOneThumbnail(withID: id)
+    }
+    return thumbnails
+}
+```
+
+`Task.checkCancellation()`ループ内の通常の呼び出しに適しています。`Task.isCancelled`カスタムのクリーニング ロジックが必要なシナリオに適しています。
+
+### 構造化されていないタスク
+
+一部のシナリオでは、UI イベントによってトリガーされる非同期操作など、タスク ツリーの制約から抜け出す必要があります。使用`Task`非構造化タスクの作成 (20:39):
+
+```swift
+@MainActor
+class MyDelegate: UICollectionViewDelegate {
+    func collectionView(_ view: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt item: IndexPath) {
+        let ids = getThumbnailIDs(for: item)
+        Task {
+            let thumbnails = await fetchThumbnails(for: ids)
+            display(thumbnails, in: cell)
+        }
+    }
+}
+```
+
+構造化されていないタスクには手動のライフサイクル管理が必要です。後続のキャンセルのためにタスク参照を保存します (22:11):
+
+```swift
+@MainActor
+class MyDelegate: UICollectionViewDelegate {
+    var thumbnailTasks: [IndexPath: Task<Void, Never>] = [:]
+
+    func collectionView(_ view: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt item: IndexPath) {
+        let ids = getThumbnailIDs(for: item)
+        thumbnailTasks[item] = Task {
+            defer { thumbnailTasks[item] = nil }
+            let thumbnails = await fetchThumbnails(for: ids)
+            display(thumbnails, in: cell)
+        }
+    }
+
+    func collectionView(_ view: UICollectionView, didEndDisplay cell: UICollectionViewCell, forItemAt item: IndexPath) {
+        thumbnailTasks[item]?.cancel()  //  セルが画面を離れるときにキャンセル
+    }
+}
+```
+
+### Detached Task
+
+`Task.detached`現在のタスクからコンテキストを継承しない、完全に独立したタスクを作成します (24:09)。真に独立したバックグラウンド作業に適しています。
+
+```swift
+Task.detached(priority: .background) {
+    writeToLocalCache(thumbnails)
+}
+```
+
+タスク グループは、切り離されたタスク内に作成することもできます (24:57)。
+
+```swift
+Task.detached(priority: .background) {
+    withTaskGroup(of: Void.self) { g in
+        g.async { writeToLocalCache(thumbnails) }
+        g.async { log(thumbnails) }
+        g.async { ... }
+    }
+}
+```
+
+## 重要ポイント
+
+1. **構造化された同時実行を優先します**:`async let`そして`TaskGroup`ライフサイクルはコンパイラとランタイムによって自動的に管理され、エラーの伝播とデカスケードは自動的に行われます。構造化されていない`Task`UI コールバックなどの必要なシナリオでのみ使用されます。
+
+2. **`async let`より良い`TaskGroup`シナリオ**: 同時実行数が固定されており既知の場合、`async let`構文はより簡潔になり、コンパイラのチェックはより厳密になります。サブタスクの数が動的に変化する場合にのみ使用されます`TaskGroup`。
+
+3. **共同キャンセルの実装**: 長時間実行される非同期操作は定期的にチェックする必要があります`Task.isCancelled`または電話する`Task.checkCancellation()`。これは構造化された同時実行の「礼儀」であり、不必要な計算を回避するための鍵です。
+
+4. **使用`defer`非構造化タスクのクリーンアップ**: ストレージ`Task`引用する場合はタスク本文の最初に使用します`defer { thumbnailTasks[item] = nil }`メモリ リークを防ぐために、タスクの完了後に辞書が自動的にクリーンアップされるようにします。
+
+5. **注意して使用してください`Task.detached`**: タスク ツリーの外にあるため、キャンセルはカスケードされず、エラーは親タスクによって捕捉されません。真に独立したバックグラウンド作業 (ログの書き込み、キャッシュの永続化など) にのみ使用されます。
+
+## 関連セッション
+
+- [WWDC2021 10132 - Swift の async/await](https://developer.apple.com/videos/play/wwdc2021/10132/) — async/await 構文の基本
+- [WWDC2021 10133 - Swift Actors で可変状態を保護する](https://developer.apple.com/videos/play/wwdc2021/10133/) — アクターの協力と構造化された同時実行性
+- [WWDC2021 10019 - SwiftUI の同時実行](https://developer.apple.com/videos/play/wwdc2021/10019/) — SwiftUI でのタスクと async/await の使用
+- [WWDC2021 10058 - AsyncSequence について](https://developer.apple.com/videos/play/wwdc2021/10058/) — 非同期シーケンスと構造化された同時実行性の組み合わせ

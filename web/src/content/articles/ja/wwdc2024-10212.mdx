@@ -1,0 +1,127 @@
+---
+title: "What's new in location authorization"
+description: "location authorization is turning 2.0. learn about new recommendations and techniques to get the authorization you need, and a new system of diagnostics that can let you know when an authorization goa"
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10212.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10212/"
+sessionId: "wwdc2024-10212"
+year: "2024"
+relatedSessions:
+  - title: "What's new in privacy"
+    code: "10123"
+    description: "at apple, we believe privacy is a fundamental human right. learn about new and i"
+---
+
+## ハイライト
+
+> Core Location の位置認可は常に複雑な話題。ユーザーは「使用中のみ」を付与しても「おおよその位置」だけかもしれない。ある機能が突然「正確な位置」を必要とすれば `requestTemporaryFullAccuracy` を呼ぶ。以前「1 回のみ許可」を選んで別 app に切り替えた場合、認可は失われ再リクエストが必要。認可状態の組み合わせがコードを脆くする。
+
+---
+
+## 主要内容
+
+`CLLocationManager` で位置認可を管理すると、コードは簡単に脆くなる。ユーザーが「1 回のみ許可」を選び、別 app に切り替えて戻ると認可は失われ、再び `requestWhenInUseAuthorization` を呼ぶ必要がある。近似位置のみ付与されているのにナビ機能が正確な位置を必要とすれば `requestTemporaryFullAccuracy(withPurposeKey:)` を呼ぶが、一時認可は期限切れになる。プロセス全体は手続き型：現在状態を自分で判断し、次に呼ぶメソッドを決め、分岐の見落としでスタックする。
+
+iOS 18 で導入された `CLServiceSession` はこのモデルを「手続き型」から「宣言型」に転換。session を作成し、必要な認可レベル（例：`.whenInUse`）をシステムに伝える。システムが適切なタイミングでユーザーにプロンプトを表示。機能が正確な位置を必要とすれば `fullAccuracyPurposeKey` 付き session を追加——置換ではなく重ね合わせ。各機能モジュールが独立して認可要件を宣言し、Core Location が一括処理。`CLLocationUpdate.liveUpdates` や `CLMonitor.events` など AsyncSequence を反復すると、システムは自動的に `.whenInUse` の暗黙 session があるとみなす——多くのケースで古い手動認可コードを削除するだけで十分。
+
+## 詳細
+
+**CLServiceSession の基本用法**（[01:07](https://developer.apple.com/videos/play/wwdc2024/10212/?time=67)）
+
+以前は位置認可取得に `CLLocationManager` + delegate の大量コードが必要。`CLServiceSession` なら数行で済む：
+
+```swift
+// CLServiceSession in action
+
+Task {
+    let session = CLServiceSession(authorization: .whenInUse)
+
+    for try await update in CLLocationUpdate.liveUpdates {
+        // Process update.location or update.authorizationDenied
+    }
+}
+```
+
+キーポイント:
+- `CLServiceSession(authorization: .whenInUse)` で認可目標を「使用中のみ」と宣言。システムが適切なタイミングで認可をリクエスト
+- session のライフサイクルは保持時間で決まる：保持中はシステムが目標を認識、解放後はその目標の認可を維持しない
+- `CLLocationUpdate.liveUpdates` の反復自体も暗黙の `.whenInUse` session を作成（[07:15](https://developer.apple.com/videos/play/wwdc2024/10212/?time=435)）
+
+**fullAccuracy session の重ね合わせ**（[04:08](https://developer.apple.com/videos/play/wwdc2024/10212/?time=248)）
+
+ユーザーがナビを開始すると正確な位置が必要。元の session を置換せず `fullAccuracyPurposeKey` 付き session を重ねる：
+
+```swift
+// 基本 session：おおよその位置だけが必要
+let baseSession = CLServiceSession(authorization: .whenInUse)
+
+// ナビゲーション機能には正確な位置が必要なため、session を重ねる
+let navSession = CLServiceSession(
+    authorization: .whenInUse,
+    fullAccuracyPurposeKey: "Nav"
+)
+```
+
+キーポイント:
+- `fullAccuracyPurposeKey: "Nav"` は Info.plist のローカライズ文字列に対応し、正確な位置が必要な理由をユーザーに説明
+- 重ね合わせ（layering）で置換ではない：ベース session は不変、新 session が正確位置要件を追加宣言
+- 各機能モジュールが独立して session を作成・解放。モジュール間調整不要
+
+**暗黙 Service Session**（[07:34](https://developer.apple.com/videos/play/wwdc2024/10212/?time=454)）
+
+`liveUpdates` の反復自体が `.whenInUse` 認可目標を暗黙に含むため、明示的 session 作成を省略可能：
+
+```swift
+Task {
+    for try await update in CLLocationUpdate.liveUpdates {
+        // Process update.location or update.authorizationDenied
+    }
+}
+```
+
+キーポイント:
+- 暗黙 session はデフォルト有効。`liveUpdates` や `monitor.events` 反復時に自動適用
+- 暗黙動作が不要なら Info.plist で `NSLocationRequireExplicitServiceSession` を設定
+- 暗黙 session は `.always` や `fullAccuracy` 要件を含まない——これらは明示宣言が必要
+
+**Diagnostic Properties**（[13:37](https://developer.apple.com/videos/play/wwdc2024/10212/?time=817)）
+
+`CLServiceSession` は `diagnostics` AsyncSequence を公開し、認可状態をリアルタイムで把握可能：
+
+```swift
+// Following the progress of location authorization with CLServiceSession
+Task {
+    let mySession = CLServiceSession(authorization:.whenInUse)
+
+    for try await diagnostic in mySession.diagnostics {
+        if (!diagnostic.authorizationRequestInProgress) {
+            reactToChanges(authorized:!diagnostic.authorizationDenied)
+        }
+    }
+}
+```
+
+キーポイント:
+- `diagnostic.authorizationRequestInProgress` が false なら、ユーザーが選択済み（または既存認可あり）
+- `diagnostic.authorizationDenied` は認可拒否
+- `diagnostic.authorizationDeniedGlobally` はシステム全体で位置サービス無効——異なるガイダンスを表示可能
+- `diagnostic.insufficientlyInUse` は現在状態ではシステムが認可プロンプトを表示できない
+- `CLLocationUpdate` と `CLMonitor.Event` にも Diagnostic Properties 追加：`.accuracyLimited`（近似位置は 15–20 分ごとに更新）、`.locationUnavailable`（Core Location が一時的に位置を特定不可）
+
+## 重要ポイント
+
+- **何をするか**：すべての `CLLocationManager` 手動認可リクエストコードを `CLServiceSession` に置換。**価値**：宣言型モデルが「今どの状態か、次に何を呼ぶか」の判断ロジックを排除。システムが認可復旧を処理（suspend 後のフォアグラウンド復帰など）。**始め方**：プロジェクト内の `requestWhenInUseAuthorization()` と `requestTemporaryFullAccuracy(withPurposeKey:)` 呼び出しを探し、対応機能モジュールで `CLServiceSession` に置換。
+
+- **何をするか**：正確な位置が必要な機能ごとに `fullAccuracyPurposeKey` 付き重ね session を独立作成。**価値**：ユーザーは近似位置は許可しても正確位置は拒否するかも——重ね session で各機能の認可要件を自己完結。**始め方**：正確位置が必要な機能点を列挙。各機能起動時に `CLServiceSession(authorization: .whenInUse, fullAccuracyPurposeKey: "YourKey")` を作成、終了時に解放。
+
+- **何をするか**：タイムアウトと推測ロジックを Diagnostic Properties に置換。**価値**：以前は「位置更新待ち」と「認可拒否」を区別できずタイムアウトが必要だった——今は `.authorizationDenied`、`.accuracyLimited` 等を直接確認し正確な UI フィードバック。**始め方**：`liveUpdates` や `diagnostics` 反復ループで各 update/event の Diagnostic Properties を確認し、対応 UI 状態を表示（例：「位置精度が制限されています。ナビが不正確な場合があります」）。
+
+- **何をするか**：app 起動時に以前の session を再構築。**価値**：Core Location は terminate 後数秒しか session 状態を保持しない——再起動後すぐ session を再作成しないとバックグラウンド位置更新が中断。**始め方**：起動ロジックで永続化された機能状態（例：「運動ルート記録中」）に基づき、対応 `CLServiceSession` を即座に再作成するか `liveUpdates` 反復を再開。
+
+## 関連セッション
+
+- [What's new in privacy](/articles/wwdc2024-10123) — iOS 18 プライバシーフレームワーク更新。新しい宣言型位置認可モデルと連携
+- [Meet Core Location](/articles/wwdc2023-10180) — 2023 年に `CLLocationUpdate` と `CLMonitor` を導入した基礎 session
+- [Discover streamlined location updates](/articles/wwdc2023-10179) — `CLLocationUpdate.liveUpdates` の詳細用法。暗黙 session の由来
+- [Meet CLMonitor](/articles/wwdc2023-10185) — `CLMonitor` のジオフェンスと条件監視。イベント反復が暗黙 session をトリガー

@@ -1,0 +1,562 @@
+---
+title: "Build agentic app experiences with the Foundation Models framework"
+description: "Learning"
+date: "2026-06-10"
+tags: ["Foundation Models", "DynamicProfile", "Agentic AI", "LanguageModelSession", "Private Cloud Compute"]
+thumbnail: "/images/sessions/2026/242.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/242/"
+sessionId: "wwdc2026-242"
+year: "2026"
+relatedSessions:
+  - title: "Session 241 - Bring your model to Apple Intelligence"
+    code: "241"
+    description: "Learn the detailed capabilities and integration path for PrivateCloudComputeLanguageModel"
+  - title: "Session 243 - Debug and profile your Foundation Models features"
+    code: "243"
+    description: "Learn how to use Xcode Instruments to detect KV cache invalidation and performance bottlenecks"
+  - title: "Session 298 - Evaluate your AI features"
+    code: "298"
+    description: "Learn how to use the Evaluations framework to quantify the effects of your context-engineering strategy"
+  - title: "Session 324 - Integrate Core AI into your app"
+    code: "324"
+    description: "Learn how the Core AI framework integrates with Foundation Models"
+  - title: "Session 347 - Build secure agentic experiences"
+    code: "347"
+    description: "Learn how to set privacy boundaries and security policies in multi-agent systems"
+---
+
+## Highlight
+
+> Apple introduced the `DynamicProfile` API in the Foundation Models framework, allowing the same `LanguageModelSession` to dynamically switch models, instructions, and tool configurations across task stages. Apple also open-sourced the `FoundationModelsUtilities` package for managing conversation-history trimming and multi-agent orchestration.
+
+## Core Content
+
+### The dilemma of an origami app
+
+Imagine you are building a craft-teaching app called Origami. The user uploads a photo. The app first helps the user brainstorm ideas, then generates a detailed tutorial, and later lets the user upload progress photos during the project to get guidance.
+
+These three stages share the same conversation context, but each stage needs something completely different. Brainstorming needs creativity, tutorial generation needs deep reasoning, and progress coaching needs fast responses. The old approach was to create three separate `LanguageModelSession` instances, manually pass summaries around, and constantly break context. Or you kept one session running through everything, letting tokens pile up until the model became less useful.
+
+Apple's solution this year is called `DynamicProfile`.
+
+### Dynamic model switching: changing agents like changing hats
+
+([02:08](https://developer.apple.com/videos/play/wwdc2026/242/?time=128)) `DynamicProfile` lets you switch the underlying model, temperature, `reasoningLevel`, and other configuration inside the same session based on the current task stage. Before each model call, the `body` property is reevaluated, and the session's "persona" changes with it.
+
+The Origami app is a typical example. The brainstorming stage uses `PrivateCloudComputeLanguageModel` with temperature set to 1 to encourage creativity. The tutorial-planning stage also uses the cloud model but enables deep reasoning. The final review and coaching stage switches to `SystemLanguageModel` to save cost.
+
+### Conversation history management: prune without cutting the roots
+
+([07:56](https://developer.apple.com/videos/play/wwdc2026/242/?time=476)) When switching models, different models have different context-window sizes. `DynamicProfile` provides two ways to manage history.
+
+The first is `historyTransform`, which locally transforms history before each request. It only affects the snapshot sent to the model and does not modify the session's real history. This stateless design avoids state-synchronization problems.
+
+The second is reading and writing `history` directly through `@SessionProperty`. This approach is "lossy": changes are reflected in every profile in the session. It is useful for summarization and trimming at response boundaries, such as compressing 50 history entries into one summary inside an `onResponse` callback.
+
+### Two orchestration patterns: baton pass and phone a friend
+
+([12:49](https://developer.apple.com/videos/play/wwdc2026/242/?time=769)) When multiple profiles need to collaborate, Apple recommends two patterns.
+
+**Baton-pass**: Multiple profiles share the full conversation history and switch the currently active profile through a tool. The receiving profile is responsible for the final answer. This fits collaboration scenarios that need continuous context.
+
+**Phone-a-friend**: The main profile uses a tool to spawn a short-lived child session. The child session handles a subtask independently, returns the result, and is then destroyed. This fits consultation scenarios where context should be isolated.
+
+### Controlling when tools are called
+
+([15:29](https://developer.apple.com/videos/play/wwdc2026/242/?time=929)) The new `ToolCallingMode` has three options: `allowed` (default, the model decides), `disallowed` (tool calls are forbidden), and `required` (the model must call a tool).
+
+`required` is useful in agent systems, but it has a trap: the model can fall into an infinite tool-calling loop. You must provide an exit condition, such as switching modes based on a state variable, or providing a "final answer" tool that throws an error to force an exit.
+
+### The tradeoff between performance and accuracy
+
+([18:29](https://developer.apple.com/videos/play/wwdc2026/242/?time=1109)) Modifying conversation history affects the underlying KV cache. Appending history usually preserves the cache, but deleting or modifying history entries, or changing tools, triggers cache invalidation and increases time to first token. Apple does not handle this automatically for you. Instead, it upgraded Xcode's Foundation Models Instrument so you can measure and optimize it yourself.
+
+There is another risk: accuracy. If you add a new tool to a session, but the history shows that the model previously completed similar tasks without that tool, the model may become confused. Apple's recommendation is to build an evaluation set with the Evaluations framework and validate your context-engineering strategy with data.
+
+## Details
+
+### Declaring combined instructions with DynamicInstructions
+
+([04:58](https://developer.apple.com/videos/play/wwdc2026/242/?time=298)) `DynamicInstructions` packages related instructions and tools into reusable components, and supports nested composition like SwiftUI views.
+
+```swift
+struct BrainstormFacilitator: DynamicInstructions {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicInstructions {
+        Instructions {
+            "You are a warm and friendly expert crafting brainstorm facilitator."
+        }
+        GenerateProjectTitle()
+        if orchestrator.techniques.contains(.origami) {
+            OrigamiExpert()
+        }
+    }
+}
+```
+
+Key points:
+- `DynamicInstructions` can include things conditionally, such as loading `OrigamiExpert` only when the user chooses origami
+- Nested instructions and tools are concatenated automatically, with no manual string stitching
+- It is useful for packaging domain knowledge as reusable modules
+
+### Declaring multi-stage configuration with DynamicProfile
+
+([06:41](https://developer.apple.com/videos/play/wwdc2026/242/?time=401)) The `body` of `DynamicProfile` returns a different `Profile` configuration based on external state.
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .brainstorming:
+            Profile { BrainstormFacilitator(orchestrator: orchestrator) }
+                .model(orchestrator.pccLanguageModel)
+                .temperature(1)
+        case .planning:
+            Profile { TutorialAuthor(orchestrator: orchestrator) }
+                .model(orchestrator.pccLanguageModel)
+                .reasoningLevel(.deep)
+        case .reviewing:
+            Profile { CraftCoach() }
+                .model(orchestrator.systemLanguageModel)
+        }
+    }
+}
+```
+
+Key points:
+- `body` is reevaluated on every prompt, so state changes automatically affect the next model call
+- `.model()` specifies the underlying model, `.temperature()` controls creativity, and `.reasoningLevel(.deep)` enables deep reasoning
+- You do not need to create multiple sessions; changing `orchestrator.mode` is enough to change agent behavior
+
+Pass the DynamicProfile when initializing the session:
+
+```swift
+let session = LanguageModelSession(profile: CraftProfile(orchestrator: orchestrator))
+```
+
+### Trimming history with historyTransform
+
+([08:33](https://developer.apple.com/videos/play/wwdc2026/242/?time=513)) `historyTransform` filters history entries before each request without affecting the session's real transcript.
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .reviewing:
+            Profile { CraftCoach() }
+                .model(orchestrator.systemLanguageModel)
+                .historyTransform { history in
+                    guard let latestResponseIndex = lastResponseEntryIndex(history) else {
+                        return history
+                    }
+                    let filteredHistory = history[0..<latestResponseIndex].filter { entry in
+                        isToolCallsOrToolOutput(entry)
+                    }
+                    return filteredHistory + history[latestResponseIndex...]
+                }
+        }
+    }
+}
+```
+
+Key points:
+- `historyTransform` only modifies the snapshot sent to the model; the session keeps the full history
+- It is useful for lossless transformations targeted at a specific profile
+- For on-device models, trimming history helps avoid exceeding the context window
+
+### Encapsulating reusable logic with a custom modifier
+
+([09:15](https://developer.apple.com/videos/play/wwdc2026/242/?time=555)) Encapsulate a complex `historyTransform` as a reusable modifier.
+
+```swift
+struct DroppingToolCallsProfileModifier: LanguageModelSession.DynamicProfileModifier {
+    func body(content: Content) -> some DynamicProfile {
+        content
+            .historyTransform { history in
+                guard let latestResponseIndex = lastResponseEntryIndex(history) else {
+                    return history
+                }
+                let filteredHistory = history[0..<latestResponseIndex].filter { entry in
+                    isToolCallsOrToolOutput(entry)
+                }
+                return filteredHistory + history[latestResponseIndex...]
+            }
+    }
+}
+
+extension LanguageModelSession.DynamicProfile {
+    func droppingCompletedToolCalls() -> some DynamicProfile {
+        self.modifier(DroppingToolCallsProfileModifier())
+    }
+}
+```
+
+Key points:
+- A custom modifier conforms to the `DynamicProfileModifier` protocol
+- Add chainable methods to `DynamicProfile` through an `extension`
+- The `FoundationModelsUtilities` package already includes common modifiers such as `.rollingWindow` and `.droppingCompletedToolCalls`
+
+### Managing the history window with FoundationModelsUtilities
+
+([09:27](https://developer.apple.com/videos/play/wwdc2026/242/?time=567))
+
+```swift
+import FoundationModelsUtilities
+
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .reviewing:
+            Profile { CraftCoach() }
+                .rollingWindow(size: .entries(10))
+                .droppingCompletedToolCalls()
+        }
+    }
+}
+```
+
+Key points:
+- `FoundationModelsUtilities` is an open-source Swift package from Apple that is updated between OS release cycles
+- `.rollingWindow(size: .entries(10))` keeps only the most recent 10 history entries
+- `.droppingCompletedToolCalls()` drops completed tool-call records
+- Modifier order affects the final result
+
+### Summarizing at response boundaries with lifecycle modifiers
+
+([10:48](https://developer.apple.com/videos/play/wwdc2026/242/?time=648)) `onResponse` runs after every model response, making it a good place to update state or modify history.
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    @SessionProperty(\.history) var history
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .planning:
+            Profile { TutorialAuthor(orchestrator: orchestrator) }
+                .model(orchestrator.pccLanguageModel)
+                .reasoningLevel(.deep)
+                .onResponse {
+                    if history.count > 50, let responseIndex = lastResponseIndex(history) {
+                        history = history[responseIndex...]
+                    }
+                }
+        }
+    }
+}
+```
+
+Key points:
+- `@SessionProperty(\.history)` accesses the session's built-in history property
+- Directly modifying `history` affects every profile in the session
+- It is useful for lossy summarization and trimming at response boundaries
+
+### Declaring custom session properties
+
+([11:40](https://developer.apple.com/videos/play/wwdc2026/242/?time=700))
+
+```swift
+extension SessionPropertyValues {
+    @SessionPropertyEntry var summary: String?
+}
+```
+
+Read and write the property in a profile:
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    @SessionProperty(\.history) var history
+    @SessionProperty(\.summary) var summary
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .planning:
+            Profile {
+                TutorialAuthor(orchestrator: orchestrator)
+                if let summary {
+                    Instructions { "Summary: \(summary)" }
+                }
+            }
+            .onResponse {
+                if history.count > 50, let responseIndex = lastResponse(history.prefix(40)) {
+                    summary = try await summarize(history[0..<responseIndex])
+                    history = history[responseIndex...]
+                }
+            }
+        }
+    }
+}
+```
+
+Key points:
+- Use `@SessionPropertyEntry` to declare a custom property, and every property must have an initial value
+- `summary` is shared between profiles, so key information from dropped history can be preserved through the summary
+- Any profile can read and write it, and changes are visible to all components
+
+### Baton-pass orchestration pattern
+
+([13:02](https://developer.apple.com/videos/play/wwdc2026/242/?time=782)) Multiple profiles share the full history and switch the active state through a tool.
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .brainstorm:
+            Profile {
+                BrainstormInstructions()
+                BatonPassTool()
+            }
+            .onToolCall { orchestrator.mode = .tutorial }
+            .model(orchestrator.serverModel)
+        case .tutorial:
+            Profile {
+                TutorialInstructions()
+                BatonPassTool()
+            }
+            .onToolCall { orchestrator.mode = .brainstorm }
+            .model(orchestrator.systemModel)
+        }
+    }
+}
+```
+
+Key points:
+- `.onToolCall` runs side effects when a tool is called, such as switching modes
+- Both profiles can see the full conversation history
+- The receiving profile is responsible for the final answer
+
+### Phone-a-friend orchestration pattern
+
+([14:14](https://developer.apple.com/videos/play/wwdc2026/242/?time=854)) The main profile spawns a child session to handle a subtask.
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var body: some DynamicProfile {
+        Profile {
+            BrainstormInstructions()
+            PhoneFriendTool(
+                name: "generate_title",
+                description: "Generate a creative project title",
+                profile: TitleProfile()
+            )
+        }
+    }
+}
+
+struct PhoneFriendTool<P: LanguageModelSession.DynamicProfile>: Tool {
+    func call(arguments: GeneratedContent) async throws -> String {
+        let session = LanguageModelSession(profile: profile())
+        let response = try await session.respond(to: arguments)
+        return response.content
+    }
+}
+```
+
+Key points:
+- The child session has an independent transcript and is isolated from the parent session
+- After the child session finishes, it returns a result and is destroyed
+- The parent profile is always responsible for the final answer
+
+### Skills mode loads domain knowledge
+
+([15:15](https://developer.apple.com/videos/play/wwdc2026/242/?time=915))
+
+```swift
+struct CraftingSkills: LanguageModelSession.DynamicInstructions {
+    var activations: SkillActivations
+    var body: some DynamicInstructions {
+        Skills(activations: activations) {
+            Skill(
+                name: "origami_folds",
+                description: "Details about specific types of folds",
+                prompt: """
+                    Valley Fold: Paper is folded toward you, creating a V-shaped crease
+                    Mountain Fold: Paper is folded away from you, creating an inverted V
+                    ...
+                    """
+            )
+            Skill(...)
+            Skill(...)
+        }
+    }
+}
+```
+
+Key points:
+- `Skills` is a type in the `FoundationModelsUtilities` package
+- Each `Skill` contains a name, description, and detailed prompt
+- `activations` controls which skills are active, avoiding loading too much domain knowledge at once
+
+### Tool Calling Mode control
+
+([15:31](https://developer.apple.com/videos/play/wwdc2026/242/?time=931))
+
+```swift
+public struct ToolCallingMode: Sendable {
+    public static let allowed: ToolCallingMode
+    public static let disallowed: ToolCallingMode
+    public static let required: ToolCallingMode
+}
+
+struct OrigamiExpert: LanguageModelSession.DynamicProfile {
+    var body: some LanguageModelSession.DynamicProfile {
+        Profile {
+            Instructions("You are an origami expert")
+            QueryOrigamiDatabaseTool()
+            ShowDirectionsTool()
+        }
+        .toolCallingMode(.required)
+    }
+}
+```
+
+Pass it as a generation option:
+
+```swift
+let response = try await session.respond(
+    to: "Write out the instructions for folding a paper crane.",
+    options: GenerationOptions(toolCallingMode: .required)
+)
+```
+
+Key points:
+- `allowed`: the model decides, and this is the most common mode
+- `disallowed`: forbids tool calls, useful when the user enters an unrelated page
+- `required`: the model can only call tools and must be paired with an exit condition
+
+### Exiting a tool-calling loop
+
+([16:47](https://developer.apple.com/videos/play/wwdc2026/242/?time=1007)) Conditional mode switching:
+
+```swift
+struct OrigamiExpert: LanguageModelSession.DynamicProfile {
+    let state: OrigamiAppState
+
+    var body: some LanguageModelSession.DynamicProfile {
+        Profile {
+            Instructions("Answer questions about how to fold origami")
+            QueryOrigamiDatabaseTool()
+        }
+        .toolCallingMode(state.queriedDatabase ? .disallowed : .required)
+        .onToolCall { state.queriedDatabase = true }
+    }
+}
+```
+
+Use a tool that throws an error to force an exit:
+
+```swift
+struct FinalAnswerTool: Tool {
+    var output: String?
+
+    @Generable struct Arguments {
+        var answer: String
+    }
+
+    func call(arguments: Arguments) async throws -> Never {
+        output = arguments.answer
+        throw CancellationError()
+    }
+}
+```
+
+Key points:
+- Conditional `toolCallingMode` is the gentler exit strategy
+- Throwing `CancellationError()` immediately interrupts the loop and returns control to you
+- By default, a tool error rolls back the transcript
+
+### Controlling the transcript error-handling policy
+
+([17:28](https://developer.apple.com/videos/play/wwdc2026/242/?time=1048))
+
+```swift
+struct OrigamiExpert: LanguageModelSession.DynamicProfile {
+    let state: OrigamiAppState
+
+    var body: some LanguageModelSession.DynamicProfile {
+        Profile {
+            Instructions("Answer questions about how to fold origami")
+            QueryOrigamiDatabaseTool()
+        }
+        .transcriptErrorHandlingPolicy(.preserveTranscript)
+    }
+}
+
+let session = LanguageModelSession()
+session.transcriptErrorHandlingPolicy = .preserveTranscript
+```
+
+Key points:
+- `.revertTranscript` (default): rolls back to the previous state after a tool error
+- `.preserveTranscript`: keeps the error scene, allowing you to manually repair and continue
+- When choosing `.preserveTranscript`, you are responsible for ensuring the transcript remains valid
+
+### Manually modifying the transcript
+
+([17:51](https://developer.apple.com/videos/play/wwdc2026/242/?time=1071))
+
+```swift
+public final class LanguageModelSession: Sendable {
+    public var transcriptErrorHandlingPolicy: TranscriptErrorHandlingPolicy { get set }
+    public var transcript: Transcript { get set }
+    public var isResponding: Bool { get }
+}
+```
+
+Key points:
+- `transcript` is now mutable, but it can only be changed when `isResponding == false`
+- Modifying the transcript during a response is a programming error and will crash
+- Combined with `.preserveTranscript`, you can manually repair history after a tool error
+
+## Key Takeaways
+
+### 1. Build a multi-stage AI writing assistant
+
+**What to build**: A long-form writing app with three stages: "brainstorm outline -> expand section by section -> polish and proofread." Each stage automatically switches to the most suitable model configuration.
+
+**Why it is worth building**: `DynamicProfile` lets all three stages share the same session, so outline context naturally flows into expansion without manual prompt stitching. Brainstorming uses a high-temperature PCC model for creativity, while polishing uses the on-device model for fast responses.
+
+**How to start**: Define a `WritingOrchestrator` to track the current stage, then use a `switch` in the `DynamicProfile` `body` to return different configurations. Use `.reasoningLevel(.deep)` for expansion and `.temperature(0.3)` for polishing.
+
+### 2. Build a customer-service agent with a domain knowledge base
+
+**What to build**: An e-commerce customer-service app that automatically loads the relevant category knowledge skill when the user asks a question, then unloads it after the consultation to save context.
+
+**Why it is worth building**: The `Skills` pattern lets you package each category's knowledge as an independent `Skill` and load it dynamically through `SkillActivations`. You do not need to stuff all knowledge into one huge system prompt.
+
+**How to start**: Use the `Skills` type from `FoundationModelsUtilities` to define knowledge for each category, then decide which `Skill` values to activate in `DynamicInstructions` based on the category the user is browsing.
+
+### 3. Build an AI companion with unlimited-length conversations
+
+**What to build**: An AI companion app that needs to remember months of conversation, periodically summarizes history through `onResponse`, and stores key facts with `@SessionPropertyEntry`.
+
+**Why it is worth building**: `SessionProperty` makes state sharing across profiles declarative. You can store birthdays, preferences, and other key facts mentioned by the user as properties, so they are not lost even when history is trimmed.
+
+**How to start**: Declare `@SessionPropertyEntry var keyFacts: [String]`, use a small model in `onResponse` to extract key facts and append them, and summarize history when it exceeds a threshold, injecting the summary into `Instructions`.
+
+### 4. Build an on-device/cloud hybrid coding assistant
+
+**What to build**: A coding assistant where simple completions respond instantly on device, while complex refactoring tasks automatically upgrade to the cloud model and then switch back to on device afterward.
+
+**Why it is worth building**: The `baton-pass` mode in `DynamicProfile` lets on-device and cloud models hand work off seamlessly. Simple questions avoid cloud tokens, while complex questions do not sacrifice quality.
+
+**How to start**: Define `.quickComplete` and `.deepRefactor` modes. Use `SystemLanguageModel` for the former and `PCCLanguageModel` + `.reasoningLevel(.deep)` for the latter. Add a tool that lets either the user or model trigger the mode switch.
+
+### 5. Build a multi-agent research tool
+
+**What to build**: A research assistant with three roles: "search agent -> analysis agent -> writing agent," using the `phone-a-friend` pattern to isolate each role's context.
+
+**Why it is worth building**: The search agent's context is full of messy search results and should not pollute the analysis agent's reasoning. `phone-a-friend` lets each agent focus on its own task and pass only refined information through tools.
+
+**How to start**: Use `BrainstormProfile` in the main session. Inside a search tool, create an independent `SearchProfile` session and return structured results before destroying it. In the analysis stage, create an `AnalysisProfile` session to process the search results.
+
+## Related Sessions
+
+- [Session 241 - Bring your model to Apple Intelligence](/articles/wwdc2026-241) — Learn the detailed capabilities and integration path for PrivateCloudComputeLanguageModel
+- [Session 243 - Debug and profile your Foundation Models features](/articles/wwdc2026-243) — Learn how to use Xcode Instruments to detect KV cache invalidation and performance bottlenecks
+- [Session 298 - Evaluate your AI features](/articles/wwdc2026-298) — Learn how to use the Evaluations framework to quantify the effects of your context-engineering strategy
+- [Session 324 - Integrate Core AI into your app](/articles/wwdc2026-324) — Learn how the Core AI framework integrates with Foundation Models
+- [Session 347 - Build secure agentic experiences](/articles/wwdc2026-347) — Learn how to set privacy boundaries and security policies in multi-agent systems

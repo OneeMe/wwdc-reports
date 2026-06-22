@@ -1,0 +1,330 @@
+---
+title: "Core Data: Sundries and maxims"
+description: "core data is the central way to durably and persistently store information from your app — and we're going to show you how to refine that implementation for even faster data ingest and fetching. discover how you can improve data capture with batch insert, tailor fetch requests to your data needs, and react to notifications about changes in the persistent store."
+date: 2020-06-10
+tags: ["Core Data", "Developer Tools", "System Services"]
+thumbnail: "/images/sessions/2020/10017.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10017/"
+sessionId: "wwdc2020-10017"
+year: "2020"
+relatedSessions:
+  - title: "Sync a Core Data store with the CloudKit public database"
+    code: "10650"
+    description: "Core Data store と CloudKit public database の同期をさらに学びます。"
+  - title: "Data Essentials in SwiftUI"
+    code: "10040"
+    description: "SwiftUI ビューがデータソースを中心にどのように更新されるかを理解します。"
+  - title: "Advances in diffable data sources"
+    code: "10045"
+    description: "collection view と table view の効率的なデータ更新を学びます。"
+  - title: "Advances in UICollectionView"
+    code: "10097"
+    description: "データ結果を現代的な collection view のリストと outline として表示します。"
+  - title: "Diagnose performance issues with the Xcode Organizer"
+    code: "10076"
+    description: "本番環境の集計指標でディスク書き込み、スクロールの引っかかり、性能問題を特定します。"
+---
+
+## ハイライト
+
+> Apple は Core Data の batch insert block 変体、batch update/delete、fetch のトリミング、ObjectID 通知を示し、大量データのインポート、クエリ、永続ストア変更への応答のメモリと時間コストを下げる方法を紹介しました。
+
+## 主要内容
+
+多くの Core Data App は同じ入り口を持ちます。ネットワークから大量の JSON を受け取り、バックグラウンド context が managed object に変換し、ローカル store に保存し、view context が変更をマージして UI を更新します。Earthquakes サンプルは USGS feed を読むこの方式です。データ量が増えると、バックグラウンド context は多数のオブジェクトを作成または fetch し、保存後すぐ破棄されます。([00:32](https://developer.apple.com/videos/play/wwdc2020/10017/?time=32))
+
+このセッションの主線は、その重い処理をより軽い Core Data 経路へ移すことです。バッチ操作は insert、update、delete を直接扱い、managed object 作成コストを減らします。通常の save notification は出ず、accessor や callback も動かないため、Apple は persistent history を同じチェーンに置きます。まずバッチ操作を記録し、履歴から通知と局所更新を駆動します。([01:16](https://developer.apple.com/videos/play/wwdc2020/10017/?time=76))
+
+後半は fetch と通知です。リストが十数行しか見せないとき、全オブジェクトを hydrate する必要はありません。スレッドをまたぐ処理で managed object を直接渡すのも適しません。Core Data は batch size、`propertiesToFetch`、relationship prefetch、ObjectID 結果、dictionary 結果、count 結果を提供します。store が拡張されたり、別 App や share extension が変更したりするとき、ObjectID 通知、remote change 通知、persistent history がどこで何が変わったかを App に伝えます。([08:25](https://developer.apple.com/videos/play/wwdc2020/10017/?time=505)、[13:06](https://developer.apple.com/videos/play/wwdc2020/10017/?time=786))
+
+## 詳細
+
+### バッチ操作を受け止める persistent history を有効にする（[01:43](https://developer.apple.com/videos/play/wwdc2020/10017/?time=103)）
+
+バッチ操作の代償は明確です。通常の保存フローがなく save notification も出ません。managed object もインスタンス化されないため accessor と callback は呼ばれません。セッションの救済は persistent history を有効にし、batch operation を記録してから、現在のビューが気にする変化を履歴から見つけることです。
+
+```swift
+storeDesc.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
+```
+
+キーポイント:
+
+- `storeDesc` は persistent store description です。
+- `NSPersistentHistoryTrackingKey` を有効にすると batch insert/update/delete が persistent history に入ります。
+- この設定は「store で何が起きたか」を解決し、managed object の accessor を自動実行しません。
+- UI が一部のオブジェクトだけ気にするなら、ObjectID や時間範囲で persistent history を絞ります。
+
+### NSBatchInsertRequest でインポートのピークを下げる（[02:15](https://developer.apple.com/videos/play/wwdc2020/10017/?time=135)）
+
+`NSBatchInsertRequest` は当初、辞書配列を受け取れました。iOS 14 では handler 形式が追加され、Core Data が block に次の辞書または managed object を繰り返し要求できます。transcript はインポート時のピークメモリ低下とオブジェクト割り当て削減を明示しています。
+
+```swift
+//NSBatchInsertRequest.h
+
+@available(iOS 13.0, *)
+open class NSBatchInsertRequest : NSPersistentStoreRequest {
+    open var resultType: NSBatchInsertRequestResultType
+
+    public convenience init(entityName: String, objects dictionaries: [[String : Any]])
+    public convenience init(entity: NSEntityDescription, objects dictionaries: [[String : Any]])
+
+    @available(iOS 14.0, *)
+    open var dictionaryHandler: ((inout Dictionary<String, Any>) -> Void)?
+    open var managedObjectHandler: ((inout NSManagedObject) -> Void)?
+
+    public convenience init(entity: NSEntityDescription, dictionaryHandler handler: @escaping (inout Dictionary<String, Any>) -> Void)
+    public convenience init(entity: NSEntityDescription, managedObjectHandler handler: @escaping (inout NSManagedObject) -> Void)
+}
+```
+
+キーポイント:
+
+- 辞書配列 initializer は入力がすでに `[[String: Any]]` のとき向いています。
+- `dictionaryHandler` と `managedObjectHandler` は iOS 14 の入口です。
+- handler により Core Data が次の行を要求するたびに供給でき、完全な配列を先に作らなくて済みます。
+- `resultType` は実行後の戻りを決め、マージ要件に応じて選びます。
+
+Earthquakes 例はまず従来の保存を示します。各 quake 用に managed object を作り、値を入れ、`save()` します。
+
+```swift
+//Earthquakes Sample - Regular Save
+
+   for quakeData in quakesBatch {
+        guard let quake = NSEntityDescription.insertNewObject(forEntityName: "Quake", into: taskContext) as? Quake else { ... }
+        do {
+            try quake.update(with: quakeData)
+        } catch QuakeError.missingData {
+            ...
+            taskContext.delete(quake)
+        }
+        ...
+    }
+    do {
+        try taskContext.save()
+    } catch { ... }
+```
+
+キーポイント:
+
+- ループ内で大量の `Quake` managed object が作られます。
+- 各オブジェクトで属性更新とエラー処理が走ります。
+- 最後の 1 回 `save()` で大きな変更セットがマージされます。
+- セッションの計測では、この経路の大量インポートは 1 分以上、idle memory は約 30 MB でした。
+
+同じデータを block 形式の batch insert にすると次のとおりです。
+
+```swift
+//Earthquakes Sample - Batch Insert with a block
+
+var batchInsert = NSBatchInsertRequest(entityName: "Quake", dictionaryHandler: {
+    (dictionary) in
+        if (blockCount == batchSize) {
+            return true
+        } else {
+            dictionary = quakesBatch[blockCount]
+            blockCount += 1
+        }
+    })
+    var insertResult : NSBatchInsertResult
+    do {
+        insertResult = try taskContext.execute(batchInsert) as! NSBatchInsertResult
+        ...
+    }
+```
+
+キーポイント:
+
+- `dictionaryHandler` は 1 回の呼び出しで 1 件の quake 辞書を埋めます。
+- `true` を返すとデータ供給完了で Core Data は次を要求しません。
+- `taskContext.execute(batchInsert)` で persistent store request を直接実行します。
+- セッションの計測では、辞書配列 batch insert は 13 秒、block ingestion は 11 秒でした。
+
+### unique constraint と merge policy で UPSERT する（[04:33](https://developer.apple.com/videos/play/wwdc2020/10017/?time=273)）
+
+Earthquakes feed は毎回直近 30 日分を返し、大半は既存で少数だけ新規または更新です。例では quake の `code` を unique constraint にし、batch insert を実行する context に merge policy を設定します。同じ `code` では既存行を更新し、削除してから挿入しません。
+
+```swift
+let moc = NSManagedObjectContext(concurrencyType:
+                           NSManagedObjectContextConcurrencyType.privateQueueConcurrencyType)
+
+moc.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+
+insertResult = try moc.execute(insertRequest)
+```
+
+キーポイント:
+
+- unique constraint は Core Data model に置き、例では quake の `code` です。
+- `NSMergeByPropertyObjectTrumpMergePolicy` は競合時に現在オブジェクトの属性で store 側を上書きします。
+- merge policy は batch insert request を実行する context に設定する必要があります。
+- これは SQL UPSERT に相当し、衝突時は指定属性を更新します。
+
+### batch update/delete で全量オブジェクトを引かない（[06:10](https://developer.apple.com/videos/play/wwdc2020/10017/?time=370)）
+
+条件に合う quake を検証済みにするだけなら、全オブジェクトを fetch して属性を変え保存すると、表示不要なオブジェクトまでメモリに載ります。`NSBatchUpdateRequest` は述語に合うオブジェクトの属性を直接更新します。
+
+```swift
+//Earthquakes Sample - Batch Update
+
+let updateRequest = NSBatchUpdateRequest(entityName: "Quake")
+updateRequest.propertiesToUpdate = ["validated" : true]
+updateRequest.predicate = NSPredicate("%K > 2.5", "magnitude")
+
+var updateResult : NSBatchUpdateResult
+do {
+    updateResult = try taskContext.execute(updateRequest) as! NSBatchUpdateResult
+    ...
+}
+```
+
+キーポイント:
+
+- `NSBatchUpdateRequest(entityName:)` は更新対象 entity を指します。
+- `propertiesToUpdate` に変更するフィールドと値を書きます。
+- `predicate` で範囲を限定し、例は `magnitude > 2.5` の quake だけです。
+- `execute` 後は `NSBatchUpdateResult` が返り、managed object を個別にインスタンス化しません。
+
+削除も batch 経路に向きます。例は 30 日より古い quake を削除し、batch delete に `fetchLimit` を設定して store 書き込みロックの長時間占有を避けます。
+
+```swift
+// Batch Delete without and with a Fetch Limit
+
+   DispatchQueue.global(qos: .background).async {
+       moc.performAndWait { () -> Void in
+          do {
+              let expirationDate = Date.init().addingTimeInterval(-30*24*3600)
+
+              let request = NSFetchRequest<Quake>(entityName: "Quake")
+              request.predicate = NSPredicate(format:"creationDate < %@", expirationDate)
+
+              let batchDelete = NSBatchDeleteRequest(fetchRequest: request)
+              batchDelete.fetchLimit = 1000
+              moc.execute(batchDelete)
+           }
+       }
+   }
+```
+
+キーポイント:
+
+- クリーンアップは background queue に置き、Core Data 操作は `moc.performAndWait` に入れます。
+- `creationDate < expirationDate` が削除条件です。
+- `NSBatchDeleteRequest(fetchRequest:)` は fetch request の範囲定義を再利用します。
+- `fetchLimit = 1000` で 1 回の削除を有界にし、長い書き込みロックを減らします。
+
+### ビュー要件に合わせて fetch をトリミングする（[08:25](https://developer.apple.com/videos/play/wwdc2020/10017/?time=505)）
+
+fetch のデフォルト結果は managed object です。オブジェクトグラフ全体の走査や fetched results controller の追従に向きます。リストが少数行しか見せないときは batch size を設定し、最初のバッチだけ hydrate し、スクロールで続きを読み込めます。セッションの計測では、同じ Earthquakes リストの idle memory が約 17 MB から約 12 MB に下がりました。
+
+もう 1 つのトリミングは属性と関係です。UI が一部フィールドだけ必要なら `propertiesToFetch` を設定します。関係が必ず触られるなら key path を prefetch し、初回 traverse で fault を連発させません。スレッドをまたぐなら ObjectID 結果が managed object より適し、読み取り専用集計は dictionary 結果が向きます。
+
+```swift
+//Fetch average magnitude of each place
+
+let magnitudeExp = NSExpression(forKeyPath: "magnitude")
+let avgExp = NSExpression(forFunction: "avg:", arguments: [magnitudeExp])
+
+let avgDesc = NSExpressionDescription()
+avgDesc.expression = avgExp
+avgDesc.name = "average magnitude"
+avgDesc.expressionResultType = .floatAttributeType
+
+let fetch = NSFetchRequest<NSFetchRequestResult>(entityName: "Quake")
+fetch.propertiesToFetch = [avgDesc, "place"]
+fetch.propertiesToGroupBy = ["place"]
+fetch.resultType = .dictionaryResultType
+```
+
+キーポイント:
+
+- `NSExpression(forKeyPath: "magnitude")` で集計対象属性を選びます。
+- `NSExpression(forFunction: "avg:", arguments:)` で平均を定義します。
+- `NSExpressionDescription` で集計結果に名前と型を与えます。
+- `propertiesToFetch` に集計フィールドとグループ化フィールドを含めます。
+- `propertiesToGroupBy = ["place"]` で地点ごとにグループ化します。
+- `dictionaryResultType` は軽量な読み取り専用結果を返し、統計ビューやスレッド間受け渡しに使えます。
+
+### ObjectID 通知と remote change で store 変更に応答する（[13:16](https://developer.apple.com/videos/play/wwdc2020/10017/?time=796)）
+
+iOS 14 は `NSManagedObjectContext` に Swift 向けの通知名を追加し、ObjectID 版の通知も加えました。ObjectID notification は managed object の save notification の軽量版で、persistent history transaction が支えます。
+
+```swift
+//NSManagedObjectContext.h
+
+@available(iOS 14.0, *)
+extension NSManagedObjectContext {
+    public static let willSaveObjectsNotification: Notification.Name
+    public static let didSaveObjectsNotification: Notification.Name
+    public static let didChangeObjectsNotification: Notification.Name
+
+    public static let didSaveObjectIDsNotification: Notification.Name
+    public static let didMergeChangesObjectIDsNotification: Notification.Name
+}
+```
+
+キーポイント:
+
+- `willSaveObjectsNotification`、`didSaveObjectsNotification`、`didChangeObjectsNotification` は Swift 向けに整理された名前です。
+- `didSaveObjectIDsNotification` と `didMergeChangesObjectIDsNotification` は完全な managed object ではなく ObjectID を渡します。
+- 「どのオブジェクトが変わったか」だけ分かればよい UI やバックグラウンド処理に向きます。
+- セッションは inserted、updated、deleted オブジェクトと ObjectID 版を含む新しい `NotificationKey` も列挙しています。
+
+同一 store を share extension、第 2 の App、Photos extension が変更すると、App は以前フォアグラウンド復帰時に persistent history を poll していました。remote change notification を有効にすると、Core Data client が store を変更したときに直接通知できます。
+
+```swift
+storeDesc.setOption(true as NSNumber, forKey: NSPersistentStoreRemoteChangeNotificationPostOptionKey)
+storeDesc.setOption(true as NSNumber, forKey: NSPersistentHistoryTrackingKey)
+```
+
+キーポイント:
+
+- `NSPersistentStoreRemoteChangeNotificationPostOptionKey` で remote change notification を有効にします。
+- `NSPersistentHistoryTrackingKey` により通知の `userInfo` に persistent history token を載せられます。
+- token で persistent history を読み、ObjectID レベルの変化に変換できます。
+- プロセス内外の Core Data client 変更をカバーし、フォアグラウンド poll より直接的です。
+
+persistent history 自体もトリミングします。セッション最後は ObjectID で履歴変化を絞るリクエストを示します。
+
+```swift
+let changeDesc = NSPersistentHistoryChange.entityDescription(with: moc)
+let request = NSFetchRequest<NSFetchRequestResult>()
+
+//Set fetch request entity and predicate
+request.entity = changeDesc
+request.predicate =
+    NSPredicate(format: "%K = %@",changeDesc?.attributesByName["changedObjectID"], objectID)
+
+//Set up history request with distantPast and set fetch request
+let historyReq = NSPersistentHistoryChangeRequest.fetchHistory(after: Date.distantPast)
+historyReq.fetchRequest = request
+
+let results = try moc.execute(historyReq)
+```
+
+キーポイント:
+
+- `NSPersistentHistoryChange.entityDescription(with:)` で history change の entity description を取得します。
+- fetch の predicate は `changedObjectID` を指します。
+- `fetchHistory(after:)` が履歴クエリの起点を定義します。
+- `historyReq.fetchRequest = request` で通常 fetch の絞り込みを history request に適用します。
+- 実行後は指定 ObjectID の、指定時刻以降の変化だけが返ります。
+
+## 重要ポイント
+
+- **やること**: ニュース、天気、相場系 App のバックグラウンド取り込みを batch insert に切り替える。**価値**: Earthquakes 例では従来保存が 1 分以上かかり、batch insert は同じ取り込みを十数秒に短縮しました。**始め方**: 入力を entity 属性辞書に整理し、データが大きければ `NSBatchInsertRequest(entityName:dictionaryHandler:)` にし、store で persistent history を有効にします。
+
+- **やること**: 繰り返し取り込む feed を UPSERT として設計する。**価値**: 直近 30 日の地震 feed は大半が既存データで、一意 `code` と merge policy で既存行を更新でき、削除再挿入を避けられます。**始め方**: Core Data model で業務上の一意キーに unique constraint を設定し、batch insert を実行する context に `NSMergeByPropertyObjectTrumpMergePolicy` を設定します。
+
+- **やること**: 定期クリーンアップに batch delete と fetch limit を追加する。**価値**: 期限切れオブジェクトの削除は store 書き込みロックを取り、上限がないとユーザー待ちが長くなります。**始め方**: `NSFetchRequest` で期限条件を書き、`NSBatchDeleteRequest` を作り、データ規模に応じた `fetchLimit` でバッチ実行します。
+
+- **やること**: 大きなリスト向けに fetch をトリミングする。**価値**: セッションでは batch size で Earthquakes リストの idle memory が約 17 MB から約 12 MB に下がりました。**始め方**: 先頭画面に必要なフィールドを確認し、batch size と `propertiesToFetch` を設定します。cell が必ず触る関係なら relationship prefetch を追加します。
+
+- **やること**: フォアグラウンド poll を remote change notification に置き換える。**価値**: share extension、別 App、拡張が同一 store を変更するとき、通知と persistent history token で具体的な変化を追えます。**始め方**: `NSPersistentStoreRemoteChangeNotificationPostOptionKey` と `NSPersistentHistoryTrackingKey` を同時に有効にし、通知後に ObjectID または時間範囲で history を照会します。
+
+## 関連セッション
+
+- [Sync a Core Data store with the CloudKit public database](/articles/wwdc2020-10650) — Core Data store と CloudKit public database の同期経路を続けます。
+- [Data Essentials in SwiftUI](/articles/wwdc2020-10040) — SwiftUI が source of truth と data model を中心にビューを更新する仕組みを理解します。
+- [Advances in diffable data sources](/articles/wwdc2020-10045) — Core Data の変化を collection view と table view の安定した差分更新に変換します。
+- [Advances in UICollectionView](/articles/wwdc2020-10097) — fetch 結果表示のためのモダンな collection view リスト、アウトライン、cell 設定を学びます。
+- [Diagnose performance issues with the Xcode Organizer](/articles/wwdc2020-10076) — 本番集約指標でディスク書き込み、スクロールヒッチ、性能回帰を追跡します。

@@ -1,0 +1,262 @@
+---
+title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+description: "develop generative ai features for your swiftui apps using the foundation models framework. get started by applying the basics of the framework to create an awesome feature. watch step-by-step example"
+date: 2026-06-10
+tags: ["Machine Learning"]
+thumbnail: "/images/sessions/2025/259.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/259/"
+sessionId: "wwdc2025-259"
+year: "2025"
+relatedSessions:
+  - title: "Meet the Foundation Models framework"
+    code: "286"
+    description: "Meet the Foundation Models framework and learn the overall capabilities of on-device large language models."
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "Dive into the internals of Guided Generation, tool calling, and streaming output."
+  - title: "Explore prompt design & safety for on-device foundation models"
+    code: "248"
+    description: "Prompt design and safety practices."
+  - title: "Get started with MLX for Apple silicon"
+    code: "315"
+    description: "Train and deploy your own models on Apple silicon with MLX."
+---
+
+## Highlight
+
+> The Foundation Models framework lets Swift developers generate custom structs directly with the `@Generable` annotation. No hand-written JSON parsing.
+
+---
+
+## Core Content
+
+The hardest part of trip planning is starting from a blank page: where to go, how many days, where to sleep, what to eat. In this code-along, Naomy hands the whole job to an on-device LLM. Pick a landmark (say, Joshua Tree), tap Generate, and the model spits out a full itinerary with a daily activity plan. No network, no data upload. The model already ships inside macOS, iPadOS, iOS, and visionOS.
+
+But wiring the model into a SwiftUI app raises a few problems. How do you iterate on prompts without burning a day? The model returns strings — how do you turn them into Swift structs? How does the model reach external data sources like MapKit? How do you cut output latency? What if the device has Apple Intelligence turned off? In thirty minutes, the session walks through all five: live prompt iteration in Xcode Playground ([02:54](https://developer.apple.com/videos/play/wwdc2025/259/?time=174)), `@Generable` plus `@Guide` for structured output ([04:47](https://developer.apple.com/videos/play/wwdc2025/259/?time=287)), implementing the `Tool` protocol to reach MapKit ([11:43](https://developer.apple.com/videos/play/wwdc2025/259/?time=703)), streaming responses with `PartiallyGenerated` ([20:15](https://developer.apple.com/videos/play/wwdc2025/259/?time=1215)), and using the new Foundation Models Instrument to find bottlenecks, then driving first-token latency to near-zero with prewarm and `includeSchemaInPrompt: false` ([24:24](https://developer.apple.com/videos/play/wwdc2025/259/?time=1464)).
+
+---
+
+## Detailed Content
+
+**Prompt iteration in Xcode Playground ([02:54](https://developer.apple.com/videos/play/wwdc2025/259/?time=174))**. Re-running the app every time you tweak a prompt eats a whole day. The updated Xcode Playground gives a faster path: write `#Playground` in any Swift file and the canvas echoes results live, like SwiftUI Preview. Change one word, the model re-runs at once.
+
+**Guided Generation ([04:47](https://developer.apple.com/videos/play/wwdc2025/259/?time=287))**. Mark a custom struct as `@Generable` and the model produces an instance of that type directly. The `@Guide` macro adds a description, restricts the value set, or caps array length. Multiple guides stack.
+
+```swift
+import FoundationModels
+
+@Generable
+struct Itinerary {
+    @Guide(description: "A catchy title for the trip")
+    var title: String
+
+    var description: String
+
+    var rationale: String
+
+    @Guide(.count(3))
+    var days: [DayPlan]
+}
+
+@Generable
+struct DayPlan {
+    var title: String
+    var activities: [String]
+}
+```
+
+Key points:
+- `@Generable` applies to a struct, and every property must also be Generable (`String`, `Int`, and other primitives are built in).
+- `@Guide(description:)` injects the description into the schema, equivalent to a per-field prompt.
+- `@Guide(.count(3))` forces the `days` array to hold exactly three elements. The constraint takes effect during generation, not as a post-hoc check.
+
+**Writing Instructions with the builder API ([06:50](https://developer.apple.com/videos/play/wwdc2025/259/?time=410))**. The `Instructions` closure takes both strings and Generable instances as few-shot examples. Foundation Models converts Generable instances to model-readable text on its own.
+
+```swift
+@Observable
+final class ItineraryPlanner {
+    let landmark: Landmark
+    var itinerary: Itinerary?
+
+    private let session: LanguageModelSession
+
+    init(landmark: Landmark) {
+        self.landmark = landmark
+        self.session = LanguageModelSession {
+            "You are a travel planner. Build a 3-day itinerary."
+            "Landmark: \(landmark.name)"
+            "Here is an example itinerary:"
+            Itinerary.exampleJapanTrip
+        }
+    }
+
+    func generate() async throws {
+        let response = try await session.respond(
+            to: "Generate an itinerary for \(landmark.name).",
+            generating: Itinerary.self
+        )
+        itinerary = response.content
+    }
+}
+```
+
+Key points:
+- `LanguageModelSession` takes instructions through a trailing closure. Inside, a result builder mixes strings with Generable instances.
+- `respond(to:generating:)` names the output type as `Itinerary.self`, and the framework injects the schema into the prompt.
+- Mark the planner `@Observable` so the UI refreshes when `itinerary` changes.
+- Naomy stresses ([09:22](https://developer.apple.com/videos/play/wwdc2025/259/?time=562)) that the planner should be created in `.task`, not as a `@State` initial value. Otherwise SwiftUI rebuilds it again and again for nothing.
+
+**The Tool protocol for external data ([11:12](https://developer.apple.com/videos/play/wwdc2025/259/?time=672))**. The model decides when to call a tool and how many times. A Tool needs a unique `name`, a `description` (so the model knows when to use it), an `Arguments` type (must be Generable), and a `call` method.
+
+```swift
+import FoundationModels
+import MapKit
+
+struct FindPointsOfInterestTool: Tool {
+    let name = "findPointsOfInterest"
+    let description = "Search for points of interest near a landmark, given a category."
+
+    let landmark: Landmark
+
+    @Generable
+    enum Category: String {
+        case restaurant
+        case marina
+        case desertAttraction
+        case hikingTrail
+    }
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Natural language search query, e.g. 'sunset viewpoint'")
+        var query: String
+        var category: Category
+    }
+
+    func call(arguments: Arguments) async throws -> ToolOutput {
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = arguments.query
+        request.region = MKCoordinateRegion(
+            center: landmark.coordinate,
+            latitudinalMeters: 20_000,
+            longitudinalMeters: 20_000
+        )
+        let response = try await MKLocalSearch(request: request).start()
+        let names = response.mapItems.prefix(5).map(\.name).compactMap { $0 }
+        return ToolOutput(names.joined(separator: ", "))
+    }
+}
+```
+
+Key points:
+- `name` and `description` get written into instructions automatically. The model decides whether to call based on them.
+- `Arguments` must be Generable. The model fills query and category from the schema. Pairing the Great Barrier Reef with marina and Joshua Tree with desertAttraction is the model's world knowledge at work ([13:07](https://developer.apple.com/videos/play/wwdc2025/259/?time=787)).
+- `call(arguments:)` is async. It searches points of interest within a 20km radius and returns a `ToolOutput`.
+- Register the tool by passing the instance through the `tools:` parameter when initializing `LanguageModelSession`. You can also nudge the model in the prompt with "use the tool" to raise the call rate ([15:30](https://developer.apple.com/videos/play/wwdc2025/259/?time=930)).
+
+**Availability handling ([16:37](https://developer.apple.com/videos/play/wwdc2025/259/?time=997))**. The device may not support Apple Intelligence, the user may have it off, or the model may still be downloading. Three states map to three UI branches:
+
+```swift
+struct LandmarkTripView: View {
+    let landmark: Landmark
+    private let model = SystemLanguageModel.default
+
+    var body: some View {
+        switch model.availability {
+        case .available:
+            generateButton
+        case .unavailable(.appleIntelligenceNotEnabled):
+            Text("Enable Apple Intelligence in Settings to plan trips.")
+        case .unavailable(.modelNotReady):
+            Text("Model is still downloading. Please try again later.")
+        case .unavailable:
+            funFactView // Device doesn't support it at all; hide the generate button
+        }
+    }
+}
+```
+
+Key points:
+- `SystemLanguageModel.default.availability` returns a state enum. Developers ship a fallback UI per case.
+- You don't have to actually toggle Apple Intelligence off to test. The Xcode scheme has a **Foundation Models Availability** override that simulates Device Not Eligible, Apple Intelligence Not Enabled, and Model Not Ready ([17:27](https://developer.apple.com/videos/play/wwdc2025/259/?time=1047)).
+
+**Streaming output ([20:15](https://developer.apple.com/videos/play/wwdc2025/259/?time=1215))**. Swap `respond` for `streamResponse`. The return value is no longer a complete `Itinerary` but `Itinerary.PartiallyGenerated` — every property is turned into Optional automatically.
+
+```swift
+func generateStreaming() async throws {
+    let stream = session.streamResponse(
+        to: "Generate an itinerary for \(landmark.name).",
+        generating: Itinerary.self
+    )
+    for try await partial in stream {
+        partialItinerary = partial // Each frame is a more complete Itinerary.PartiallyGenerated
+    }
+}
+```
+
+Key points:
+- The return type is `AsyncSequence`. Each iteration yields a more complete version. The first frame may carry only `title`, the second adds `description`, and so on.
+- `PartiallyGenerated` conforms to `Identifiable` automatically, so SwiftUI's `ForEach` works without manual ID handling ([22:53](https://developer.apple.com/videos/play/wwdc2025/259/?time=1373)).
+- In the view, unwrap with `if let title = partial?.title` and pair it with `.contentTransition(.interpolate)` for animation. Text fades in section by section.
+
+**Performance tuning ([24:24](https://developer.apple.com/videos/play/wwdc2025/259/?time=1464))**. The new Foundation Models Instrument splits work into three lanes: Asset Loading (blue, model load time), Inference, and Tool Calling (purple). It also shows input token count. Naomy uses two tricks to cut first-token latency:
+
+```swift
+// Tweak 1: prewarm when the user opens landmark details
+struct LandmarkDescriptionView: View {
+    let planner: ItineraryPlanner
+
+    var body: some View {
+        descriptionContent
+            .task {
+                planner.session.prewarm()
+            }
+    }
+}
+
+// Tweak 2: skip schema injection
+let response = try await session.respond(
+    to: "Generate an itinerary for \(landmark.name).",
+    generating: Itinerary.self,
+    options: GenerationOptions(includeSchemaInPrompt: false)
+)
+```
+
+Key points:
+- `prewarm()` loads the model into memory ahead of time. The right moment is right after the user signals intent (opening the landmark). By the time they finish reading the intro and tap Generate, the model is ready ([26:28](https://developer.apple.com/videos/play/wwdc2025/259/?time=1588)).
+- `includeSchemaInPrompt: false` saves schema tokens, but one of two preconditions must hold: the same session has already sent a request of the same type, or the instructions already carry a full example.
+- Watch out: turning schema injection off drops the `@Guide` descriptions, so the example must be complete. If a property is Optional, the example needs to cover both the value-present and nil cases ([28:35](https://developer.apple.com/videos/play/wwdc2025/259/?time=1715)).
+
+---
+
+## Core Takeaways
+
+- **What to do: treat the on-device LLM as an "auto-generator" for business fields, not a chat box**.
+  Why it pays off: the old way is model emits JSON, client parses, fields drift, and things crash. Guided Generation hands the constraint to the model runtime — the type is the contract.
+  How to start: pick a feature you currently piece together with templates (recommendation copy, menu categories, trip summaries), add `@Generable` plus `@Guide` to the target struct, and get it running in `#Playground` before wiring it to the UI.
+
+- **What to do: add `.contentTransition(.interpolate)` plus streaming on key fields**.
+  Why it pays off: streaming turns "wait 8 seconds for a wall of text" into "first line in 1 second, read as it arrives". Perceived latency drops by an order of magnitude.
+  How to start: swap `respond` for `streamResponse`, bind the view to `PartiallyGenerated`, unwrap field by field with `if let`, and add transitions to text and lists.
+
+- **What to do: prewarm at user behavior hooks**.
+  Why it pays off: the model can be paged out of memory by the system, so the first call waits for load. Prewarm shifts that wait to a moment the user can't feel.
+  How to start: find the gap between "user expresses intent" and "user actually taps generate" (opening details, starting to type, scrolling onto the target card), and call `session.prewarm()` from `.task` or `onChange`.
+
+- **What to do: make availability state a first-class UI branch**.
+  Why it pays off: Apple Intelligence isn't on every device. Showing "something went wrong" loses users. Routing each unavailable substate to its own copy keeps conversion.
+  How to start: at the top of the entry view, switch on `SystemLanguageModel.default.availability`, write three messages for the three unavailable cases, and walk through every branch using the Xcode scheme's Foundation Models Availability override.
+
+- **What to do: turn on `includeSchemaInPrompt: false` once the prompt is stable**.
+  Why it pays off: schema tokens are a hidden cost. Sending the same schema across rounds of conversation is slow and wastes context.
+  How to start: write a complete Generable example in instructions first (cover both states of any Optional property), then turn off schema injection in `GenerationOptions` and compare input token counts in the Foundation Models Instrument.
+
+---
+
+## Related Sessions
+
+- [Meet the Foundation Models framework](/articles/wwdc2025-286) — Framework overview. Watch this before the code-along.
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — Inside Guided Generation, tool calling, and streaming output.
+- [Explore prompt design & safety for on-device foundation models](/articles/wwdc2025-248) — Best practices for prompt design and safety guardrails.
+- [Develop for Shortcuts and Spotlight with App Intents](/articles/wwdc2025-260) — Wrap generation in App Intents so Shortcuts and Spotlight can invoke it directly.
+- [Design interactive snippets](/articles/wwdc2025-281) — Surface AI-generated results as snippets at system entry points.

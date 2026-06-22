@@ -1,0 +1,424 @@
+---
+title: "Optimize your use of Core Data and CloudKit"
+description: "join us as we explore the three parts of the development cycle that can help you optimize your core data and cloudkit implementation. we'll show you how you can analyze your app's architecture and feature set to verify assumptions, explore changes in behavior after ingesting large data sets, and get actionable feedback to make improvements to your workflow."
+date: 2026-06-10
+tags: ["Core Data", "CloudKit", "Developer Tools"]
+thumbnail: "/images/sessions/2022/10119.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10119/"
+sessionId: "wwdc2022-10119"
+year: "2022"
+relatedSessions:
+  - title: "Evolve your Core Data schema"
+    code: "10120"
+    description: "Core Data スキーマの移行と、スキーマの変更が CloudKit 同期にどのように関連するかについて学びます。"
+  - title: "Track down hangs with Xcode and on-device detection"
+    code: "10082"
+    description: "Xcode、Instruments、およびデバイス診断データを使用して、実際のアプリの不具合を特定します。"
+  - title: "Diagnose performance issues with the Xcode Organizer"
+    code: "10076"
+    description: "Xcode Organizer を通じて、実際のユーザーデバイス上で集約されたパフォーマンスデータを表示します。"
+---
+## ハイライト
+
+> アップルの場合`NSPersistentCloudKitContainer`サンプル アプリでは、データ ジェネレーター、XCTest、Instruments、統合ログ、sysdiagnose を使用してパフォーマンスを分析し、Core Data および CloudKit 同期アプリの問題を診断する方法を示します。
+
+---
+
+## 主要内容
+
+Core Data と CloudKit の間の同期の問題は、データ サイズが増加した後に発生することがよくあります。小規模なデータ セットは正常に動作しますが、10 GB の画像データ、最初の完全インポート、バックグラウンド エクスポート、およびプッシュ トリガー インポートも正常に動作するという意味ではありません。
+
+このセッションの焦点は開発サイクルです。最初にデータを構築して仮説を調査し、次にツールを使用して結果を分析し、最後にチームまたは Apple が問題を再現できるようにする診断データを収集します。 ([00:42](https://developer.apple.com/videos/play/wwdc2022/10119/?time=42))
+
+サンプル アプリのモデルは非常に具体的です。投稿にはタイトルと本文があり、投稿には複数の添付ファイルが関連付けられ、画像データ ImageData は 1 対 1 の関係の背後に配置され、オンデマンドで読み込まれます。 ([02:51](https://developer.apple.com/videos/play/wwdc2022/10119/?time=171)) このモデルでは、大きな画像、関係トラバーサル、同期インポートとエクスポートを安定してテストできます。
+
+## 詳細
+
+### 1. データ ジェネレーターを使用して、反復可能な大規模なデータ セットを作成する
+
+組み込みの「Generate 1000 Posts」は 1 つのデータ形状のみを検証できます。 Apple は、探索アクションをデータ ジェネレーターとして記述することを推奨しています。つまり、固定ルールを使用して特定のサイズ、構造、変動範囲のデータを生成し、それをテストまたはデバッグ UI に接続します。 ([03:30](https://developer.apple.com/videos/play/wwdc2022/10119/?time=210))
+
+公式の例では、それぞれ 11 個の画像添付ファイルを含む 60 個の投稿、合計 660 個の画像が生成されます。各画像は平均 10 ～ 20MB で、セット全体では 10GB に近づきます。 ([04:34](https://developer.apple.com/videos/play/wwdc2022/10119/?time=274))
+
+```swift
+class LargeDataGenerator {
+    func generateData(context: NSManagedObjectContext) throws {
+        try context.performAndWait {
+            for postCount in 1...60 {
+                //add a post               
+                for attachmentCount in 1...11 {
+                    //add an attachment with an image
+                    let imageFileData = NSData(contentsOf: url!)!
+               }
+            }
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `LargeDataGenerator`データ構築ロジックを別の型にカプセル化し、テストと UI の両方で同じエントリ ポイントを呼び出すことができます。
+-`generateData(context:)`引き継ぐ`NSManagedObjectContext`、生成ロジックは特定のコンテナーにバインドされません。
+-`context.performAndWait`コア データの書き込みをコンテキスト キューに入れて実行します。
+- 外層`1...60`ポストの数を制御、内部レイヤー`1...11`投稿ごとの添付ファイルの数を制御します。
+-`NSData(contentsOf:)`実際の画像データを読み取り、単に空のシェル オブジェクトをテストするのではなく、実際の大きなオブジェクトにテストを実行させます。
+
+このエントリ ポイントを使用すると、単体テストでまずジェネレーター自体を検証できます。 ([05:07](https://developer.apple.com/videos/play/wwdc2022/10119/?time=307))
+
+```swift
+class TestLargeDataGenerator: CoreDataCloudKitDemoUnitTestCase {
+    func testGenerateData() throws {
+        let context = self.coreDataStack.persistentContainer.newBackgroundContext()
+        try self.generator.generateData(context: context)
+        try context.performAndWait {                     
+            let posts = try context.fetch(Post.fetchRequest())
+            for post in posts {
+                self.verify(post: post, has: 11, matching: imageDatas)
+            }
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `newBackgroundContext()`メイン コンテキストへの大量の書き込みを避けるために、ジェネレーターにバックグラウンド コンテキストを与えます。
+-`try self.generator.generateData(context:)`テストでは 10GB レベルの代表的なデータが生成されました。
+-`Post.fetchRequest()`生成された投稿を取得します。
+-`verify(post:has:matching:)`テスト データ自体のエラーを防ぐために、各投稿に 11 個の画像添付ファイルがあることをアサートします。
+
+### 2. 同期イベントを XCTest コントロール ポイントに変換する
+
+このセッションでは次のことについて議論します`NSPersistentCloudKitContainer`したがって、データの生成後にエクスポートとインポートをテストする必要があります。 ([05:33](https://developer.apple.com/videos/play/wwdc2022/10119/?time=333)) 公式の例では、エクスポート コンテナを作成し、データを生成し、待機します。`.export`イベントが完了しました。
+
+```swift
+func testExportThenImport() throws {
+    let exportContainer = newContainer(role: "export", postLoadEventType: .setup)
+    try self.generator.generateData(context: exportContainer.newBackgroundContext())
+    self.expectation(for: .export, from: exportContainer)
+    self.waitForExpectations(timeout: 1200)
+}
+```
+
+キーポイント:
+
+- `newContainer(role:postLoadEventType:)`エクスポート用に作成する`NSPersistentCloudKitContainer`。
+- `generateData(context:)`大きなデータ セットをこのコンテナのバックグラウンド コンテキストに直接書き込みます。
+-`expectation(for: .export, from:)`CloudKit エクスポート イベントを XCTest の期待値に変換します。
+-`waitForExpectations(timeout: 1200)`大きなデータのアップロードには最大 20 分かかります。
+
+論理的な依存関係を待つ`NSPersistentCloudKitContainer.eventChangedNotification`。（[06:35](https://developer.apple.com/videos/play/wwdc2022/10119/?time=395)）
+
+```swift
+func expectation(for eventType: NSPersistentCloudKitContainer.EventType,
+                 from container: NSPersistentCloudKitContainer) -> [XCTestExpectation] {
+    var expectations = [XCTestExpectation]()
+    for store in container.persistentStoreCoordinator.persistentStores {
+        let expectation = self.expectation(
+            forNotification: NSPersistentCloudKitContainer.eventChangedNotification,
+            object: container
+        ) { notification in
+            let userInfoKey = NSPersistentCloudKitContainer.eventNotificationUserInfoKey
+            let event = notification.userInfo![userInfoKey]               
+            return (event.type == eventType) &&
+                (event.storeIdentifier == store.identifier) &&
+                (event.endDate != nil)
+        }
+        expectations.append(expectation)
+    }
+    return expectations
+}
+```
+
+キーポイント:
+
+- メソッドパラメータ内`eventType`待機するように指定する`.setup`、`.export`または`.import`。
+- ループスルー`persistentStores`、各店舗への期待を構築します。
+-`eventChangedNotification`はい`NSPersistentCloudKitContainer`イベント通知が送信されました。
+-`eventNotificationUserInfoKey`通知からイベント オブジェクトを取得します。
+-`event.type == eventType`イベントタイプが一致していることを確認します。
+-`event.storeIdentifier == store.identifier`イベントが現在のストアに属していることを確認します。
+-`event.endDate != nil`インシデントが終了したことを確認します。
+
+次に、テストでは新しいインポート コンテナーを作成し、空のストア ファイルを使用して最初のインポートをトリガーし、他のデバイスが初めてすべてのデータをダウンロードしたときに何が起こるかを観察します。 ([07:18](https://developer.apple.com/videos/play/wwdc2022/10119/?time=438))
+
+```swift
+func testExportThenImport() throws {
+    let exportContainer = newContainer(role: "export", postLoadEventType: .setup)
+    try self.generator.generateData(context: exportContainer.newBackgroundContext())
+    self.expectation(for: .export, from: exportContainer)
+    self.waitForExpectations(timeout: 1200)
+    
+    let importContainer = newContainer(role: "import", postLoadEventType: .import)
+    self.waitForExpectations(timeout: 1200)
+}
+```
+
+キーポイント:
+
+- 前半で大規模なデータセットのエクスポートを完了します。
+-`newContainer(role: "import", postLoadEventType: .import)`新しいコンテナを使用した空のデバイスの最初のインポートをシミュレートします。
+- 2回目`waitForExpectations`インポートが完了するまで待ちます。
+- このテストでは、「ビッグ データのアップロード」と「ビッグ データの最初のダウンロード」を同じ反復可能なリンクに配置します。
+
+同じジェネレーターをデバッグ UI に接続することもできます。 ([08:23](https://developer.apple.com/videos/play/wwdc2022/10119/?time=503))
+
+```swift
+UIAlertAction(title: "Generator: Large Data", 
+              style: .default) {_ in
+    let generator = LargeDataGenerator()
+    try generator.generateData(context: context)
+    self.dismiss(animated: true)
+}
+```
+
+キーポイント:
+
+- `UIAlertAction`ジェネレーターをアプリ内のデバッグ ポータルとして公開します。
+-`LargeDataGenerator()`テストでデータ構築ロジックを再利用します。
+-`generateData(context:)`現在のアプリ データベースに同じ大規模なデータ セットを生成します。
+-`dismiss(animated:)`デバッグ ポップアップ ウィンドウを閉じて、開発者がリストと添付ファイルの同期パフォーマンスを直接観察できるようにします。
+
+### 3. Instruments を使用して、本当に時間のかかるコードを見つける
+
+データ ジェネレーターは問題を再現可能にし、計測器はどこに時間が費やされたかを示します。 Apple は、Xcode テストガターでプロファイルを選択し、Time Profiler を起動して、XCTest を直接分析します。 ([09:42](https://developer.apple.com/videos/play/wwdc2022/10119/?time=582))
+
+最初の分析で判明したのは、`LargeDataGenerator`再スタックはサムネイルを生成するために使用されます。ただし、データ モデルは ImageData からの要求に応じてサムネイルを計算するようにすでに設計されているため、ジェネレーターが事前にサムネイルを生成するのは冗長な作業です。 ([10:38](https://developer.apple.com/videos/play/wwdc2022/10119/?time=638))
+
+```swift
+func generateData(context: NSManagedObjectContext) throws {
+    try context.performAndWait {
+        for postCount in 1...60 {
+            for attachmentCount in 1...11 {
+                let attachment = Attachment(context: context)
+                let imageData = ImageData(context: context)
+                imageData.attachment = attachment
+                imageData.data = autoreleasepool {
+                    let imageFileData = NSData(contentsOf: url!)!
+                    attachment.thumbnail = Attachment.thumbnail(from: imageFileData,        
+                                                                thumbnailPixelSize: 80)
+                    return imageFileData
+                }
+            }
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `Attachment(context:)`そして`ImageData(context:)`コアデータオブジェクトを作成します。
+-`imageData.attachment = attachment`画像データと添付ファイルの関係を確立します。
+-`autoreleasepool`一時的な画像データの公開範囲を制御します。
+-`NSData(contentsOf:)`大きな画像を読んでください。
+-`attachment.thumbnail = Attachment.thumbnail(...)`事前にサムネイルを生成します。これはまさに、Time Profiler が検出する追加コストです。
+
+改訂されたジェネレーターでは、サムネイルの生成が削除され、元の画像データのみが保存されます。 ([11:13](https://developer.apple.com/videos/play/wwdc2022/10119/?time=673))
+
+```swift
+func generateData(context: NSManagedObjectContext) throws {
+    try context.performAndWait {
+        for postCount in 1...60 {
+            for attachmentCount in 1...11 {
+                let attachment = Attachment(context: context)
+                let imageData = ImageData(context: context)
+                imageData.attachment = attachment
+                imageData.data = autoreleasepool {
+                    return NSData(contentsOf: url!)!
+                }
+            }
+        }
+    }
+}
+```
+
+キーポイント:
+
+- オブジェクトの作成と関係の設定は変更されず、テスト データの形状も変更されません。
+-`imageData.data`実際のイメージはまだ保存されており、CloudKit の同期圧力は依然として存在します。
+- 消去`attachment.thumbnail`モデル設計のオンデマンド計算パスにサムネイルを返す値を割り当てます。
+-Appleが示した結果は次のとおりです。`generateData`テスト実行時間は従来の10分の1に短縮されます。 ([11:55](https://developer.apple.com/videos/play/wwdc2022/10119/?time=715))
+
+### 4. 割り当てを使用してコア データ テストのメモリ制限を制御する
+
+Time Profiler は時間のかかる問題を解決しましたが、Allocations では別の問題が明らかになりました。テストは 10 GB を超えるメモリで実行されており、データのほぼ全体のセットがメモリに保持されていました。 ([12:26](https://developer.apple.com/videos/play/wwdc2022/10119/?time=746))
+
+問題は検証コードにあります。まずすべての投稿を取得し、次にリレーションシップを通じて Attachment と ImageData にアクセスします。これにより、添付ファイルと画像データが管理オブジェクト コンテキストに登録され、コンテキストが作業を完了するまで解放されません。 ([14:15](https://developer.apple.com/videos/play/wwdc2022/10119/?time=855))
+
+```swift
+func verifyPosts(in context: NSManagedObjectContext) throws {
+    try context.performAndWait {
+        let fetchRequest = Post.fetchRequest()
+        let posts = try context.fetch(fetchRequest)
+
+        for post in posts {
+            // verify post
+
+            let attachments = post.attachments as! Set<Attachment>
+            for attachment in attachments {
+
+                XCTAssertNotNil(attachment.imageData)
+                //verify image
+            }
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `Post.fetchRequest()`確認エントリを投稿します。
+-`context.fetch(fetchRequest)`すべての投稿を一度に取得します。
+-`post.attachments`添付ファイルのコレクションは、リレーションシップに基づいてアクセスされます。
+-`attachment.imageData`画像データが読み込まれます。
+- 高速に実行されるテストでは、これらのオブジェクトが自然に解放される時間がなくなり、メモリのピークが増加します。
+
+Apple の変更は、Attachment を逆に取得し、objectID のみを最初に取得することです。次に、オンデマンドでオブジェクトを実体化し、添付ファイルが 10 件検証されるごとにコンテキストをリセットします。 ([14:49](https://developer.apple.com/videos/play/wwdc2022/10119/?time=889))
+
+```swift
+func verifyPosts(in context: NSManagedObjectContext) throws {
+    try context.performAndWait {
+        let fetchRequest = Attachment.fetchRequest()
+        fetchRequest.resultType = .managedObjectIDResultType
+        let attachments = try context.fetch(fetchRequest) as! [NSManagedObjectID]
+
+        for index in 0...attachments.count - 1 {
+            let attachment = context.object(with: attachments[index]) as! Attachment
+
+            //verify attachment
+            let post = attachment.post!
+            //verify post
+
+            if 0 == (index % 10) {
+                context.reset()
+            }
+        }
+    }
+}
+```
+
+キーポイント:
+
+- `Attachment.fetchRequest()`検証を添付ファイルのディメンションから開始しましょう。
+-`.managedObjectIDResultType`フェッチして返します`NSManagedObjectID`、まだ完全なオブジェクトをコンテキストにロードしないでください。
+-`context.object(with:)`ループ内で必要に応じて現在の添付ファイルを取得します。
+-`attachment.post!`次に、所属するPostを逆に検証します。
+-`index % 10`掃除の頻度をコントロールします。
+-`context.reset()`コンテキスト キャッシュされたオブジェクトと関連メモリを解放します。
+
+このような変更の価値は「メモリの節約」だけではありません。テストの調整可能な最高水準点を確立し、メモリが少ないマシンでも同じテストを実行できるようにします。 ([16:27](https://developer.apple.com/videos/play/wwdc2022/10119/?time=987))
+
+### 5. 統合ログを使用して同期リンクを観察する
+
+`NSPersistentCloudKitContainer`同期はアプリのプロセス内だけで行われるわけではありません。 Apple はエクスポートとインポートのリンクを表示します: アプリがストアに書き込まれた後、コンテナーは次の質問をします。`dasd`エクスポートを実行するのは適切ですか。その後渡された`cloudd`オブジェクトを CloudKit にエクスポートします。受信デバイスは`apsd`プッシュを受信した後、インポートがトリガーされます。 ([17:27](https://developer.apple.com/videos/play/wwdc2022/10119/?time=1047))
+
+開発中に使用可能`log stream`複数のターミナル タブを開いて、アプリ、CloudKit、プッシュ、スケジュールのログをそれぞれ表示します。 ([20:41](https://developer.apple.com/videos/play/wwdc2022/10119/?time=1241))
+
+```bash
+# Application
+log stream --predicate 'process = "CoreDataCloudKitDemo" AND 
+                        (sender = "CoreData" OR sender = "CloudKit")'
+
+# CloudKit 
+log stream --predicate 'process = "cloudd" AND
+                        message contains[cd] "iCloud.com.example.CloudKitCoreDataDemo"'
+
+# Push
+log stream --predicate 'process = "apsd" AND message contains[cd] "CoreDataCloudKitDemo"'
+
+# Scheduling
+log stream --predicate 'process = "dasd" AND 
+                        message contains[cd] "com.apple.coredata.cloudkit.activity" AND
+                        message contains[cd] "CEF8F02F-81DC-48E6-B293-6FCD357EF80F"'
+```
+
+キーポイント:
+
+- アプリ述語フォロー`CoreDataCloudKitDemo`インプロセスコアデータとCloudKitログ。
+-`cloudd`述語はコンテナ識別子を使用して CloudKit サーバー関連の操作をフィルタリングします。
+-`apsd`predicate は、プッシュ通知がデバイスに到達するかどうかを監視します。
+-`dasd`述語観察`NSPersistentCloudKitContainer`スケジュールされたバックグラウンドアクティビティ。
+- 最後の段落の UUID はストア識別子であり、ログを特定の永続ストアに集約できます。
+
+### 6. 診断データを共有可能なフィードバックに変える
+
+デバイスで問題が発生した場合、Session は 3 段階のデータ収集プロセスを提供します。つまり、CloudKit ログ プロファイルをインストールし、問題を再現し、sysdiagnose をキャプチャします。デバイスにアクセスできる場合は、Xcode Device Organizer を使用して、App コンテナーにストア ファイルをダウンロードします。 ([21:59](https://developer.apple.com/videos/play/wwdc2022/10119/?time=1319))
+
+sysdiagnose を取得したら、次を使用できます。`log show`から`system_logs.logarchive`ここでログを確認してください。 ([24:36](https://developer.apple.com/videos/play/wwdc2022/10119/?time=1476))
+
+```bash
+log show --info --debug
+    --predicate 'process = "apsd" AND
+                 message contains[cd] "iCloud.com.example.CloudKitCoreDataDemo"'
+    system_logs.logarchive
+
+log show --info --debug
+    --start "2022-06-04 09:40:00"
+    --end "2022-06-04 09:42:00"
+    --predicate 'process = "apsd" AND 
+                 message contains[cd] "iCloud.com.example.CloudKitCoreDataDemo"'
+    system_logs.logarchive
+```
+
+キーポイント:
+
+- `--info --debug`より詳細なログ レベルをオンにします。
+-`--predicate`開発段階からのフィルターを再利用します。
+-`system_logs.logarchive`sysdiagnose でログ アーカイブをポイントします。
+-`--start`そして`--end`問題が再現される時間枠にクエリを制限します。
+
+4 種類のログを述語に組み合わせて、フィードバック レポートの一部としてチームメイトまたは Apple に送信することもできます。 ([25:17](https://developer.apple.com/videos/play/wwdc2022/10119/?time=1517))
+
+```bash
+log show --info --debug
+    --start "2022-06-04 09:40:00" --end "2022-06-04 09:42:00"
+    --predicate '(process = "CoreDataCloudKitDemo" AND
+                      (sender = "CoreData" or sender = "CloudKit")) OR
+                 (process = "cloudd" AND
+                      message contains[cd] "iCloud.com.example.CloudKitCoreDataDemo") OR
+                 (process = "apsd" AND message contains[cd] "CoreDataCloudKitDemo") OR 
+                 (process = "dasd" AND
+                     message contains[cd] "com.apple.coredata.cloudkit.activity" AND
+                     message contains[cd] "CEF8F02F-81DC-48E6-B293-6FCD357EF80F")'
+    system_logs.logarchive
+```
+
+キーポイント:
+
+- アプリをカバーする 1 つのコマンド、`cloudd`、`apsd`、`dasd`4つのリンク。
+- 時間枠は、繰り返し間隔内のログの量を制御します。
+- コンテナ識別子とストア識別子を使用すると、フィードバックを特定のアプリと特定のストアに送信できます。
+- コマンド自体はフィードバック レポートと共有できるため、受信者は同じフィルター セットを再利用できます。
+
+---
+
+## 重要ポイント
+
+- **対処方法**: デバッグ データ ジェネレーターを同期アプリに追加します。  
+  **実行する価値がある理由**: セッション内`LargeDataGenerator`10 GB レベルのデータ セットをテストと UI で再現可能にします。  
+  **開始方法**: 受信を書きます`NSManagedObjectContext`の`generateData(context:)`、最初に、大きな画像、複数の添付ファイル、空のフィールド、または極端な数のリレーションシップなど、最も問題のあるデータ形状を生成します。
+
+- **何をすべきか**:`NSPersistentCloudKitContainer`同期イベントには XCTest によってアクセスされます。  
+  **実行する価値がある理由**: エクスポートと最初のインポートには明確な終了イベントがあるため、「様子見」の手動検証を減らすことができます。  
+  **開始方法**: モニタリング`NSPersistentCloudKitContainer.eventChangedNotification`、使用`event.type`、`event.storeIdentifier`そして`event.endDate`対象イベントをフィルタリングします。
+
+- **やるべきこと**: ビッグ データ テスト用の時間プロファイラーと割り当てのベースラインを確立します。  
+  **実行する価値がある理由**: Apple の例では、Time Profiler は冗長なサムネイル生成の問題を発見し、Allocations は Verifier が大きな画像を保持するという問題を発見しました。  
+  **開始方法**: Xcode で単一の XCTest のプロファイルを選択し、最初に最も重要なコール スタックを確認し、次に割り当てを使用して、大きなオブジェクトの割り当てとリリース スタックを確認します。
+
+- **内容**: 一連の同期ログ コマンドを準備します。  
+  **実行する価値がある理由**: Core Data + CloudKit の同期は複数のアプリにまたがります。`dasd`、`cloudd`、`apsd`、アプリのログを見るだけでは、スケジュール設定やプッシュの問題を見逃しがちです。  
+  **開始方法**: この記事をバンドル、CloudKit コンテナ識別子、永続ストア識別子に合わせて修正してください。`log stream` predicate。
+
+- **やるべきこと**: 顧客の機器の診断プロセスをチーム プレイブックに書き込みます。  
+  **実行する価値がある理由**: セッションには、CloudKit ログ プロファイル、sysdiagnose、Device Organizer ダウンロード コンテナーの 3 種類のデータが明確に表示されます。  
+  **開始方法**: プロファイルのインストール手順、sysdiagnose キーストローク、問題の再発時間、および`log show`クエリコマンド。
+
+---
+
+## 関連セッション
+
+- [Core Data スキーマを進化させる](/articles/wwdc2022-10120) — Core Data スキーマの移行と、スキーマの変更が CloudKit 同期に与える影響について学び続けます。
+- [Xcode とデバイス上の検出でハングを追跡](/articles/wwdc2022-10082) — Xcode とデバイスの診断データを使用して、実際のアプリケーションでハングを特定する方法を学びます。
+- [Xcode Organizer を使用してパフォーマンスの問題を診断する](/articles/wwdc2020-10076) — Xcode Organizer を使用して、実際のデバイス上で集約されたパフォーマンス データを表示する方法を学びます。

@@ -1,0 +1,440 @@
+---
+title: "Meet the Evaluations framework"
+description: "Learn how to use the Evaluations framework with Swift Testing to measure AI-powered features, define metrics and evaluators, generate samples, and use model judges."
+date: "2026-06-10"
+tags: ["Evaluations", "Swift Testing", "Generative AI", "Foundation Models", "Model Judge"]
+thumbnail: "/images/sessions/2026/298.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/298/"
+sessionId: "wwdc2026-298"
+year: "2026"
+relatedSessions:
+  - title: "Improve your prompts by hill climbing with Evaluations"
+    code: "335"
+    description: "A deeper look at iteratively improving prompts with the Evaluations framework, directly connected to the hill-climbing methodology in Session 298"
+  - title: "Create robust evaluations for agentic apps"
+    code: "299"
+    description: "Advanced uses of the Evaluations framework in agentic apps, including deeper coverage of SampleGenerator"
+  - title: "Bring your model to Apple silicon"
+    code: "232"
+    description: "Learn the fundamentals of the Foundation Models framework, the target being evaluated by the Evaluations framework"
+  - title: "Explore machine learning with MLX"
+    code: "328"
+    description: "Local AI model deployment with MLX Swift, which can work with Evaluations to assess model performance"
+  - title: "Swift Testing"
+    code: "267"
+    description: "Evaluations integrates deeply with Swift Testing; learn the full use of testing macros and traits"
+---
+
+## Highlight
+
+> Apple introduces the Evaluations framework, letting developers use Swift Testing to automatically evaluate AI-powered features. By defining metrics and evaluators, teams can quantify model output quality and solve a problem traditional unit tests cannot handle: probabilistic behavior.
+
+## Core Content
+
+### Traditional tests break down in the age of AI
+
+When you write traditional code, input A always produces output B. `XCTAssertEqual` is perfect for validating that deterministic behavior. But after integrating Foundation Models, the same book review might generate three tags this time and nine tags next time. The input-output contract of unit testing is broken.
+
+([01:03](https://developer.apple.com/videos/play/wwdc2026/298/?time=63))
+
+Developers need to answer three questions: how often does my app produce unexpected results? How often does an agent take an abnormal path? Under what conditions does it produce unsafe results? Unit tests cannot answer these questions.
+
+### The Evaluations framework: writing "tests" for probabilistic code
+
+([02:08](https://developer.apple.com/videos/play/wwdc2026/298/?time=128))
+
+The Evaluations framework does not aim for 100% exact matches. It lets you define metrics and evaluators, run a batch of samples, and inspect aggregate statistics. For example: "80% of the time, the number of tags is between three and eight."
+
+The framework is directly tied to Swift Testing. Evaluations run in the app's test target, and Xcode generates a dedicated Evaluation Report that shows whether each sample passed and includes the model's complete response.
+
+### From two samples to evaluation-driven development
+
+([04:54](https://developer.apple.com/videos/play/wwdc2026/298/?time=294))
+
+The session demonstrates this with a "Book Tracker" app. The app has a BookTaggingService that automatically tags book reviews. A developer first discovers through manual testing that "Pride & Prejudice" generated nine tags, which is too many, while "Dracula" generated seven, which is acceptable.
+
+They then automate this human judgment: define a `BookTaggingEvaluation`, wrap book reviews and expected tags in `ModelSample`, and use an `Evaluator` to check whether the number of tags falls between three and eight. After the test runs, the report shows only a 50% pass rate.
+
+The developer suspects the problem is in the `@Guide` macro on the `@Generable` type. After adding a `.count(3...8)` constraint to the `tags` property and rerunning the evaluation, the pass rate becomes 100%. The session calls this loop of "change the constraint -> run the evaluation -> inspect the result" hill climbing.
+
+([10:04](https://developer.apple.com/videos/play/wwdc2026/298/?time=604))
+
+But the story does not end there. After expanding the dataset, every book review happens to generate exactly eight tags. The model is sitting on the upper bound. That shows quantitative metrics can tell you whether something is correct, but not whether it is good.
+
+### Use AI to test AI: Model Judge
+
+([16:07](https://developer.apple.com/videos/play/wwdc2026/298/?time=967))
+
+Quantitative metrics such as tag count, word count, or whether a known genre is included can be computed in code. But what about qualitative questions? For example, the tags for "Alice in Wonderland" include "overrated" and "pretentious." Those describe a reader's reaction, not the book itself.
+
+The Evaluations framework answers with `ModelJudgeEvaluator`: use another model as the judge and have it score the model under test. The judge model should be at least as capable as the model being evaluated. For example, use Private Cloud Compute to judge an on-device small model.
+
+([18:53](https://developer.apple.com/videos/play/wwdc2026/298/?time=1133))
+
+One key design choice is to use an even-numbered scale, such as one to four, instead of an odd-numbered scale. Odd-numbered scales make judge models drift toward the middle score; even-numbered scales force a clearer judgment.
+
+([22:17](https://developer.apple.com/videos/play/wwdc2026/298/?time=1337))
+
+Another key design is `ScoreDimension`. Do not treat "quality" as one vague metric. Break it into concrete dimensions, such as "Relevance" for whether tags describe the book itself, and "Usefulness" for whether tags help browsing. Each dimension has its own scoring rubric and rationale, helping you locate problems precisely.
+
+([23:17](https://developer.apple.com/videos/play/wwdc2026/298/?time=1397))
+
+Finally, use `ModelJudgePrompt` to give the judge model app context. For example, tell it that this is a personal library app, not a book review platform, so it does not treat reader criticism as a valid description of the book.
+
+## Details
+
+### Define a basic evaluation
+
+([04:54](https://developer.apple.com/videos/play/wwdc2026/298/?time=294))
+
+```swift
+import Evaluations
+
+struct BookTaggingEvaluation: Evaluation {
+    // 1. Define the code under test: call BookTaggingService and return output
+    func subject(from input: ModelSample<String, BookTags>) async throws -> BookTags {
+        return try await BookTaggingService.generateTags(for: input.prompt)
+    }
+
+    // 2. Define the dataset
+    var dataset = ArrayLoader(samples: [
+        ModelSample(
+            prompt: "okay I am OBSESSED and I need everyone to read this RIGHT NOW...",
+            expected: BookTags(tags: ["classic", "romance", "wit", "regency"])
+        ),
+        ModelSample(
+            prompt: "Read this in one sitting between midnight and 4am and I cannot...",
+            expected: BookTags(tags: ["classic", "gothic", "horror", "vampire", "suspense"])
+        ),
+    ])
+
+    // 3. Define the metric
+    let tagCount = Metric("TagCount")
+
+    // 4. Define the evaluator
+    var evaluators: Evaluators {
+        Evaluator { _, subject in
+            let count = subject.value.tags.count
+            if count >= 3 && count <= 8 {
+                return tagCount.passing(rationale: "\(count) tags")
+            }
+            return tagCount.failing(rationale: "Got \(count) tags, expected 3-8")
+        }
+    }
+
+    // 5. Aggregate statistics
+    func aggregateMetrics(using aggregator: inout MetricsAggregator) {
+        aggregator.computeMean(of: tagCount)
+    }
+}
+```
+
+Key points:
+
+- `subject(from:)` is the entry point for the code under test. The framework automatically calls it for every sample in the dataset.
+- `ModelSample` contains `prompt` as input and `expected` as expected output. `expected` is optional.
+- The `Evaluator` closure receives `subject`, the output of the code under test, and returns `passing` or `failing`.
+- The `rationale` parameter matters because it appears in the report as the failure reason.
+
+### Run evaluations with Swift Testing
+
+([08:02](https://developer.apple.com/videos/play/wwdc2026/298/?time=482))
+
+```swift
+@Suite("Book Tag Evaluations")
+struct BookTagEvaluationTests {
+    let evaluation = BookTaggingEvaluation()
+    let evaluationInfo: [String: String] = [
+        "Model": "on-device",
+        "Dataset": "v1"
+    ]
+
+    @Test("Book Tag Evaluations", .evaluates(evaluation, info: evaluationInfo))
+    func evaluateBookTagging() async throws {
+        let result = EvaluationContext.current.result
+        let rangeMetric = BookTagEvaluationTests.evaluation.tagCount
+        #expect(result.aggregateValue(.mean(of: rangeMetric)) >= 0.8)
+    }
+}
+```
+
+Key points:
+
+- The `@Test` macro registers the evaluation with Swift Testing through the `.evaluates` trait.
+- `EvaluationContext.current.result` contains all metrics and aggregate results for this evaluation run.
+- `aggregateValue(.mean(of:))` calculates the average pass rate for the selected metric.
+- The optimization target is set to 0.8, or 80%, leaving room for probabilistic models.
+
+### Constrain model output with @Guide
+
+([10:09](https://developer.apple.com/videos/play/wwdc2026/298/?time=609))
+
+```swift
+@Generable
+struct BookTags: Codable {
+    @Guide(
+        description: "Descriptive tags capturing themes, genres, moods, and topics from the summary",
+        .count(3...8)
+    )
+    var tags: [String]
+}
+```
+
+Key points:
+
+- The `.count(3...8)` constraint in `@Guide` is a structural constraint and is more reliable than natural language inside a prompt.
+- This is the core hill-climbing move: move constraints out of natural language and into the type system.
+
+### Expand datasets and generate synthetic samples
+
+([11:15](https://developer.apple.com/videos/play/wwdc2026/298/?time=675))
+
+```swift
+// Build from existing data
+var dataset = ArrayLoader(samples:
+    Book.sampleBooks.map { book in
+        ModelSample(prompt: book.review, expected: BookTags(tags: book.tags))
+    }
+)
+
+// Or automatically synthesize samples with SampleGenerator
+var samples: [ModelSample<String>] = [
+    ModelSample(prompt: "The largest planet in our solar system...", expected: "Jupiter."),
+    ModelSample(prompt: "The capital of Thailand...", expected: "Bangkok."),
+]
+
+for try await sample in samples.makeSamples(
+    """
+    Generate diverse sentence completions about the listed topics:
+      - The Solar System
+      - World Capitals
+    """,
+    targetCount: 1000
+) {
+    samples.append(sample)
+}
+```
+
+Key points:
+
+- `ArrayLoader` wraps a sample array and supports lazy loading.
+- `SampleGenerator` uses a model to automatically create more samples, solving the scaling problem of hand-written data.
+- A good dataset needs diversity: different lengths, different genres, and personal opinions.
+
+### Multiple quantitative evaluators
+
+([14:02](https://developer.apple.com/videos/play/wwdc2026/298/?time=842))
+
+```swift
+let wordCount = Metric("WordCount")
+let hasGenreTag = Metric("HasGenreTag")
+
+var evaluators: Evaluators {
+    // Check whether tags contain multiple words
+    Evaluator { _, subject in
+        for tag in subject.value.tags {
+            if tag.contains(" ") {
+                return wordCount.failing(rationale: "Tag \(tag) contains multiple words")
+            }
+        }
+        return wordCount.passing()
+    }
+
+    // Check whether a known genre tag is included
+    Evaluator { _, subject in
+        let tags = subject.value.tags.map { $0.lowercased() }
+        let knownGenres = await BookTaggingService.knownGenres
+        for tag in tags {
+            if knownGenres.contains(tag) {
+                return hasGenreTag.passing(rationale: "Matched \(tag)")
+            }
+        }
+        return hasGenreTag.failing()
+    }
+}
+```
+
+Key points:
+
+- One Evaluation can contain multiple Evaluators.
+- A quantitative Evaluator is just a Swift closure, and it can call asynchronous APIs such as `knownGenres`.
+- Each Evaluator independently returns pass or fail and does not affect the others.
+
+### Aggregate more statistics
+
+([14:27](https://developer.apple.com/videos/play/wwdc2026/298/?time=867))
+
+```swift
+let tagCount = Metric("TagCount")
+let tagTotal = Metric("TagTotal")
+
+func aggregateMetrics(using aggregator: inout MetricsAggregator) {
+    aggregator.computeMean(of: tagCount)
+    aggregator.group("Distribution of Tag Totals") { aggregator in
+        aggregator.computeStandardDeviation(of: tagTotal)
+        aggregator.computeMean(of: tagTotal)
+        aggregator.computeVariance(of: tagTotal)
+    }
+}
+```
+
+Key points:
+
+- `computeMean` calculates the mean, `computeStandardDeviation` calculates standard deviation, and `computeVariance` calculates variance.
+- `group` collects related metrics together so they appear together in the report.
+- Standard deviation and variance help reveal whether model output is stable.
+
+### Build a Model Judge
+
+([18:53](https://developer.apple.com/videos/play/wwdc2026/298/?time=1133))
+
+```swift
+ModelJudgeEvaluator(
+    "TagQuality",
+    scale: .numeric([
+        4: "Tags are relevant and helpful for browsing",
+        3: "Mostly relevant, one tag too vague or generic",
+        2: "Several tags are wrong or generic",
+        1: "Unhelpful or irrelevant"
+    ]),
+    judge: PrivateCloudComputeLanguageModel()
+)
+```
+
+Key points:
+
+- `scale` defines the one-to-four scoring rubric, and each level has a clear description.
+- Use an even number of levels, such as four, to prevent the judge model from choosing the middle.
+- `judge` specifies the judge model. This example uses a stronger model from Private Cloud Compute.
+
+### Split score dimensions
+
+([22:17](https://developer.apple.com/videos/play/wwdc2026/298/?time=1337))
+
+```swift
+let relevance = ScoreDimension(
+    "Relevance",
+    description: """
+        Whether each tag describes a quality, theme, or tone
+        of the book itself rather than incidental details or
+        the reader's personal reactions.
+        """,
+    scale: .numeric([
+        4: "Every tag describes the book itself",
+        3: "Most tags describe the book",
+        2: "Some tags describe personal reactions",
+        1: "Tags don't meaningfully describe the book"
+    ])
+)
+
+let usefulness = ScoreDimension(
+    "Usefulness",
+    description: """
+        Whether the tags help users browse and filter
+        their personal library effectively.
+        """,
+    scale: .numeric([
+        4: "All tags are useful for browsing",
+        3: "Most tags help with browsing",
+        2: "Some tags are too vague to be useful",
+        1: "Tags don't help with browsing"
+    ])
+)
+```
+
+Key points:
+
+- Each `ScoreDimension` has a name, a detailed description, and a scoring scale.
+- Descriptions must be specific enough for the judge model to follow them.
+- "Relevance" and "Usefulness" are two independent dimensions. Scoring them separately is what lets you locate problems.
+
+### Assemble the full Model Judge
+
+([22:32](https://developer.apple.com/videos/play/wwdc2026/298/?time=1352))
+
+```swift
+var evaluators: Evaluators {
+    // Quantitative evaluators
+    Evaluator { _, subject in /* tag count check */ }
+    Evaluator { _, subject in /* word count check */ }
+    Evaluator { _, subject in /* genre check */ }
+
+    // Qualitative evaluator
+    ModelJudgeEvaluator(
+        judge: PrivateCloudComputeLanguageModel(),
+        dimensions: [relevance, usefulness],
+        prompt: ModelJudgePrompt(
+            instructions: """
+                You are evaluating tags generated for a personal book-tracking app
+                where users organize their library by browsing and filtering tags.
+                """,
+            evaluationTarget: { value in
+                "\(value.tags.count) Generated tags: " + value.tags.joined(separator: ", ")
+            },
+            reference: { input, _ in
+                let expectedTags = input.expected?.tags.joined(separator: ", ")
+                return ["Expected Tags": expectedTags ?? "No expected tags defined"]
+            }
+        )
+    )
+}
+```
+
+Key points:
+
+- Quantitative Evaluators and ModelJudgeEvaluator can be mixed together.
+- `ModelJudgePrompt` provides three key pieces of context:
+  - `instructions`: tells the judge model what app it is evaluating.
+  - `evaluationTarget`: formats the tested output for the judge to inspect.
+  - `reference`: provides expected output as a reference.
+- `reference` is optional. When expected tags exist, the judge can compare against them; when they do not, it can score independently.
+
+## Key Takeaways
+
+**1. Add quality guardrails to existing AI features**
+
+What to do: Pick one feature already using Foundation Models and write an Evaluation with 20 to 30 representative samples.
+
+Why it is worth doing: Most AI features do not have ongoing quality monitoring after launch, leaving developers to discover problems through user feedback. Evaluation lets you catch regressions in CI.
+
+How to start: Begin with the simplest quantitative metrics: output length, format validation, and keyword inclusion. Once that works, add a Model Judge.
+
+**2. Use Evaluation Report for prompt iteration**
+
+What to do: Change the prompt-tuning workflow into a closed loop: change prompt -> run Evaluation -> inspect report.
+
+Why it is worth doing: The session demonstrates the power of hill climbing. A single `@Guide(.count(3...8))` change raises the pass rate from 50% to 100%. The rationale in the report tells you directly what to adjust next.
+
+How to start: Run `@Test(.evaluates)` in Xcode, open Report Navigator, switch to the Evaluations tab, and inspect the rationale for each failing sample.
+
+**3. Build a regression test set with SampleGenerator**
+
+What to do: Combine hand-written seed samples with `SampleGenerator` to automatically generate thousands of test cases.
+
+Why it is worth doing: AI model version upgrades, prompt tweaks, and system updates can all change output behavior. A large enough regression dataset can catch problems before release.
+
+How to start: Write 10 to 20 seed samples that cover different scenarios, call `makeSamples(targetCount: 1000)` to expand the dataset, and run the full Evaluation.
+
+**4. Break vague "quality" into ScoreDimensions**
+
+What to do: Split "is this AI output good?" into two to four independently scored dimensions.
+
+Why it is worth doing: A vague "quality" score does not produce actionable feedback. With separate dimensions, rationale can pinpoint whether the model failed to understand the input or understood it but returned the wrong format.
+
+How to start: List the criteria you care about during manual review. Turn each one into a `ScoreDimension` with concrete one-to-four scoring standards.
+
+**5. Add Evaluation to CI/CD**
+
+What to do: Add Evaluation tests to Xcode Cloud or another CI pipeline and set target thresholds.
+
+Why it is worth doing: AI feature "tests" cannot only run locally. Automated evaluation in CI ensures team changes do not reduce model performance.
+
+How to start: Set a reasonable `#expect` threshold in `@Test`, such as `>= 0.8`, and add the test target to your CI build.
+
+## Related Sessions
+
+- [Improve your prompts by hill climbing with Evaluations](/articles/wwdc2026-335) - A deeper look at iteratively improving prompts with the Evaluations framework, directly connected to the hill-climbing methodology in Session 298
+- [Create robust evaluations for agentic apps](/articles/wwdc2026-299) - Advanced uses of the Evaluations framework in agentic apps, including deeper coverage of SampleGenerator
+- [Bring your model to Apple silicon](/articles/wwdc2026-232) - Learn the fundamentals of the Foundation Models framework, the target being evaluated by the Evaluations framework
+- [Explore machine learning with MLX](/articles/wwdc2026-328) - Local AI model deployment with MLX Swift, which can work with Evaluations to assess model performance
+- [Swift Testing](/articles/wwdc2026-267) - Evaluations integrates deeply with Swift Testing; learn the full use of testing macros and traits

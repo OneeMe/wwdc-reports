@@ -1,0 +1,209 @@
+---
+title: "Meet WebKit for SwiftUI"
+description: "discover how you can use webkit to effortlessly integrate web content into your swiftui apps. learn how to load and display web content, communicate with webpages, and more."
+date: 2026-06-10
+tags: ["Safari と Web", "SwiftUI", "アプリサービス"]
+thumbnail: "/images/sessions/2025/231.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/231/"
+sessionId: "wwdc2025-231"
+year: "2025"
+relatedSessions:
+  - title: "Learn more about Declarative Web Push"
+    code: "235"
+    description: "learn how declarative web push can help you deliver notifications more reliably."
+---
+
+## ハイライト
+
+> WebKit チームは SwiftUI 向けにネイティブの `WebView` ビューと、Observable な `WebPage` クラスを提供しました。前者は URL を渡すだけで Web ページを表示でき、後者はコンテンツのロード・制御と JavaScript との通信を担います。
+
+---
+
+## 主要内容
+
+これまで SwiftUI に WebKit を組み込むには、`UIViewRepresentable` や `NSViewRepresentable` を使って `WKWebView` を SwiftUI ビューにラップする必要がありました。状態の同期は Coordinator + delegate の転送で行い、iOS / macOS / visionOS をまたぐ場合はプラットフォーム分岐も別途必要でした。結局、URL を 1 つ表示するだけで数十行のグルーコードが必要となり、タイトルやスクロール位置を監視しようとするとさらに手間が増えていました。
+
+今年、WebKit チームはこの API 一式をそのまま SwiftUI に統合しました。`WebView` はネイティブの SwiftUI ビューで、URL を 1 つ渡せばレンダリングでき、すべての WebKit 対応プラットフォームで同じコードが動作します。`WebPage` は新しい `Observable` クラスで、コンテンツのロード、プロパティの参照、JavaScript の実行、ナビゲーションポリシーのカスタマイズを担います。両者は単体でも利用できますし、組み合わせて使うこともできます。`WebPage` を `WebView` に渡せば、ページタイトル・URL・読み込み進捗・テーマカラーがすべて Observable なプロパティとなり、`@Observable` モデルでそのまま UI を駆動できます。
+
+---
+
+## 詳細
+
+最もシンプルな使い方は、URL を直接 `WebView` に渡す方法です。状態が変化すると自動的に再読み込みが行われます（[03:01](https://developer.apple.com/videos/play/wwdc2025/231/?time=181)）。
+
+```swift
+struct ContentView: View {
+    @State private var url = URL(string: "https://www.example.com")!
+
+    var body: some View {
+        WebView(url: url)
+    }
+}
+```
+
+**ポイント:**
+- `WebView(url:)` はネイティブな SwiftUI ビューで、URL が変わるとナビゲーションがトリガーされます。
+- `UIViewRepresentable` でブリッジする必要はもうなく、iOS / iPadOS / macOS / visionOS で 1 つのコードを共有できます。
+
+ページのプロパティを観察したり、コンテンツを制御したい場合は `WebPage` を使い、それを `WebView` に渡します（[03:42](https://developer.apple.com/videos/play/wwdc2025/231/?time=222)）。
+
+```swift
+@Observable
+final class ArticleViewModel {
+    let webPage = WebPage()
+    let article: LakeArticle
+
+    init(article: LakeArticle) { self.article = article }
+
+    func loadArticle() {
+        webPage.load(URLRequest(url: article.url))
+    }
+}
+```
+
+**ポイント:**
+- `WebPage` は `Observable` なクラスで、ロード・制御・JS 通信をカプセル化します。
+- `load(_:)` は `URLRequest` を受け取りますが、同名の API は HTML 文字列 + base URL や、Web archive データ + MIME type + エンコーディングを直接渡す形にも対応しています。
+
+アプリの bundle 内にあるローカルの HTML/CSS を Web ページとしてロードしたい場合は、`URLSchemeHandler` プロトコルを実装し、カスタム scheme を登録します（[06:36](https://developer.apple.com/videos/play/wwdc2025/231/?time=396)）。
+
+```swift
+struct LakesSchemeHandler: URLSchemeHandler {
+    func reply(for request: URLRequest)
+        -> some AsyncSequence<URLSchemeTaskResult, any Error>
+    {
+        // yield a URLResponse, then yield Data values
+        // can stream asynchronously thanks to AsyncSequence
+    }
+}
+
+let handler = LakesSchemeHandler()
+var configuration = WebPage.Configuration()
+if let scheme = URLScheme("lakes") {
+    configuration.urlSchemeHandlers[scheme] = handler
+}
+let page = WebPage(configuration: configuration)
+```
+
+**ポイント:**
+- `URLScheme("lakes")`: WebKit が予約済みの scheme（`https`、`file`、`about` など）を渡すと `nil` が返ります。
+- `reply(for:)` は `AsyncSequence<URLSchemeTaskResult, _>` を返し、最初に `URLResponse` を、続いて `Data` を yield します。ストリーミングとキャンセル伝播がそのまま使えます。
+- `Configuration.urlSchemeHandlers` に登録し、その configuration を `WebPage` の初期化に渡します。
+
+ナビゲーションイベントの監視には新しく追加された `currentNavigationEvent` プロパティを使い、Swift 6.2 の `Observations` と組み合わせて `AsyncSequence` として扱います（[10:59](https://developer.apple.com/videos/play/wwdc2025/231/?time=659)）。
+
+```swift
+for await event in Observations({ webPage.currentNavigationEvent }) {
+    switch event {
+    case .finished(let id):
+        await parseSections()
+    case .failed(let id, let error),
+         .failedProvisionalNavigation(let id, let error):
+        handle(error)
+    default:
+        break
+    }
+}
+```
+
+**ポイント:**
+- 1 回のナビゲーションでは順番に `startedProvisionalNavigation` → `receivedServerRedirect`（任意） → `committed` → `finished` がトリガーされ、いずれの段階でも `failed` / `failedProvisionalNavigation` が発生し得ます。
+- `currentNavigationEvent` 自体が観察可能なので、`Observations` と組み合わせれば `for-await` ループで書け、delegate ベースよりも処理の流れが線形に書けます。
+
+JavaScript の実行は `callJavaScript` で行い、引数辞書も渡せます（[12:33](https://developer.apple.com/videos/play/wwdc2025/231/?time=753)、[18:29](https://developer.apple.com/videos/play/wwdc2025/231/?time=1109)）。
+
+```swift
+let raw = try await webPage.callJavaScript(
+    "return parseSections(document.documentElement.outerHTML);"
+)
+let sections = (raw as? [[String: String]]) ?? []
+
+let offset = try await webPage.callJavaScript(
+    "return document.getElementById(id).offsetTop;",
+    arguments: ["id": sectionId]
+)
+```
+
+**ポイント:**
+- 戻り値の型は `Any?` なので、自分で具体的な Swift 型へキャストする必要があります。
+- `arguments` 辞書のキーは JS 側ではローカル変数として現れ、値は自動的に JS の値へ変換されます。同じスクリプトを使い回す際に便利です。
+
+ナビゲーションポリシーをカスタマイズするには `WebPage.NavigationDeciding` プロトコルを実装します。外部リンクであればシステムブラウザに渡す例です（[13:50](https://developer.apple.com/videos/play/wwdc2025/231/?time=830)）。
+
+```swift
+struct LakeNavigationDecider: WebPage.NavigationDeciding {
+    let onExternalLink: (URL) -> Void
+
+    func decidePolicy(
+        for action: WebPage.NavigationAction,
+        preferences: inout WebPage.NavigationPreferences
+    ) async -> WKNavigationActionPolicy {
+        let url = action.request.url
+        if url?.scheme == "lakes" || url?.host == "lakes.apple.com" {
+            return .allow
+        }
+        if let url { onExternalLink(url) }
+        return .cancel
+    }
+}
+```
+
+**ポイント:**
+- このプロトコルは navigation action、response、authentication の 3 つのタイミングでポリシーを差し込むフックを提供します。
+- ナビゲーションをキャンセルした後は、対象 URL を SwiftUI の状態に戻し、environment value の `openURL` で既定のブラウザを開けば OK です。
+
+ビューモディファイアの面では、`scrollBounceBehavior`、`findNavigator` などの既存モディファイアがそのまま使えます。さらに `webViewScrollPosition`、`onScrollGeometryChange`、`webViewScrollInputBehavior` が追加され、より細かな制御が可能になりました（[15:52](https://developer.apple.com/videos/play/wwdc2025/231/?time=952)、[19:29](https://developer.apple.com/videos/play/wwdc2025/231/?time=1169)）。
+
+```swift
+WebView(webPage)
+    .navigationTitle(webPage.title)
+    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+    .findNavigator(isPresented: $isFindPresented)
+    .webViewScrollInputBehavior(.enabled, for: .look) // visionOS look-to-scroll
+    .webViewScrollPosition($scrollPosition)
+    .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y } action: { _, y in
+        selectedSection = nearestSection(to: y)
+    }
+```
+
+**ポイント:**
+- `webViewScrollPosition` は `ScrollPosition` と組み合わせて使い、`scrollTo` でプログラムからスクロール位置をジャンプさせられます。
+- `onScrollGeometryChange` ではスクロールオフセットやコンテンツサイズの変化を取り出し、サイドバーの選択項目を逆方向に更新するのに使えます。
+- visionOS の look-to-scroll は `webViewScrollInputBehavior(.enabled, for: .look)` で有効化します。デフォルトはオフです。
+
+---
+
+## 重要ポイント
+
+**1. 既存の `WKWebView` ラッパー層を `WebView` + `WebPage` へ移行する**
+
+なぜやる価値があるか: `UIViewRepresentable` + Coordinator のグルーコードを取り除けますし、プラットフォーム分岐もまとめられます。タイトル・URL・進捗・テーマカラーが直接 `@Observable` のデータフローに乗ります。
+
+どう着手するか: まずは表示中心の画面（詳細ページや説明ページ）を `WebView(url:)` に置き換え、プロパティを監視したい画面については `WebPage` 化したうえで ViewModel に保持するようにします。
+
+**2. ローカルリソース向けの一時ディレクトリ運用を `URLSchemeHandler` で置き換える**
+
+なぜやる価値があるか: bundle 内の HTML/CSS/画像はカスタム scheme 経由でアプリから直接配信できます。一度 tmp に展開してから `file://` で読み込むような対応が不要になり、権限やパスにまつわる問題から解放されます。さらに `AsyncSequence` ベースのストリーミングレスポンスも標準で使えます。
+
+どう着手するか: `URLSchemeHandler.reply(for:)` を実装し、先に `URLResponse` を返したうえで `Data` をチャンクごとに返すようにします。`WebPage.Configuration.urlSchemeHandlers` で登録し、組み込みコンテンツのリンクをカスタム scheme に書き換えていきます。
+
+**3. ナビゲーションと状態監視を `Observations` + `for-await` で書き直す**
+
+なぜやる価値があるか: `WKNavigationDelegate` ではコールバックが複数のメソッドに散らばっており、1 本の線形ロジックとして組み立てるのが難しいです。`currentNavigationEvent` と Swift 6.2 の `Observations` を組み合わせれば、1 つの task の中で読み込みフロー全体を読み切れます。
+
+どう着手するか: ビューに `.task { for await event in Observations({ page.currentNavigationEvent }) { ... } }` を付け、`finished / failed` で分岐して UI を更新します。必要に応じて `title`、`estimatedProgress`、`themeColor` の監視にも `Observations` を使います。
+
+**4. `callJavaScript(_:arguments:)` で Web ページをクエリ可能なデータソースにする**
+
+なぜやる価値があるか: アプリ内 Web ビューの多くはレンダリングだけが目的ですが、ページ内には実は構造化された情報（目次、フォームフィールド、スクロール位置など）があります。引数付きの JS 呼び出しを使えば、汎用スクリプトを 1 つ書いて複数箇所で使い回せます。
+
+どう着手するか: Web ページ側に `parseSections` や `offsetTop` のような純関数を用意し、Swift 側からは `callJavaScript` に `arguments` 辞書を渡して呼び出します。戻り値を `as?` で Swift 型にキャストし、SwiftUI のリストを駆動します。
+
+---
+
+## 関連セッション
+
+- [Learn more about Declarative Web Push](/articles/wwdc2025-235) — Web プッシュ通知が service worker の JavaScript に依存する形から脱却し、宣言的な JSON で直接配信できるようになります。
+- [What's new in SwiftUI](/articles/wwdc2025-256) — 今年の SwiftUI における新しいビュー、モディファイア、Observable との統合ポイントの概観です。
+- [Explore concurrency in SwiftUI](/articles/wwdc2025-266) — SwiftUI における `@Observable`、`Observations`、`for-await` の使い方を解説しています。
+- [What's new in Swift](/articles/wwdc2025-245) — Swift 6.2 の `Observations` API と並行性の改善の紹介で、本 session の `for-await` による監視はこれを土台にしています。

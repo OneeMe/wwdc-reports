@@ -1,0 +1,231 @@
+---
+title: "Explore Metal 4 games"
+description: "learn to optimize your game engine with the latest advancements in metal 4. we"
+date: 2026-06-10
+tags: ["グラフィックスとゲーム"]
+thumbnail: "/images/sessions/2025/254.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/254/"
+sessionId: "wwdc2025-254"
+year: "2025"
+relatedSessions:
+  - title: "Discover Metal 4"
+    code: "205"
+    description: "learn how to get started leveraging the powerful new features of metal 4 in your"
+  - title: "Go further with Metal 4 games"
+    code: "258"
+    description: "learn about advanced metal 4 features for high-end games"
+  - title: "Combine Metal 4 machine learning and graphics"
+    code: "262"
+    description: "learn how to seamlessly combine machine learning into your graphics applications"
+  - title: "Bring your SceneKit project to RealityKit"
+    code: "288"
+    description: "understand scenekit deprecation and explore how to transition your 3d projects t"
+---
+
+## Highlight
+
+> Metal 4 四部作の第 2 弾です。GPU Driver Engineers の Jason と Yang が、ゲームエンジン最適化の 3 つの軸、すなわちエンコーディング効率、リソース管理、パイプラインのロードについて解説します。
+
+## 主要内容
+
+ゲームエンジンはどこで詰まるのでしょうか。典型的な現代の AAA タイトルでは、1 フレームあたり数千回の draw call、kernel dispatch、blit を発行します。fragment shader が出力する attachment レイアウトを切り替えるたびに、エンジンは新しい render encoder を開く必要がありますし、buffer データが直前の blit に依存していれば、そこに同期を 1 つ挟まなければなりません。さらにロード時には数千個の pipeline state がシリアルにコンパイルされ、プレイヤーはローディング画面を眺めて待たされます。Ubisoft の『Assassin's Creed Shadows』は Apple Silicon 上で GB 級のジオメトリとテクスチャを扱い、shader の数も数千に及びます。この規模になると、エンコーディングのホットパスに 1 つでも余分なオーバーヘッドが入ると、目に見えるカクつきとして増幅されてしまうのです。
+
+Metal 4 はこれらのペインポイントを 3 つに分けて解決します。エンコード側では render と compute の 2 種類の encoder を「少なく強く」して、1 つの encoder により多くの操作を収められるようにします。リソース側では argument table、residency set、queue barrier によって bindless モデルを数千リソース規模まで拡張します。パイプライン側では unspecialized pipeline と specialization を導入してコンパイル結果を再利用し、さらにマルチスレッドコンパイルと ahead-of-time コンパイルを組み合わせることで、ロード時間を限りなくゼロに近づけます。前者 2 つは Jason、最後のパイプラインは Yang が担当しますが、いずれも「無駄な処理を減らし、制御権を開発者に渡す」という方向性で一貫しています。
+
+## 詳細
+
+**compute エンコーディングの統一と Pass Barrier（[02:24](https://developer.apple.com/videos/play/wwdc2025/254/?time=144)）**。kernel dispatch、blit、acceleration structure build はすべて同じ compute encoder に入るようになり、デフォルトで並行実行されます。依存関係がある場合は Pass Barrier で表現します。
+
+```objc
+id<MTL4ComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+[encoder copyFromBuffer:src sourceOffset:0 toBuffer:buffer1 destinationOffset:0 size:64];
+
+[encoder barrierAfterEncoderStages:MTLStageBlit
+               beforeEncoderStages:MTLStageDispatch
+                 visibilityOptions:MTL4VisibilityOptionDevice];
+
+[encoder setComputePipelineState:pso];
+
+[argTable setAddress:buffer1.gpuAddress atIndex:0];
+[encoder setArgumentTable:argTable];
+[encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+
+[encoder endEncoding];
+```
+
+**ポイント**
+
+- `computeCommandEncoder` 1 つで blit と dispatch の両方を扱えるため、encoder の切り替えが不要です。
+- `copyFromBuffer:...` は `buffer1` への書き込みであり、依存関係における「プロデューサー」にあたります。
+- `barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch` で、blit が完了してから dispatch を開始することを明示的に宣言します。この barrier を入れない場合、blit と dispatch は並行実行されます。
+- `MTL4VisibilityOptionDevice` で可視範囲を device 全体に指定し、後続の dispatch が blit の最新結果を参照できるようにします。
+
+**Color attachment mapping（[04:29](https://developer.apple.com/videos/play/wwdc2025/254/?time=269)）**。1 つの render encoder にすべての attachment の「スーパーセット」を設定し、各 pipeline ごとに異なる logical→physical のマッピングを差し替えることで、出力レイアウトの違いごとに encoder を新規作成する必要がなくなります。
+
+```objc
+MTL4RenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
+desc.supportColorAttachmentMapping = YES;
+desc.colorAttachments[0].texture = colortex0;
+desc.colorAttachments[1].texture = colortex1;
+desc.colorAttachments[2].texture = colortex2;
+desc.colorAttachments[3].texture = colortex3;
+desc.colorAttachments[4].texture = colortex4;
+```
+
+```objc
+MTLLogicalToPhysicalColorAttachmentMap* myAttachmentRemap = [MTLLogicalToPhysicalColorAttachmentMap new];
+[myAttachmentRemap setPhysicalIndex:0 forLogicalIndex:0];
+[myAttachmentRemap setPhysicalIndex:3 forLogicalIndex:1];
+[myAttachmentRemap setPhysicalIndex:4 forLogicalIndex:2];
+
+[renderEncoder setRenderPipelineState:myPipeline];
+[renderEncoder setColorAttachmentMap:myAttachmentRemap];
+```
+
+**ポイント**
+
+- `supportColorAttachmentMapping = YES` でマッピング機能を有効化します。
+- ディスクリプタには 5 つの color attachment を設定してスーパーセットを構成し、すべての pipeline の出力要件をカバーします。
+- `setPhysicalIndex:forLogicalIndex:` で fragment shader の logical index を実際の attachment にルーティングします。pipeline を切り替える際は `setColorAttachmentMap:` を呼ぶだけで済み、新しい encoder を開く必要はありません。
+
+**Suspend/Resume による複数 encoder の同一 GPU pass への統合（[08:03](https://developer.apple.com/videos/play/wwdc2025/254/?time=483)）**。マルチスレッドでエンコーディングしたあとに 1 度だけ commit することで、途中の store/load コストを回避できます。
+
+```objc
+id<MTL4RenderCommandEncoder> enc0 = [cmdbuf0 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionSuspending];
+id<MTL4RenderCommandEncoder> enc1 = [cmdbuf1 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionResuming | MTL4RenderEncoderOptionSuspending];
+id<MTL4RenderCommandEncoder> enc2 = [cmdbuf2 renderCommandEncoderWithDescriptor:desc options:MTL4RenderEncoderOptionResuming];
+
+id<MTL4CommandBuffer> cmdbufs[] = { cmdbuf0, cmdbuf1, cmdbuf2 };
+[commandQueue commit:cmdbufs count:3];
+```
+
+**ポイント**
+
+- `MTL4RenderEncoderOptionSuspending` は、現在の encoder で GPU pass を終了させないことを示します。
+- 中間の encoder は `Resuming | Suspending` を同時に指定し、前後をつなぎます。
+- 3 つの command buffer を `commit:count:` で一度にコミットすると、Metal はそれらを同じ pass として認識し、tile memory が DRAM に書き戻されません。
+
+**Drawable の同期と queue barrier（[11:48](https://developer.apple.com/videos/play/wwdc2025/254/?time=708) / [13:25](https://developer.apple.com/videos/play/wwdc2025/254/?time=805)）**。drawable は暗黙的に追跡されなくなり、開発者が queue 上の wait/signal で明示的に同期を取ります。encoder をまたぐ依存関係は Queue Barrier を使い、stage 単位の粒度でフィルタします。
+
+```objc
+id<MTL4ComputeCommandEncoder> compute = [commandBuffer computeCommandEncoder];
+[compute dispatchThreadgroups:threadGrid threadsPerThreadgroup:threadsPerThreadgroup];
+[compute endEncoding];
+
+id<MTL4RenderCommandEncoder> render = [commandBuffer renderCommandEncoderWithDescriptor:des];
+
+[render barrierAfterQueueStages:MTLStageDispatch
+                   beforeStages:MTLStageFragment
+              visibilityOptions:MTL4VisibilityOptionDevice];
+
+[renderCommandEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                         vertexStart:vertexStart
+                         vertexCount:vertexCount];
+[render endEncoding];
+```
+
+**ポイント**
+
+- `barrierAfterQueueStages:MTLStageDispatch` は、先行するすべての encoder の dispatch ステージの完了を待ちます。
+- `beforeStages:MTLStageFragment` で当該 encoder の fragment ステージのみをブロックします。vertex ステージは compute と重ねて実行できるため、並列性を最大化できます。
+- encoder 単位でまるごとブロックするのではなく stage 単位でフィルタするのが、この同期モデルの肝です。
+
+**Flexible render pipeline state（[20:41](https://developer.apple.com/videos/play/wwdc2025/254/?time=1241)）**。まず color attachment 関連のフィールドをすべて unspecialized にした pipeline をコンパイルし、そこから opaque / transparent / hologram の 3 つのバリアントを specialize します。vertex / fragment の binary body は再利用されます。
+
+```objc
+pipelineDescriptor.colorAttachments[i].pixelFormat   = MTLPixelFormatUnspecialized;
+pipelineDescriptor.colorAttachments[i].writeMask     = MTLColorWriteMaskUnspecialized;
+pipelineDescriptor.colorAttachments[i].blendingState = MTL4BlendStateUnspecialized;
+```
+
+```objc
+pipelineDescriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+pipelineDescriptor.colorAttachments[0].writeMask =
+    MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
+pipelineDescriptor.colorAttachments[0].blendingState = MTL4BlendStateEnabled;
+pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+pipelineDescriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+
+id<MTLRenderPipelineState> transparentPipeline =
+    [compiler newRenderPipelineStateBySpecializationWithDescriptor:pipelineDescriptor
+                                                          pipeline:unspecializedPipeline
+                                                             error:&error];
+```
+
+**ポイント**
+
+- 前半: pixelFormat、writeMask、blendingState をすべて `Unspecialized` にすることで、vertex binary、fragment binary body、デフォルトの fragment output を含む pipeline を生成します。
+- 後半: 実際の attachment 設定を入れて `newRenderPipelineStateBySpecializationWithDescriptor:pipeline:` を呼ぶと、fragment output 部分のみが再生成され、shader のフルコンパイルが走らないため非常に高速です。
+
+**Ahead-of-time コンパイル（[28:24](https://developer.apple.com/videos/play/wwdc2025/254/?time=1704)）**。実行時に pipeline ディスクリプタを収集して `mtl4-json` にシリアライズし、開発機では `metal-tt` で archive をビルドします。リリース版では archive から pipeline を引き、ヒットしなければオンラインコンパイルにフォールバックする構成です。
+
+```objc
+MTL4PipelineDataSetSerializerDescriptor *desc = [MTL4PipelineDataSetSerializerDescriptor new];
+desc.configuration = MTL4PipelineDataSetSerializerConfigurationCaptureDescriptors;
+id<MTL4PipelineDataSetSerializer> serializer =
+    [device newPipelineDataSetSerializerWithDescriptor:desc];
+
+MTL4CompilerDescriptor *compilerDesc = [MTL4CompilerDescriptor new];
+[compilerDesc setPipelineDataSetSerializer:serializer];
+id<MTL4Compiler> compiler = [device newCompilerWithDescriptor:compilerDesc error:nil];
+
+NSData *data = [serializer serializeAsPipelinesScriptWithError:&err];
+NSString *path = [NSString pathWithComponents:@[folder, @"pipelines.mtl4-json"]];
+BOOL success = [data writeToFile:path options:NSDataWritingAtomic error:&err];
+```
+
+**ポイント**
+
+- `CaptureDescriptors` モードはディスクリプタのみを記録し、コンパイル成果物は保存しないため、メモリ消費を抑えられます。
+- serializer を compiler に紐付けると、作成されたすべての pipeline が自動的に記録されます。
+- `serializeAsPipelinesScriptWithError:` で `pipelines.mtl4-json` を出力し、`metal-tt` を介して GPU binary archive をビルドします。
+
+```objc
+id<MTL4Archive> archive = [device newArchiveWithURL:archiveURL error:&error];
+id<MTLRenderPipelineState> pipeline =
+    [archive newRenderPipelineStateWithDescriptor:descriptor error:&error];
+
+if (pipeline == nil)
+{
+    pipeline = [compiler newRenderPipelineStateWithDescriptor:descriptor
+                                          compilerTaskOptions:nil
+                                                        error:&error];
+}
+```
+
+**ポイント**
+
+- `newArchiveWithURL:` でディスクから archive をロードします。
+- 同一のディスクリプタで archive 内の pipeline を引き、ヒットすれば実質ゼロコストで取得できます。
+- ヒットしなかった場合（ディスクリプタの不一致、OS 非互換、GPU アーキテクチャの非互換など）には必ずオンラインコンパイルへフォールバックする経路を残します。さもないとゲームの pipeline が欠落してしまいます。
+
+## 重要ポイント
+
+- **やること: すべての compute 操作を 1 つの encoder にまとめ、依存関係は Pass Barrier で表現する**
+  - なぜ価値があるか: Metal 4 はデフォルトで dispatch、blit、acceleration structure build を同じ compute encoder 内で並行実行します。依存関係がない処理は自動的に GPU を埋められます。
+  - 始め方: 既存の compute パスを棚卸しし、blit と dispatch のために別々に encoder を作っていたロジックを取り除きます。本当にデータ依存があるところにだけ `barrierAfterEncoderStages:beforeEncoderStages:` を入れましょう。
+
+- **やること: color attachment mapping で render pass を統合する**
+  - なぜ価値があるか: シーンで render encoder を 1 つ増やすたびに、tile memory の store/load コストが追加されます。マッピング機構を使えば、1 つの encoder で複数の fragment 出力レイアウトに対応できます。
+  - 始め方: render encoder を必要なすべての attachment のスーパーセットで構成し、pipeline ごとに `MTLLogicalToPhysicalColorAttachmentMap` を用意します。リリース前に profiling で tile memory が溢れていないかを確認しましょう。
+
+- **やること: render pipeline は基本的に unspecialized + specialization で運用する**
+  - なぜ価値があるか: city builder のデモでは opaque / transparent / hologram の 3 つの pipeline で vertex / fragment の binary body を共有でき、specialization は fragment output 部分だけを再生成するため、コンパイル時間が大きく短縮されます。
+  - 始め方: pipeline ディスクリプタの pixelFormat / writeMask / blendingState を unspecialized にしたものを 1 つコンパイルしておきます。リリース後に Instruments の Metal System Trace で specialization のパフォーマンス低下が顕著な shader を特定し、その一部だけをバックグラウンドで full-state コンパイルしましょう。
+
+- **やること: pipeline のロードを ahead-of-time に倒す**
+  - なぜ価値があるか: オンラインのマルチスレッドコンパイルでもカクつきは減らせますが、ahead-of-time にすればロード時間を限りなくゼロに近づけられ、プレイヤーはほとんどローディングを意識しなくなります。
+  - 始め方: dev build で `MTL4PipelineDataSetSerializer` を仕込んで `mtl4-json` を収集し、`metal-tt` で archive をビルドして ship パッケージに同梱します。実行時は `MTL4Archive` から pipeline を引き、`compiler newRenderPipelineStateWithDescriptor:` へのフォールバックは必ず残しておきましょう。
+
+- **やること: residency set は少なく大きく、drawable は明示的に同期する**
+  - なぜ価値があるか: 少数の大きい residency set にすることで Metal はリソースをまとめて準備でき、drawable の明示的な wait/signal は暗黙の追跡に比べてオーバーヘッドが制御しやすくなります。
+  - 始め方: 変化しない residency set は command queue に紐付け、頻繁に変わるものは command buffer に紐付けます。CAMetalLayer の dynamic residency set は queue に 1 度追加するだけで済みます。各フレームでは `[queue waitForDrawable:]` → コミット → `[queue signalDrawable:]` → `present` の流れにしましょう。
+
+## 関連セッション
+
+- [Discover Metal 4](/articles/wwdc2025-205) — Metal 4 四部作の第 1 弾。encoder、argument table、residency set の全体設計をカバー
+- [Go further with Metal 4 games](/articles/wwdc2025-258) — 第 3 弾。MetalFX と ray tracing の応用的な使い方
+- [Combine Metal 4 machine learning and graphics](/articles/wwdc2025-262) — 第 4 弾。ML 推論をグラフィックスパイプラインに直接組み込む
+- [Bring your SceneKit project to RealityKit](/articles/wwdc2025-288) — SceneKit 廃止後、3D プロジェクトを RealityKit に移行するためのパス

@@ -1,0 +1,257 @@
+---
+title: "Display EDR content with Core Image, Metal, and SwiftUI"
+description: "discover how you can add support for rendering in extended dynamic range (edr) from a core image based multi-platform swiftui application. we'll outline best practices for displaying ciimages to a mtkview using viewrepresentable. we'll also share the simple steps to enable edr rendering and explore some of the over 150 built-in cifilters that support edr."
+date: 2026-06-10
+tags: ["WWDC 2022", "Core Image", "EDR", "Metal", "SwiftUI"]
+thumbnail: "/images/sessions/2022/10114.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10114/"
+sessionId: "wwdc2022-10114"
+year: "2022"
+relatedSessions:
+  - title: "Explore EDR on iOS"
+    code: "10113"
+    description: "Understand the EDR model, headroom, tone mapping, and HDR rendering on iPhone and iPad."
+  - title: "Display HDR video in EDR with AVFoundation and Metal"
+    code: "110565"
+    description: "Build an EDR video playback pipeline with AVFoundation and Metal."
+  - title: "Discover Metal 3"
+    code: "10066"
+    description: "Review Metal 3 rendering, tooling, and performance features for Apple silicon."
+  - title: "What's new in SwiftUI"
+    code: "10052"
+    description: "See the SwiftUI updates that frame the multi-platform app structure used by this sample."
+---
+## ハイライト
+
+> Core Image チームの David Hayward 氏は、Core Image での EDR (Extended Dynamic Range) の使用法を体系的に説明しました。 EDR では、ディスプレイのヘッドルームを超えない限り、標準の 0 ～ 1 の範囲外のピクセル値を許可し、1 より大きい値を使用して SDR 白よりも明るいピクセルを表します。
+
+## 主要内容
+
+多くの画像アプリはすでに HDR データにアクセスできます。 TIFF、OpenEXR、HDR ビデオ フレーム、Metal レンダリング結果、ProRAW DNG にはすべて、SDR ホワイトを超える輝度値が含まれる可能性があります。多くの場合、問題は表示リンクにあります。Core Image は浮動小数点ピクセルを生成しますが、最終ビューは SDR パイプラインに従って表示され、1 を超えるハイライトはクリップされます。
+
+このセッションでは、完全な SwiftUI パスが提供されます。それは最初に使用されます`ViewRepresentable`パッケージ`MTKView`、SwiftUI アプリに Metal レンダー ターゲットを持たせます。それから使用します`Renderer`各フレームに置く`CIImage`にレンダリングする`CIRenderDestination`; 最後に、EDR に必要なレイヤー、ピクセル形式、色空間、ヘッドルームをこのパイプラインに接続します ([03:39](https://developer.apple.com/videos/play/wwdc2022/10114/?time=219))。
+
+EDR の重要なルールは短いです。SDR の白は 1 のまま、黒は 0 のままで、1 を超える値は明るいピクセルを表します。現在のディスプレイのヘッドルームを超える値はクリップされます。ヘッドルームはモニター、周囲光、画面の明るさによって変化するため、レンダリング コードはヘッドルームを定数としてキャッシュできません ([00:47](https://developer.apple.com/videos/play/wwdc2022/10114/?time=47))。
+
+Apple は実装手順を 3 つの手順に圧縮しました。EDR をサポートするために View を初期化します。各レンダリングの前に現在のヘッドルームを読み取ります。させて`ContentView`の`imageProvider`このヘッドルームを使用して生成します`CIImage`（[08:50](https://developer.apple.com/videos/play/wwdc2022/10114/?time=530)）。
+
+## 詳細
+
+### MTKView を使用してコア イメージのレンダリングを実行する
+
+([05:17](https://developer.apple.com/videos/play/wwdc2022/10114/?time=317)) サンプル アプリの最初のレイヤーは次のとおりです。`MetalView`。これは SwiftUI View ですが、内部的に作成されています`MTKView`。
+
+```swift
+struct MetalView: ViewRepresentable {
+    
+    @StateObject var renderer: Renderer
+    
+    func makeView(context: Context) -> MTKView {
+        let view = MTKView(frame: .zero, device: renderer.device)
+       
+        view.delegate = renderer
+
+        // Suggest to Core Animation, through MetalKit, how often to redraw the view.
+        view.preferredFramesPerSecond = 30
+       
+        // Allow Core Image to render to the view using Metal's compute pipeline.
+        view.framebufferOnly = false
+        
+       return view
+    }
+```
+
+キーポイント:
+
+- `ViewRepresentable`プラットフォーム ビューを SwiftUI に接続します。 macOSではそうです`NSView`、他のプラットフォームは`UIView`。
+- `renderer`はい`@StateObject`、Metal コマンド キューと Core Image コンテキストの保持を担当します。
+-`view.delegate = renderer`させて`Renderer`引き継ぐ`draw()`電話。
+-`preferredFramesPerSecond = 30`アニメーション アプリを活用しましょう`MTKView`定期的に描画をトリガーします。
+-`framebufferOnly = false`Core Image が Metal コンピューティング パイプライン経由でこのビューにレンダリングできるようにします。
+
+画像エディターの場合は、代わりにセッションを使用することをお勧めします`enableSetNeedsDisplay`。このようにして、スライダー、ボタン、またはビデオ フレームが到着すると、無意味な定期的な更新を避けるために別の描画がトリガーされます ([06:18](https://developer.apple.com/videos/play/wwdc2022/10114/?time=378))。
+
+### レンダラーはフレームごとに CIRenderDestination を作成します
+
+（[07:12](https://developer.apple.com/videos/play/wwdc2022/10114/?time=432)）`Renderer`の`draw(in:)`現在の表示比率を決定し、Core Image レンダー ターゲットを作成し、`imageProvider`現在時刻のコピーが必要です`CIImage`。
+
+```swift
+func draw(in view: MTKView) {
+  if let commandBuffer = commandQueue.makeCommandBuffer(),
+     let drawable = view.currentDrawable {
+      // Calculate content scale factor so CI can render at Retina resolution.
+  #if os(macOS)
+      var contentScale = view.convertToBacking(CGSize(width: 1.0, height: 1.0)).width
+  #else
+      var contentScale = view.contentScaleFactor
+  #endif
+
+      let destination = CIRenderDestination(width: Int(view.drawableSize.width),
+                          height: Int(view.drawableSize.height), 
+                          pixelFormat: view.colorPixelFormat,
+                          commandBuffer: commandBuffer,
+                          mtlTextureProvider: { () -> MTLTexture in
+                                   return drawable.texture
+                          })
+       
+      let time = CFTimeInterval(CFAbsoluteTimeGetCurrent() - self.startTime)
+
+      // Create a displayable image for the current time.
+      var image = self.imageProvider(time, contentScaleFactor)
+
+      image = image.transformed(by: CGAffineTransform(translationX: shiftX, y: shiftY))
+      image = image.composited(over: self.opaqueBackground)
+                
+      _ = try? self.cicontext.startTask(toRender: image, from: backBounds,
+                                             to: destination, at: CGPoint.zero)
+```
+
+キーポイント:
+
+- `makeCommandBuffer()`このフレームのメタル コマンド バッファを作成します。
+-`view.currentDrawable`最終表示用のテクスチャを提供します。
+- macOSの場合`convertToBacking`ポイント対ピクセル比を計算します。 iOS および iPadOS で使用される`contentScaleFactor`。
+- `CIRenderDestination`コアイメージ出力をに接続します`drawable.texture`。
+- `imageProvider`時間と比率で表示されるようにこのフレームを生成します`CIImage`。
+- `startTask(toRender:)`Core Image に結果を Metal ターゲットにレンダリングさせます。
+
+ビューは別のモニターにドラッグされる可能性があり、CIImage はピクセル単位で測定されるため、コンテンツ スケールはここでフレームごとに計算されます ([07:12](https://developer.apple.com/videos/play/wwdc2022/10114/?time=432))。
+
+### Open EDR: レイヤー、ピクセル形式、色空間
+
+([09:17](https://developer.apple.com/videos/play/wwdc2022/10114/?time=557))`MTKView`EDR サポートを追加する場合、最初のステップは次のとおりです。`makeView()`。
+
+```swift
+if let caMtlLayer = view.layer as? CAMetalLayer  {
+    caMtlLayer.wantsExtendedDynamicRangeContent = true
+    view.colorPixelFormat = MTLPixelFormat.rgba16Float
+    view.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
+}
+```
+
+キーポイント:
+
+- `wantsExtendedDynamicRangeContent = true`教えて`CAMetalLayer`このレイヤーは EDR コンテンツを表示したいと考えています。
+-`.rgba16Float`16ビット浮動小数点ピクセル形式を採用し、1を超えるカラー値を表現可能。
+-`extendedLinearDisplayP3`拡張されたリニア Display P3 カラー スペースを使用します。
+- このコードは表示ターゲットを初期化するだけであり、各ピクセルの明るさはまだ決定していません。
+
+このステップでは、コンテナーの機能に対処します。これがないと、1 を超える値を使用しても、後続の Core Image コンテンツは EDR パスに従って表示できません。
+
+### 各ドローの前にヘッドルームを読む
+
+([09:35](https://developer.apple.com/videos/play/wwdc2022/10114/?time=575)) 2 番目のステップは、`Renderer.draw()`。レンダリング前に、ヘッドルームを現在の画面から読み取って、コンテンツ生成ロジックに渡す必要があります。
+
+```swift
+let screen = view.window?.screen;
+#if os(macOS)
+     let headroom = screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0
+#else
+     let headroom = screen?.currentEDRHeadroom ?? 1.0
+#endif
+     var image = self.imageProvider(time, contentScaleFactor, headroom)
+```
+
+キーポイント:
+
+- `view.window?.screen`このビューが現在表示されている画面を見つけます。
+- macOSの使用`maximumExtendedDynamicRangeColorComponentValue`。
+- iOS および iPadOS で使用`currentEDRHeadroom`。
+- 読み取り失敗時のフォールバック`1.0`これは、SDR 範囲のみを使用することと同じです。
+-`headroom`渡されました`imageProvider`、画像生成コードが現在の表示機能に応じてハイライトを制御できるようにします。
+
+session は、ヘッドルームが動的属性であることを明確に強調しています。周囲の光、画面の明るさ、モニターの変化はすべて影響するため、適切である必要があります。`draw()`([09:49](https://developer.apple.com/videos/play/wwdc2022/10114/?time=589)) を読み込みます。
+
+### CIFilter を使用して EDR ハイライトを生成する
+
+([12:42](https://developer.apple.com/videos/play/wwdc2022/10114/?time=762)) アプリが EDR をサポートした後、この例ではチェッカーボードにリップル トランジションを追加し、`shadingImage`明るい鏡面ハイライトを作成します。
+
+```swift
+let ripple = CIFilter.rippleTransition()
+ripple.inputImage = image
+ripple.targetImage = image
+ripple.center = CGPoint(x: 512.0, y: 384.0)
+ripple.time = Float(fmod(time*0.25, 1.0))
+ripple.shadingImage = shading
+image = ripple.outputImage
+```
+
+キーポイント:
+
+- `CIFilter.rippleTransition()`リップル遷移フィルターを作成します。
+-`inputImage`そして`targetImage`どちらも現在のチェッカー イメージを指しており、エフェクトは同じピクチャのリップル変更に使用されます。
+-`center`リップルの中心を設定します。
+-`time`現在のアニメーション時間を使用して、トランジションの進行を推進します。
+-`shadingImage`鏡面ハイライト マップを提供します。
+-`outputImage`リップルとハイライトを重ね合わせた後のコア イメージ出力です。
+
+スペキュラー マップは、別の Core Image フィルター ([13:34](https://developer.apple.com/videos/play/wwdc2022/10114/?time=814)) から取得されます。ここからヘッドルームの実際の活用が始まります。
+
+```swift
+let gradient = CIFilter.linearGradient()
+let w = min( headroom, 8.0 )
+gradient.color0 = CIColor(red: w, green: w, blue: w, 
+                          colorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!)!
+gradient.color1 = CIColor.clear
+gradient.point0 = CGPoint(x: sin(angle)*90.0 + 100.0, y: cos(angle)*90.0 + 100.0)
+gradient.point1 = CGPoint(x: sin(angle)*85.0 + 100.0, y: cos(angle)*85.0 + 100.0)
+let shading = gradient.outputImage?.cropped(to: CGRect(x: 0, y: 0, width: 200, height: 200))
+```
+
+キーポイント:
+
+- `linearGradient()`2 つのポイントと 2 つの色を含むプロシージャル イメージを生成します。ビットマップ データは必要ありません。
+-`min(headroom, 8.0)`白の明るさを現在のヘッドルームとサンプル選択の間の最大値に制限します。
+-`CIColor(red: w, green: w, blue: w, ...)`RGB コンポーネントが 1 より大きいことを許可します。
+-`extendedLinearSRGB`クランプされていない線形色空間を提供します。
+-`color1 = .clear`ハイライトを明るい白から透明に移行させます。
+-`cropped(to:)`無限範囲の勾配をリップル フィルターに必要なサイズにカットします。
+
+Core Image には、EDR をサポートする 150 を超えるフィルターが組み込まれています。セッションで挙げられた例としては、`CIColorControls`、`CIExposureAdjust`、gradient filters、`CIAreaLogarithmicHistogram`および CIColorCube シリーズ ([10:46](https://developer.apple.com/videos/play/wwdc2022/10114/?time=646))。
+
+### SDR カラー キューブに EDR 入力を処理させます
+
+([16:13](https://developer.apple.com/videos/play/wwdc2022/10114/?time=973)) 従来のカラー キューブ データは通常、0 ～ 1 のみをカバーします。WWDC 2022 Give`CIColorCubeWithColorSpace`追加した`extrapolate`、既存の SDR キューブ データを EDR 入力に使用できるようにします。
+
+```swift
+let f = CIFilter.colorCubeWithColorSpace()
+f.cubeDimension = 32
+f.cubeData = sdrData
+f.extrapolate = true
+f.inputImage = edrImage
+let edrResult = f.outputImage
+```
+
+キーポイント:
+
+- `colorCubeWithColorSpace()`色空間を使用してカラー キューブ フィルターを作成します。
+-`cubeDimension = 32`キューブのサイズを設定します。
+-`cubeData = sdrData`元の SDR ルック データを引き続き使用します。
+-`extrapolate = true`フィルターが SDR キューブ データを EDR 入力に外挿できるようにします。
+-`inputImage = edrImage`1 より大きい輝度値を含む画像を渡します。
+-`outputImage`EDR 出力機能は維持されます。
+
+EDR により適した結果を取得したい場合、セッションでは、HLG や PQ などの EDR カラー スペースを使用して新しいキューブ データを作成し、場合によってはキューブの次元を増やすという別の方法についても言及されました ([15:32](https://developer.apple.com/videos/play/wwdc2022/10114/?time=932))。
+
+### CIKernel の境界をカスタマイズする
+
+([16:25](https://developer.apple.com/videos/play/wwdc2022/10114/?time=985)) カスタム CIKernel を EDR に移行する場合は、最初に RGB 計算を確認してください。コード内で使用する場合`clamp`、`min`、`max`RGB を 0 ～ 1 に制限すると、多くの場合、これらの制限を取り除くことができます。
+
+アルファは 0 から 1 の間に維持する必要があります。セッションで示された反例は、カーネルが誤ってアルファを 5 倍にしてしまったことです。正しいアプローチは、アルファではなく RGB のみを増幅することです。そうしないと、ミキシングまたは表示時に未定義の動作が発生します ([16:50](https://developer.apple.com/videos/play/wwdc2022/10114/?time=1010))。
+
+## 重要ポイント
+
+- **EDR ハイライターを作成**: ProRAW、OpenEXR、または HDR ビデオ フレームをロードし、複数のオーバーレイ領域を表示します。これを実行する価値がある理由は、EDR ハイライトが SDR プレビューでは簡単に見逃される可能性があるためです。から入手できます`CIImage`入力を開始し、Core Image フィルターを使用して疑似カラー オーバーレイを生成し、`MTKView`ヘッドルームを押してレンダリングします。
+
+- **強度を調整できる鏡面ハイライト フィルターを作成します**:`linearGradient()`そして`rippleTransition()`インタラクティブなエフェクトに変更されました。ユーザーがスライダーをドラッグすると、ハイライトの方向、サイズ、キャップが更新されます。実装エントリは`enableSetNeedsDisplay`、`imageProvider`そして`CIColor(red: w, green: w, blue: w, colorSpace:)`。
+
+- **画像エディターに EDR ルック プレビューを追加**: 既存の SDR カラー キューブを再利用し、`extrapolate`オンにすると、まず古い外観で EDR 入力を処理できるようになります。次に、HLG または PQ 用の新しいキューブ データを作成します。実装エントリは`CIFilter.colorCubeWithColorSpace()`、`cubeData`、`extrapolate`そして`inputImage`。
+
+- **ヘッドルーム デバッグ HUD を作成**: 現在の画面のヘッドルームをレンダリング画面の隅に表示し、明るさ、周囲光、外部モニターによって変化するその曲線を記録します。実装エントリは`currentEDRHeadroom`、`maximumExtendedDynamicRangeColorComponentValue`そしてすべてのフレーム`draw(in:)`の読み取りロジック。
+
+## 関連セッション
+
+- [iOS での EDR の探索](/articles/wwdc2022-10113) — iOS および iPadOS での EDR、ヘッドルーム、トーン マッピング、リファレンス モードについて説明します。
+- [AVFoundation と Metal を使用して EDR で HDR ビデオを表示する](/articles/wwdc2022-110565) — AVFoundation と Metal を使用して HDR ビデオの EDR 再生リンクを構築する方法を示します。
+- [Discover Metal 3](/articles/wwdc2022-10066) - Metal 3 のレンダリング、パフォーマンス、ツールの更新について紹介しており、MTKView レンダリング パイプラインを理解するための背景情報です。
+- [SwiftUI の新機能](/articles/wwdc2022-10052) — SwiftUI 2022 アップデートの概要。このセッションではマルチプラットフォーム SwiftUI アプリ構造にコンテキストを追加します。

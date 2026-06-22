@@ -1,0 +1,270 @@
+---
+title: "Load resources faster with Metal 3"
+description: "discover how you can use fast resource streaming in metal 3 to quickly load assets. we'll show you how to use an asynchronous set-it-and-forget-it workflow in your app to take advantage of the speed of ssd storage and the throughput of apple silicon's unified memory architecture. we'll also explore how you can create separate queues that run parallel to — and synchronize with — your gpu render and compute work. finally, we'll share how to designate assets like audio with high-priority queues to help you load data with lower latency."
+date: 2026-06-10
+tags: ["WWDC 2022", "Metal", "Graphics & Games"]
+thumbnail: "/images/sessions/2022/10104.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10104/"
+sessionId: "wwdc2022-10104"
+year: "2022"
+relatedSessions:
+  - title: "Discover Metal 3"
+    code: "10066"
+    description: "リソースの読み込み、オフライン コンパイル、メッシュ シェーダー、MetalFX などの機能を含む、Metal 3 の全体的な方向性を紹介します。"
+  - title: "Target and optimize GPU binaries with Metal 3"
+    code: "10102"
+    description: "最初の起動時とレベル読み込み時のコンパイルの遅延を軽減するための Metal 3 のオフライン コンパイルと GPU バイナリについて説明します。"
+  - title: "Boost performance with MetalFX Upscaling"
+    code: "10103"
+    description: "MetalFX アップスケーリングにより、ゲームのレンダリング解像度を低くしてパフォーマンスを向上させる方法を紹介します。"
+  - title: "Maximize your Metal ray tracing performance"
+    code: "10105"
+    description: "アクセラレーション構造、プリミティブごとのデータ、デバッグ ツールなど、メタル 3 レイ トレーシング パイプラインのパフォーマンスの最適化について説明します。"
+---
+## ハイライト
+
+> GPU ソフトウェア エンジニアの Jaideep Joshi が、ゲームやグラフィックスを多用するアプリ向けに特別に設計された非同期リソース読み込み API である Metal 3 の高速リソース読み込み機能を紹介します。
+
+---
+
+## 主要内容
+大規模なゲームのリソースの読み込みには、非常に直接的な問題があります。リソースが詳細になればなるほど、プレイヤーが待たなければならない時間が長くなります。レベルを開始する前にすべてのテクスチャ、オーディオ、ジオメトリ データをメモリに読み込むと、操作中の遅延を回避できますが、読み込み画面が長くなり、より多くのメモリを消費します。
+
+Metal 3 の Fast Resource Loading は、このリンクを解決します。これにより、リソースの読み込みが非同期 IO コマンドに変わります。アプリは読み込みリクエストを発行した後、現在のスレッドをブロックする必要がなく、コーディング、レンダリング、または計算作業を続行できます。 IO コマンド キューは複数のコマンド バッファを同時に実行することもでき、高速 SSD と Apple Silicon のユニファイド メモリ アーキテクチャにより適しています。
+
+このセッションの中心的なシナリオはストリーミング読み込みです。プレーヤーが黒板に近づくと、ゲームは高解像度のテクスチャを読み込みます。オープンワールドマップはエリアごとにプリロードされています。サウンドエフェクトが大きなテクスチャよりも緊急である場合、オーディオリソースはより優先度の高いキューに移動されます。共通の目標は、現在必要なデータのみをゲームにロードさせ、プレイヤーが気づく前にロードしようとすることです。
+
+もう 1 つの重要な点は粒度です。 Apple は、ミップ レベル全体を一度にロードするのではなく、ロード リクエストを小さな部分に分割することをお勧めします。たとえば、スパース テクスチャを使用して表示領域をタイルごとにロードするなどです。リクエストの数は増加しますが、最新のストレージ ハードウェアはリクエストを同時に処理でき、Metal 3 の IO キューはこのモード用に設計されています。
+
+## 詳細
+### リソースファイルを開く
+
+([05:19](https://developer.apple.com/videos/play/wwdc2022/10104/?time=319)) 高速リソース読み込みの最初のステップは、ファイル ハンドルを作成することです。このハンドルの由来は、`MTLDevice`、後続のすべてのロード コマンドは、それを通じてファイルの内容を読み取ります。
+
+```swift
+// Create an Metal File IO Handle
+
+// Create handle to an existing file
+var fileIOHandle: MTLIOFileHandle!
+do {
+    try fileHandle = device.makeIOHandle(url: filePath)
+} catch {
+    print(error)
+}
+```
+
+キーポイント:
+- `MTLIOFileHandle`Metal IO システムが読み取ることができるファイル ハンドルを表します。
+-`device.makeIOHandle(url:)`Metal デバイスで既存のファイルを開きます。
+-`catch`パスが間違っているか、リソースにアクセスできないなど、ブランチ処理ファイルを開けませんでした。
+- 公式クリップ内での記載名は`fileIOHandle`、割り当ては次のように書かれます`fileHandle`;変数名は実際のプロジェクトでは一貫性を保つ必要があります。
+
+### IO コマンドキューを作成する
+
+([06:49](https://developer.apple.com/videos/play/wwdc2022/10104/?time=409)) ロード コマンドはレンダリング キューに直接送信されませんが、`MTLIOCommandQueue`。デフォルトのキューはコンカレントですが、シリアルに変更してコマンド バッファを順番に実行することもできます。
+
+```swift
+// Create a Metal IO command queue
+
+let commandQueueDescriptor = MTLIOCommandQueueDescriptor()
+
+commandQueueDescriptor.type = MTLIOCommandQueueType.concurrent // or serial
+
+var ioCommandQueue: MTLIOCommandQueue!
+do {
+    try ioCommandQueue = device.makeIOCommandQueue(descriptor: commandQueueDescriptor)
+} catch {
+    print(error)
+}
+```
+
+キーポイント:
+- `MTLIOCommandQueueDescriptor`IO キューの動作を記述するために使用されます。
+-`type = .concurrent`複数の IO コマンド バッファーを同時に実行し、順不同で完了できるようにします。
+- リソースに厳密な順序要件がある場合は、シリアル キューを使用できます。
+-`device.makeIOCommandQueue(descriptor:)`記述子に基づいてメタル IO キューを作成します。
+
+### テクスチャの送信とバッファーの読み込み
+
+([07:17](https://developer.apple.com/videos/play/wwdc2022/10104/?time=437)) IO キューが作成された後、アプリはキューからコマンド バッファを生成し、コマンドをエンコードしてそこにロードします。 Metal 3 は、テクスチャへのロード、バッファへのロード、CPU がアクセス可能なメモリへのロードという 3 種類のロードをサポートします。
+
+```swift
+// Create Metal IO Command Buffer
+
+let ioCommandBuffer = ioCommandQueue.makeCommandBuffer()
+
+// Encode load commands
+// Encode load texture and load buffer commands
+ioCommandBuffer.load(texture, slice: 0, level: 0, size: size, 
+                     sourceBytesPerRow:bytesPerRow, sourceBytesPerImage: bytesPerImage,  
+                     destinationOrigin: destOrigin,
+                     sourceHandle: fileHandle, sourceHandleOffset: 0)
+ioCommandBuffer.load(buffer, offset: 0, size: size,
+                     sourceHandle: fileHandle, sourceHandleOffset: 0)
+
+
+// Commit command buffer for execution
+ioCommandBuffer.commit()
+```
+
+キーポイント:
+- `makeCommandBuffer()`IOキューからロードバッチを作成します。
+- 初め`load`ファイル データを Metal テクスチャにロードします。これは、テクスチャ ストリーミングのロードに使用できます。
+-`slice`、`level`、`destinationOrigin`テクスチャを書き込む領域を指定します。
+- 2番目`load`ファイル データをメタル バッファにロードします。これはジオメトリ データまたはシーン データに使用できます。
+-`sourceHandleOffset`読み取りを開始するファイル内のオフセットを指定します。
+-`commit()`ロード作業を送信すると、呼び出しスレッドはロードが完了するまで待つ必要がありません。
+
+### 共有イベントを使用して読み込みとレンダリングを同期する
+
+([08:51](https://developer.apple.com/videos/play/wwdc2022/10104/?time=531)) 非同期読み込みにより、準備が整う前にレンダリングでリソースを読み取ることができないという新たな問題が発生します。メタル3用途`MTLSharedEvent`IO コマンド バッファとグラフィックス コマンド バッファ間の同期を確立します。
+
+```swift
+var sharedEvent: MTLSharedEvent!
+sharedEvent = device.makeSharedEvent()
+
+// Create Metal IO command buffer
+let ioCommandBuffer = ioCommandQueue.makeCommandBuffer()
+
+ioCommandBuffer.waitForEvent(sharedEvent, value: waitVal)
+
+// Encode load commands
+
+ioCommandBuffer.signalEvent(sharedEvent, value: signalVal)
+ioCommandBuffer.commit()
+
+// Graphics work waits for the IO command buffer to signal
+```
+
+キーポイント:
+- `device.makeSharedEvent()`キュー間で使用できる同期オブジェクトを作成します。
+-`waitForEvent(_:value:)`IO コマンドバッファを実行する前に、特定のイベント値を待機させます。
+- ロード コマンドは、wait と signal の間にエンコードされます。
+-`signalEvent(_:value:)`IO コマンド バッファ内のすべてのロード コマンドが完了すると、信号が発行されます。
+- 対応するグラフィックス コマンド バッファーは、アンロードされたリソースの読み取りを回避するために、同じイベント値を待機します。
+
+### 不要になったロードをキャンセルします。
+
+([10:29](https://developer.apple.com/videos/play/wwdc2022/10104/?time=629)) オープンワールド ゲームでは、プレイヤーが移動する可能性のあるエリアが事前に読み込まれることがよくあります。一部のプリロードは、プレーヤーが方向を変えると価値を失います。 Metal 3 では、コマンド バッファーの粒度でこれらの IO ジョブをキャンセルする試みが許可されます。
+
+```swift
+// Player in the center region
+// Encode loads for the North-West region
+ioCommandBufferNW.commit()
+// Encode loads for the West region
+ioCommandBufferW.commit()
+// Encode loads for the South-West region
+ioCommandBufferSW.commit()
+
+// Player in the western region and heading south
+// tryCancel NW command buffer
+ioCommandBufferNW.tryCancel()
+
+// ..
+// ..
+func regionNWCancelled() -> Bool {
+    return ioCommandBufferNW.status == MTLIOStatus.cancelled
+}
+```
+
+キーポイント:
+- 各領域のプリロードは、個別の IO コマンド バッファーに入れることができます。
+- プレイヤーがまだ中央エリアにいるとき、ゲームは北西、西、南西の方向に同時にロードを送信します。
+- プレイヤーが南に移動した後、`tryCancel()`北西エリアのロードをキャンセルしてみてください。
+-`status == .cancelled`コマンドバッファが実際にキャンセルされたかどうかを判断するために使用されます。
+- キャンセルの粒度は、単一のロード コマンドではなく、コマンド バッファーです。
+
+### 緊急リソースの優先順位を高くする
+
+([12:28](https://developer.apple.com/videos/play/wwdc2022/10104/?time=748)) テクスチャとオーディオはどちらも高速リソース読み込みを通じて読み取ることができますが、レイテンシー要件は異なります。プレーヤーが新しいシーンにテレポートすると、後で多数のテクスチャが完成する可能性があるため、テレポートのサウンド効果をすぐに再生する必要があります。解決策は、オーディオ用に優先度の高い IO キューを作成することです。
+
+```swift
+// Create a Metal IO command queue
+
+let commandQueueDescriptor = MTLIOCommandQueueDescriptor()
+commandQueueDescriptor.type = MTLIOCommandQueueType.concurrent // or serial
+
+// Set Metal IO command queue Priority
+commandQueueDescriptor.priority = MTLIOPriority.high // or normal or low
+
+var ioCommandQueue: MTLIOCommandQueue!
+do {
+    try ioCommandQueue = device.makeIOCommandQueue(descriptor: commandQueueDescriptor)
+} catch {
+    print(error)
+}
+```
+
+キーポイント:
+- `priority`高、標準、または低に設定できます。
+- 高優先キューは、オーディオなどの遅延に敏感なリソースに適しています。
+- テクスチャの読み込みは、通常の優先度のキューを通過し続けることができます。
+・ キュー作成後に優先度を変更することはできないため、事前にリソースの種類に応じてキューを設計する必要があります。
+
+### オフライン圧縮リソース パッケージ
+
+([14:04](https://developer.apple.com/videos/play/wwdc2022/10104/?time=844)) 高速リソース読み込みは圧縮ファイルもサポートしています。 Apple は、オフライン段階で圧縮パッケージを生成することをお勧めします。実行時、Metal 3 はオフセットに基づいて解凍する必要があるチャンクを見つけ、解凍されたデータをリソースにロードします。
+
+```swift
+// Create a compressed file
+
+// Create compression context
+let chunkSize = 64 * 1024
+let compressionMethod = MTLIOCompressionMethod.zlib
+let compressionContext = MTLIOCreateCompressionContext(compressedFilePath, compressionMethod, chunkSize)
+
+// Append uncompressed file data to the compression context
+// Get uncompressed file data 
+MTLIOCompressionContextAppendData(compressionContext, filedata.bytes, filedata.length)
+
+
+// Write the compressed file
+MTLIOFlushAndDestroyCompressionContext(compressionContext)
+```
+
+キーポイント:
+- `chunkSize`圧縮パッケージ内のブロック サイズを決定します。セッションの例では 64K を使用します。
+-`MTLIOCompressionMethod.zlib`ZLib 圧縮方式を選択します。
+-`MTLIOCreateCompressionContext`オフライン圧縮コンテキストを作成します。
+-`MTLIOCompressionContextAppendData`複数回呼び出して、異なるファイルのデータを同じ圧縮コンテキストに追加できます。
+-`MTLIOFlushAndDestroyCompressionContext`圧縮ファイルを書き出してコンテキストを破棄します。
+
+### 圧縮ファイルの読み取り
+
+([15:05](https://developer.apple.com/videos/play/wwdc2022/10104/?time=905)) 実行時に圧縮ファイルを開くときは、圧縮パッケージの作成時に使用した圧縮方法を渡す必要があります。`makeIOHandle`。その後、Metal 3 は、load コマンドが実行されるときにインライン解凍を実行します。
+
+```swift
+// Create an Metal File IO Handle
+
+// Create handle to a compressed file
+var compressedFileIOHandle : MTLIOFileHandle!
+do {
+    try compressedFileHandle = device.makeIOHandle(url: compressedFilePath, compressionMethod: MTLIOCompressionMethod.zlib)
+} catch {
+    print(error)
+}
+```
+
+キーポイント:
+- 圧縮ファイルも通過します`MTLIOFileHandle`読み込みパイプラインに入ります。
+-`compressionMethod`オフライン圧縮中に使用される方法と一致する必要があります。
+- Metal 3 は、ファイル オフセットを、解凍する必要があるチャンクのリストに変換します。
+- 公式クリップ内での記載名は`compressedFileIOHandle`、割り当ては次のように書かれます`compressedFileHandle`;変数名は実際のプロジェクトでは一貫性を保つ必要があります。
+
+## 重要ポイント
+- **視覚的な距離に応じてロードされるテクスチャ システムを作成します。 ** 低解像度のミップのみが遠くからロードされ、プレーヤーが近くにあるときに使用されます。`load(texture:slice:level:size:...)`より高解像度のデータを読み込みます。これにより、初期ロード時間が短縮され、最初に使用するビデオ メモリが少なくなります。
+
+- **オープンワールドエリアのプリロードを行います。 ** マップを領域に分割します。各領域は IO コマンド バッファに対応します。プレイヤーの移動方向が変わると、不要になったエリアに呼び出しが行われます。`tryCancel()`、ストレージ帯域幅を新しいターゲット領域に残します。
+
+- **オーディオ用に高優先度の IO キューを確立します。 ** テレポート、戦闘プロンプト、および主要な UI サウンドエフェクトが利用可能です`loadBytes`アプリによって割り当てられたメモリにロードして配置します`MTLIOPriority.high`キューを削減し、大量のテクスチャのロードによって速度が低下するリスクを軽減します。
+
+- **リソースを Metal IO 圧縮パッケージに入れます。 ** ビルドフェーズ中に使用されます`MTLIOCreateCompressionContext`圧縮ファイルを生成し、実行時に使用します。`compressionMethod`の`makeIOHandle`開ける。多くのテクスチャ、幾何学的データ、オーディオを含むゲーム プロジェクトに適しています。
+
+- **Metal System Trace を使用して、読み込みが十分に早いかどうかを確認します。 ** セッションでは、Xcode 14 の Metal System Trace がロード操作のエンコードと実行時間を観察できると述べました。赤色のアンロードされたタイルの表示時間を IO キュー アクティビティと一致させることで、ロード リクエストの送信が遅すぎたかどうかを判断できます。
+
+## 関連セッション
+
+- [Discover Metal 3](/articles/wwdc2022-10066) - Metal 3 の新機能の中での Fast Resource Loading の位置を理解するために、まず Metal 3 の概要を見てみましょう。
+- [Metal 3 で GPU バイナリをターゲットにして最適化する](/articles/wwdc2022-10102) — リソースの読み込みにより IO 待機が解決され、GPU バイナリの最適化によりシェーダー コンパイルの待機が解決されます。どちらも最初の画面とレベルの読み込みにラグがあります。
+- [MetalFX アップスケーリングによるパフォーマンスの向上](/articles/wwdc2022-10103) - 高速リソース読み込みは高品質のリソースをより速く送信する役割を果たし、MetalFX はより低いレンダリング コストで高解像度の画像を出力する役割を果たします。
+- [メタル レイ トレーシングのパフォーマンスを最大化する](/articles/wwdc2022-10105) — これも Metal 3 ゲーム パフォーマンスのトピックに属しており、レイ トレーシング シーンの読み込み、構築、デバッグのコストを継続的に調査するのに適しています。

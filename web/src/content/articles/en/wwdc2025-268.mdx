@@ -1,0 +1,184 @@
+---
+title: "Embracing Swift concurrency"
+description: "join us to learn the core swift concurrency concepts. concurrency helps you improve app responsiveness and performance, and swift is designed to make asynchronous and concurrent code easier to write c"
+date: 2026-06-10
+tags: ["UIKit", "Liquid Glass", "iPadOS", "Observable", "HDR"]
+thumbnail: "/images/sessions/2025/268.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/268/"
+sessionId: "wwdc2025-268"
+year: "2025"
+relatedSessions:
+  - title: "Code-along: Cook up a rich text experience in SwiftUI with AttributedString"
+    code: "280"
+    description: "learn how to build a rich text experience with swiftui"
+  - title: "Explore Swift and Java interoperability"
+    code: "307"
+    description: "learn how you can mix swift and java in a single codebase. we"
+  - title: "Improve memory usage and performance with Swift"
+    code: "312"
+    description: "discover ways to improve the performance and memory management of your swift cod"
+  - title: "Optimize SwiftUI performance with Instruments"
+    code: "306"
+    description: "discover the new swiftui instrument. we"
+---
+
+## Highlight
+
+> A new App project in Xcode 26 turns on Main Actor mode by default. All code is implicitly `@MainActor`. When you need to run something in the background, mark it `@concurrent`.
+
+---
+
+## Core content
+
+Most developers have hit the same trap on their first network request: call `URLSession.shared.data(from:)` synchronously on the main thread, and the UI freezes for a few seconds. The app looks dead. The main thread has to handle touch events and redraw the UI, so once network IO holds it, nothing else moves. The Swift team's answer this time is not another GCD API. It moves "which thread does this run on" into the language as a property the compiler can check.
+
+A new App project in iOS 19 / Xcode 26 turns on Main Actor mode by default. Code you write without any annotation is implicitly `@MainActor`. The compiler knows it can only run on the main thread, so it lets you read global variables and singletons freely. When some computation, say image decoding, starts dropping frames, you mark that function `@concurrent`. The compiler then tells you exactly which main-thread-only state it touches and forces you to wrap that state in a value type or an actor before passing it across. The migration path is gradual: start single-threaded, use `async/await` for high-latency calls, use `@concurrent` to offload CPU-bound work, and finally use `actor` to move the data itself off the main thread.
+
+---
+
+## Details
+
+The whole talk is built around an image-loading example. The first version is synchronous and blocking:
+
+```swift
+final class ImageModel {
+  var imageCache: [URL: Image] = [:]
+  let view = View()
+
+  func fetchAndDisplayImage(url: URL) throws {
+    let data = try Data(contentsOf: url)
+    let image = decodeImage(data)
+    view.displayImage(image)
+  }
+}
+```
+
+Key points:
+- `fetchAndDisplayImage` is a synchronous function. The whole flow runs on the main thread in one shot.
+- Reading a small local file is fine. Swap in a network URL, and the main thread blocks on network IO and the UI freezes.
+
+Step one is to make it `async` so network IO no longer blocks the main thread ([06:10](https://developer.apple.com/videos/play/wwdc2025/268/?time=370)):
+
+```swift
+final class ImageModel {
+  var imageCache: [URL: Image] = [:]
+  let view = View()
+
+  func fetchAndDisplayImage(url: URL) async throws {
+    let (data, _) = try await URLSession.shared.data(from: url)
+    let image = decodeImage(data)
+    view.displayImage(image)
+  }
+}
+```
+
+Key points:
+- The signature gains `async`. The call to `URLSession` uses `await`.
+- `await` marks a suspension point. The function gives up the main thread there and resumes when data comes back.
+- The function still runs on the main thread, but while it waits for the network the main thread can handle touches and draw other UI.
+- `URLSession` does the actual IO on a background thread. The application code itself introduces no concurrency.
+
+An `async` function has to start inside a task. On a button tap you write ([07:31](https://developer.apple.com/videos/play/wwdc2025/268/?time=451)):
+
+```swift
+func onTapEvent() {
+  Task {
+    do {
+      try await fetchAndDisplayImage(url: url)
+    } catch let error {
+      displayError(error)
+    }
+  }
+}
+```
+
+Key points:
+- `Task { ... }` creates a new task that wraps the whole fetch + display flow.
+- The task runs in order from start to finish. Multiple tasks interleave on the main thread.
+- The error is caught inside the task, so it does not get swallowed.
+
+Only when the app actually hits a main-thread stall, say `decodeImage` is too slow on large images, do you move that part to the background. Use `@concurrent` ([11:11](https://developer.apple.com/videos/play/wwdc2025/268/?time=671)):
+
+```swift
+final class ImageModel {
+  var imageCache: [URL: Image] = [:]
+  let view = View()
+
+  func fetchAndDisplayImage(url: URL) async throws {
+    let (data, _) = try await URLSession.shared.data(from: url)
+    let image = await decodeImage(data, at: url)
+    view.displayImage(image)
+  }
+
+  @concurrent
+  func decodeImage(_ data: Data, at url: URL) async -> Image {
+    Image()
+  }
+}
+```
+
+Key points:
+- `@concurrent` tells Swift this function always runs in the background.
+- The caller uses `await`. While decoding runs, the main thread keeps doing other work.
+- `decodeImage` is no longer in the main actor's isolation domain, so the compiler refuses to let it touch `imageCache` directly. That is the point: it forces you to handle cross-thread shared data explicitly.
+
+For data races on shared mutable reference types, the talk shows the actor approach ([25:10](https://developer.apple.com/videos/play/wwdc2025/268/?time=1510)):
+
+```swift
+actor NetworkManager {
+  var openConnections: [URL: Connection] = [:]
+
+  func openConnection(for url: URL) async -> Connection {
+    if let connection = openConnections[url] {
+      return connection
+    }
+    let connection = Connection()
+    openConnections[url] = connection
+    return connection
+  }
+
+  func closeConnection(_ connection: Connection, for url: URL) async {
+    openConnections.removeValue(forKey: url)
+  }
+}
+```
+
+Key points:
+- Change `class` to `actor`. The mutable state in `openConnections` is now isolated by the actor.
+- External callers of `openConnection` / `closeConnection` must `await`. The actor guarantees only one call runs inside it at a time.
+- The main thread and background threads can all use the same `NetworkManager` safely, without manual locking.
+
+Value types take a different path. `struct` and `enum` are `Sendable` by default. Their copy semantics avoid sharing automatically when you pass them across tasks ([16:56](https://developer.apple.com/videos/play/wwdc2025/268/?time=1016)). Reach for value types first; only when shared mutable state is unavoidable do you bring in an actor. That is the order Apple recommends.
+
+---
+
+## Takeaways
+
+- **What to do: confirm Main Actor default mode is on for new iOS 19 projects**
+  - Why it matters: the new Xcode 26 template enables it by default. The compiler adds `@MainActor` to your UI module code automatically, which removes a pile of explicit annotations. Reading UI singletons and global state no longer trips data race warnings.
+  - How to start: search "Default Actor Isolation" in Build Settings and confirm it is `MainActor`. For older projects, switch UI-related modules first and leave business logic modules alone for now.
+
+- **What to do: replace every synchronous `URLSession.shared.data(...)` call with `async/await`**
+  - Why it matters: synchronous network IO on the main thread almost always stalls the UI. The `async` version does not require you to introduce concurrency. A single `await` turns a stall into a suspension point.
+  - How to start: grep for `Data(contentsOf:)` and any synchronous `URLSession` use. Make the caller `async` and start it from a button callback with `Task { }`.
+
+- **What to do: use Instruments to find the calls that actually burn main-thread time, then add `@concurrent`**
+  - Why it matters: the talk says it plainly: many apps need no concurrency at all. Moving every slow call to the background just complicates the code and adds new data races. Profile first.
+  - How to start: run Time Profiler in Instruments and find the function with the highest main-thread share. If it really is CPU-bound (image decoding, parsing a large JSON), mark it `@concurrent` and let the compiler tell you which isolated state it touches.
+
+- **What to do: refactor cross-thread shared mutable reference types into actors**
+  - Why it matters: a singleton `class` accessed from multiple threads needs manual locking, and that is easy to get wrong. An `actor` builds the synchronization into the language. Callers must `await`, and the compiler blocks every data race for you.
+  - How to start: list the manager and cache classes that several threads touch and convert them to `actor` one by one. Every external call must `await`, which may force functions up the call chain to become `async`.
+
+- **What to do: pass cross-task data with value types and `Sendable`**
+  - Why it matters: a `struct` is `Sendable` by default. Copy semantics avoid sharing without effort, and that is much simpler than an actor. Apple lists "prefer value types" as the first principle.
+  - How to start: review the data you pass between tasks. Use `struct` whenever you can instead of `class`. If a reference type has to travel, make sure it is immutable and mark it `Sendable`; otherwise convert it to a value-type snapshot.
+
+---
+
+## Related sessions
+
+- [Code-along: Cook up a rich text experience in SwiftUI with AttributedString](/articles/wwdc2025-280) — build a rich text editor in SwiftUI and pair it with Swift concurrency for data updates
+- [Explore Swift and Java interoperability](/articles/wwdc2025-307) — mix Swift and Java in one codebase and handle concurrency boundaries across languages
+- [Improve memory usage and performance with Swift](/articles/wwdc2025-312) — Swift memory management and performance tips, a good follow-up after offloading work with `@concurrent`
+- [Optimize SwiftUI performance with Instruments](/articles/wwdc2025-306) — use the new SwiftUI Instrument to track UI stalls and decide whether you need to introduce concurrency

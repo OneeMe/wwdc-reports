@@ -1,0 +1,519 @@
+---
+title: "Create audio drivers with DriverKit"
+description: "discover how to use the audiodriverkit api to consolidate your audio server plug-in and driverkit extension into a single package. learn how you can simplify audio driver installation with an app instead of an installer package and distribute your driver through the mac app store. and we'll take you through how the core audio hal interacts with audiodriverkit and discover best practices for audio device drivers."
+date: "2021-06-06"
+tags: ["System Services", "Audio & Video"]
+thumbnail: "/images/sessions/2021/10190.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10190/"
+sessionId: "wwdc2021-10190"
+year: "2021"
+relatedSessions:
+  - title: "What's new in AVFoundation"
+    code: "10146"
+    description: "オーディオおよびビデオ アセットの再生、検査、作成に関する AVFoundation の最新アップデートについて学びます。"
+  - title: "Discover built-in sound classification in SoundAnalysis"
+    code: "10036"
+    description: "SoundAnalysis を使用して、オーディオ ストリームから個別の音を検出して分類します。"
+  - title: "Explore ShazamKit"
+    code: "10044"
+    description: "Shazam の正確なオーディオ マッチング機能をアプリに統合します。"
+  - title: "Immerse your app in Spatial Audio"
+    code: "10265"
+    description: "Spatial Audio を使用して、空間オーディオ エクスペリエンスをアプリと Web に提供します。"
+---
+## ハイライト
+
+> macOS Monterey では AudioDriverKit が導入されています。ハードウェア オーディオ ドライバーは、ユーザー空間で実行される DriverKit 拡張機能を使用して CoreAudio HAL に直接接続できるため、オーディオ サーバー プラグイン、独立したインストール パッケージ、再起動プロセスが不要になります。
+
+## 主な内容
+
+macOS オーディオ ハードウェア ドライバーを作成するには、以前は 2 層のコードを維持する必要がありました。
+
+最初の層はオーディオ サーバー プラグインです。 CoreAudio HAL (Hardware Abstraction Layer、ハードウェア抽象化層) との接続を担当します。もう 1 つの層は、カーネル拡張機能 (kext) または DriverKit 拡張機能 (dext) です。ハードウェアとの通信を担当します。
+
+このリンクは機能しますが、開発者はプラグインと dext の間の通信に対処する必要があります。コンポーネントの数が増えると、リソースの使用量が増加し、オーバーヘッドと遅延も増加する可能性があります。
+
+macOS Big Sur では、ドライバー開発がカーネルからユーザー空間に移行しました。セキュリティは向上しましたが、オーディオ ドライバーには依然としてオーディオ サーバー プラグインと dex コンポーネントが必要です。
+
+macOS Monterey には、AudioDriverKit という新しいオプションが追加されました。これは DriverKit フレームワークであり、オーディオ ドライバーには dext のみが必要です。このフレームワークは、dext と CoreAudio HAL の間のプロセス間通信を処理します。
+
+インストール方法も変わりました。 AudioDriverKit 拡張機能は Mac アプリにパッケージ化されています。ユーザーがアプリをインストールしてドライバーを許可すると、システムは別のインストーラー パッケージを必要としたり、再起動したりすることなく、動的に dext を読み込むことができます。
+
+このセッションの要点は明らかです。USB または PCI オーディオ ハードウェア ドライバーを作成している場合は、ドライバー モデルをユーザー空間のデクストに収束させることができます。仮想オーディオ デバイスのみを作成している場合でも、Apple は引き続きオーディオ サーバー プラグイン モデルを使用することを推奨します。
+
+＃＃詳細
+
+### AudioDriverKit の基本アーキテクチャ
+
+([02:30](https://developer.apple.com/videos/play/wwdc2021/10190/?time=150)) CoreAudio HAL は、AudioDriverKit を通じてドライバー拡張機能と通信します。 AudioDriverKit は、HAL で使用するプライベート ユーザー クライアントを作成します。このユーザー クライアントはあなたの dex には公開されません。
+
+アプリが dext と直接通信する必要がある場合は、さらにカスタム ユーザー クライアントを開くことができます。このパスは、デバイス モードの切り替えやハードウェア ステータスの読み取りなど、メーカーのコントロール パネルに適しています。
+
+```cpp
+// SimpleAudioDriver example override of IOService::NewUserClient
+kern_return_t SimpleAudioDriver::NewUserClient_Impl(uint32_t in_type,
+													 IOUserClient** out_user_client)
+{
+	kern_return_t error = kIOReturnSuccess;
+	//	Have the super class create the IOUserAudioDriverUserClient object if the type is
+	//	kIOUserAudioDriverUserClientType
+	if (in_type == kIOUserAudioDriverUserClientType)
+	{
+		error = super::NewUserClient(in_type, out_user_client, SUPERDISPATCH);
+	}
+	else
+	{
+		IOService* user_client_service = nullptr;
+		error = Create(this, "SimpleAudioDriverUserClientProperties", &user_client_service);
+		FailIfError(error, , Failure, "failed to create the SimpleAudioDriver user-client");
+		*out_user_client = OSDynamicCast(IOUserClient, user_client_service);
+	}
+	return error;
+}
+```
+
+キーポイント:
+- `NewUserClient_Impl`クライアントプロセスが dext に接続するときに呼び出されます。
+-`kIOUserAudioDriverUserClientType`これは HAL が要求するタイプであり、HAL に渡されます。`IOUserAudioDriver`基本クラスの作成。
+-`super::NewUserClient(...)`作成する`IOUserAudioDriverUserClient`、HAL 通信を処理するために AudioDriverKit によって使用されます。
+- 他の種類のウォーキング`IOService::Create`、デクストより`info.plist`エントリはカスタム ユーザー クライアントを作成します。
+-`OSDynamicCast(IOUserClient, user_client_service)`作成したサービスオブジェクトを次のように変換します。`IOUserClient`戻る。
+
+### ドライバーエントリ: IOUserAudioDriver を継承
+
+([05:58](https://developer.apple.com/videos/play/wwdc2021/10190/?time=358)) オーディオデクストへの入り口は`IOUserAudioDriver`サブクラス。それ自体はから継承します`IOService`、したがって、それを処理する必要があります`Start`、`Stop`、`NewUserClient`これらのサービス ライフサイクル メソッド。
+
+```cpp
+// SimpleAudioDriver example, subclass of IOUserAudioDriver
+
+class SimpleAudioDriver: public IOUserAudioDriver
+{
+public:
+	virtual bool init() override;
+	virtual void free() override;
+
+	virtual kern_return_t Start(IOService* provider) override;
+	virtual kern_return_t Stop(IOService* provider) override;
+	virtual kern_return_t NewUserClient(uint32_t in_type,
+										 IOUserClient** out_user_client) override;
+
+	virtual kern_return_t StartDevice(IOUserAudioObjectID in_object_id,
+									   IOUserAudioStartStopFlags in_flags) override;
+
+	virtual kern_return_t StopDevice(IOUserAudioObjectID in_object_id,
+									  IOUserAudioStartStopFlags in_flags) override;
+```
+
+キーポイント:
+- `init()`そして`free()`ドライバー オブジェクト自体の初期化と解放を管理します。
+-`Start(IOService* provider)`dex の開始時に入力し、それを使用してセッションを作成します`SimpleAudioDevice`、次に使用します`AddObject`ドライバーに追加します。
+-`Stop(IOService* provider)`dext の停止時に入力され、デバイス関連のリソースを解放するために使用されます。
+-`NewUserClient(...)`HALユーザークライアントとカスタムユーザークライアントの接続入口を担当します。
+-`StartDevice(...)`そして`StopDevice(...)`HAL がオーディオ デバイスの IO を開始および停止するときに呼び出されます。
+
+### デバイス、ストリーム、オーディオ形式を作成する
+
+（[07:04](https://developer.apple.com/videos/play/wwdc2021/10190/?time=424)）`IOUserAudioDevice`オーディオデバイスを表します。装置の下に吊るす`IOUserAudioStream`。ストリームの使用`IOMemoryDescriptor`オーディオ IO を行うために、このメモリは CoreAudio HAL にマッピングされます。
+
+セッションの例では、入力ストリームを作成します。実際のハードウェア ドライバでは、Apple はこのメモリをハードウェア DMA で使用されるのと同じ IO メモリにすることを推奨しています。
+
+```cpp
+// SimpleAudioDevice::init, set device sample rates and create IOUserAudioStream object
+...
+    SetAvailableSampleRates(sample_rates, 2);
+    SetSampleRate(kSampleRate_1);
+
+    //	Create the IOBufferMemoryDescriptor ring buffer for the input stream
+    OSSharedPtr<IOBufferMemoryDescriptor> io_ring_buffer;
+    const auto buffer_size_bytes = static_cast<uint32_t>(in_zero_timestamp_period *
+        sizeof(uint16_t) * input_channels_per_frame);
+    IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, buffer_size_bytes, 0,
+       io_ring_buffer.attach());
+
+    //	Create input stream object and pass in the IO ring buffer memory descriptor
+    ivars->m_input_stream = IOUserAudioStream::Create(in_driver,
+                                                      IOUserAudioStreamDirection::Input,
+                                                      io_ring_buffer.get());
+...
+```
+
+キーポイント:
+- `SetAvailableSampleRates(sample_rates, 2)`デバイスがサポートするサンプルレートのリストを宣言します。
+-`SetSampleRate(kSampleRate_1)`現在のサンプリング レートを設定します。
+-`IOBufferMemoryDescriptor::Create(...)`入力ストリームで使用されるリング バッファを作成します。
+-`buffer_size_bytes`ゼロのタイムスタンプ期間、16 ビットのサンプル サイズ、および入力チャネルの数に基づいて計算されます。
+-`IOUserAudioStream::Create(...)`入力方向にオーディオ ストリームを作成し、ストリームにメモリ記述子を与えます。
+
+([08:19](https://developer.apple.com/videos/play/wwdc2021/10190/?time=499)) ストリームは作成直後には機能しません。また、サポートする形式のリストを宣言し、現在の形式を設定し、ストリームをデバイスに追加します。
+
+```cpp
+// SimpleAudioDevice::init continued
+    IOUserAudioStreamBasicDescription input_stream_formats[2] = {
+            kSampleRate_1, IOUserAudioFormatID::LinearPCM,
+            static_cast<IOUserAudioFormatFlags>(
+                    IOUserAudioFormatFlags::FormatFlagIsSignedInteger |
+                    IOUserAudioFormatFlags::FormatFlagsNativeEndian),
+            static_cast<uint32_t>(sizeof(int16_t)*input_channels_per_frame),
+            1,
+            static_cast<uint32_t>(sizeof(int16_t)*input_channels_per_frame),
+            static_cast<uint32_t>(input_channels_per_frame),
+            16
+		    },
+        ...
+    }
+
+    ivars->m_input_stream->SetAvailableStreamFormats(input_stream_formats, 2);
+    ivars->m_input_stream_format = input_stream_formats[0];
+    ivars->m_input_stream->SetCurrentStreamFormat(&ivars->m_input_stream_format);
+
+    error = AddStream(ivars->m_input_stream.get());
+```
+
+キーポイント:
+- `IOUserAudioStreamBasicDescription`ストリームの音声フォーマットについて説明します。
+-`IOUserAudioFormatID::LinearPCM`リニアPCMを表します。
+-`FormatFlagIsSignedInteger`サンプリングされた値が符号付き整数であることを示します。
+-`FormatFlagsNativeEndian`プラットフォームのネイティブ バイト オーダーを使用することを示します。
+-`SetAvailableStreamFormats(...)`ストリームがサポートするフォーマットのリストを登録します。
+-`SetCurrentStreamFormat(...)`現在の形式を設定します。
+-`AddStream(...)`HAL が認識できるようにストリームをデバイスに追加します。
+
+### ボリュームコントロールとカスタムプロパティ
+
+([08:50](https://developer.apple.com/videos/play/wwdc2021/10190/?time=530)) AudioDriverKit は、ボリューム コントロールをオーディオ オブジェクトとしてモデル化します。例えば`IOUserAudioLevelControl`初期値が -6 dB、範囲が -96 dB ～ 0 dB の入力ボリューム コントロールを作成します。
+
+```cpp
+//	Create volume control object for the input stream.
+    ivars->m_input_volume_control = IOUserAudioLevelControl::Create(in_driver,
+        true, -6.0, {-96.0, 0.0},
+        IOUserAudioObjectPropertyElementMain,
+        IOUserAudioObjectPropertyScope::Input,
+        IOUserAudioClassID::VolumeControl);
+
+    //	Add volume control to device
+    error = AddControl(ivars->m_input_volume_control.get());
+```
+
+キーポイント:
+- `IOUserAudioLevelControl::Create(...)`ボリュームコントロールオブジェクトを作成します。
+- 2番目のパラメータ`true`このコントロールが構成可能であることを示します。
+-`-6.0`はボリュームの初期値です。
+-`{-96.0, 0.0}`はdB範囲です。
+-`IOUserAudioObjectPropertyScope::Input`このコントロールが入力スコープに作用することを示します。
+-`AddControl(...)`デバイスにコントロールを追加します。
+
+([09:22](https://developer.apple.com/videos/play/wwdc2021/10190/?time=562))`IOUserAudioObject`すべてにカスタム属性を含めることができます。カスタム プロパティには、セレクター、スコープ、要素を含むプロパティ アドレスが必要です。
+
+```cpp
+// SimpleAudioDevice::init, Create custom property
+
+IOUserAudioObjectPropertyAddress prop_addr = {
+    kSimpleAudioDriverCustomPropertySelector,
+    IOUserAudioObjectPropertyScope::Global,
+    IOUserAudioObjectPropertyElementMain
+};
+
+custom_property = IOUserAudioCustomProperty::Create(in_driver, prop_addr, true,
+    IOUserAudioCustomPropertyDataType::String,
+    IOUserAudioCustomPropertyDataType::String);
+
+qualifier = OSSharedPtr(
+    OSString::withCString(kSimpleAudioDriverCustomPropertyQualifier0), OSNoRetain);
+data = OSSharedPtr(
+    OSString::withCString(kSimpleAudioDriverCustomPropertyDataValue0), OSNoRetain);
+custom_property->SetQualifierAndDataValue(qualifier.get(), data.get());
+
+AddCustomProperty(custom_property.get());
+```
+
+キーポイント:
+- `IOUserAudioObjectPropertyAddress`属性アドレスを定義します。
+-`kSimpleAudioDriverCustomPropertySelector`カスタムセレクターです。
+-`IOUserAudioObjectPropertyScope::Global`グローバルスコープを表します。
+-`IOUserAudioCustomProperty::Create(...)`カスタム プロパティ オブジェクトを作成します。
+- 二`IOUserAudioCustomPropertyDataType::String`修飾子の種類とデータ値をそれぞれ指定します。
+-`SetQualifierAndDataValue(...)`修飾子とデータ値を書き込みます。
+-`AddCustomProperty(...)`プロパティをデバイスにアタッチします。
+
+### IO を開始し、ストリーム メモリをマップする
+
+([11:18](https://developer.apple.com/videos/play/wwdc2021/10190/?time=678)) HAL がデバイス IO を実行したい場合、ドライバーはデバイスの`StartIO`。実際のハードウェア ドライバーはここでハードウェア IO を開始する必要があります。この例にはハードウェアがないため、タイマーとアクションを使用して割り込みと DMA をシミュレートします。
+
+```cpp
+// StartIO
+kern_return_t SimpleAudioDevice::StartIO(IOUserAudioStartStopFlags in_flags)
+{
+    __block kern_return_t error = kIOReturnSuccess;
+    __block OSSharedPtr<IOMemoryDescriptor> input_iomd;
+    ivars->m_work_queue->DispatchSync(^(){
+		//	Tell IOUserAudioObject base class to start IO for the device
+        error = super::StartIO(in_flags);
+        if (error == kIOReturnSuccess)
+        {
+            // Get stream IOMemoryDescriptor, create mapping and store to ivars
+            input_iomd = ivars->m_input_stream->GetIOMemoryDescriptor();
+            input_iomd->CreateMapping(0, 0, 0, 0, 0, ivars->m_input_memory_map.attach());
+
+            // Start timers to send timestamps and generate sine tone on the stream buffer
+            StartTimers();
+        }
+    });
+    return error;
+}
+```
+
+キーポイント:
+- `DispatchSync(...)`起動プロセスをワークキューに入れて同期的に実行します。
+-`super::StartIO(in_flags)`IO が開始されたことを基本クラスのデバイスに通知します。
+-`GetIOMemoryDescriptor()`入力ストリームのメモリ記述子を取得します。
+-`CreateMapping(...)`作成する`IOMemoryMap`、バッファのアドレス、長さ、オフセットは後で取得できます。
+-`StartTimers()`例のタイム ソースを開始して、ゼロのタイムスタンプを生成し、オーディオ データをテストします。
+
+### ゼロのタイムスタンプを更新します
+
+([11:57](https://developer.apple.com/videos/play/wwdc2021/10190/?time=717)) HAL では、IO を同期するためにサンプル時間とホスト時間のペアが必要です。`IOUserAudioClockDevice`供給`UpdateCurrentZeroTimestamp`そして`GetCurrentZeroTimestamp`、このペアのアトミックな更新と読み取り用。
+
+```cpp
+kern_return_t SimpleAudioDevice::StartTimers()
+{
+...
+	//	clear the device's timestamps
+	UpdateCurrentZeroTimestamp(0, 0);
+	auto current_time = mach_absolute_time();
+	auto wake_time = current_time + ivars->m_zts_host_ticks_per_buffer;
+
+	//	start the timer, the first time stamp will be taken when it goes off
+	ivars->m_zts_timer_event_source->WakeAtTime(kIOTimerClockMachAbsoluteTime,
+												 wake_time,
+												 0);
+	ivars->m_zts_timer_event_source->SetEnable(true);
+...
+}
+```
+
+キーポイント:
+- `UpdateCurrentZeroTimestamp(0, 0)`まず、デバイスの現在のタイムスタンプをクリアします。
+-`mach_absolute_time()`現在のホスト時間を読み取ります。
+-`m_zts_host_ticks_per_buffer`バッファに対応するホスト ティックを表します。
+-`WakeAtTime(...)`ゼロ タイムスタンプ タイマーの次回の起動をスケジュールします。
+-`SetEnable(true)`タイマーイベントソースを有効にします。
+
+([12:27](https://developer.apple.com/videos/play/wwdc2021/10190/?time=747)) タイマーがトリガーされた後、サンプルは現在のタイムスタンプを読み取り、サンプル時間とホスト時間をバッファー ステップ分進めてから、それらをデバイスに書き込みます。
+
+```cpp
+void SimpleAudioDevice::ZtsTimerOccurred_Impl(OSAction* action, uint64_t time)
+{
+...
+	GetCurrentZeroTimestamp(&current_sample_time, &current_host_time);
+	auto host_ticks_per_buffer = ivars->m_zts_host_ticks_per_buffer;
+	if (current_host_time != 0) {
+		current_sample_time += GetZeroTimestampPeriod();
+		current_host_time += host_ticks_per_buffer;
+	}
+	else {
+		current_sample_time = 0;
+		current_host_time = time;
+	}
+	// Update the device with the current timestamp
+	UpdateCurrentZeroTimestamp(current_sample_time, current_host_time);
+
+	//	set the timer to go off in one buffer
+	ivars->m_zts_timer_event_source->WakeAtTime(kIOTimerClockMachAbsoluteTime,
+												current_host_time + host_ticks_per_buffer, 0);
+}
+```
+
+キーポイント:
+- `GetCurrentZeroTimestamp(...)`最後のサンプル時間とホスト時間を読み取ります。
+-`current_host_time != 0`アンカー タイムスタンプがすでに存在することを示します。
+-`GetZeroTimestampPeriod()`毎回進むサンプル フレームの数を返します。
+- 初めて発動したとき、`time`ホストタイムアンカーとして使用されます。
+-`UpdateCurrentZeroTimestamp(...)`新しいペアリングをデバイスに書き込み、HAL が IO の実行と同期に使用します。
+- 最後の行は、タイマーを次のバッファ時点にスケジュールします。
+
+### 書き込み入力バッファ
+
+([13:03](https://developer.apple.com/videos/play/wwdc2021/10190/?time=783)) この例では、入力オーディオを正弦波でシミュレートします。実際のハードウェア ドライバーでは、このステップは通常、DMA によって書き込まれるオーディオ データに対応します。
+
+```cpp
+void SimpleAudioDevice::GenerateToneForInput(size_t in_frame_size)
+{
+	// Fill out the input buffer with a sine tone
+	if (ivars->m_input_memory_map)
+	{
+		//	Get the pointer to the IO buffer and use stream format information
+		//	to get buffer length
+		const auto& format = ivars->m_input_stream_format;
+		auto buffer_length = ivars->m_input_memory_map->GetLength() /
+            (format.mBytesPerFrame / format.mChannelsPerFrame);
+		auto num_samples = in_frame_size;
+		auto buffer = reinterpret_cast<int16_t*>(ivars->m_input_memory_map->GetAddress() +
+            ivars->m_input_memory_map->GetOffset());
+...
+}
+```
+
+キーポイント:
+- `ivars->m_input_memory_map`出席した場合は説明する`StartIO`メモリマップが作成されました。
+-`m_input_stream_format`現在のストリーム形式を提供します。
+-`GetLength()`マップされたメモリ長を返します。
+-`format.mBytesPerFrame / format.mChannelsPerFrame`1 つのサンプル内のバイト数を取得します。
+-`GetAddress() + GetOffset()`書き込み可能なバッファの開始アドレスを取得します。
+-`reinterpret_cast<int16_t*>`この例では、符号付き 16 ビット PCM 形式に対応します。
+
+([13:30](https://developer.apple.com/videos/play/wwdc2021/10190/?time=810)) バッファを書き込むとき、この例ではボリューム コントロールのスカラー値を読み取り、正弦波を乗算して、チャネル数に応じてリング バッファに書き込みます。
+
+```cpp
+void SimpleAudioDevice::GenerateToneForInput(size_t in_frame_size)
+{
+...
+	auto input_volume_level = ivars->m_input_volume_control->GetScalarValue();
+
+	for (size_t i = 0; i < num_samples; i++)
+	{
+		float float_value = input_volume_level *
+    sin(2.0 * M_PI * frequency *
+       static_cast<double>(ivars->m_tone_sample_index) / format.mSampleRate);
+
+		int16_t integer_value = FloatToInt16(float_value);
+		for (auto ch_index = 0; ch_index < format.mChannelsPerFrame; ch_index++)
+		{
+			auto buffer_index =
+                (format.mChannelsPerFrame * ivars->m_tone_sample_index + ch_index) %
+                buffer_length;
+			buffer[buffer_index] = integer_value;
+		}
+		ivars->m_tone_sample_index += 1;
+	}
+}
+```
+
+キーポイント:
+- `GetScalarValue()`入力ボリュームコントロールのゲインを読み取ります。
+-`sin(...)`現在のサンプル インデックスに対応する正弦波サンプルを生成します。
+-`FloatToInt16(float_value)`浮動小数点サンプルを 16 ビット整数サンプルに変換します。
+- 内側のループボタン`mChannelsPerFrame`各チャンネルに同じサンプル値を書き込みます。
+-`% buffer_length`リングバッファのラップアラウンドを処理します。
+-`m_tone_sample_index += 1`次のスポーン位置を進めます。
+
+### 構成変更: HAL が最初に IO を停止するようにします
+
+([14:02](https://developer.apple.com/videos/play/wwdc2021/10190/?time=842)) サンプリング レートまたはストリーム形式を変更したい場合、ドライバーはデバイスのステータスを直接変更することはできません。正しいプロセスは次のように呼び出すことです`RequestDeviceConfigurationChange`。
+
+HAL はリクエストを受信すると、構成変更が開始されることをリスナーに通知します。デバイスが IO を実行している場合、HAL はまず IO を停止し、古い状態をキャプチャしてから、ドライバーの`PerformDeviceConfigurationChange`。変更が完了すると、HAL は IO 関連のステータスを更新し、クライアントに通知し、必要に応じて IO を再開します。
+
+```cpp
+// IOUserAudioClockDevice.h and IOUserAudioDevice.h
+
+kern_return_t RequestDeviceConfigurationChange(uint64_t in_change_action,
+											    OSObject* in_change_info);
+
+virtual kern_return_t PerformDeviceConfigurationChange(uint64_t in_change_action,
+											            OSObject* in_change_info);
+
+virtual kern_return_t AbortDeviceConfigurationChange(uint64_t change_action,
+													  OSObject* in_change_info);
+```
+
+キーポイント:
+- `RequestDeviceConfigurationChange(...)`構成変更リクエストを開始します。
+-`in_change_action`変更の種類を識別します。
+-`in_change_info`どれでも構いません`OSObject`、変更コンテキストを渡すために使用されます。
+-`PerformDeviceConfigurationChange(...)`デバイスステータスの変更を実際に許可する場所です。
+-`AbortDeviceConfigurationChange(...)`構成の変更を中止するために使用されます。
+
+([15:32](https://developer.apple.com/videos/play/wwdc2021/10190/?time=932)) この例では、カスタム ユーザー クライアント コマンドを使用して、ハードウェアのボトムアップ構成変更をシミュレートし、サンプリング レートの切り替えを要求します。
+
+```cpp
+kern_return_t SimpleAudioDriver::HandleTestConfigChange()
+{
+	auto change_info = OSSharedPtr(OSString::withCString("Toggle Sample Rate"), OSNoRetain);
+	return ivars->m_simple_audio_device->RequestDeviceConfigurationChange(
+        k_custom_config_change_action, change_info.get());
+}
+
+class SimpleAudioDevice: public IOUserAudioDevice
+{
+...
+	virtual kern_return_t PerformDeviceConfigurationChange(uint64_t change_action,
+												    OSObject* in_change_info) final LOCALONLY;
+}
+```
+
+キーポイント:
+- `OSString::withCString("Toggle Sample Rate")`変更の説明を作成します。
+-`OSSharedPtr(..., OSNoRetain)`これを管理してください`OSString`。
+- `RequestDeviceConfigurationChange(...)`カスタムアクションを与え、デバイスに情報を変更します。
+-`PerformDeviceConfigurationChange(...)`デバイスのサブクラスでオーバーライドする必要があります。
+
+([16:05](https://developer.apple.com/videos/play/wwdc2021/10190/?time=965)) 変更を実行すると、サンプルは現在のサンプル レートを読み取り、2 つのサンプル レートを切り替えて、サンプル レートが変更されたことをストリーム デバイスに通知します。
+
+```cpp
+// In SimpleAudioDevice::PerformDeviceConfigurationChange
+	kern_return_t ret = kIOReturnSuccess;
+	switch (change_action) {
+		case k_custom_config_change_action: {
+			if (in_change_info)	{
+				auto change_info_string = OSDynamicCast(OSString, in_change_info);
+				DebugMsg("%s", change_info_string->getCStringNoCopy());
+			}
+
+			double rate_to_set = static_cast<uint64_t>(GetSampleRate()) !=
+                static_cast<uint64_t>(kSampleRate_1) ? kSampleRate_1 : kSampleRate_2;
+			ret = SetSampleRate(rate_to_set);
+			if (ret == kIOReturnSuccess) {
+				// Update stream formats with the new rate
+				ret = ivars->m_input_stream->DeviceSampleRateChanged(rate_to_set);
+			}
+		}
+			break;
+
+		default:
+			ret = super::PerformDeviceConfigurationChange(change_action, in_change_info);
+			break;
+	}
+
+	// Update the cached format:
+	ivars->m_input_stream_format = ivars->m_input_stream->GetCurrentStreamFormat();
+
+	return ret;
+}
+```
+
+キーポイント:
+- `switch (change_action)`変更タイプごとに分散されます。
+-`OSDynamicCast(OSString, in_change_info)`リクエストフェーズ中に渡された説明文字列を取得します。
+-`GetSampleRate()`現在のデバイスのサンプリング レートを読み取ります。
+-`SetSampleRate(rate_to_set)`デバイスのサンプリング レートを変更します。
+-`DeviceSampleRateChanged(rate_to_set)`ストリームに現在のストリーム形式を更新させます。
+- 未処理のアクションは引き継がれます。`super::PerformDeviceConfigurationChange(...)`。
+-最後に使用してください`GetCurrentStreamFormat()`ドライバーのキャッシュ形式を更新します。
+
+## 重要なポイント
+
+1. **やるべきこと**: USB オーディオ インターフェイス用のコンパニオン コントロール アプリを作成します。
+   **実行する価値がある理由**: AudioDriverKit 拡張機能は Mac アプリにパッケージ化できます。ユーザーはアプリのインストール後にドライバーをロードでき、独立したインストーラーは必要ありません。
+   **開始方法**: を使用します`IOUserAudioDriver`dext エントリとして、デバイス制御コマンドをカスタム ユーザー クライアントに配置し、次を使用します。`RequestDeviceConfigurationChange`サンプルレートまたはストリーム形式を更新します。
+
+2. **やるべきこと**: 録音機器にハードウェア ゲインと入力レベルのコントロールを追加します。
+   **実行する価値がある理由**: セッション ショー`IOUserAudioLevelControl`、制御値を IO パスで使用して入力バッファを処理できます。
+   **開始方法**:`IOUserAudioDevice`初期化中に作成される`IOUserAudioLevelControl`、使用`AddControl`デバイスに追加されました。バッファの書き込みまたは読み取り時に呼び出されます`GetScalarValue()`ゲインを適用します。
+
+3. **対処方法**: マルチサンプリング レートのハードウェアに対して安定したサンプリング レートの切り替えを行います。
+   **実行する価値がある理由**: サンプリング レートの変更は IO ステータスに影響します。AudioDriverKit は、HAL と調整された構成変更プロセスを提供します。
+   **開始方法**: まずはお電話ください`RequestDeviceConfigurationChange`、存在する`PerformDeviceConfigurationChange`に実行されました`SetSampleRate`、そして stream を呼び出します`DeviceSampleRateChanged`。
+
+4. **内容**: ハードウェア製造元の診断情報をコントロール パネルに公開します。
+   **実行する価値がある理由**: AudioDriverKit はカスタム ユーザー クライアントをサポートし、`IOUserAudioCustomProperty`。
+   **開始方法**: を使用します`IOUserAudioCustomProperty::Create`デバイスのプロパティを定義します。アプリ側は、カスタマイズされたユーザー クライアントを介して dex と通信し、ハードウェアのステータスを読み取るか、テスト コマンドをトリガーします。
+
+5. **やるべきこと**: 低遅延入力デバイス用のタイムスタンプ検証ツールを構築します。
+   **実行する価値がある理由**: HAL はサンプル時間とホスト時間に依存して IO をペアリングおよび同期します。タイムスタンプがハードウェア クロックに近いと、録画の安定性に影響します。
+   **開始方法**: デバイス内のメンテナンス`UpdateCurrentZeroTimestamp`、記録`mach_absolute_time`サンプル時間との関係、およびコントロール アプリでのジッターやバッファー サイクルの変化を表示します。
+
+## 関連セッション
+
+- [AVFoundation の最新情報](/articles/wwdc2021-10146) — オーディオおよびビデオ アセットの再生、検査、オーサリングのための Apple のメディア フレームワークの更新について説明します。
+- [SoundAnalysis で組み込みのサウンド分類を検出する](/articles/wwdc2021-10036) — ハードウェア入力リンクと合わせて評価するのに適した、オーディオ入力から特定のサウンドを検出します。
+- [ShazamKit を探索する](/articles/wwdc2021-10044) — アプリに入力された後の音声データの処理に重点を置き、正確な音声マッチングを使用して認識エクスペリエンスを構築します。
+- [アプリを空間オーディオに没入させる](/articles/wwdc2021-10265) — 再生エクスペリエンスにおける空間オーディオの位置を理解し、オーディオ出力エクスペリエンスの上位レベルの視点を完了します。

@@ -1,0 +1,536 @@
+---
+title: "Swift concurrency: Update a sample app"
+description: "Discover Swift concurrency in action: follow along as we update an existing sample app. Get real-world experience with async/await, actors, and continuations. We'll also explore techniques for migrating existing code to Swift concurrency over time."
+date: "2021-06-06"
+tags: ["Swift", "Concurrency"]
+thumbnail: "/images/sessions/2021/10194.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10194/"
+sessionId: "wwdc2021-10194"
+year: "2021"
+relatedSessions:
+  - title: "Meet async/await in Swift"
+    code: "10132"
+    description: "Introducing the basic model and calling methods of Swift async/await."
+  - title: "Protect mutable state with Swift actors"
+    code: "10133"
+    description: "Explain how actors isolate mutable state and avoid data races."
+  - title: "Explore structured concurrency in Swift"
+    code: "10134"
+    description: "Explain task hierarchy, cancellation, and structured concurrency."
+  - title: "Discover concurrency in SwiftUI"
+    code: "10019"
+    description: "Use Swift concurrency for UI updates in SwiftUI applications."
+  - title: "Swift concurrency: Behind the scenes"
+    code: "10254"
+    description: "Explain the scheduling and performance design of the Swift concurrency runtime."
+---
+## Highlight
+
+> Apple uses the Coffee Tracker sample app to demonstrate the gradual migration of completion handlers, Dispatch queues and callback queues to async/await, actors and MainActor, allowing existing Swift projects to obtain clearer asynchronous code and safer state isolation.
+
+## Core Content
+
+Coffee Tracker is a watchOS sample app. The user records the coffee they drank that day, and the dial complication displays the current caffeine level.
+
+This app is small, but has concurrency issues common to real projects. The interface and model are updated in the main queue. Background I/O uses a dispatch queue. HealthKit's completion handler may return from any queue. The code surface is divided into three layers: UI, model, and HealthKit, but the runtime is scattered across multiple execution queues.
+
+In the past, when maintaining this kind of code, developers had to remember which queue each callback was executed in. To save HealthKit data, you need to write a completion handler. Reading HealthKit query results continues processing from the callback. Before updating the SwiftUI model, you must manually jump back to the main thread.
+
+Apple introduced async/await (asynchronous wait), actor (actor) and MainActor (main actor) in Swift 5.5. What this speech does is very specific: not rewriting the entire app, but just migrating along the data flow of Coffee Tracker, piece by piece.
+
+The first step is to replace the existing asynchronous API with`await`call. The second step is to wrap the callback API, which does not yet have an async version, with a continuation. The third step is to put the shared state into the actor. Finally mark the UI model as`@MainActor`, letting the compiler take care of main thread isolation.
+
+### Start migrating from the underlying function
+
+Saving caffeine samples is a good place to start. It is close to HealthKit, the call chain is short, and the scope of changes is small.
+
+Apple first`store.save`The completion handler version is replaced with the async version. The caller no longer passes in the closure, but directly`try await`Wait for the results. Error handling remains in the same function.
+
+### The old API can continue to exist
+
+Project migration usually cannot be completed in one go. The speech retains the completion handler entry, marks the old method as deprecated, and then creates it internally`Task`Call the new async method.
+
+This way, the old caller can still work. New code can directly use the async version.
+
+### actor turns concurrency boundaries into type boundaries
+
+HealthKitController is responsible for authorizing, saving and querying HealthKit. inside it has`isAuthorized`、`anchor`etc. status. Previously these states could be accessed simultaneously by different queues.
+
+Bundle`HealthKitController`Change to`actor`Finally, state access is isolated by actors. External calls to its methods require`await`. Concurrency boundaries are written on the type declaration and can be seen directly by the caller from the code.
+
+### Pass the UI model to MainActor
+
+CoffeeData is for SwiftUI`ObservableObject`, its`currentDrinks`Will drive the interface. This object should be updated on the main thread.
+
+Give the speech first`updateModel(newDrinks:deletedDrinks:)`mark`@MainActor`, and later put the entire`CoffeeData`The type is marked as`@MainActor`. This way, model updates and SwiftUI bindings remain within the main execution environment.
+
+## Detailed Content
+
+### 1. Replace HealthKit save callback with async/await
+
+([07:34](https://developer.apple.com/videos/play/wwdc2021/10194/?time=454)) HealthKit`HKHealthStore.save(_:)`With the async version, the saved sample can be written as sequential code. The success path and error path are in the same`do/catch`in processing.
+
+```swift
+do {
+    try await store.save(caffeineSample)
+    self.logger.debug("\(mgCaffeine) mg Drink saved to HealthKit")
+} catch {
+    self.logger.error("Unable to save \(caffeineSample) to the HealthKit store: \(error.localizedDescription)")
+}
+```
+
+Key points:
+- `do`Wraps asynchronous calls that may throw errors.
+-`try await store.save(caffeineSample)`Wait for HealthKit to finish saving the sample.
+-`self.logger.debug`Only executed after successful save.
+-`catch`Catch save failed errors.
+-`error.localizedDescription`Write logs to facilitate locating the cause of HealthKit save failure.
+
+([09:38](https://developer.apple.com/videos/play/wwdc2021/10194/?time=578)) The function itself also needs to become async. The caller knows by the function signature that it will hang.
+
+```swift
+public func save(drink: Drink) async {
+```
+
+Key points:
+- `public`Keep the original access level.
+-`func save(drink: Drink)`still receive a`Drink`。
+- `async`Indicates that the function can be called internally`await`, the caller must also use`await`。
+
+([10:15](https://developer.apple.com/videos/play/wwdc2021/10194/?time=615)) The synchronization context cannot be directly`await`, a task needs to be created.
+
+```swift
+Task { await self.healthKitController.save(drink: drink) }
+```
+
+Key points:
+- `Task { ... }`Create a new asynchronous task.
+-`await`Wait for the actor or async function to finish saving.
+-`self.healthKitController.save(drink: drink)`Reuse the newly migrated async method.
+
+### 2. Add async alternative entry to the old completion handler
+
+([12:13](https://developer.apple.com/videos/play/wwdc2021/10194/?time=733)) During the migration process, the old API can be retained. Apple's approach is to mark the old method as deprecated and call the new async method internally.
+
+```swift
+@available(*, deprecated, message: "Prefer async alternative instead")
+public func requestAuthorization(completionHandler: @escaping (Bool) -> Void ) {
+    Task {
+        let result = await requestAuthorization()
+        completionHandler(result)
+    }
+}
+```
+
+Key points:
+- `@available(*, deprecated, message: "Prefer async alternative instead")`Remind callers to use the async version instead.
+-`completionHandler`Keep the old calling form.
+-`Task`Allow async methods to be called inside synchronized methods.
+-`let result = await requestAuthorization()`Call the new authorization function.
+-`completionHandler(result)`Bridge the async result back to the old callback.
+
+([14:55](https://developer.apple.com/videos/play/wwdc2021/10194/?time=895)) The new authorization function returns directly`Bool`. The caller no longer has to read the result in the closure.
+
+```swift
+public func requestAuthorization() async -> Bool {
+    guard isAvailable else { return false }
+
+    do {
+        try await store.requestAuthorization(toShare: types, read: types)
+        self.isAuthorized = true
+        return true
+    } catch let error {
+        self.logger.error("An error occurred while requesting HealthKit Authorization: \(error.localizedDescription)")
+        return false
+    }
+}
+```
+
+Key points:
+- `async -> Bool`Indicates that the function is completed asynchronously and returns whether the authorization is successful.
+-`guard isAvailable else { return false }`First deal with the situation where the device does not support HealthKit.
+-`try await store.requestAuthorization(toShare: types, read: types)`Request HealthKit authorization.
+-`self.isAuthorized = true`Record the authorization success status.
+-`catch let error`Catching authorization errors.
+- Log and return on failure`false`。
+
+### 3. Use continuation to wrap HealthKit queries without async version
+
+（[17:43](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1063)）`HKAnchoredObjectQuery`Still using completion handler. Used here`withCheckedThrowingContinuation`Convert callback results into async return values.
+
+```swift
+private func queryHealthKit() async throws -> ([HKSample]?, [HKDeletedObject]?, HKQueryAnchor?) {
+    return try await withCheckedThrowingContinuation { continuation in
+        // Create a predicate that only returns samples created within the last 24 hours.
+        let endDate = Date()
+        let startDate = endDate.addingTimeInterval(-24.0 * 60.0 * 60.0)
+        let datePredicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: [.strictStartDate, .strictEndDate])
+
+        // Create the query.
+        let query = HKAnchoredObjectQuery(
+            type: caffeineType,
+            predicate: datePredicate,
+            anchor: anchor,
+            limit: HKObjectQueryNoLimit) { (_, samples, deletedSamples, newAnchor, error) in
+
+            // When the query ends, check for errors.
+            if let error = error {
+                continuation.resume(throwing: error)
+            } else {
+                continuation.resume(returning: (samples, deletedSamples, newAnchor))
+            }
+        }
+        store.execute(query)
+    }
+}
+```
+
+Key points:
+- `async throws`Indicates that the query will hang or may throw an error.
+-`withCheckedThrowingContinuation`Create an error-throwing continuation.
+-`endDate`and`startDate`Limit samples to the last 24 hours.
+-`HKQuery.predicateForSamples`Construct HealthKit query conditions.
+-`HKAnchoredObjectQuery`Query new samples, deleted samples and new anchors.
+-`if let error = error`Failed to process query.
+-`continuation.resume(throwing: error)`Handle callback errors to the async caller.
+-`continuation.resume(returning: (samples, deletedSamples, newAnchor))`Return query results.
+-`store.execute(query)`Start a HealthKit query.
+
+([20:17](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1217)) After packaging is completed, the upper-layer loading function can be written in order: query, update anchor, convert data, and update model.
+
+```swift
+@discardableResult
+public func loadNewDataFromHealthKit() async -> Bool {
+
+    guard isAvailable else {
+        logger.debug("HealthKit is not available on this device.")
+        return false
+    }
+
+    logger.debug("Loading data from HealthKit")
+
+    do {
+        let (samples, deletedSamples, newAnchor) = try await queryHealthKit()
+
+        // Update the anchor.
+        self.anchor = newAnchor
+
+        // Convert new caffeine samples into Drink instances.
+        let newDrinks: [Drink]
+        if let samples = samples {
+            newDrinks = self.drinksToAdd(from: samples)
+        } else {
+            newDrinks = []
+        }
+
+        // Create a set of UUIDs for any samples deleted from HealthKit.
+        let deletedDrinks = self.drinksToDelete(from: deletedSamples ?? [])
+
+        // Update the data on the main queue.
+        await MainActor.run {
+            // Update the model.
+            self.updateModel(newDrinks: newDrinks, deletedDrinks: deletedDrinks)
+        }
+        return true
+    } catch {
+        self.logger.error("An error occurred while querying for samples: \(error.localizedDescription)")
+        return false
+    }
+}
+```
+
+Key points:
+- `@discardableResult`Allows the caller to ignore the return value.
+-`guard isAvailable`Prevent devices that don't support HealthKit from continuing.
+-`try await queryHealthKit()`Wait for the newly wrapped query function to return.
+-`self.anchor = newAnchor`Save the position for the next incremental query.
+-`drinksToAdd(from:)`Convert HealthKit samples to`Drink`。
+- `drinksToDelete(from:)`Convert deleted records into UUID collections.
+-`await MainActor.run`Switch model updates to the main execution environment.
+-`catch`Log query failure and return`false`。
+
+### 4. Use @MainActor to fix the UI model update position
+
+（[25:09](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1509)）`updateModel(newDrinks:deletedDrinks:)`The data used for display is modified. mark it`@MainActor`Finally, the caller does not have to write by hand`MainActor.run`Wrap the entire update logic.
+
+```swift
+@MainActor
+private func updateModel(newDrinks: [Drink], deletedDrinks: Set<UUID>) {
+```
+
+Key points:
+- `@MainActor`Isolate this method to the main actor.
+-`private`Representation methods are only used within the type.
+-`newDrinks`It is a drink list converted from the new sample in HealthKit.
+-`deletedDrinks`Is a collection of UUIDs corresponding to deleted samples in HealthKit.
+
+([26:43](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1603)) Only one line is reserved at the calling point`await`。
+
+```swift
+await self.updateModel(newDrinks: newDrinks, deletedDrinks: deletedDrinks)
+```
+
+Key points:
+- `await`Indicates that calls may cross actor boundaries.
+-`self.updateModel`Will be executed on the main actor.
+- The call site no longer manages main queue switching directly.
+
+([50:03](https://developer.apple.com/videos/play/wwdc2021/10194/?time=3003)) When the entire UI model should be used on the main thread, the entire type can be marked.
+
+```swift
+@MainActor
+class CoffeeData: ObservableObject {
+```
+
+Key points:
+- `@MainActor`Act on the entire`CoffeeData`On type.
+-`CoffeeData`Instance method and property access defaults to the main actor.
+-`ObservableObject`Binds to SwiftUI, suitable for placement in the main actor.
+
+### 5. Change HealthKitController to actor
+
+（[29:24](https://developer.apple.com/videos/play/wwdc2021/10194/?time=1764)）`HealthKitController`Manage HealthKit related state. Change the type declaration to`actor`Finally, its internal mutable state is protected by actor serialization.
+
+```swift
+actor HealthKitController {
+```
+
+Key points:
+- `actor`Define an isolation-protected reference type.
+-`HealthKitController`Internal state cannot be accessed at will by external synchronization.
+- External calls to actor-isolated methods usually require`await`。
+
+([34:01](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2041)) The old completion handler method does not need to access the actor isolation state and can be marked as`nonisolated`. This way the old entry does not require the caller to wait across actors.
+
+```swift
+@available(*, deprecated, message: "Prefer async alternative instead")
+nonisolated public func requestAuthorization(completionHandler: @escaping (Bool) -> Void ) {
+    // ...
+}
+
+@available(*, deprecated, message: "Prefer async alternative instead")
+nonisolated public func loadNewDataFromHealthKit(completionHandler: @escaping (Bool) -> Void = { _ in }) {
+    // ...
+}
+```
+
+Key points:
+- `nonisolated`Indicates that this method is not isolated to actor instances.
+- Two old methods are still marked deprecated.
+- Can be created inside the method body`Task`, and then call the actor's async method.
+- This writing method serves for gradual migration and retains the old caller.
+
+### 6. Use CoffeeDataStore actor to isolate disk read and write status
+
+([36:20](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2180)) The speech then changed the disk reading and writing from`CoffeeData`Tear it out and put it in a private actor.
+
+```swift
+private actor CoffeeDataStore {
+
+}
+```
+
+Key points:
+- `private actor`Only used within the current file or scope.
+-`CoffeeDataStore`Specially responsible for loading and saving beverage data.
+- Disk I/O related state separated from UI model.
+
+（[38:37](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2317)）`savedValue`Move into the actor to determine whether the data has really changed.
+
+```swift
+private var savedValue: [Drink] = []
+```
+
+Key points:
+- `private var`Is the actor's internal mutable state.
+-`[Drink]`Saves the last drink list written to disk.
+- initial value`[]`Indicates that no drinks have been saved yet.
+
+([39:00](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2340)) The file path is also put in`CoffeeDataStore`, allowing storage details to be concentrated in one type.
+
+```swift
+private var dataURL: URL {
+    get throws {
+        try FileManager
+            .default
+            .url(for: .documentDirectory,
+                 in: .userDomainMask,
+                 appropriateFor: nil,
+                 create: false)
+            // Append the file name to the directory.
+            .appendingPathComponent("CoffeeTracker.plist")
+    }
+}
+```
+
+Key points:
+- `private var dataURL: URL`Calculate plist file path.
+-`get throws`Indicates that obtaining the path may throw an error.
+-`FileManager.default.url`Find the user documentation directory.
+-`.appendingPathComponent("CoffeeTracker.plist")`Append application data file name.
+
+([45:26](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2726)) After the saving logic is moved into the actor,`savedValue`and file writing are performed within the same isolation domain.
+
+```swift
+// Begin saving the drink data to disk.
+func save(_ currentDrinks: [Drink]) {
+
+    // Don't save the data if there haven't been any changes.
+    if currentDrinks == savedValue {
+        logger.debug("The drink list hasn't changed. No need to save.")
+        return
+    }
+
+    // Save as a binary plist file.
+    let encoder = PropertyListEncoder()
+    encoder.outputFormat = .binary
+
+    let data: Data
+
+    do {
+        // Encode the currentDrinks array.
+        data = try encoder.encode(currentDrinks)
+    } catch {
+        logger.error("An error occurred while encoding the data: \(error.localizedDescription)")
+        return
+    }
+
+    // Save the data to disk as a binary plist file.
+    do {
+        // Write the data to disk.
+        try data.write(to: self.dataURL, options: [.atomic])
+
+        // Update the saved value.
+        self.savedValue = currentDrinks
+
+        self.logger.debug("Saved!")
+    } catch {
+        self.logger.error("An error occurred while saving the data: \(error.localizedDescription)")
+    }
+}
+```
+
+Key points:
+- `func save(_ currentDrinks: [Drink])`Receives the list of drinks in the current UI model.
+-`if currentDrinks == savedValue`Avoid writing the same data repeatedly.
+-`PropertyListEncoder()`Create plist encoder.
+-`encoder.outputFormat = .binary`Specify a binary plist.
+-`try encoder.encode(currentDrinks)`Encode the array as`Data`。
+- `try data.write(to: self.dataURL, options: [.atomic])`Write to file atomically.
+-`self.savedValue = currentDrinks`The cache value is updated after the write is successful.
+- two`catch`Handle encoding failures and writing failures separately.
+
+### 7. Use async to initialize the loading data stream
+
+（[48:01](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2881)）`CoffeeData`The loading process can now be strung together: read disk data from the actor, clean up expired drinks, update the model, request HealthKit authorization, and then load new data.
+
+```swift
+func load() async {
+    var drinks = await store.load()
+
+    // Drop old drinks
+    drinks.removeOutdatedDrinks()
+
+    // Assign loaded drinks to model
+    currentDrinks = drinks
+
+    // Load new data from HealthKit.
+    let success = await self.healthKitController.requestAuthorization()
+    guard success else {
+        logger.debug("Unable to authorize HealthKit.")
+        return
+    }
+
+    await self.healthKitController.loadNewDataFromHealthKit()
+}
+```
+
+Key points:
+- `func load() async`Indicates that the loading process will hang.
+-`await store.load()`from`CoffeeDataStore`The actor reads disk data.
+-`drinks.removeOutdatedDrinks()`Delete expired drinks.
+-`currentDrinks = drinks`Update model data used by SwiftUI.
+-`await self.healthKitController.requestAuthorization()`Request HealthKit authorization.
+-`guard success else`Return early when authorization fails.
+-`await self.healthKitController.loadNewDataFromHealthKit()`Pull new HealthKit data.
+
+([49:08](https://developer.apple.com/videos/play/wwdc2021/10194/?time=2948)) Initializers cannot be directly marked as async. for speech`Task`Start loading.
+
+```swift
+Task { await load() }
+```
+
+Key points:
+- `Task`Start asynchronous work during initialization.
+-`await load()`Call the loading process just now.
+- After the UI model is created, data loading continues within the task.
+
+### 8. Replace completion handler in background refresh
+
+([52:18](https://developer.apple.com/videos/play/wwdc2021/10194/?time=3138)) watchOS background task processing function can also be created`Task`, using async methods to check for HealthKit updates. After the task is completed, call the system API to mark the completion of the background task.
+
+```swift
+// Check for updates from HealthKit.
+let model = CoffeeData.shared
+
+Task {
+    let success = await model.healthKitController.loadNewDataFromHealthKit()
+
+    if success {
+        // Schedule the next background update.
+        scheduleBackgroundRefreshTasks()
+        self.logger.debug("Background Task Completed Successfully!")
+    }
+
+    // Mark the task as ended, and request an updated snapshot, if necessary.
+    backgroundTask.setTaskCompletedWithSnapshot(success)
+}
+```
+
+Key points:
+- `let model = CoffeeData.shared`Get the shared UI model.
+-`Task`Start asynchronous background refresh logic.
+-`await model.healthKitController.loadNewDataFromHealthKit()`Pull new data from HealthKit.
+-`if success`Only schedule the next background refresh on success.
+-`scheduleBackgroundRefreshTasks()`Continue the watchOS background refresh rhythm.
+-`backgroundTask.setTaskCompletedWithSnapshot(success)`Notify the system that the task has ended.
+
+## Core Takeaways
+
+### 1. Perform progressive async/await migration for existing apps
+
+- **What to do**: Start with a low-level service close to the system framework and change the completion handler method to an async method.
+- **Why it's worth doing**: The speech showed that the old method can be retained, and the new method gradually replaces the call chain internally, without changing the entire project at once.
+- **How ​​to get started**: Pick one`save`、`load`or`requestAuthorization`This kind of small function is added`async`version; used internally by old completion handler methods`Task`Call the new version and add`@available(*, deprecated, message: "Prefer async alternative instead")`。
+
+### 2. The package does not yet have an async version of the callback API
+
+- **What to do**: Wrap the system APIs in the project that still rely on completion handlers into async functions.
+- **Why it’s worth doing**:`HKAnchoredObjectQuery`The example shows that continuation can turn the callback result into`try await`, the upper-level business logic will be smoother.
+- **How ​​to start**: Write a private helper, e.g.`queryHealthKit() async throws`;exist`withCheckedThrowingContinuation`Create the original query in; on success`resume(returning:)`, when failed`resume(throwing:)`。
+
+### 3. Put cache and file reading and writing into actors
+
+- **What**: Create a private actor for local caching, plist/JSON file reading and writing, and last saved values.
+- **Why it’s worth doing**:`CoffeeDataStore`Bundle`savedValue`and`dataURL`All are included in the same actor to reduce the background state in the UI model.
+- **How ​​to start**: New`private actor DataStore`;Bundle`savedValue`, file URL,`save(_:)`、`load()`Move in; use externally`await store.save(value)`and`await store.load()`call.
+
+### 4. Mark the SwiftUI model with @MainActor
+
+- **What to do**: Put the driver interface`ObservableObject`or its update method marked as`@MainActor`.
+- **Why it’s worth doing**: CoffeeData’s`currentDrinks`Will trigger SwiftUI update, put it after MainActor, the calling place will no longer be scattered`DispatchQueue.main.async`or`MainActor.run`.
+- **How ​​to start**: First let me modify it`@Published`attribute method addition`@MainActor`;If the entire model is UI-oriented, then`@MainActor`onto the class declaration.
+
+### 5. Rewrite the asynchronous link of the background task
+
+- **What to do**: Change watchOS background refresh, push processing, scheduled synchronization and other entrances to`Task`+ async service calls.
+- **Why it’s worth doing**: The ExtensionDelegate in the speech retains the system callback entry, uses the async method internally to load HealthKit data, and finally ends the background task according to the system requirements.
+- **How ​​to start**: Create in delegate method`Task`; in task`await`Call the model or service; schedule the next task after success; finally call the system's completion API.
+
+## Related Sessions
+
+- [Meet async/await in Swift](/articles/wwdc2021-10132) — Understand async functions, await calls, and error handling from the language level.
+- [Protect mutable state with Swift actors](/articles/wwdc2021-10133) — Explain how actor isolation protects mutable state.
+- [Explore structured concurrency in Swift](/articles/wwdc2021-10134) — Explain task structure, cancellation propagation and concurrent task organization.
+- [Discover concurrency in SwiftUI](/articles/wwdc2021-10019) — Demonstrates the use of Swift concurrent update interface in SwiftUI applications.
+- [Swift concurrency: Behind the scenes](/articles/wwdc2021-10254) — Learn how the Swift concurrency runtime schedules tasks.

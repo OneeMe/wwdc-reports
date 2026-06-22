@@ -1,0 +1,288 @@
+---
+title: "Explore new advances in App Intents"
+description: "explore all the new enhancements available in the app intents framework in this year"
+date: 2026-06-10
+tags: ["Machine Learning"]
+thumbnail: "/images/sessions/2025/275.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/275/"
+sessionId: "wwdc2025-275"
+year: "2025"
+relatedSessions:
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+  - title: "Get to know App Intents"
+    code: "244"
+    description: "learn how app intents power system experiences across platforms"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+---
+
+## Highlight
+
+> This year's App Intents update is broad, and the core change is Interactive Snippets. A Snippet used to show only a confirmation or a result. Now it can hold buttons and toggles. When the user taps one, the system runs an existing App Intent in the background and refreshes the Snippet view. You write no glue code for this — your existing Intents are reused as-is.
+
+---
+
+## Core content
+
+In the past, to expose an App's features in other parts of the system, a developer had to adapt code separately for Shortcuts, Spotlight, and Visual Intelligence. The Snippet was just a static result card: it confirmed a request or echoed a result, with no interaction. If the user wanted to act on the result, they had to open the main App. That extra "open the App again" step slowed down many flows.
+
+iOS 26 turns the Snippet into an Interactive Snippet. In the sample TravelTracking App, after finding the closest landmark, the Snippet shows a heart-shaped button. When the user taps the button, the system runs the App's existing `UpdateFavoritesIntent`, then re-renders the view through the same SnippetIntent. The heart turns from outline to filled. The whole interaction happens inside the Snippet; the App does not need to launch in the foreground. The system also wires up the refresh flow for you: each refresh re-fetches the AppEntity from your declared parameters, calls the SnippetIntent's `perform` method to redraw the view, and SwiftUI's `contentTransition` modifier handles the animation.
+
+Beyond Snippets, this Session also covers Visual Intelligence image search (IntentValueQuery + SemanticContentDescriptor), On-screen Entity (using NSUserActivity to hand the current view to ChatGPT), running Actions directly from Spotlight, UndoableIntent, IntentModes (declaring whether an Intent runs in the background or the foreground), the new ComputedProperty and DeferredProperty macros, and AppIntentsPackage, which lets Intents live in Swift Packages and static libraries.
+
+---
+
+## Detailed content
+
+**SnippetIntent is a new protocol**. It binds "what parameters render the view" and "how it renders" to the same type. The original Intent only needs to add `ShowsSnippetIntent` to its return type and pass a SnippetIntent instance to `.result(...)` ([04:08](https://developer.apple.com/videos/play/wwdc2025/275/?time=248)):
+
+```swift
+struct ClosestLandmarkIntent: AppIntent {
+    static let title: LocalizedStringResource = "Find Closest Landmark"
+
+    @Dependency var modelData: ModelData
+
+    func perform() async throws -> some ReturnsValue<LandmarkEntity> & ShowsSnippetIntent & ProvidesDialog {
+        let landmark = await self.findClosestLandmark()
+
+        return .result(
+            value: landmark,
+            dialog: IntentDialog(
+                full: "The closest landmark is \(landmark.name).",
+                supporting: "\(landmark.name) is located in \(landmark.continent)."
+            ),
+            snippetIntent: LandmarkSnippetIntent(landmark: landmark)
+        )
+    }
+}
+```
+
+Key points:
+
+- The return type composes three protocols: `ReturnsValue<LandmarkEntity>` (the return value), `ShowsSnippetIntent` (show a Snippet), and `ProvidesDialog` (also provide a spoken response).
+- `dialog` has two parts, `full` and `supporting`. The first is read out in full; the second is used in smaller display contexts.
+- The `snippetIntent` parameter tells the system: each time you refresh the Snippet, feed this LandmarkEntity back in.
+
+The SnippetIntent itself is a standalone AppIntent ([04:31](https://developer.apple.com/videos/play/wwdc2025/275/?time=271)):
+
+```swift
+struct LandmarkSnippetIntent: SnippetIntent {
+    static let title: LocalizedStringResource = "Landmark Snippet"
+
+    @Parameter var landmark: LandmarkEntity
+    @Dependency var modelData: ModelData
+
+    func perform() async throws -> some IntentResult & ShowsSnippetView {
+        let isFavorite = await modelData.isFavorite(landmark)
+
+        return .result(
+            view: LandmarkView(landmark: landmark, isFavorite: isFavorite)
+        )
+    }
+}
+```
+
+Key points:
+
+- Properties marked with `@Parameter` are filled in by the system on each refresh; AppEntity types go through Query again.
+- `@Dependency` injects runtime dependencies; it is not part of serialization.
+- `perform` should not modify App state, because the system may call it more than once in response to events such as Dark Mode changes.
+- Add `ShowsSnippetView` to the return type, and pass a SwiftUI view to `.result(view:)`.
+
+**Buttons inside a Snippet reuse existing Intents directly** ([05:45](https://developer.apple.com/videos/play/wwdc2025/275/?time=345)):
+
+```swift
+struct LandmarkView: View {
+    let landmark: LandmarkEntity
+    let isFavorite: Bool
+
+    var body: some View {
+        // ...
+        Button(intent: UpdateFavoritesIntent(landmark: landmark, isFavorite: !isFavorite)) { /* ... */ }
+
+        Button(intent: FindTicketsIntent(landmark: landmark)) { /* ... */ }
+        // ...
+    }
+}
+```
+
+Key points:
+
+- The `Button(intent:)` initializer first appeared in 2023 with interactive Widgets and is reused here.
+- After the user taps, the system runs the Intent, then re-renders the view through the SnippetIntent declared earlier.
+- The same API works for Toggle.
+
+**Confirmation Snippets use `requestConfirmation`** ([06:53](https://developer.apple.com/videos/play/wwdc2025/275/?time=413)):
+
+```swift
+struct FindTicketsIntent: AppIntent {
+
+    func perform() async throws -> some IntentResult & ShowsSnippetIntent {
+        let searchRequest = await searchEngine.createRequest(landmarkEntity: landmark)
+
+        // Present a snippet that allows people to change
+        // the number of tickets.
+        try await requestConfirmation(
+            actionName: .search,
+            snippetIntent: TicketRequestSnippetIntent(searchRequest: searchRequest)
+        )
+
+        // Resume searching...
+    }
+}
+```
+
+Key points:
+
+- `requestConfirmation` blocks `perform` until the user confirms or cancels. On cancel it throws — do not catch it; let it propagate.
+- `actionName: .search` decides the text on the confirmation button.
+- State the user changes inside the Snippet, like the ticket count, can be stored on an AppEntity (`SearchRequestEntity`); on the next refresh the latest value is read back through Query.
+
+**Use the static `reload()` to refresh a Snippet from your code** ([08:01](https://developer.apple.com/videos/play/wwdc2025/275/?time=481)):
+
+```swift
+func performRequest(request: SearchRequestEntity) async throws {
+    // Set to pending status...
+
+    TicketResultSnippetIntent.reload()
+
+    // Kick off search...
+
+    TicketResultSnippetIntent.reload()
+}
+```
+
+Key points: calling `reload()` makes the system rerun the full refresh flow for that SnippetIntent. It fits state changes such as "search starting" and "search finished".
+
+**Visual Intelligence image search hooks in through `IntentValueQuery`** ([09:24](https://developer.apple.com/videos/play/wwdc2025/275/?time=564)):
+
+```swift
+struct LandmarkIntentValueQuery: IntentValueQuery {
+
+    @Dependency var modelData: ModelData
+
+    func values(for input: SemanticContentDescriptor) async throws -> [LandmarkEntity] {
+        guard let pixelBuffer: CVReadOnlyPixelBuffer = input.pixelBuffer else {
+            return []
+        }
+
+        let landmarks = try await modelData.searchLandmarks(matching: pixelBuffer)
+
+        return landmarks
+    }
+}
+```
+
+Key points:
+
+- `SemanticContentDescriptor` carries the selected pixels. You can turn them into a CGImage with VideoToolbox or CoreImage.
+- The returned AppEntity must also conform to `OpenIntent`, or the App will not appear in the search panel.
+- Return only a few pages of results, and keep search time short.
+
+**Use `@UnionValue` for multiple result types** ([11:40](https://developer.apple.com/videos/play/wwdc2025/275/?time=700)):
+
+```swift
+@UnionValue
+enum VisualSearchResult {
+    case landmark(LandmarkEntity)
+    case collection(CollectionEntity)
+}
+
+struct LandmarkIntentValueQuery: IntentValueQuery {
+    func values(for input: SemanticContentDescriptor) async throws -> [VisualSearchResult] {
+        // ...
+    }
+}
+
+struct OpenLandmarkIntent: OpenIntent { /* ... */ }
+struct OpenCollectionIntent: OpenIntent { /* ... */ }
+```
+
+Key point: each Entity behind a case needs its own OpenIntent.
+
+**ComputedProperty and DeferredProperty are new macros** ([24:23](https://developer.apple.com/videos/play/wwdc2025/275/?time=1463) / [24:48](https://developer.apple.com/videos/play/wwdc2025/275/?time=1488)):
+
+```swift
+struct SettingsEntity: UniqueAppEntity {
+    @ComputedProperty
+    var defaultPlace: PlaceDescriptor {
+        UserDefaults.standard.defaultPlace
+    }
+
+    init() {}
+}
+
+struct LandmarkEntity: IndexedEntity {
+    @DeferredProperty
+    var crowdStatus: Int {
+        get async throws {
+            await modelData.getCrowdStatus(self)
+        }
+    }
+}
+```
+
+Key points:
+
+- `@ComputedProperty` fits properties computed on the fly from cheap sources such as UserDefaults or in-memory state, and avoids duplicate storage.
+- `@DeferredProperty` fits properties that involve async work, network calls, or slow IO; they are computed only when explicitly requested.
+- `IndexedEntity` skips DeferredProperty during Spotlight indexing, so slow work does not run on every index pass.
+
+**App Intents can now live in a Package** ([25:50](https://developer.apple.com/videos/play/wwdc2025/275/?time=1550)):
+
+```swift
+// Framework or dynamic library
+public struct LandmarksKitPackage: AppIntentsPackage { }
+
+// App target
+struct LandmarksPackage: AppIntentsPackage {
+    static var includedPackages: [any AppIntentsPackage.Type] {
+        [LandmarksKitPackage.self]
+    }
+}
+```
+
+Key point: declare an `AppIntentsPackage` inside a Framework or static library, then have the App's root Package list it in `includedPackages`. The Intents in that module are then discovered.
+
+---
+
+## Core takeaways
+
+**1. Turn the "result card" into a "control panel"**
+
+Why it matters: a Snippet used to be a read-only echo of the result. To do anything with it, the user had to open the App, which is costly. The Interactive Snippet puts "see the data" and "act on it next" in the same view, in line with Apple's principles of being lightweight, immediate, and glanceable.
+
+How to start: find the Intents in your App that return a Snippet, list the two or three actions a user takes most often after seeing a result (favorite, share, delete, search again), and drop the matching Intents into the SnippetView with `Button(intent:)`. No extra routing code needed.
+
+**2. Use `@DeferredProperty` to trim AppEntity initialization cost**
+
+Why it matters: Spotlight indexing, Shortcuts lists, and Snippet rendering all pull AppEntities. If a property needs a network call, initialization gets slow. DeferredProperty makes expensive fields compute only when an Intent really uses them.
+
+How to start: walk through every AppEntity field. Mark fields that need `await`, can fail, or depend on outside services as `@DeferredProperty`. Mark fields read straight from UserDefaults or memory as `@ComputedProperty`, and drop the duplicate storage.
+
+**3. Hook into Visual Intelligence image search so your App shows up in the system screenshot panel**
+
+Why it matters: in iOS 26, when a user highlights an image, the system search panel appears. Whether your App shows up there depends on whether you implement `IntentValueQuery`. Apps that hook in early get this new traffic source.
+
+How to start: write an `IntentValueQuery` that takes a `SemanticContentDescriptor` and feeds its `pixelBuffer` to your existing image search backend. Implement `OpenIntent` for the returned Entity type so tapping a result jumps back to the matching page in your App. If you have several result types, wrap them with `@UnionValue`.
+
+**4. Split App Intents into Swift Packages**
+
+Why it matters: in large projects or when several Apps share code, App Intents had to live in the main App target, which made reuse hard. `AppIntentsPackage` lets Frameworks and static libraries contribute Intents too.
+
+How to start: pull shared Entities, Queries, and Intents into a `LandmarksKitPackage`-style Package, and have the main App reference it explicitly through `includedPackages` in its own `AppIntentsPackage`.
+
+---
+
+## Related Sessions
+
+- [Design interactive snippets](/articles/wwdc2025-281) — companion design guidelines, with focus on Snippet height limits and the glanceable experience
+- [Get to know App Intents](/articles/wwdc2025-244) — App Intents framework primer, watch this first
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — combine Foundation Models with App Intents to give Intents AI capabilities
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — in-depth look at guided generation and tool calling in Foundation Models

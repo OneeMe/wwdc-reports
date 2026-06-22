@@ -1,0 +1,283 @@
+---
+title: "Detect and diagnose memory issues"
+description: "discover how you can understand and diagnose memory performance problems with xcode. we'll take you through the latest updates to xcode's tools, explore metrics, check out the memgraph collection feature in xctest, and learn how to catch regressions using a performance xctest."
+date: "2021-06-06"
+tags: ["Developer Tools", "Performance", "Memory"]
+thumbnail: "/images/sessions/2021/10180.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2021/10180/"
+sessionId: "wwdc2021-10180"
+year: "2021"
+relatedSessions:
+  - title: "Ultimate application performance survival guide"
+    code: "10181"
+    description: "Establish an application performance diagnostic process using system metrics and tools"
+  - title: "ARC in Swift: Basics and beyond"
+    code: "10216"
+    description: "Explaining Swift automatic reference counting and circular reference issues"
+  - title: "Symbolication: Beyond the basics"
+    code: "10211"
+    description: "Explain how debugging symbols can help locate performance and crash issues"
+  - title: "Getting started with Instruments"
+    code: "411"
+    description: "Learn to use Instruments to analyze application runtime behavior"
+---
+## Highlight
+
+> Xcode 13 adds ktrace and memgraph diagnostic collection to performance XCTest. Developers can get memory snapshots before and after testing when memory regression occurs, and use leaks, vmmap, heap, malloc_history to locate leaks, heap growth and fragmentation.
+
+## Core Content
+
+The user clicks "Save Recipe", the App downloads the data, and the interface displays "Saved". The functionality looks complete.
+
+After a few weeks, users of older devices started reporting that the app was coming back from the background and restarting frequently. The reason may be memory pressure. iOS memory is limited, and the system will terminate the background app to reclaim memory. The larger the memory footprint of the app, the smaller the chance of remaining in the memory.
+
+A common practice used by developers in the past was to manually capture the memory map after a problem occurred. This process is too late. When users encounter problems, it is difficult for developers to reproduce the same operation path, and it is also difficult to know which submission introduced growth.
+
+The solution given by Apple in this session is to put memory monitoring into XCTest. Before each new function is incorporated, use performance testing to record memory indicators and set a baseline. If the average value of subsequent runs exceeds the baseline, the test fails directly.
+
+Xcode 13 changes are in the diagnostic phase. After the performance test failed,`xcodebuild`Diagnostic files can be collected. Non-memory metrics are collected by ktrace, and memory metrics are collected by memgraph. memgraph records process address space, virtual memory areas, malloc blocks, and pointer relationships between them. Once developers get the pre/post snapshots of failed tests, they can continue to analyze where the growth comes from.
+
+### From "whether to return" to "why to return"
+
+Performance XCTest starts by answering the first question: is this run worse than the baseline.
+
+memgraph continues to answer the second question: Why does memory increase? The speech divided common problems into three categories: leaks, heap allocation regressions, and fragmentation. The corresponding tools are`leaks`、`vmmap`、`heap`、`malloc_history`。
+
+### For memory footprint, see dirty and compressed
+
+App's memory profile can be divided into three categories: dirty, compressed, and clean. Dirty memory is the memory written by the App, including heap allocations, decoded image buffers and frameworks. Compressed memory is dirty pages that have not been accessed recently and are compressed by the memory compressor. Clean memory is data that has not been written and can be paged out, such as memory mapped files on disk.
+
+The footprint discussed in this session refers to dirty memory plus compressed memory. Clean memory does not count towards the footprint here.
+
+## Detailed Content
+
+### 1. Measuring memory with performance XCTest ([04:52](https://developer.apple.com/videos/play/wwdc2021/10180/?time=292))
+
+Apple uses`measure(metrics:options:block:)`API, put the "Save Recipe" UI path into performance testing. The test goal is`XCUIApplication`memory usage.
+
+```swift
+// Monitor memory performance with XCTests
+
+func testSaveMeal() {
+    let app = XCUIApplication()
+
+    let options = XCTMeasureOptions()
+    options.invocationOptions = [.manuallyStart]
+
+    measure(metrics: [XCTMemoryMetric(application: app)],
+            options: options) {
+
+        app.launch()
+
+        startMeasuring()
+
+        app.cells.firstMatch.buttons["Save meal"].firstMatch.tap()
+
+             let savedButton = app.cells.firstMatch.buttons["Saved"].firstMatch
+        XCTAssertTrue(savedButton.waitForExistence(timeout: 30))
+    }
+}
+```
+
+Key points:
+- `let app = XCUIApplication()`Create the target app object in the UI test.
+-`let options = XCTMeasureOptions()`Create a performance measurement configuration.
+-`options.invocationOptions = [.manuallyStart]`Let the test manually control the starting point of the measurement.
+-`measure(metrics: [XCTMemoryMetric(application: app)], options: options)`Specifies the memory metrics to measure for the target application.
+-`app.launch()`The application is started, but measurements have not yet been taken into account.
+-`startMeasuring()`Start logging memory metrics to avoid interfering with the results of save operations during startup.
+-`app.cells.firstMatch.buttons["Save meal"].firstMatch.tap()`Perform user action: Click the Save button.
+-`let savedButton = app.cells.firstMatch.buttons["Saved"].firstMatch`Find the UI state after saving.
+-`XCTAssertTrue(savedButton.waitForExistence(timeout: 30))`Wait up to 30 seconds for the download and save to complete.
+
+Xcode displays the measurements for each iteration and calculates the average. Developers can set a certain average value as baseline. Subsequent averages exceed baseline and the test fails with regression.
+
+### 2. Collect ktrace and memgraph ([07:49](https://developer.apple.com/videos/play/wwdc2021/10180/?time=469))
+
+Xcode 13 adds performance test diagnostic collection. The command line entry is`xcodebuild`of`enablePerformanceTestsDiagnostics` flag。
+
+```bash
+xcodebuild test -enablePerformanceTestsDiagnostics YES
+```
+
+Key points:
+- `xcodebuild test`Run tests from the command line, suitable for putting into CI.
+-`-enablePerformanceTestsDiagnostics YES`Enable performance test diagnostic collection.
+- Non-memory indicators collect ktrace files, which can be opened for analysis using Instruments.
+- Memory metrics are collected in memgraph files, which can be analyzed with Xcode visual debugger and command line tools.
+
+After the test is completed, the console output will indicate whether the test failed, whether it failed because of regression, how much the current average is worse than the baseline, and`xcresult`The path to the bundle. Open`xcresult`Afterwards, the attached memgraph can be found at the bottom of the test log.
+
+XCTest will append an additional iteration to enable malloc stack logging. The memory test will get two memgraphs:`pre`is a snapshot at the beginning of the measurement,`post`is a snapshot at the end of the measurement. They are used to analyze memory growth within an iteration.
+
+### 3. Check for leaks first ([12:17](https://developer.apple.com/videos/play/wwdc2021/10180/?time=737))
+
+Stefan suggested that after getting the memgraph of the failed test, check for leaks first. A leak occurs when a process allocates an object, then loses all references and the memory is not released. A common reason in Swift is retain cycle (strong reference cycle).
+
+```bash
+leaks post.memgraph
+```
+
+Key points:
+- `leaks`Is a command line tool for checking leaks.
+-`post.memgraph`is the memory snapshot at the end of the measurement.
+- The output shows the number of leaks and the number of bytes leaked.
+- The object graph in the output can hint at reference relationships between leaked objects.
+- Appear`ROOT CYCLE`When, the problem is retain cycle.
+- Because XCTest automatically enables malloc stack logging, the output also contains the allocation call stack of the leaked object.
+
+In the Meal Planner example in the speech,`leaks`Showing 4 leaks totaling 240 bytes. The object graph contains`ROOT CYCLE`, the symbol shows that it is related to the meal plan and menu item objects. The call stack continues to point to the allocation location`populateMealData`。
+
+The fix comes from Swift ARC (Automatic Reference Counting): avoid two objects holding strong references to each other. If the business must retain the reverse relationship, change one of the references to a weak reference.
+
+```swift
+weak var mealPlan: MealPlan?
+```
+
+Key points:
+- `weak`Indicates that this property does not increase the reference count of the referenced object.
+-`MealPlan?`It needs to be an optional type because the weak reference object will automatically become`nil`.
+- After changing the back reference to a weak reference, the two objects no longer form a retain cycle through strong references.
+- ARC can release the object after the external reference disappears.
+
+### 4. Use vmmap and heap to find heap growth ([15:27](https://developer.apple.com/videos/play/wwdc2021/10180/?time=927))
+
+If there are no leaks, look at the heap next. Heap allocation regression means that the process allocates more objects on the heap than before, causing the footprint to grow.
+
+```bash
+vmmap -summary pre.memgraph
+vmmap -summary post.memgraph
+```
+
+Key points:
+- `vmmap -summary`Gives an overview of process memory usage.
+- View pre and post separately to see the footprint difference before and after a measurement.
+- Follow to`MALLOC_`regions at the beginning because these regions contain heap objects.
+- exist`vmmap`Outputting,`swapped`Corresponds to compressed memory on iOS.
+- Look when analyzing footprint`dirty size`and`swapped size`。
+
+In the example in the speech, the pre footprint is about 112 MB and the post footprint is about 125 MB, an increase of about 13 MB.`MALLOC_LARGE`The region holds approximately 13 MB of dirty memory, matching the regression size.
+
+Then use`heap -diffFrom`See what new heap objects are added in the post.
+
+```bash
+heap post.memgraph -diffFrom pre.memgraph
+```
+
+Key points:
+- `heap`Used to inspect heap objects in memgraph.
+-`post.memgraph`is the target snapshot to be analyzed.
+-`-diffFrom pre.memgraph`Only objects that exist in post but not in pre are displayed.
+- The output will show the number of objects by object class and the total number of bytes.
+- A lot`non-object`In Swift usually means raw malloced bytes.
+
+In the speech example,`heap -diffFrom`Approximately 13 MB of new objects are displayed, the main types of which are`non-object`. This means that we need to continue checking raw malloced bytes.
+
+### 5. Chase from address to allocation call stack ([17:23](https://developer.apple.com/videos/play/wwdc2021/10180/?time=1043))
+
+Confirm growth from`non-object`Finally, get the specific address first.
+
+```bash
+heap post.memgraph -addresses non-object -minSize 500000
+```
+
+Key points:
+- `-addresses`Outputs the address of the matching object.
+-`non-object`Filter only raw malloced bytes.
+-`-minSize 500000`Reduce noise by only looking at objects that are at least 500 KB.
+- Once an object of about 13 MB is found, it can be considered as the main suspect.
+
+With the address, you can see who referenced it and also where it was assigned.
+
+```bash
+leaks --traceTree 0xADDRESS post.memgraph
+leaks --referenceTree --groupByType post.memgraph
+malloc_history post.memgraph -fullStacks 0xADDRESS
+```
+
+Key points:
+- `leaks --traceTree 0xADDRESS post.memgraph`Display the object tree referencing this address.
+-`leaks --referenceTree --groupByType post.memgraph`Aggregates the reference tree downward from the root object, grouped by type.
+-`malloc_history post.memgraph -fullStacks 0xADDRESS`Displays the complete allocation call stack for the address object.
+-`malloc_history`Depends on malloc stack logging; the memgraph collected by XCTest is automatically enabled.
+
+During the speech,`leaks --traceTree`and`leaks --referenceTree`all point to`meal data`object.`malloc_history -fullStacks`point allocation location to`saveMeal`function. The problem is that the cell saves a large buffer, which is still held by class members after being written to disk. The repair method is to clear the reference after the writing is completed.
+
+```swift
+mealData = nil
+```
+
+Key points:
+- `mealData`Is a class member, the reference will continue to exist as long as the cell instance exists.
+- Continuing to hold the large buffer after writing to disk will allow each saved cell to retain memory.
+-`mealData = nil`After removing the last reference, Swift's`Data`The underlying buffer will be released.
+- This fix shortens the lifetime of large objects and reduces peak footprint.
+
+### 6. Check fragmentation ([24:51](https://developer.apple.com/videos/play/wwdc2021/10180/?time=1491))
+
+Fragmentation refers to dirty pages that are not fully used. iOS pages are fixed-size, unsplitable blocks. After a process writes part of a page, the entire page is considered dirty. The hole left after the object is released will become waste if it cannot accommodate subsequent allocations.
+
+```bash
+vmmap -summary post.memgraph
+```
+
+Key points:
+- the same`vmmap -summary`Fragments can be viewed.
+- Scroll to the malloc zones at the bottom of the output.
+- look`% FRAG`Column, which represents the proportion of waste due to fragmentation in each malloc zone.
+- Pay attention under normal circumstances`DefaultMallocZone`.
+- memgraph heap allocation comes in when malloc stack logging is enabled`MallocStackLoggingLiteZone`.
+- Apple's empirical target is a fragmentation rate of about 25% or less.
+
+The principle of reducing fragmentation is to allocate objects with similar life cycles closer together in memory. In this way, a larger continuous free area can be formed when released. The speech also mentioned autorelease pool: after the pool goes out of scope, the objects created in it will be released so that these temporary objects have a similar life cycle.
+
+```swift
+autoreleasepool {
+    // Allocate temporary objects that should be released together.
+}
+```
+
+Key points:
+- `autoreleasepool`Create a local release scope.
+- Temporary objects in the scope will be released when the pool ends.
+- Suitable for putting a batch of temporary objects with similar life cycles together.
+- For long-running processes or extensions, fragmentation needs to be checked regularly.
+
+## Core Takeaways
+
+### 1. Add memory regression testing to high-risk UI processes
+
+- **What to do**: Write UI performance tests for processes such as "save", "import", "export" and "download offline package".
+- **Why it's worth doing**: These processes make it easy to create large objects.`XCTMemoryMetric`You can fail before regressing into the main branch.
+- **How ​​to start**: Use`XCUIApplication`Open the target page with`XCTMeasureOptions`set up`.manuallyStart`, called before the key click`startMeasuring()`。
+
+### 2. Connect the memgraph collection to CI
+
+- **What**: CI is enabled when running performance tests`-enablePerformanceTestsDiagnostics YES`, put the failed test`xcresult`Save as build product.
+- **Why it's worth doing**: When a regression occurs, developers can directly download the pre/post memgraph without having to reproduce it again.
+- **How ​​to start**: In existing`xcodebuild test`Add flag after the command and archive it in CI`xcresult`path.
+
+### 3. Create a release checklist for large objects
+
+- **What to do**: Check image decoding buffer, download data, import file, temporary`Data`Whether to release after use.
+- **Why it's worth doing**: The 13 MB regression in the talk comes from buffers that are still held by class members after writing to disk.
+- **How ​​to start**: Use`heap -diffFrom`To find the growth type, use`malloc_history -fullStacks`Find the allocation function and clear the last reference at the end of the operation.
+
+### 4. Establish a fixed troubleshooting path for retain cycle
+
+- **What to do**: Put`leaks post.memgraph`As a first step in memory regression.
+- **Why it’s worth doing**:`ROOT CYCLE`Circular references can be pointed out directly, and malloc stack logging can bring out the object allocation location.
+- **How ​​to start**: Get the post memgraph and run it first`leaks`, enter Xcode from the app symbol in the output, check the bidirectional reference, and change the reverse relationship to`weak`。
+
+### 5. Check fragmentation rate for long-running extensions
+
+- **What to do**: Use regularly`vmmap -summary`Check the extension's malloc zone fragmentation rate.
+- **Why it's worth doing**: Long-running processes undergo a lot of allocations and deallocations, making it easier for the address space to become fragmented.
+- **How ​​to start**: Grab the memgraph and view it`% FRAG`, focus on`DefaultMallocZone`or when MSL is enabled`MallocStackLoggingLiteZone`, aiming for about 25% or less.
+
+## Related Sessions
+
+- [Ultimate application performance survival guide](/articles/wwdc2021-10181) — Establish an application performance diagnosis process from indicators to tools.
+- [ARC in Swift: Basics and beyond](/articles/wwdc2021-10216) — Understand Swift ARC, strong references, weak references, and circular references.
+- [Symbolication: Beyond the basics](/articles/wwdc2021-10211) — Learn to map addresses back to function names and source code locations to assist in analyzing the call stack.
+- [Getting started with Instruments](/articles/wwdc19-411) — Observe object lifecycles using tools such as Instruments’ Allocations.

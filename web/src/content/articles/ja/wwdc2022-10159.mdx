@@ -1,0 +1,172 @@
+---
+title: "Scale compute workloads across Apple GPUs"
+description: "Discover how you can create compute workloads that scale efficiently across Apple GPUs. Learn how to saturate the GPU by improving your work distribution, minimize GPU timeline gaps with effective pipelining and concurrent dispatches, and use atomic operations effectively. We'll also take you through the latest counters and tools in Xcode and Instruments that can help you optimize spatial and temporal memory access patterns."
+date: "2022-06-07"
+tags: ["Metal", "GPU", "Performance"]
+thumbnail: "/images/sessions/2022/10159.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10159/"
+sessionId: "wwdc2022-10159"
+year: "2022"
+relatedSessions:
+  - title: "Discover Metal 3"
+    code: "10007"
+    description: "Metal 3 の新機能の概要"
+  - title: "Program Metal in C++ with metal-cpp"
+    code: "10160"
+    description: "C++ で Metal コードを書く"
+  - title: "Transform your geometry with Metal mesh shaders"
+    code: "10162"
+    description: "メタル メッシュ シェーダ ジオメトリ処理パイプライン"
+---
+## ハイライト
+
+> Apple M1 GPU は、8 コア iPad から 64 コア Mac Studio まで同じアーキテクチャを共有していますが、コンピューティング ワークロードの線形スケーリング パフォーマンスを得るには、不均一な作業分散、アイドル状態の GPU タイムライン、およびアトミック操作の競合という 3 つの主要なボトルネックを解決する必要があります。
+
+## 主要内容
+
+Metal コンピューティング アプリケーションは M1 上で適切に実行されますが、M1 Ultra ではパフォーマンスが 30% 向上するだけであり、コア数を 2 倍にする効果には程遠いです。何が問題ですか?
+
+GPU ワークロードのスケーラビリティとは、GPU コアの数の増加に比例してパフォーマンスが向上できるかどうかを指します。理想的な状況は線形スケーリング、つまりコア数が 2 倍、パフォーマンスが 2 倍になることです。実際には、理想的ではない 3 つの状況が一般的です。パフォーマンスが頭打ちになる、GPU タイムラインに多数のアイドル ギャップが存在する、パフォーマンスの向上が不均一である (特定のコア数の範囲でボトルネックが発生する)。
+
+([00:59](https://developer.apple.com/videos/play/wwdc2022/10159/?time=59)) Apple M1 GPU ファミリは 8 コアから 64 コアに拡張され、同じ GPU アーキテクチャがすべての Metal 3 機能をサポートします。 Affinity Photo や DaVinci Resolve などのプロフェッショナル アプリは、すでに優れたクロスデバイス スケーラビリティを提供しています。
+
+ボトルネックは、計算制限と帯域幅制限の 2 つのカテゴリに分類されます。最適化プロセス中に、この 2 つを行ったり来たりすることができます。計算がボトルネックである場合は、負荷の一部をメモリ アクセスにオフロードしてみてください。そしてその逆も同様です。 MPS および MPSGraph フレームワークはすべてのハードウェアに対して最適化されていますが、カスタム コンピューティング カーネルは依然として手動チューニングが必要です。
+
+([04:37](https://developer.apple.com/videos/play/wwdc2022/10159/?time=277)) 作業の配布は、確認する必要がある最初のリンクです。ワークロードは 3D スレッドグループ グリッドに分散されます。スレッド グループは GPU コア全体に均等に分散されており、各スレッド グループは、容量は限られていますが、非常に高速なスレッド グループ メモリにアクセスできます。単一のスレッド グループはさらに SIMD グループに分割されます (幅は Apple GPU では 32 に固定されています)。スレッド グループあたり最大 1024 スレッド、スレッド グループ メモリの最大 32KB。
+
+スレッド グループの数が少なすぎると、GPU が飽和状態になることがあります。経験則として、良好な占有率を達成するには、各シェーダ コアに 1K ～ 2K の同時スレッドが必要です。 M1 (8 コア) には少なくとも 8K ～ 16K スレッドが必要で、M1 Max (32 コア) には 32K ～ 64K、M1 Ultra (64 コア) には 64K ～ 128K が必要です。
+
+([06:43](https://developer.apple.com/videos/play/wwdc2022/10159/?time=403)) もう 1 つのよくある問題は、スレッド グループが大きすぎることです。スレッド グループが大きすぎると、GPU コア間で負荷を均等に分散できなくなります。ベスト プラクティスは、ワークロードに適切にマップされる SIMD 幅の最小倍数 (32) を使用することです。
+
+## 詳細
+
+### GPU タイムラインのギャップを解消する
+
+([08:18](https://developer.apple.com/videos/play/wwdc2022/10159/?time=498)) GPU アイドル状態はパフォーマンスを最大に低下させる原因となります。 CPU/GPU のシリアル化により GPU の 50% のみを使用するワークロードを考えてみましょう。 CPU は作業の一部を実行し、GPU が完了するのを待ってから次の部分を実行します。 GPU コアが 2 倍になったとしても、全体的なパフォーマンスの向上には限界があります。コアを 2 倍にした後、GPU 部分は 2 倍高速になりますが、CPU 部分は変化せず、合計時間は 2 ユニットから 1.5 ユニットに短縮され、33% の改善にすぎません。
+
+根本的な原因は通常、`waitUntilCompleted`結果として CPU/GPU が同期されます。これを修正するにはいくつかの方法があります。
+
+**waitUntilCompleted の代わりに MTLSharedEvents を使用してください**
+
+```objc
+// 不推荐：阻塞 CPU 等待 GPU
+[commandBuffer waitUntilCompleted];
+
+// 推荐：使用共享事件减少同步开销
+id<MTLSharedEvent> sharedEvent = [device newSharedEvent];
+[commandBuffer encodeSignalEvent:sharedEvent value:1];
+// CPU 可以在需要时检查事件状态，不必阻塞
+```
+
+キーポイント:
+- `waitUntilCompleted`現在のスレッドをブロックし、GPU タイムラインにギャップが発生します
+- `MTLSharedEvents`オーバーヘッドが低くなり、より柔軟な同期戦略が可能になります
+- 可能であれば、CPU/GPU 同期ポイントを完全に削除します。
+
+**パイプライン化されたワークロード**
+
+([10:57](https://developer.apple.com/videos/play/wwdc2022/10159/?time=657)) アルゴリズムがデータの次のバッチを事前に知っている場合、共有イベントを待つ前に作業の次のバッチをエンコードできます。こうすることで、GPU が枯渇することがなくなり、常にやるべき作業が残ります。
+
+**同時ディスパッチを使用する**
+
+([12:54](https://developer.apple.com/videos/play/wwdc2022/10159/?time=774)) 複数の画像が処理されるシナリオでは、当初は 1 つずつ順番に処理されていました。使用`MTLDispatchTypeConcurrent`最後に、ドライバーはさまざまなピクチャの独立した作業の実行をインターリーブして、カーネル同期のオーバーヘッドを隠し、各カーネルの起動フェーズと終了フェーズを同時に埋めることができます。
+
+```objc
+// 创建支持并发分派的命令缓冲区
+id<MTLCommandBuffer> commandBuffer = [commandQueue commandBufferWithUnretainedReferences];
+
+// 使用 concurrent dispatch type
+// 需要手动插入 barrier 管理依赖关系
+```
+
+実験結果では、2 枚の画像のインターリーブ処理が 30%、3 枚の画像の並列処理が 70% 向上しました。
+
+### アトミック操作を最適化する
+
+([14:07](https://developer.apple.com/videos/play/wwdc2022/10159/?time=847)) グローバル アトミック操作 (グローバル アトミック操作) は GPU 全体で一貫しています。多数のスレッドが同じメモリ アドレスをめぐって競合すると、パフォーマンスが急激に低下し、コアの数が増えるほど、競合はより深刻になります。
+
+リダクション アルゴリズムを例として挙げます。すべてのバッファ内の値を合計します。
+
+**推奨されません**: 各スレッドはメイン メモリへのアトミックな追加を直接実行します。
+
+```metal
+// 性能差：所有线程竞争同一个全局地址
+kernel void badReduction(device float* buffer [[buffer(0)]],
+                         device atomic_float* result [[buffer(1)]],
+                         uint gid [[thread_position_in_grid]])
+{
+    atomic_fetch_add_explicit(result, buffer[gid], memory_order_relaxed);
+}
+```
+
+**推奨されるアプローチ**: 2 レベルの削減。最初はスレッド グループ内で SIMD 命令とスレッドグループ アトミック操作を使用し、最後にスレッド グループごとに 1 つのグローバル アトムのみを書き込みます。
+
+```metal
+kernel void goodReduction(device float* buffer [[buffer(0)]],
+                          device atomic_float* result [[buffer(1)]],
+                          uint lid [[thread_index_in_threadgroup]],
+                          uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup float sharedSum;
+    
+    // 第一步：SIMD-group 内归约，使用寄存器操作，不访问内存
+    float localSum = buffer[lid]; // 简化示例
+    localSum = simd_sum(localSum);
+    
+    // 第二步：每个 SIMD-group 的最后一个线程写入 threadgroup 内存
+    if (lid == 31) {
+        atomic_fetch_add_explicit(&sharedSum, localSum, memory_order_relaxed);
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // 第三步：每个线程组只写一个全局原子
+    if (lid == 0) {
+        atomic_fetch_add_explicit(result, sharedSum, memory_order_relaxed);
+    }
+}
+```
+
+キーポイント:
+- `simd_sum`SIMD グループ命令がメモリの往復なしにレジスタ間でデータを交換するのを待ちます。
+- スレッドグループのアトミック操作は、GPU コアごとに独立したスレッドグループ メモリによって処理され、コアの数に比例して拡張されます。
+- 最終ステップのグローバル アトミック操作の数はスレッド グループの数に等しく、各スレッド グループの完了時間は異なるため、当然のことながら競合が分散されます。
+
+### メモリアクセスモードの最適化
+
+([17:15](https://developer.apple.com/videos/play/wwdc2022/10159/?time=1035)) GPU タイムラインにギャップがない場合でも、スケーリング パフォーマンスは依然として最適ではない可能性があります。これは、GPU リミッターを確認する必要がある場合です。 Xcode と Metal System Trace は詳細なカウンターを提供します。
+
+メモリ アクセスが非効率であると、ラスト レベル キャッシュ (LLC) または MMU リミッターが高くなり、使用率が低下する可能性があります。 2 つの最適化方向:
+
+1. **データ レイアウトの再編成**: データ アクセスをよりローカライズする
+2. **アクセス モードの調整**: スレッド グループのアクセス モードをデータ レイアウトと一致させます。
+
+([18:12](https://developer.apple.com/videos/play/wwdc2022/10159/?time=1092)) メモリ内のデータは行に配置されているが、スレッド グループは正方形の 2D パターンでデータにアクセスすると仮定します。最初の SIMD グループによってアクセスされるデータはキャッシュ ラインにパックされますが、キャッシュ ライン スペースのほとんどが無駄になります。解決策の 1 つは、スレッド グループが各キャッシュ ラインを完全に利用できるように、データをストリップに再編成することです。
+
+もう 1 つのオプションは、スレッド グループを再構成することです。たとえば、正方形のスレッド グループをより細長い長方形のスレッド グループに置き換えると、アクセス パターンが行優先のデータ レイアウトに合わせられます。
+
+### ブレンダーサイクルのケース
+
+([20:08](https://developer.apple.com/videos/play/wwdc2022/10159/?time=1208)) Blender Cycles はソートを使用してスレッドの分岐を減らし、マテリアル タイプごとにレイ ヒットをソートします。これにより、スレッドの発散は減少しますが、空間メモリの発散が増加し、結果として MMU リミッターが高くなります。
+
+解決策: ソートする前にメモリ範囲をパーティション化します。ソート時に同じパーティション上のインデックスが混在しないようにしてください。このようにして、SIMD グループによってアクセスされるデータ範囲はパーティションに制限され、MMU の負荷が大幅に軽減されます。実験結果: トップ リミッターと LLC リミッターが約 20% 削減され、GPU 読み取り帯域幅が大幅に向上し、全体的なパフォーマンスが 10% ～ 30% 向上しました (シナリオに応じて)。
+
+## 重要ポイント
+
+**画像処理パイプラインを最適化**
+
+バッチ画像フィルタリング用のアプリをお持ちの場合は、それを使用しているかどうかを確認してください`waitUntilCompleted`CPU と GPU をシリアル化します。代わりに使用してください`MTLSharedEvents`パイプライン処理と組み合わせることで、GPU 使用率を 50% から 100% 近くまで高めることができ、M1 Ultra でほぼ線形のパフォーマンス拡張を実現します。入り口は、`MTLSharedEvent`そして`encodeSignalEvent:value:`。
+
+**GPU 上での並列パーティクル システムの実装**
+
+パーティクル シミュレーションでは通常、位置の更新、衝突検出、およびフレームごとのレンダリングが必要です。同時ディスパッチを使用して、さまざまなパーティクル グループの作業をずらして送信し、カーネル同期のオーバーヘッドを非表示にします。バリアは依存関係ポイントに手動で挿入されることに注意してください。主要な API は次のとおりです。`MTLDispatchTypeConcurrent`。
+
+**機械学習推論用に最適化されたメモリ レイアウト**
+
+アプリがカスタム ニューラル ネットワーク レイヤーに Metal を使用している場合は、メモリ アクセス パターンを確認してください。重みデータを行優先からスレッド グループ アクセスにより適した形式に再配置すると、LLC リミッターを大幅に削減できます。 Xcode 14 の新しいカウンター (MMU Limiter、MMU Utilization、MMU TLB Miss Rate) を使用して、最適化の効果を検証します。
+
+## 関連セッション
+
+- [Discover Metal 3](/articles/wwdc2022-10007) — Metal 3 の新機能の概要
+- [metal-cpp を使用した C++ での Metal のプログラム](/articles/wwdc2022-10160) — C++ で Metal コードを作成する
+- [メタル メッシュ シェーダーを使用してジオメトリを変換する](/articles/wwdc2022-10162) — メタル メッシュ シェーダーのジオメトリ処理パイプライン

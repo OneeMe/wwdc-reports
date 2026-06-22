@@ -1,0 +1,208 @@
+---
+title: "Secure your app: threat modeling and anti-patterns"
+description: "it's more important than ever to consider vulnerabilities and potential threats and recognize where you should apply safeguards in your app. understand how to identify potential risks through threat modeling and how to avoid common anti-patterns. learn coding techniques and how to take advantage of platform-supplied protections to help you mitigate risk and protect people while they're using your app."
+date: "2020-06-10"
+tags: ["WWDC 2020", "Security", "Threat Modeling", "Secure Coding"]
+thumbnail: "/images/sessions/2020/10189.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10189/"
+sessionId: "wwdc2020-10189"
+year: "2020"
+relatedSessions:
+  - title: "Build an Endpoint Security app"
+    code: "10159"
+    description: "Endpoint Security フレームワークを使用して macOS セキュリティ製品を構築し、システム イベント監視の観点を完成させます。"
+  - title: "Boost performance and security with modern networking"
+    code: "10111"
+    description: "セキュリティ監査にネットワーク境界を含めるために、IPv6、HTTP/2、TLS 1.3、および暗号化された DNS を確認します。"
+  - title: "Build trust through better privacy"
+    code: "10676"
+    description: "プライバシー原則とプラットフォーム機能に基づいて、ユーザーの信頼とデータ最小化の習慣を構築します。"
+  - title: "Explore logging in Swift"
+    code: "10168"
+    description: "ログによる機密データの漏洩を防ぐために、Swift 統合ログのプライバシー保護形式について学習します。"
+  - title: "One-tap account security upgrades"
+    code: "10666"
+    description: "Account Authentication Modification 拡張機能を使用して、ユーザーが Apple でサインインし、強力なパスワードにアップグレードできるようにします。"
+---
+## ハイライト
+
+> Apple は、パス トラバーサル、セッション状態、デシリアライゼーション ホワイトリスト、バッファ長、整数オーバーフローの 5 つのコード スニペットを使用して、アプリに入る各外部入力のチェックポイントに脅威モデリングが適用されることを示しています。
+
+## 主要内容
+
+セキュリティの問題が暗号化アルゴリズムのレベルでのみ発生することはほとんどありません。より一般的な状況は、アプリが外部入力を内部データとして扱うことです。リモート エンドから送信されたファイル名、別のデバイスから送信されたセッション メッセージ、CloudKit レコードのバイナリ フィールド、および逆シリアル化フェーズ中に宣言されたクラス コレクションはすべて、攻撃のエントリ ポイントになる可能性があります。
+
+このセッションの内容は、脅威モデリングをコードレベルの問題に分解します。開発者はまず、データがアプリに入る場所を見つけてから、次の 3 つの質問をします。この値によってファイル パスが変更されるかどうか、ステート マシンをプッシュできるかどうか、ランタイムによって作成されるべきではないオブジェクトが作成されるかどうか、メモリ操作に入る前に長さと数量が検証されるかどうかです。
+
+Apple が提供する保護方法も非常に簡単です。ファイル名は最初に次のように収束します`lastPathComponent`; セッション メッセージは、セッション、状態、送信者を同時に一致させる必要があります。動的クラスコレクションはプロトコル制約によって生成されます。固定サイズのメモリは、タイプと長さをチェックする前にコピーされます。量からバイトを計算するときに使用されます`os_mul_overflow`。これらのチェックは小規模に見えるかもしれませんが、攻撃者が信頼境界を越えることができるかどうかを決定します。
+
+## 詳細
+
+### 1. パス トラバーサル: 外部ファイル名を 1 つの安全なファイル名に統合する
+
+([16:34](https://developer.apple.com/videos/play/wwdc2020/10189/?time=994)) ファイル インポート機能でよくあるエラーは、リモート エンドからデータを転送することです。`name`ローカル ディレクトリの後ろに直接移動します。最初に採取した断片`lastPathComponent`、空の文字列を拒否します。`.`そして`..`、最後に一時ディレクトリに書き込みます。
+
+```swift
+func handleIncomingFile(_ incomingResourceURL: URL, with name: String, from fromID: String) {
+    guard
+         case let safeFileName = name.lastPathComponent,
+         safeFileName.count > 0,
+         safeFileName != "..", safeFileName != "." else { return }
+
+    let destinationFileURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                                 .appendingPathComponent(safeFileName)
+
+    // Copy the file into a temporary directory
+    try! FileManager.default.copyItem(at: incomingResourceURL, to: destinationFileURL)
+
+}
+```
+
+キーポイント:
+
+- `name.lastPathComponent`外部入力に含まれるディレクトリ階層を削除し、最後のパス コンポーネントのみを残します。
+-`safeFileName.count > 0`無意味な宛先パスが生成されるのを避けるために、空のファイル名を拒否します。
+-`safeFileName != ".."`そして`safeFileName != "."`現在のディレクトリと親ディレクトリの 2 つの特別なパス コンポーネントを拒否します。
+-`NSTemporaryDirectory()`インポートされたファイルを一時ディレクトリに制限してから渡します`appendingPathComponent`チェックされたファイル名を結合します。
+
+### 2. ステータス管理: リモート メッセージは現在のステータスと送信者と一致する必要があります。
+
+([22:26](https://developer.apple.com/videos/play/wwdc2020/10189/?time=1346)) セッション招待受諾メッセージはリモート エンドから送信されるため、それだけに依存することはできません。`sessionIdentifier`接続ステータスを「接続済み」に切り替えるだけです。このコードは、セッションが存在するかどうか、ステータスがまだ招待中かどうか、送信者が招待リストに含まれているかどうかもチェックします。
+
+```swift
+func handleSessionInviteAccepted(with message: RemoteMessage, from fromID: String) {
+    guard session = sessionsByIdentifier[message.sessionIdentifier],
+          session.state == .inviting,
+          session.invitedFromIdentifiers.contains(fromID) else { return }
+
+    session.state = .connected
+    session.setupSocket(to: fromID) { socket in
+        cameraController.send(to: socket)
+    }
+}
+```
+
+キーポイント:
+
+- `sessionsByIdentifier[message.sessionIdentifier]`まず、メッセージが既知のセッションを参照していることを確認します。
+-`session.state == .inviting`状態の移行を法的段階に制限し、古いメッセージは自由に状態を進めることができません。
+-`session.invitedFromIdentifiers.contains(fromID)`アクションを招待された送信者にバインドします。
+-`session.state = .connected`そして`setupSocket`3 つのチェックすべてに合格した後にのみ実行されます。
+
+### 3. 逆シリアル化のホワイトリスト: 動的コレクションも明示的なルールから生成する必要があります
+
+([30:56](https://developer.apple.com/videos/play/wwdc2020/10189/?time=1856)) 動的ビルドが必要です`allowedClasses`フラグメントは、任意のクラス名を受け入れる代わりに、ランタイム クラス リストを走査し、特定のプロトコルに準拠するクラスのみを収集します。結果のセットにはまだ境界があります。
+
+```objc
+NSSet *classesWhichConformToProtocol(Protocol *protocol) {
+    NSMutableSet *conformingClasses = [NSMutableSet set];
+
+    unsigned int classesCount = 0;
+    Class *classes = objc_copyClassList(&classesCount);
+    if (classes != NULL) {
+        for (unsigned int i = 0; i < classesCount; i++) {
+            if (class_conformsToProtocol(classes[i], protocol)) {
+                [conformingClasses addObject: classes[i]];
+            }
+        }
+        free(classes);
+    }
+    return conformingClasses;
+}
+```
+
+キーポイント:
+
+- `objc_copyClassList`現在のプロセス内のクラスのリストを Objective-C ランタイムから取得します。
+-`class_conformsToProtocol(classes[i], protocol)`ホワイトリストの条件です。プロトコルに準拠することが宣言されたクラスのみがコレクションに追加されます。
+-`free(classes)`補助チェック コードによって引き起こされるメモリ リークを回避するために、ランタイムによって返されたクラス配列を解放します。
+- 戻り値は`NSSet`、後続の安全な復号化プロセスで許可されるクラスのセットとして適しています。
+
+### 4. バッファ オーバーフロー: 固定長フィールドをコピーする前に型と長さを確認する
+
+([34:23](https://developer.apple.com/videos/play/wwdc2020/10189/?time=2063)) CloudKit レコードのフィールドは外部ストレージから取得されます。バンドル`NSData`固定サイズにコピーする`_uuid`これを行う前に、フラグメントはまずフィールドが存在すること、正しいタイプであること、およびターゲット バッファ サイズと等しい長さを持っていることを確認します。
+
+```objc
+@implementation
+- (BOOL)unpackTeaClubRecord:(CKRecord *)record {
+    ...
+    NSData *data = [record objectForKey:@"uuid"];
+    if (data == nil ||
+        ![data isKindOfClass:[NSData class]] ||
+        data.length != sizeof(_uuid)) {
+        return NO;
+    }
+    memcpy(&_uuid, data.bytes, data.length);
+    ...
+```
+
+キーポイント:
+
+- `data == nil`欠落しているフィールドは拒否され、後続のメモリ操作では空のオブジェクトが処理されません。
+-`isKindOfClass:[NSData class]`他のオブジェクトがバイナリ バッファとして扱われないように、フィールド タイプを確認してください。
+-`data.length != sizeof(_uuid)`入力長をターゲット バッファ サイズにバインドします。
+-`memcpy`長さチェック、検証されたデータからコピーされたバイト数の後にのみ実行されます。`data.length`。
+
+### 5. 整数オーバーフロー: 文字列を作成する前にバイト数を安全に計算します。
+
+([36:06](https://developer.apple.com/videos/play/wwdc2020/10189/?time=2166)) 文字列長フィールドもレコードから取得されます。フラグメントは直接使用されません`count * sizeof(unichar)`、ただし使用します`os_mul_overflow`バイト数を数えて置く`NSData.length`文字列を計算結果に合わせて初期化します。
+
+```objc
+@implementation
+- (BOOL)unpackTeaClubRecord:(CKRecord *)record {
+    ...
+    NSData *name = [record objectForKey:@"name"];
+    int32_t count = [[record objectForKey:@"nameCount"] unsignedIntegerValue];
+    int32_t byteCount = 0;
+    if (name == nil ||
+        ![name isKindOfClass:[NSData class]] ||
+        os_mul_overflow(count, sizeof(unichar), &byteCount) ||
+        name.length != byteCount) {
+        return NO;
+    }
+    _name = [[NSString alloc] initWithCharacters:name.bytes
+                                          length:count];
+    ...
+```
+
+キーポイント:
+
+- `name`そして`nameCount`これは同じレコードからのものであり、使用する前に外部入力として扱う必要があります。
+-`os_mul_overflow(count, sizeof(unichar), &byteCount)`乗算結果を入力します`byteCount`事前にオーバーフローを確認してください。
+-`name.length != byteCount`バイトバッファ長と文字数が一致していることを確認してください。
+-`initWithCharacters:length:`不完全なバッファが文字列として解釈されるのを避けるために、バイト数の検証後にのみ呼び出されます。
+
+## 重要ポイント
+
+1. **ファイルをセーフティ ネットにインポートします**
+対処法: AirDrop、ドキュメントピッカー、共有拡張機能、アプリ内のダウンロードタスクのファイル名をクリーニング機能に統一します。
+実行する価値がある理由: パス トラバーサル スニペットでは、外部ファイル名をパス スプライシングに入力する前に、ディレクトリ階層を削除し、特別なパス コンポーネントを拒否する必要があることを説明しています。
+開始方法: 1 つ書いてください`safeLocalFileName`ヘルパー、空の文字列をオーバーライド、`.`、`..`、`../../name`、絶対パスと長いファイル名をテストし、ファイルのコピーを一時ディレクトリまたはアプリのプライベート コンテナーに制限します。
+
+2. **リモート メッセージ ステート マシン**
+何をすべきか: コラボレーション、スクリーンキャスト、インスタント メッセージング、またはデバイス相互接続機能の状態テーブルを作成し、各リモート メッセージがトリガーできる状態遷移をリストします。
+実行する価値がある理由: セッションの例では、セッションが存在し、状態が`.inviting`、送信者は招待リストに含まれており、項目が 1 つ欠けていてもソケットを確立できません。
+開始方法: 置く`state`、`messageType`、`senderID`現在の権限はガード機能にマージされ、単体テストでは重複メッセージ、古いメッセージ、不明な送信者がカバーされます。
+
+3. **逆シリアル化によりクラス レジストリが可能**
+対処方法: デコードが許可されているすべてのモデル クラスを明示的なプロトコルまたはレジストリに配置し、呼び出しサイトがクラス名リストを一時的に結合できないようにします。
+実行する価値がある理由:`classesWhichConformToProtocol`フラグメントはプロトコルを使用して動的コレクションを制限し、柔軟性を維持しながら境界を監査可能にします。
+開始方法: 安全なデコードにのみ使用されるマーカー プロトコルを定義し、デコードする必要があるクラスにそのプロトコルに準拠していることを明示的に宣言させ、デコード エントリでそれを生成します。`NSSet`。
+
+4. **CloudKit フィールド解凍検証レイヤー**
+やるべきこと：のために`CKRecord`その中のバイナリ フィールド、カウント フィールド、文字列フィールドに対して統合されたアンパック関数を作成します。
+実行する価値がある理由: 両方の CloudKit スニペットが導入されています`memcpy`または`NSString`初期化前の確認`NSData`型、正確な長さ、および乗算オーバーフロー。
+開始方法: まず、UUID や名前などのフィールドを次のように変更します。`readUUID(record:key:)`、`readUTF16Name(record:dataKey:countKey:)`このような小さな機能を実行して、奇形記録のテストを完了します。
+
+5. **PR レベルの脅威モデリングのチェックリスト**
+動作: 外部入力を導入する各 PR は、ファイル パスを書き込むか、状態を進めるか、オブジェクトをデコードするか、メモリを長さごとにコピーするかという 4 つの質問に答えます。
+実行する価値がある理由: このセッションのコード スニペットは、セキュリティ レビューをいくつかの特定のエントリに圧縮しているため、「セキュリティ」一般について議論するよりも実装が簡単です。
+開始方法: これら 4 つのチェックを PR テンプレートに追加し、関連するコードに少なくとも 1 つの悪意のある入力テストが伴うことを要求します。
+
+## 関連セッション
+
+- [Endpoint Security アプリを構築する](/articles/wwdc2020-10159) — macOS でのシステム レベルのセキュリティ イベントの監視を引き続き見ていきます。これは、アプリの内部脅威モデリングと組み合わせて読むのに適しています。
+- [最新のネットワークでパフォーマンスとセキュリティを強化](/articles/wwdc2020-10111) - ネットワーク プロトコル、TLS 1.3、暗号化された DNS を同じセキュリティ境界チェック セットに組み込みます。
+- [プライバシーの向上による信頼の構築](/articles/wwdc2020-10676) - ユーザーの信頼とプライバシーの最小化の観点から、セキュリティ設計の製品層要件を満たします。
+- [Swift でのログ記録を探索する](/articles/wwdc2020-10168) — ログが情報漏洩の新たなエントリ ポイントになるのを避けるために、イベントやエラーをログに記録するときに機密データを保護する方法を学びます。
+- [ワンタップ アカウント セキュリティ アップグレード](/articles/wwdc2020-10666) — Apple でサインインおよび iCloud キーチェーンの強力なパスワード プロセスをカバーする、アカウント セキュリティ アップグレードへの直接のフォローアップ。

@@ -1,0 +1,188 @@
+---
+title: "Edit and play back HDR video with AVFoundation"
+description: "find out how you can support hdr editing and playback in your macos app, and how you can determine if a specific hardware configuration is eligible for hdr playback. we'll show you how to use avmutablevideocomposition with the built-in compositor and easily edit hdr content, explain how you can use core image's built-in image filters to create your own avmutablevideocomposition, and demonstrate how to create and use a custom compositor to enable hdr editing."
+date: 2020-06-10
+tags: ["AVFoundation", "HDR Video", "Core Image", "WWDC 2020"]
+thumbnail: "/images/sessions/2020/10009.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10009/"
+sessionId: "wwdc2020-10009"
+year: "2020"
+relatedSessions:
+  - title: "Export HDR media in your app with AVFoundation"
+    code: "10010"
+    description: "HDR メディアの書き出しフローを補足し、AVAssetExportSession、AVAssetWriter、プラットフォーム対応の制限を説明します。"
+  - title: "Optimize the Core Image pipeline for your video app"
+    code: "10008"
+    description: "動画 App における Core Image パイプライン、CIContext の再利用、Metal キュー、フィルタ性能を説明します。"
+  - title: "Build Metal-based Core Image kernels with Xcode"
+    code: "10021"
+    description: "Metal Shading Language で書いた Core Image kernel を App に統合する方法を示します。"
+  - title: "Decode ProRes with AVFoundation and VideoToolbox"
+    code: "10090"
+    description: "macOS で AVFoundation と VideoToolbox を使って ProRes コンテンツをデコード・表示するメディアパイプラインを説明します。"
+---
+
+## ハイライト
+
+> Apple は AVFoundation の AVVideoComposition に HDR 編集サポートを追加しました。内蔵 compositor と内蔵 Core Image フィルタは HDR を処理できますが、カスタム compositor は 10-bit ピクセル形式、HDR source frames、Wide Color source frames を宣言する必要があります。
+
+## 主要内容
+
+動画編集 App は以前、カット、結合、変形、ブレンドに主眼を置いていました。HDR になると問題はより細かくなります。ピクセルは SDR の 0〜1 範囲を超え得ます。一般的な配信形式は 10-bit を使い、トーンカーブは HLG や PQ かもしれません。SDR 前提の既存トランジション、フィルタ、カスタム合成器はハイライトを潰したり、フィルタ結果を負の値にしたりする可能性があります。
+
+このセッションはリスクを 1 つの中核オブジェクト `AVVideoComposition` に集約します。`AVComposition` は主にタイムライン上の素材配置を記述し、HDR はほとんど気にしません。`AVVideoComposition` は幾何変換、ブレンド、フィルタ処理を担い、入出力の色特性を知る必要があります。Apple の更新により、内蔵 compositor を使う場合、または `AVMutableVideoComposition(asset:applyingCIFiltersWithHandler:)` で内蔵 Core Image フィルタを呼ぶ場合、フレームワークが HDR フレームを処理してくれます。
+
+開発者がコードを変える必要があるのはカスタムロジックです。カスタム Metal Core Image kernel は拡張ダイナミックレンジを受け入れ、最大輝度が 1 だと仮定してはいけません。カスタム compositor は 10-bit 以上の pixel buffer をサポートし、HDR source frames を受け取り、Wide Color を処理できることを AVFoundation に伝える必要があります。再生側では `AVPlayer.eligibleForHDRPlayback` で現在のハードウェアとディスプレイが HDR プレビューに適しているか判断します。
+
+## 詳細
+
+### 1. 内蔵 compositor の HDR パス（[06:43](https://developer.apple.com/videos/play/wwdc2020/10009/?time=403)）
+
+一般的な編集ワークフローは `AVComposition` と `AVVideoComposition` を作り、`AVPlayerItem` でプレビューするか `AVAssetExportSession` で書き出します。セッションは HDR の鍵が `AVVideoComposition` にあると明言しています。ブレンドと変形を担当するためです。
+
+```swift
+let videoComposition = AVMutableVideoComposition()
+
+videoComposition.instructions = [videoCompositionInstruction]
+videoComposition.frameDuration = CMTimeMake(value: 1, timescale: 30)
+videoComposition.renderSize = assetSize
+```
+
+キーポイント:
+
+- `instructions` は各タイムライン区間でのビデオレイヤーのブレンドや変形を記述します。複数の instruction は重複せず、時間の空白も残せません。
+- `frameDuration` は合成出力のフレームレートを決めます。例は 1/30 秒です。
+- `renderSize` は出力画面サイズです。
+- このコードは `customVideoCompositorClass` を設定していないため、AVFoundation は内蔵 compositor を使います。transcript では、このパスの既存 App が HDR ビデオを入力すると、同じ instruction セットで HDR 出力が得られると説明しています。
+
+### 2. Core Image フィルタで AVVideoComposition を作る（[09:55](https://developer.apple.com/videos/play/wwdc2020/10009/?time=595)）
+
+2 番目のパスは単一ビデオレイヤーのフィルタに向いています。`AVMutableVideoComposition` は最初の有効なビデオトラックの現在フレームを handler に渡し、開発者は `request.sourceImage` を `CIFilter` に送り、`request.finish` で結果を返します。
+
+```swift
+let videoComposition =
+    AVMutableVideoComposition(asset: asset,
+    applyingCIFiltersWithHandler: {
+        (request: AVAsynchronousCIImageFilteringRequest) -> Void in
+
+        let ciFilter = CIFilter(name: "CIZoomBlur")
+
+        ciFilter!.setValue(request.sourceImage, forKey: kCIInputImageKey)
+
+        request.finish(with: ciFilter!.outputImage!, context: nil)
+    })
+```
+
+キーポイント:
+
+- `applyingCIFiltersWithHandler` は composition instruction の手書きを省き、フレームごとのフィルタ処理に集中できます。
+- `request.sourceImage` は現在の入力フレームで、transcript では `CIImage` に対応します。
+- `CIZoomBlur` は Core Image 内蔵フィルタです。セッションは内蔵 Core Image フィルタが HDR ソースを処理できると説明しています。
+- `request.finish(with:context:)` はフィルタ出力を AVFoundation に返し、その後も video composition パイプラインが処理します。
+
+### 3. カスタム Core Image kernel は拡張ダイナミックレンジを受け入れる（[10:57](https://developer.apple.com/videos/play/wwdc2020/10009/?time=657)）
+
+handler がカスタム Metal Core Image kernel を呼ぶ場合、コードは HDR フレームのピクセル範囲を理解する必要があります。セッションはハイライト検出 kernel を示します。RGB のいずれかが 1 を超えれば、そのピクセルを極めて明るい赤に塗ります。
+
+```metal
+#include <metal_stdlib>
+#include <CoreImage/CoreImage.h>
+using namespace metal;
+
+extern "C" float4 HDRHighlight(coreimage::sample_t s, coreimage::destination dest) {
+    if (s.r > 1.0 || s.g > 1.0 || s.b > 1.0)
+        return float4(2.0, 0.0, 0.0, 1.0);
+    else
+        return s;
+}
+```
+
+キーポイント:
+
+- `CoreImage/CoreImage.h` は Metal Core Image kernel に必要な型を導入します。
+- `coreimage::sample_t s` は入力ピクセルです。HDR コンテンツでは `s.r`、`s.g`、`s.b` が 1 より大きくなり得ます。
+- `float4(2.0, 0.0, 0.0, 1.0)` は SDR 白点を超える赤を意図的に出力し、HDR ハイライト領域をマークします。
+- セッションは続けて color inverter を反例に示します。SDR 向けに `1.0 - s.r` と書くと、HDR ピクセルが 1 より大きいとき結果は負になります。
+
+### 4. カスタム compositor は HDR 能力を宣言する（[13:58](https://developer.apple.com/videos/play/wwdc2020/10009/?time=838)）
+
+カスタム compositor は自由度が最も高く、複数ビデオレイヤーをブレンドし、各レイヤーに幾何変換とフィルタを適用できます。その代わり、フレームワークは HDR 対応を自動では仮定しません。開発者は実際の合成ロジックと能力宣言の両方を扱います。
+
+```swift
+class SampleCustomCompositor: NSObject, AVVideoCompositing {
+    var sourcePixelBufferAttributes: [String : Any]? =
+        [kCVPixelBufferPixelFormatTypeKey as String:
+            [kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange]]
+
+    var requiredPixelBufferAttributesForRenderContext: [String : Any] =
+        [kCVPixelBufferPixelFormatTypeKey as String:
+            [kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange]]
+
+    var supportsHDRSourceFrames = true
+    var supportsWideColorSourceFrames = true
+
+    func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
+        ...
+    }
+
+    func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {
+    }
+}
+```
+
+キーポイント:
+
+- `sourcePixelBufferAttributes` は compositor がサポートする入力 pixel buffer 形式を伝えます。
+- `requiredPixelBufferAttributesForRenderContext` は出力 render context に必要な形式を伝えます。
+- `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` は例の 10-bit 形式です。実プロジェクトでは実際にサポートする形式を列挙します。
+- `supportsHDRSourceFrames = true` は新フィールドです。未設定または `false` の場合、フレームワークは compositor に渡す前に HDR ソースを SDR に変換します。
+- `supportsWideColorSourceFrames = true` は HDR が Wide Color と伴うことが多いことを反映します。transcript では HDR を処理できる compositor は Wide Color も処理できると仮定すると説明しています。
+
+### 5. 色属性と再生適格性の確認（[17:49](https://developer.apple.com/videos/play/wwdc2020/10009/?time=1069)、[21:01](https://developer.apple.com/videos/play/wwdc2020/10009/?time=1261)）
+
+composition の色属性を指定しない場合、フレームワークは HLG、PQ、SDR の優先順で出力形式を選びます。HLG、PQ、SDR への固定出力には `colorPrimaries`、`colorTransferFunction`、`colorYCbCrMatrix` を明示設定します。プレビュー再生ではシステムが HDR を表示できるかも確認します。
+
+```swift
+extension AVPlayer {
+    @available(macOS 10.15, *)
+    open class var eligibleForHDRPlayback: Bool { get }
+}
+
+if AVPlayer.eligibleForHDRPlayback {
+    videoComposition.colorPrimaries = AVVideoColorPrimaries_ITU_R_2020
+    videoComposition.colorTransferFunction = AVVideoTransferFunction_ITU_R_2100_HLG
+    videoComposition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_2020
+}
+else {
+    videoComposition.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+    videoComposition.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
+    videoComposition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
+}
+```
+
+キーポイント:
+
+- `AVPlayer.eligibleForHDRPlayback` は class var で、`AVPlayer` インスタンスを作らずに問い合わせできます。
+- `true` はシステムが HDR ビデオを消費でき、内蔵または外付けディスプレイの少なくとも 1 台が HDR 表示できることを意味します。
+- HLG の例は `ITU_R_2020` color primaries、`ITU_R_2100_HLG` transfer function、`ITU_R_2020` YCbCr matrix を使います。
+- HDR 再生能力がない場合、例は composition の色属性を SDR に設定し、表示できない HDR プレビューに処理を費やさないようにします。
+- transcript はこの属性が再生能力のみを示すことも補足します。HDR を再生できないシステムでも HDR エクスポートパスは使える場合があります。
+
+## 重要ポイント
+
+- **HDR 編集プレビュー**: macOS 動画編集のプレビューウインドウを作る。**価値**: 内蔵 compositor は既存の `AVVideoComposition` instruction で HDR を扱えます。**始め方**: 既存の `AVMutableVideoComposition` 構造を維持し、色属性が SDR に固定されていないか確認します。
+
+- **HDR ハイライト診断フィルタ**: SDR 白点を超える領域を赤で示す診断フィルタを作る。**価値**: セッションの `HDRHighlight` kernel は `s.r > 1.0` などで HDR ハイライトを識別します。**始め方**: kernel を Metal Core Image ファイルに入れ、`applyingCIFiltersWithHandler` でプレビューに接続します。
+
+- **カスタム compositor の HDR 対応**: 多レイヤートランジションや PiP エディタに HDR 能力を追加する。**価値**: カスタム compositor は多層ブレンド、幾何変換、レイヤーごとのフィルタができます。**始め方**: まず 10-bit pixel buffer をサポートし、`supportsHDRSourceFrames` と `supportsWideColorSourceFrames` を設定します。
+
+- **HDR/SDR 自動プレビュー切替**: デバイス能力に応じて HDR または SDR プレビューを表示する。**価値**: `eligibleForHDRPlayback` は HDR 消費能力とディスプレイ条件の両方を確認します。**始め方**: 再生パスでこの class var を読み、true なら HLG 色属性、false なら `ITU_R_709_2` を設定します。
+
+- **共有用 SDR コピー**: 編集 App に「一般ディスプレイ向けエクスポート」オプションを提供する。**価値**: transcript は受信者に HDR 再生環境がないメール共有シナリオを示しています。**始め方**: そのエクスポートまたはプレビューパスで video composition の 3 つの色属性を SDR に設定します。
+
+## 関連セッション
+
+- [Export HDR media in your app with AVFoundation](/articles/wwdc2020-10010) — HDR コンテンツのエクスポートを続け、`AVAssetExportSession`、`AVAssetWriter`、対応形式、プラットフォーム制限を扱います。
+- [Optimize the Core Image pipeline for your video app](/articles/wwdc2020-10008) — 動画フィルタにおける `CIContext`、Metal キュー、`AVMutableVideoComposition` の性能実践を説明します。
+- [Build Metal-based Core Image kernels with Xcode](/articles/wwdc2020-10021) — `.ci.metal` ファイル、kernel 読み込み、Core Image カスタムフィルタ統合を深掘りします。
+- [Decode ProRes with AVFoundation and VideoToolbox](/articles/wwdc2020-10090) — macOS での AVFoundation デコード、VideoToolbox、Metal 表示パイプラインを補います。

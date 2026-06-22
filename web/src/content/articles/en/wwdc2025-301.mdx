@@ -1,0 +1,338 @@
+---
+title: "Deep dive into the Foundation Models framework"
+description: "level up with the foundation models framework. learn how guided generation works under the hood, and use guides, regexes, and generation schemas to get custom structured responses. we"
+date: 2026-06-10
+tags: ["Machine Learning"]
+thumbnail: "/images/sessions/2025/301.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/301/"
+sessionId: "wwdc2025-301"
+year: "2025"
+relatedSessions:
+  - title: "Bring advanced speech-to-text to your app with SpeechAnalyzer"
+    code: "277"
+    description: "discover the new speechanalyzer api for speech to text. we"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+  - title: "Develop for Shortcuts and Spotlight with App Intents"
+    code: "260"
+    description: "learn about how building app intents that make actions available and work best w"
+---
+
+## Highlight
+
+> Foundation Models uses constrained decoding to mask out candidates that violate the schema at the token level, so the on-device LLM emits output that parses straight into Swift types.
+
+---
+
+## Core content
+
+Getting an LLM to spit out structured data is a perennial pain. The usual fix is to describe the fields in the prompt and write a pile of parsing code — fragile, error-prone, and one wrong field name breaks everything. The session presenter Louis hit the same wall while building a pixel-art coffee shop game: the barista dialogue can stay free text, but once the NPC needs structured data — name, coffee order, level, an array of attributes — string concatenation in the prompt falls apart.
+
+Foundation Models answers with the `@Generable` macro. Tag a Swift struct or enum with the macro and the compiler emits the matching schema; at inference time the model walks that schema under constrained decoding — for every token the model produces, the framework masks out candidates that do not fit the schema, so the model can only pick from legal tokens ([09:21](https://developer.apple.com/videos/play/wwdc2025/301/?time=561)). That means a hallucinated field like `firstName` becomes physically impossible. If the schema is only known at runtime — say, a player-defined level entity — you can build it on the fly with `DynamicGenerationSchema`. One layer up sits Tool Calling: the model decides when to call your function, the arguments are Generable, and the framework guarantees you always receive valid input.
+
+---
+
+## Detailed content
+
+### Session: stateful conversation and the transcript
+
+Every `respond(to:)` call is logged into the session's transcript, including all prompts and responses. That is the cost of contextual memory — tokens pile up and eventually hit the context window ([03:07](https://developer.apple.com/videos/play/wwdc2025/301/?time=187)).
+
+```swift
+import FoundationModels
+
+func respond(userInput: String) async throws -> String {
+  let session = LanguageModelSession(instructions: """
+    You are a friendly barista in a world full of pixels.
+    Respond to the player's question.
+    """
+  )
+  let response = try await session.respond(to: userInput)
+  return response.content
+}
+```
+
+Key points:
+
+- `LanguageModelSession(instructions:)` injects system-level instructions through a multi-line string, telling the model the role and goal for this session.
+- `session.respond(to:)` is async throws. Before the call, the instructions and prompt are turned into tokens, the model generates tokens, and the framework detokenizes them back to a string.
+- `response.content` returns the final text. The whole pipeline runs on-device with no network calls.
+
+### Context overflow: keep the instructions and the latest response
+
+When you hit `exceededContextWindowSize`, do not throw away the entire transcript — the character would suffer instant amnesia. Louis keeps only the first entry (the instructions) and the last entry (the most recent successful response) ([03:55](https://developer.apple.com/videos/play/wwdc2025/301/?time=235)).
+
+```swift
+var session = LanguageModelSession()
+
+do {
+  let answer = try await session.respond(to: prompt)
+  print(answer.content)
+} catch LanguageModelSession.GenerationError.exceededContextWindowSize {
+  session = newSession(previousSession: session)
+}
+
+private func newSession(previousSession: LanguageModelSession) -> LanguageModelSession {
+  let allEntries = previousSession.transcript.entries
+  var condensedEntries = [Transcript.Entry]()
+  if let firstEntry = allEntries.first {
+    condensedEntries.append(firstEntry)
+    if allEntries.count > 1, let lastEntry = allEntries.last {
+      condensedEntries.append(lastEntry)
+    }
+  }
+  let condensedTranscript = Transcript(entries: condensedEntries)
+  return LanguageModelSession(transcript: condensedTranscript)
+}
+```
+
+Key points:
+
+- `previousSession.transcript.entries` returns every entry in the old session. The first entry is always the instructions.
+- `condensedEntries` keeps only the first and last entries, pushing the context back down to a safe token count.
+- Wrap the entries with `Transcript(entries:)` and feed the new transcript into a new session. The character keeps its persona and most recent memory, and forgets the rest naturally.
+
+If one or two entries are not enough, you can let Foundation Models summarize the middle of the transcript and splice that summary back in.
+
+### Sampling: randomness vs. reproducibility
+
+The model emits tokens one at a time, and each step has a probability distribution. The default random sampling keeps in-game dialogue varied; switch to greedy when you want stable output for a demo ([06:14](https://developer.apple.com/videos/play/wwdc2025/301/?time=374)).
+
+```swift
+// Deterministic output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(sampling: .greedy)
+)
+
+// Low-variance output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(temperature: 0.5)
+)
+
+// High-variance output
+let response = try await session.respond(
+  to: prompt,
+  options: GenerationOptions(temperature: 2.0)
+)
+```
+
+Key points:
+
+- `sampling: .greedy` picks the highest-probability token at each step. Given the same prompt and session state, the output is identical — but the guarantee breaks once the OS upgrade ships a new model version.
+- `temperature: 0.5` jitters the output slightly, which suits "mostly stable but not robotic" cases.
+- `temperature: 2.0` produces high-variance output, useful for creative filling. Crank it too high and the structure starts to crack.
+
+### Generable: the right path to structured output
+
+The `@Generable` macro generates a schema and an initializer for the type at compile time. When you call `respond(generating:)`, the framework parses the model output into a Swift instance for you ([08:14](https://developer.apple.com/videos/play/wwdc2025/301/?time=494)).
+
+```swift
+@Generable
+struct NPC {
+  @Guide(description: "A full name")
+  let name: String
+  @Guide(.range(1...10))
+  let level: Int
+  @Guide(.count(3))
+  let attributes: [Attribute]
+  let encounter: Encounter
+
+  @Generable
+  enum Attribute {
+    case sassy
+    case tired
+    case hungry
+  }
+  @Generable
+  enum Encounter {
+    case orderCoffee(String)
+    case wantToTalkToManager(complaint: String)
+  }
+}
+```
+
+Key points:
+
+- `@Generable` works on both structs and enums. Enum cases can carry associated values, which lets the NPC's "encounter" branch out.
+- `@Guide(description:)` constrains the meaning of a property in natural language. It is equivalent to writing the field description into the prompt, only the binding is tighter.
+- `@Guide(.range(1...10))` runs through constrained decoding so the model can only emit integer tokens between 1 and 10.
+- `@Guide(.count(3))` pins the array length to 3.
+- Properties are generated in declaration order: `name → level → attributes → encounter`. Whatever is depended on must come first ([12:00](https://developer.apple.com/videos/play/wwdc2025/301/?time=720)).
+
+You can also use a regex guide and hand the string structure straight to the regex builder:
+
+```swift
+@Generable
+struct NPC {
+  @Guide(Regex {
+    Capture {
+      ChoiceOf {
+        "Mr"
+        "Mrs"
+      }
+    }
+    ". "
+    OneOrMore(.word)
+  })
+  let name: String
+}
+```
+
+Key point: the model walks the regex state machine over the string token sequence, so it can only ever produce names shaped like `Mr. Brewster` or `Mrs. Brewster`.
+
+### DynamicGenerationSchema: build a schema at runtime
+
+Player-defined entities — letting the player build a "riddle" structure with one question and several candidate answers, for example — cannot be hard-coded at compile time. That is when you reach for `DynamicGenerationSchema` ([15:10](https://developer.apple.com/videos/play/wwdc2025/301/?time=910)).
+
+```swift
+struct LevelObjectCreator {
+  var properties: [DynamicGenerationSchema.Property] = []
+
+  mutating func addStringProperty(name: String) {
+    let property = DynamicGenerationSchema.Property(
+      name: name,
+      schema: DynamicGenerationSchema(type: String.self)
+    )
+    properties.append(property)
+  }
+
+  mutating func addArrayProperty(name: String, customType: String) {
+    let property = DynamicGenerationSchema.Property(
+      name: name,
+      schema: DynamicGenerationSchema(
+        arrayOf: DynamicGenerationSchema(referenceTo: customType)
+      )
+    )
+    properties.append(property)
+  }
+}
+
+var riddleBuilder = LevelObjectCreator(name: "Riddle")
+riddleBuilder.addStringProperty(name: "question")
+riddleBuilder.addArrayProperty(name: "answers", customType: "Answer")
+
+var answerBuilder = LevelObjectCreator(name: "Answer")
+answerBuilder.addStringProperty(name: "text")
+answerBuilder.addBoolProperty(name: "isCorrect")
+
+let schema = try GenerationSchema(
+  root: riddleBuilder.root,
+  dependencies: [answerBuilder.root]
+)
+
+let session = LanguageModelSession()
+let response = try await session.respond(
+  to: "Generate a fun riddle about coffee",
+  schema: schema
+)
+let generatedContent = response.content
+let question = try generatedContent.value(String.self, forProperty: "question")
+let answers = try generatedContent.value([GeneratedContent].self, forProperty: "answers")
+```
+
+Key points:
+
+- `DynamicGenerationSchema(type: String.self)` references a built-in type; `DynamicGenerationSchema(referenceTo: "Answer")` references another dynamic schema.
+- The dynamic schemas are independent of one another, and `GenerationSchema(root:dependencies:)` validates and assembles them at the end. Referencing a type that does not exist throws here.
+- The output type becomes `GeneratedContent`. Use `value(_:forProperty:)` to read fields by name with the type the caller specifies. Constrained decoding still guarantees no field is invented.
+
+### Tool Calling: the model calls your function
+
+A Tool lets the model invoke your code mid-generation to fetch data. Louis wants to plug into the Contacts database so NPCs can use the names of the player's contacts ([18:47](https://developer.apple.com/videos/play/wwdc2025/301/?time=1127)).
+
+```swift
+import FoundationModels
+import Contacts
+
+struct FindContactTool: Tool {
+  let name = "findContact"
+  let description = "Finds a contact from a specified age generation."
+
+  @Generable
+  struct Arguments {
+    let generation: Generation
+
+    @Generable
+    enum Generation {
+      case babyBoomers
+      case genX
+      case millennial
+      case genZ
+    }
+  }
+
+  func call(arguments: Arguments) async throws -> ToolOutput {
+    let store = CNContactStore()
+    let keysToFetch = [CNContactGivenNameKey, CNContactBirthdayKey] as [CNKeyDescriptor]
+    let request = CNContactFetchRequest(keysToFetch: keysToFetch)
+
+    var contacts: [CNContact] = []
+    try store.enumerateContacts(with: request) { contact, stop in
+      if let year = contact.birthday?.year {
+        if arguments.generation.yearRange.contains(year) {
+          contacts.append(contact)
+        }
+      }
+    }
+    guard let pickedContact = contacts.randomElement() else {
+      return ToolOutput("Could not find a contact.")
+    }
+    return ToolOutput(pickedContact.givenName)
+  }
+}
+```
+
+Key points:
+
+- Use a verb phrase for `name`, e.g. `findContact`. Keep `description` to one sentence — both fields are pasted verbatim into the prompt, and the longer they are the higher the latency ([19:08](https://developer.apple.com/videos/play/wwdc2025/301/?time=1148)).
+- `Arguments` must be `@Generable`. The model goes through constrained decoding when generating arguments, so it can never produce an undefined case like `genAlpha`.
+- `call(arguments:)` is async throws. Because Contacts access raises a system permission prompt, the framework can still take a non-personalized path when the player declines.
+
+Pass the tool instance into the session:
+
+```swift
+let session = LanguageModelSession(
+  tools: [FindContactTool()],
+  instructions: "Generate fun NPCs"
+)
+```
+
+Key point: the session holds a single tool instance shared across the whole conversation. To deduplicate contacts that have already been used, change `FindContactTool` into a class and keep a `pickedContacts: Set<String>` inside `call` ([21:55](https://developer.apple.com/videos/play/wwdc2025/301/?time=1315)).
+
+The tool calling flow ([23:03](https://developer.apple.com/videos/play/wwdc2025/301/?time=1383)): the model analyzes the prompt → decides whether to call the tool → generates `Arguments` (constrained decoding keeps them legal) → the framework runs your `call` → `ToolOutput` is written back to the transcript → the model continues the response with that result. **A single request can call the tool multiple times, and those calls run in parallel** — lock any shared state your `call` touches.
+
+---
+
+## Core takeaways
+
+- **What to do**: add a `@Generable` structured-output layer to an existing app.
+  - Why it is worth doing: until now you either hit a cloud LLM with a JSON Schema or wrote brittle parsing yourself. Foundation Models gives you type-safe output on-device — no network, no cost, no data leaving the device.
+  - How to start: pick an existing "natural language in, fixed structure out" feature (note summary, email triage, list generation), tag the target type with `@Generable`, tighten enum values with `@Guide`, and run greedy sampling first to verify the schema hit rate.
+
+- **What to do**: wire the "config editor" in a game or small tool to `DynamicGenerationSchema`.
+  - Why it is worth doing: user-defined structures are an LLM pain point, and a hard-coded schema cannot cover them. Dynamic schemas let players or operators define entities at runtime, while constrained decoding still acts as the safety net.
+  - How to start: map your existing "user-defined fields" UI to a list of `DynamicGenerationSchema.Property`, link root fields with `referenceTo:`, and call `GenerationSchema(root:dependencies:)` on save to validate the configuration.
+
+- **What to do**: use Tool Calling to feed on-device private data (Contacts, Calendar, HealthKit, Photos) into the LLM.
+  - Why it is worth doing: pushing this data through a cloud LLM raises compliance risk. A local tool call preserves privacy and lets the model decide on its own when to fetch.
+  - How to start: write a minimal `Tool` (a verb for the name, a one-sentence description, Generable Arguments) that calls a system API in `call`. Pass the tool to the session and write a guiding prompt to test whether the model invokes it. Then make it a class and harden the parallel access.
+
+- **What to do**: build a transcript compaction fallback for long conversations.
+  - Why it is worth doing: the on-device model has a much smaller context window than cloud models, so a long session is bound to hit `exceededContextWindowSize`. The user perception is "the AI suddenly forgot everything."
+  - How to start: catch `exceededContextWindowSize` and start with the simple "keep the first entry plus the most recent one" strategy. When the conversation depends heavily on the middle, let Foundation Models summarize that middle section and splice the summary back in.
+
+---
+
+## Related sessions
+
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — walks through wiring Foundation Models into a SwiftUI app step by step.
+- [Meet the Foundation Models framework](/articles/wwdc2025-286) — the introductory video for Foundation Models. Watch this first, then come back here for the deep dive.
+- [Explore prompt design & safety for on-device foundation models](/articles/wwdc2025-248) — the prompt engineering and safety design points for on-device models.
+- [Design interactive snippets](/articles/wwdc2025-281) — App Intents snippet views, which pair well with Generable output to build lightweight interactive cards.
+- [Develop for Shortcuts and Spotlight with App Intents](/articles/wwdc2025-260) — App Intents is the key path for exposing Foundation Models capabilities to system-level entry points.

@@ -1,0 +1,242 @@
+---
+title: "Get to know Create ML Components"
+description: "create ml makes it easy to build custom machine learning models for image classification, object detection, sound classification, hand pose classification, action classification, tabular data regression, and more. and with the create ml components framework, you can further customize underlying tasks and improve your model. we'll explore the feature extractors, transformers, and estimators that make up these tasks, and show you how you can combine them with other components and pre-processing steps to build custom tasks for concepts like image regression."
+date: 2026-06-10
+tags: ["WWDC 2022", "Create ML", "Machine Learning"]
+thumbnail: "/images/sessions/2022/10019.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10019/"
+sessionId: "wwdc2022-10019"
+year: "2022"
+relatedSessions:
+  - title: "Compose advanced models with Create ML Components"
+    code: "10020"
+    description: "Use Create ML Components to build temporal pipelines and speed up iterative training."
+  - title: "Explore the machine learning development experience"
+    code: "10017"
+    description: "Walk through model discovery, conversion, validation, integration, and optimization."
+  - title: "Optimize your Core ML usage"
+    code: "10027"
+    description: "Use Xcode and Instruments to understand and optimize Core ML performance."
+---
+
+## ハイライト
+
+> Create ML Components は Create ML のタスクを Transformer と Estimator に分解します。開発者は `appending` で `ImageFeaturePrint`、`LinearRegressor`、`ColumnSelector` などを組み合わせ、画像回帰や表形式回帰といった定義済みタスク以外のモデルを学習できます。
+
+## 主要内容
+
+Create ML はもともと画像分類、音声分類、動作分類、表形式回帰など、定義済みタスクの集合に向いていました。境界の外では課題が出ます。猫か犬かを判定したくない、バナナの成熟度を 1〜10 で採点したい、といったケースです。CSV のカテゴリ列と数値列に異なる前処理をしてからアボカド価格を予測したい場合もあります。
+
+この Session の答えが Create ML Components です。機械学習タスクを 2 つの基本概念に分けます。`Transformer` は入力を出力に変換し、`Estimator` は学習データから学習して `Transformer` を生成します（[03:58](https://developer.apple.com/videos/play/wwdc2022/10019/?time=238)）。コンポーネントは `appending` で連結し、前の出力型は次の入力型と一致する必要があります（[04:54](https://developer.apple.com/videos/play/wwdc2022/10019/?time=294)）。
+
+この分割により、タスク内部構造を改造できます。画像分類器は分類器を回帰器に替えて画像回帰器にできます。画像入力は特徴抽出前に顕著性クロップを通せます。表形式データは `ColumnSelector` で特定列だけ処理してから回帰学習できます。
+
+Session では 2 つの完全なタスクをデモします。1 つ目はファイル名からバナナ成熟度スコアを読み、`ImageFeaturePrint` で画像特徴を抽出し、`LinearRegressor` でスコアモデルを学習します。2 つ目はアボカド価格 CSV を読み、`ColumnSelector` で `volume` 列を選び、`StandardScaler` で標準化後、`BoostedTreeRegressor` で価格を予測します。
+
+## 詳細
+
+### 1. コンポーネントで画像回帰器を組み立てる
+
+（[08:59](https://developer.apple.com/videos/play/wwdc2022/10019/?time=539)）画像分類器は通常、特徴抽出器と分類器で構成されます。画像回帰器にするには Session では第 2 段だけ置き換えます。`ImageFeaturePrint` を残し、分類器を `LinearRegressor` に替えます。学習データのラベルも文字列から浮動小数点スコアに変わります。
+
+```swift
+import CoreImage
+import CreateMLComponents
+
+struct ImageRegressor {
+    static let trainingDataURL = URL(fileURLWithPath: "~/Desktop/bananas")
+    static let parametersURL = URL(fileURLWithPath: "~/Desktop/parameters")
+
+    static func train() async throws -> some Transformer<CIImage, Float> {
+        let estimator = ImageFeaturePrint()
+            .appending(LinearRegressor())
+
+        // File name example: banana-5.jpg
+        let data = try AnnotatedFiles(labeledByNamesAt: trainingDataURL, separator: "-", index: 1, type: .image)
+            .mapFeatures(ImageReader.read)
+            .mapAnnotations({ Float($0)! })
+
+        let (training, validation) = data.randomSplit(by: 0.8)
+        let transformer = try await estimator.fitted(to: training, validateOn: validation)
+        try estimator.write(transformer, to: parametersURL)
+
+        return transformer
+    }
+}
+```
+
+キーポイント:
+
+- `ImageFeaturePrint().appending(LinearRegressor())` は画像特徴抽出器と線形回帰器を 1 つの estimator に連結します。
+- `AnnotatedFiles(labeledByNamesAt:separator:index:type:)` はファイル名からラベルを抽出します。例：`banana-5.jpg`、区切り `-`、スコアは index 1。
+- `mapFeatures(ImageReader.read)` はファイル URL を `CIImage` に読み込みます。
+- `mapAnnotations({ Float($0)! })` はファイル名内の文字列スコアを `Float` に変換します。
+- `randomSplit(by: 0.8)` は 20% を検証用に残します。
+- `fitted(to:validateOn:)` は学習データからパラメータを学習し、検証データで効果を確認します。
+- `estimator.write(transformer, to:)` は学習済みパラメータを保存し、後で読み込みまたはデプロイに使います。
+
+戻り値型は `some Transformer<CIImage, Float>` です。呼び出し側は `CIImage` を `Float` スコアに変換できることだけを気にし、内部のコンポーネント構成は知る必要がありません。
+
+### 2. 誤差の観察、データ拡張、顕著性クロップの追加
+
+（[12:18](https://developer.apple.com/videos/play/wwdc2022/10019/?time=738)）第 1 版モデルはバナナ画像が足りず誤差が高かったです。Session では 3 つを行います。`fitted` イベントで学習・検証の最大誤差を出力、回転・拡大で学習データを拡張、特徴抽出前にカスタム `SaliencyCropper` を追加して顕著オブジェクト領域にクロップします。
+
+```swift
+import CoreImage
+import CreateMLComponents
+
+struct ImageRegressor {
+    static let trainingDataURL = URL(fileURLWithPath: "~/Desktop/bananas")
+    static let parametersURL = URL(fileURLWithPath: "~/Desktop/parameters")
+
+    static func train() async throws -> some Transformer<CIImage, Float> {
+        let estimator = SaliencyCropper()
+            .appending(ImageFeaturePrint())
+            .appending(LinearRegressor())
+
+        // File name example: banana-5.jpg
+        let data = try AnnotatedFiles(labeledByNamesAt: trainingDataURL, separator: "-", index: 1, type: .image)
+            .mapFeatures(ImageReader.read)
+            .mapAnnotations({ Float($0)! })
+            .flatMap(augment)
+
+        let (training, validation) = data.randomSplit(by: 0.8)
+        let transformer = try await estimator.fitted(to: training, validateOn: validation) { event in
+            guard let trainingMaxError = event.metrics[.trainingMaximumError] else {
+                return
+            }
+            guard let validationMaxError = event.metrics[.validationMaximumError] else {
+                return
+            }
+            print("Training max error: \(trainingMaxError), Validation max error: \(validationMaxError)")
+        }
+
+        let validationError = try await meanAbsoluteError(
+            transformer.applied(to: validation.map(\.feature)),
+            validation.map(\.annotation)
+        )
+        print("Mean absolute error: \(validationError)")
+
+        try estimator.write(transformer, to: parametersURL)
+
+        return transformer
+    }
+
+    static func augment(_ original: AnnotatedFeature<CIImage, Float>) -> [AnnotatedFeature<CIImage, Float>] {
+        let angle = CGFloat.random(in: -.pi ... .pi)
+        let rotated = original.feature.transformed(by: .init(rotationAngle: angle))
+
+        let scale = CGFloat.random(in: 0.8 ... 1.2)
+        let scaled = original.feature.transformed(by: .init(scaleX: scale, y: scale))
+
+        return [
+            original,
+            AnnotatedFeature(feature: rotated, annotation: original.annotation),
+            AnnotatedFeature(feature: scaled, annotation: original.annotation),
+        ]
+    }
+}
+```
+
+キーポイント:
+
+- `SaliencyCropper().appending(...)` はカスタム transformer を特徴抽出の前に置きます。学習と予測の両方で同じクロップ手順を通ります。
+- `.flatMap(augment)` は各学習サンプルを原画、回転、拡大の 3 サンプルに拡張します。
+- `fitted(... ) { event in ... }` はイベントコールバックで学習中の metrics を読み取ります。
+- `.trainingMaximumError` と `.validationMaximumError` は学習・検証セットの最大誤差を表します。
+- `transformer.applied(to: validation.map(\.feature))` は学習済みモデルで検証特徴を予測します。
+- `meanAbsoluteError(...)` は予測値と真のスコアの平均絶対誤差を計算します。
+- `augment(_:)` は元のラベルを保持します。回転と拡大は画像だけを変え、成熟度スコアは変えません。
+
+Session はデータ拡張は fitting 時のみ使い、予測時には使わないと明記しています（[13:59](https://developer.apple.com/videos/play/wwdc2022/10019/?time=839)）。顕著性クロップはタスク定義に入るため、学習と推論の両方で実行されます（[15:28](https://developer.apple.com/videos/play/wwdc2022/10019/?time=928)）。
+
+### 3. ColumnSelector で表形式列を処理する
+
+（[20:23](https://developer.apple.com/videos/play/wwdc2022/10019/?time=1223)）表形式データは列タイプが異なります。数値列は標準化、カテゴリ列はエンコードが必要な場合があります。Create ML Components は `ColumnSelector` で指定列を処理し、処理後の表を後続 estimator に渡します。
+
+```swift
+import CreateMLComponents
+import Foundation
+import TabularData
+
+struct TabularRegressor {
+    static let dataURL = URL(fileURLWithPath: "~/Downloads/avocado.csv")
+    static let parametersURL = URL(fileURLWithPath: "~/Downloads/parameters.pkg")
+
+    static let priceColumnID = ColumnID("price", Double.self)
+
+    static var task: some SupervisedTabularEstimator {
+        let numeric = ColumnSelector(
+            columns: ["volume"],
+            estimator: OptionalUnwrapper()
+                .appending(StandardScaler<Double>())
+        )
+        let regression = BoostedTreeRegressor<String>(
+            annotationColumnName: priceColumnID.name,
+            featureColumnNames: ["type", "region", "volume"]
+        )
+
+        return numeric.appending(regression)
+    }
+
+    static func train() async throws -> some TabularTransformer {
+        let dataFrame = try DataFrame(contentsOfCSVFile: dataURL)
+        let (training, validation) = dataFrame.randomSplit(by: 0.8)
+        let transformer = try await task.fitted(to: DataFrame(training), validateOn: DataFrame(validation)) { event in
+            guard let validationError = event.metrics[.validationError] as? Double else {
+                return
+            }
+            print("Validation error: \(validationError)")
+        }
+        try task.write(transformer, to: parametersURL)
+        return transformer
+    }
+
+    static func predict(
+        type: String,
+        region: String,
+        volume: Double
+    ) async throws -> Double {
+        let model = try task.read(from: parametersURL)
+        let dataFrame: DataFrame = [
+            "type": [type],
+            "region": [region],
+            "volume": [volume]
+        ]
+        let result = try await model(dataFrame)
+        return result[priceColumnID][0]!
+    }
+}
+```
+
+キーポイント:
+
+- `ColumnID("price", Double.self)` は予測対象列を定義し、予測結果の読み取りにも同じ列 ID を使います。
+- `ColumnSelector(columns: ["volume"], estimator: ...)` は `volume` 列だけを数値前処理の対象にします。
+- `OptionalUnwrapper().appending(StandardScaler<Double>())` はオプショナルを解包し、平均 0・標準偏差 1 に標準化します（[19:16](https://developer.apple.com/videos/play/wwdc2022/10019/?time=1156)）。
+- `BoostedTreeRegressor<String>` は `type`、`region`、`volume` を特徴に `price` を予測します。
+- `numeric.appending(regression)` は列前処理と回帰器を 1 つの表形式タスクにまとめます。
+- `DataFrame(contentsOfCSVFile:)` は TabularData フレームワークで CSV を読み込みます。
+- `task.fitted(to:validateOn:)` は表形式 transformer を学習し、イベントから検証誤差を読み取ります。
+- `task.read(from:)` は保存済みパラメータを読み込みます。Create ML Components のモデルはタスク定義とパラメータファイルの両方が必要です（[23:34](https://developer.apple.com/videos/play/wwdc2022/10019/?time=1414)）。
+- `model(dataFrame)` は `type`、`region`、`volume` を含む新しいデータフレームで予測します。
+
+デプロイには 2 つの道があります。Core ML モデルをエクスポート—自己完結で最適化された tensor 演算が使えますが、カスタム transformer と estimator は非サポートで、Core ML の入出力型も限られます（[23:55](https://developer.apple.com/videos/play/wwdc2022/10019/?time=1435)）。カスタムコンポーネントがある場合は、タスク定義とパラメータを Swift package にまとめます（[24:39](https://developer.apple.com/videos/play/wwdc2022/10019/?time=1479)）。
+
+## 重要ポイント
+
+- **果物成熟度スコアラーを作る**：バナナやアボカドの写真を撮り、1〜10 の成熟度スコアを返します。Session の画像回帰器から始め、ファイル名にスコアラベルを保存し、`ImageFeaturePrint` と `LinearRegressor` を組み合わせて学習します。
+
+- **商品写真品質チェッカーを作る**：EC やフリマ App の画像に鮮明度、被写体の中央度、販売適性スコアを付けます。人間レビュースコアをファイル名に書き、`AnnotatedFiles` でラベルを読み、Session と同様に回転・拡大のデータ拡張を加えます。
+
+- **ローカル価格推定ツールを作る**：CSV から品類、地域、数量、過去価格を読み、次のロット価格を予測します。入口は TabularData の `DataFrame`、Create ML Components の `ColumnSelector`、`StandardScaler`、`BoostedTreeRegressor` です。
+
+- **再利用可能な学習 CLI ツールを作る**：学習、検証誤差出力、パラメータ保存を Swift コマンドラインプログラムにまとめます。画像タスクは `estimator.write(transformer, to:)` でパラメータを保存し、App 側は同じタスク定義で読み込んで予測します。
+
+- **前処理付き垂直モデルパッケージを作る**：クロップ、特徴抽出、回帰器を 1 つのタスク定義に入れます。学習と推論で同じパイプラインを再利用し、App 側の手書き前処理と学習ロジックの不一致を減らします。
+
+## 関連セッション
+
+- [Compose advanced models with Create ML Components](/articles/wwdc2022-10020) — Create ML Components を続け、時系列データ、動画アクションカウント、増分学習を解説します。
+- [Explore the machine learning development experience](/articles/wwdc2022-10017) — モデル発見、変換、検証、統合、性能最適化まで、Apple プラットフォーム ML 開発フローをつなぎます。
+- [Optimize your Core ML usage](/articles/wwdc2022-10027) — Xcode と Instruments で Core ML モデルのデバイス上の読み込み、予測、計算ユニット使用を分析します。

@@ -1,0 +1,321 @@
+---
+title: "Explore the machine learning development experience"
+description: "learn how to bring great machine learning (ml) based experiences to your app. we'll take you through model discovery, conversion, and training and provide tips and best practices for ml. we'll share considerations to take into account as you begin your ml journey, demonstrate techniques for evaluating model performance, and explore how you can tune models to achieve real-time performance on device."
+date: 2026-06-10
+tags: ["WWDC 2022", "Core ML", "Machine Learning"]
+thumbnail: "/images/sessions/2022/10017.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10017/"
+sessionId: "wwdc2022-10017"
+year: "2022"
+relatedSessions:
+  - title: "Optimize your Core ML usage"
+    code: "10027"
+    description: "Use Xcode and Instruments to understand Core ML performance and optimize on-device inference."
+  - title: "Get to know Create ML Components"
+    code: "10019"
+    description: "Build custom machine learning tasks with Create ML Components."
+  - title: "Compose advanced models with Create ML Components"
+    code: "10020"
+    description: "Compose temporal pipelines and speed up model training with Create ML Components."
+---
+
+## ハイライト
+
+> この Session では白黒の古い写真の自動カラー化を例に、モデル探索、PyTorch から Core ML への変換、Xcode での性能評価、Swift 統合、Instruments によるチューニングを一気通貫で示し、90ms の静止画モデルを約 16ms のリアルタイムカメラ案に最適化します。
+
+---
+
+## 主要内容
+
+多くの App は機械学習機能を追加したいですが、最初のステップはモデルコードを書くことではありません。開発者はまず、この問題が機械学習に適しているか、モデルをどこから得るか、Apple プラットフォームへどう載せるか、変換後に正しいか、ターゲットデバイスで十分速いかを判断する必要があります。
+
+この Session は具体的なタスクでこれらに答えます。地下室の古い箱に入った白黒の家族写真を自動でカラー化することです。手作業のレタッチにはプロの写真家と画像編集ツールが必要ですが、機械学習なら数秒に短縮できます。
+
+Apple の例のフローは明快です。オープンソースの PyTorch Colorizer モデルを見つけ、coremltools で Core ML に変換し、Python で変換結果を検証し、Xcode 14 の Core ML Performance Report でデバイス上の予測時間を確認し、最後に Core Image と Core ML で Swift App に統合します。
+
+静止画版はすでに十分使えます。Performance Report では、元モデルが iPad Pro M1 と iPadOS 16 で約 90ms で予測します。要件がリアルタイムカメラに変わると、この数字は足りません。30fps カメラは約 30ms ごとに 1 フレームを生成し、90ms だとカラー化のたびに 2〜3 フレームを失います。
+
+後半は最適化フローに入ります。発表者はモデルアーキテクチャを変更し、Apple Silicon 上で PyTorch on Metal を使って再学習し、変換・検証・統合を行います。新モデルは Neural Engine 上で完全に動作し、予測時間は約 16ms です。最後に Instruments の Core ML テンプレートで、App が予測をキューに入れ、誤って 60fps を設定している問題を発見し、前フレームの予測が終わってから次を処理し、カメラを 30fps に戻します。
+
+## 詳細
+
+### 1. RGB 画像をモデルが必要とする L チャンネルに分割する（[03:06](https://developer.apple.com/videos/play/wwdc2022/10017/?time=186)）
+
+Colorizer は Lab 色空間を使います。Lab には L（明度）と a、b（色成分）の 3 チャンネルがあります。白黒入力ではモデルは L チャンネルだけを使い、新しい a、b を予測します。
+
+```python
+from skimage import color
+
+in_lab = color.rgb2lab(in_rgb)
+in_l = in_lab[:,:,0]
+```
+
+キーポイント:
+
+- `color.rgb2lab(in_rgb)` は RGB 画像を Lab 色空間に変換します。
+- `in_lab[:,:,0]` は最初のチャンネル、明度 L を取り出します。
+- a、b の色チャンネルは入力段階で捨て、モデルが予測します。
+
+モデル出力後、入力 L と予測 a、b を Lab に戻し、RGB に変換します。
+
+```python
+from skimage import color
+import numpy as np
+import torch
+
+out_lab = torch.cat((in_l, out_ab), dim=1)
+out_rgb = color.lab2rgb(out_lab.data.numpy()[0,…].transpose((1,2,0)))
+```
+
+キーポイント:
+
+- `torch.cat((in_l, out_ab), dim=1)` は元の明度とモデル出力の色成分をチャンネル方向に結合します。
+- `out_lab.data.numpy()` はテンソルを NumPy データに変換し、画像処理ライブラリで使えます。
+- `transpose((1,2,0))` はチャンネル次元を最後に移し、`lab2rgb` が期待するレイアウトに合わせます。
+- `color.lab2rgb(...)` で最終的なカラー画像を得ます。
+
+### 2. coremltools で PyTorch モデルを変換する（[03:56](https://developer.apple.com/videos/play/wwdc2022/10017/?time=236)）
+
+オープンソースモデルを見つけたら、次は Apple プラットフォームで動かすことです。例では coremltools で PyTorch モデルを Core ML の `mlpackage` に変換します。
+
+```python
+import coremltools as ct
+import torch
+import Colorizer
+
+torch_model = Colorizer().eval()
+
+example_input = torch.rand([1, 1, 256, 256])
+traced_model = torch.jit.trace(torch_model, example_input)
+
+coreml_model = ct.convert(traced_model, 
+                          inputs=[ct.TensorType(name="input", shape=example_input.shape)])
+
+coreml_model.save("Colorizer.mlpackage")
+```
+
+キーポイント:
+
+- `Colorizer().eval()` はモデル構造と重みを読み込み、推論モードに切り替えます。
+- `example_input` は 1 チャンネル 256×256 の入力サンプルを定義します。
+- `torch.jit.trace` はサンプル入力で PyTorch モデルを trace し、変換可能な表現を得ます。
+- `ct.convert` は traced モデルを Core ML に変換し、入力名と形状を宣言します。
+- `save("Colorizer.mlpackage")` は Xcode にドラッグできるモデルパッケージを生成します。
+
+### 3. Python で Core ML モデルを検証する（[04:26](https://developer.apple.com/videos/play/wwdc2022/10017/?time=266)）
+
+変換成功は機能の正しさを意味しません。発表者は Python で Core ML モデルを直接実行し、元の PyTorch フローと一致するか確認します。
+
+```python
+import coremltools as ct
+from PIL import Image
+from skimage import color
+
+in_img = Image.open("image.png").convert("RGB")
+in_rgb = np.array(in_img)
+in_lab = color.rgb2lab(in_rgb, channel_axis=2)
+
+lab_components = np.split(in_lab, indices_or_sections=3, axis=-1)
+(in_l, _, _) = [
+    np.expand_dims(array.transpose((2, 0, 1)).astype(np.float32), 0)
+    for array in lab_components
+]
+out_ab = coreml_model.predict({"input": in_l})[0]
+
+out_lab = np.squeeze(np.concatenate([in_l, out_ab], axis=1), axis=0).transpose((1, 2, 0))
+out_rgb = color.lab2rgb(out_lab, channel_axis=2).astype(np.uint8)
+out_img = Image.fromarray(out_rgb)
+```
+
+キーポイント:
+
+- `Image.open(...).convert("RGB")` はテスト画像を読み込み RGB に統一します。
+- `color.rgb2lab(..., channel_axis=2)` は最後の次元を色チャンネルとして Lab に変換します。
+- `np.split(..., axis=-1)` で L、a、b の 3 チャンネルに分割します。
+- `np.expand_dims(..., 0)` でバッチ次元を追加し、モデル入力を形成します。
+- `coreml_model.predict({"input": in_l})` で変換後の Core ML モデルが色チャンネルを予測します。
+- `np.concatenate([in_l, out_ab], axis=1)` で入力明度と出力色を結合します。
+- `color.lab2rgb` で RGB に戻し、`Image.fromarray` で表示可能な画像を生成します。
+
+### 4. Swift App でモデルを統合する（[07:11](https://developer.apple.com/videos/play/wwdc2022/10017/?time=431)）
+
+Swift の統合フローは Python と同じです。明度を抽出し、Core ML に送り、2 つの色チャンネルを取り戻し、RGB 画像を再構築します。
+
+```swift
+import CoreImage
+import CoreML
+
+func colorize(image inputImage: CIImage) throws -> CIImage {
+
+    let lightness: CIImage = extractLightness(from: inputImage)
+
+    let modelInput = try ColorizerInput(inputWith: lightness.cgImage!)
+    
+    let modelOutput: ColorizerOutput = try colorizer.prediction(input: modelInput)
+
+    let (aChannel, bChannel): (CIImage, CIImage) = extractColorChannels(from: modelOutput)
+
+    let colorizedImage = reconstructRGBImage(l: lightness, a: aChannel, b: bChannel)
+    return colorizedImage
+}
+```
+
+キーポイント:
+
+- `extractLightness(from:)` は Python の RGB→Lab→L チャンネル取得に対応します。
+- `ColorizerInput(inputWith:)` は明度画像を Core ML 入力に準備します。
+- `colorizer.prediction(input:)` でモデル推論を実行します。
+- `extractColorChannels(from:)` は 2 つの `MLShapedArray` 出力を Core Image で処理できる画像に変換します。
+- `reconstructRGBImage` は L、a、b を Lab に合成し、RGB に戻します。
+
+### 5. Core Image で Lab 変換とチャンネル合成を行う（[07:41](https://developer.apple.com/videos/play/wwdc2022/10017/?time=461)、[08:51](https://developer.apple.com/videos/play/wwdc2022/10017/?time=531)）
+
+発表者は Swift で色空間変換を手書きしません。Core Image は新しい `convertRGBtoLab` と `convertLabToRGB` フィルターを提供します。
+
+```swift
+import CoreImage.CIFilterBuiltins
+
+func extractLightness(from inputImage: CIImage) -> CIImage {
+
+    let rgbToLabFilter = CIFilter.convertRGBtoLab()
+    rgbToLabFilter.inputImage = inputImage
+    rgbToLabFilter.normalize = true
+    let labImage = rgbToLabFilter.outputImage
+
+    let matrixFilter = CIFilter.colorMatrix()
+    matrixFilter.inputImage = labImage
+    matrixFilter.rVector = CIVector(x: 1, y: 0, z: 0)
+    matrixFilter.gVector = CIVector(x: 1, y: 0, z: 0)
+    matrixFilter.bVector = CIVector(x: 1, y: 0, z: 0)
+    let lightness = matrixFilter.outputImage!
+    return lightness
+}
+```
+
+キーポイント:
+
+- `CIFilter.convertRGBtoLab()` は入力を RGB から Lab に変換します。
+- `normalize = true` はモデルが必要とする正規化範囲に明度を収めます。
+- `CIFilter.colorMatrix()` は行列で L チャンネルを抽出します。
+- `rVector`、`gVector`、`bVector` はすべて入力の第 1 成分を取り、出力は明度だけを残します。
+
+モデル出力は 2 つの `MLShapedArray` です。例ではそれぞれを単チャンネルの `CIImage` に変換します。
+
+```swift
+func extractColorChannels(from output: ColorizerOutput) -> (CIImage, CIImage) {
+
+    let outA: [Float] = output.output_aShapedArray.scalars
+    let outB: [Float] = output.output_bShapedArray.scalars
+    let dataA = Data(bytes: outA, count: outA.count * MemoryLayout<Float>.stride)
+    let dataB = Data(bytes: outB, count: outB.count * MemoryLayout<Float>.stride)
+
+    let outImageA = CIImage(bitmapData: dataA,
+        bytesPerRow: 4 * 256,
+        size: CGSize(width: 256, height: 256),
+        format: CIFormat.Lh,
+        colorSpace: CGColorSpaceCreateDeviceGray())
+    let outImageB = CIImage(bitmapData: dataB,
+        bytesPerRow: 4 * 256,
+        size: CGSize(width: 256, height: 256),
+        format: CIFormat.Lh,
+        colorSpace: CGColorSpaceCreateDeviceGray())
+   return (outImageA, outImageB)
+}
+```
+
+キーポイント:
+
+- `output_aShapedArray.scalars` と `output_bShapedArray.scalars` で予測された色成分を取り出します。
+- `Data(bytes:count:)` は浮動小数点配列を画像として読めるバイトデータに包みます。
+- `CIImage(bitmapData:...)` は各色成分用の単チャンネル Core Image 画像を作成します。
+- `bytesPerRow: 4 * 256` は幅 256 ピクセル、Float 4 バイトに対応します。
+- `CIFormat.Lh` は単チャンネル浮動小数点画像フォーマットです。
+
+最後にカスタム `CIKernel` で 3 チャンネルを Lab 画像に合成し、RGB に戻します。
+
+```swift
+func reconstructRGBImage(l lightness: CIImage,
+                         a aChannel: CIImage,
+                         b bChannel: CIImage) -> CIImage {
+    guard
+        let kernel = try? CIKernel.kernels(withMetalString: source)[0] as? CIColorKernel,
+        let kernelOutputImage = kernel.apply(extent: lightness.extent,
+                                             arguments: [lightness, aChannel, bChannel])
+    else { fatalError() }
+
+    let labToRGBFilter = CIFilter.convertLabToRGBFilter()
+    labToRGBFilter.inputImage = kernelOutputImage
+    labToRGBFilter.normalize = true
+    let rgbImage = labToRGBFilter.outputImage!
+    return rgbImage
+}
+```
+
+キーポイント:
+
+- `CIKernel.kernels(withMetalString:)` は Metal 文字列から Core Image kernel を作成します。
+- `kernel.apply` は明度画像の範囲を出力範囲とし、L、a、b を引数に渡します。
+- `CIFilter.convertLabToRGBFilter()` は合成後の Lab 画像を RGB に戻します。
+- `normalize = true` は前段の RGB→Lab 変換と対になっています。
+
+チャンネル合成自体は小さな kernel だけです。
+
+```swift
+let source = """
+#include <CoreImage/CoreImage.h>
+[[stichable]] float4 labCombine(coreimage::sample_t imL, coreimage::sample_t imA, coreimage::sample_t imB)
+{
+   return float4(imL.r, imA.r, imB.r, imL.a);
+}
+"""
+```
+
+キーポイント:
+
+- `imL`、`imA`、`imB` は明度、a チャンネル、b チャンネルの画像サンプルです。
+- `float4(imL.r, imA.r, imB.r, imL.a)` は 3 つの単チャンネル値を Lab 画像の先頭 3 成分に戻します。
+- alpha は `imL.a` を使い、入力明度画像の透明度を保持します。
+
+### 6. 90ms の静止画処理から 16ms のリアルタイム処理へ（[05:17](https://developer.apple.com/videos/play/wwdc2022/10017/?time=317)、[12:45](https://developer.apple.com/videos/play/wwdc2022/10017/?time=765)）
+
+Xcode 14 の Core ML Performance Report は Core ML モデルの時間ベース分析ができます。発表者はモデルを Xcode にドラッグし、数秒で iPad Pro M1 上の元モデルが約 90ms であることを確認します。この速度は静止画に適しています。
+
+リアルタイムカメラにはより低いレイテンシが必要です。発表者はモデルアーキテクチャを変更し、Apple Silicon での学習加速のため PyTorch on Metal で再学習します。新モデルの Performance Report では Neural Engine 上で完全に動作し、予測時間は約 16ms です。
+
+Performance Report はモデル自体だけを示します。App 実行後もまだ滑らかではなく、Instruments の Core ML テンプレートでは予測リクエストが積み上がります。1 回目の予測が終わる前に 2 回目が Core ML に送られ、以降もキューに入り続けます。発表者はカメラフレームレートが誤って 60fps になっていることも発見します。
+
+以下は Session の修正思路を表す概念的な制御フローであり、公式コードではありません。
+
+```swift
+// Conceptual pseudocode based on the runtime issue shown in Instruments.
+if previousPredictionDidFinish {
+    processNextCameraFrame()
+}
+
+cameraFrameRate = 30
+```
+
+キーポイント:
+
+- `previousPredictionDidFinish` は前回の予測完了後にのみ新フレームを処理することを表します。
+- `processNextCameraFrame()` は 1 回の Core ML 予測リクエストに対応し、リクエストのキューイングを避けます。
+- `cameraFrameRate = 30` は誤設定の 60fps を目標の 30fps に戻す修正に対応します。
+- この修正により Core ML は Neural Engine へ一度に 1 予測を正しくディスパッチし、リアルタイム効果が安定します。
+
+## 重要ポイント
+
+- **古い写真スキャンのカラー化ツールを作る**：Vision の `VNDetectRectangleRequest` でファインダー内の写真領域を見つけ、切り抜き結果を Core ML Colorizer に送ります。Session は [15:26](https://developer.apple.com/videos/play/wwdc2022/10017/?time=926) でこの組み合わせを示します。
+
+- **既存画像 App に「ローカル ML 事前検証」フローを追加する**：モデルを App に入れる前に、coremltools で Python 上で同じ入力画像を実行し、Core ML 出力が元モデルフローと一致することを確認してから Swift 統合へ進みます。
+
+- **モデル性能評価をプロトタイプ段階へ前倒しする**：機能設計時に候補モデルを Xcode 14 Performance Report にドラッグし、ターゲットデバイスの予測時間と計算ユニット分布を記録し、UI 完成後にリアルタイム性不足を知る事態を避けます。
+
+- **カメラリアルタイムフィルター用のキュー保護を作る**：カメラは毎フレーム来ますが Core ML 予測には時間がかかります。Instruments で予測が積み上がっていないか確認し、「前フレーム完了後に次を受け付ける」処理に変更します。
+
+- **Apple Silicon で小型代替モデルを学習する**：オープンソースモデルが遅い場合、入出力形状を保ち、より軽いアーキテクチャに替え、PyTorch on Metal で再学習し、変換・検証・統合の流れで置き換えます。
+
+## 関連セッション
+
+- [Optimize your Core ML usage](/articles/wwdc2022-10027) — Xcode Performance Report、Core ML Instrument、オンデバイス推論最適化を続けて解説します。
+- [Get to know Create ML Components](/articles/wwdc2022-10019) — Transformer と Estimator を組み合わせたカスタム機械学習タスクを紹介します。
+- [Compose advanced models with Create ML Components](/articles/wwdc2022-10020) — 時系列パイプライン、増分学習、より複雑なモデル合成を解説します。

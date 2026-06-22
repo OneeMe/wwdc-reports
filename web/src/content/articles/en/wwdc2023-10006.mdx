@@ -1,0 +1,259 @@
+---
+title: "Build robust and resumable file transfers"
+description: "find out how urlsession can help your apps transfer large files and recover from network interruptions. learn how to pause and resume http file transfers and support resumable uploads, and explore best practices for using urlsession to transfer files even when your app is suspended in the background."
+date: 2026-06-10
+tags: ["WWDC 2023"]
+thumbnail: "/images/sessions/2023/10006.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2023/10006/"
+sessionId: "wwdc2023-10006"
+year: "2023"
+relatedSessions:
+  - title: "Ready, set, relay: Protect app traffic with network relays"
+    code: "10002"
+    description: "learn how relays can make your app's network traffic more private and secure without the overhead of a vpn."
+  - title: "Reduce network delays with L4S"
+    code: "10004"
+    description: "learn how low latency, low loss, scalable throughput (l4s) can reduce network delays and improve your app's responsiveness."
+  - title: "What's new in Background Assets"
+    code: "10108"
+    description: "discover how background assets can help your app download content before it even launches."
+---
+
+## Highlight
+
+> URLSession in iOS 17 adds pause/resume APIs for upload tasks (Upload Task) matching download tasks (Download Task), introduces an IETF-standard resumable upload protocol, and adds finer-grained control for background transfers.
+
+---
+
+## Core Content
+
+When building an app that transfers large files, network interruptions are the norm, not the exception. Users enter elevators, switch Wi-Fi, or walk into dead zones—and multi-GB downloads or uploads in progress may abort and require starting over. Before iOS 17, URLSession had `cancelByProducingResumeData` for download tasks, but upload tasks had no equivalent API. If you wanted resumable file uploads, you had to implement chunking logic at the application layer yourself.
+
+iOS 17 fills this gap for upload tasks. `URLSessionUploadTask` now supports `cancelByProducingResumeData()` to pause uploads and generate resume data, and `uploadTask(withResumeData:)` to continue from the resume point. The API shape is identical to download tasks—zero learning cost.
+
+But client APIs alone are not enough. Pause/resume requires server cooperation—the server must understand where the client continues uploading. iOS 17 introduces a resumable upload protocol based on the latest IETF standard draft. Apple also published a SwiftNIO server reference implementation to help backend teams integrate quickly.
+
+Additionally, Background URLSession in iOS 17 gains finer control: you can set earliest begin time for tasks, estimate transfer byte counts to optimize system scheduling, and declare whether constrained networks are allowed.
+
+---
+
+## Detailed Content
+
+### Pausing and resuming download tasks ([04:53](https://developer.apple.com/videos/play/wwdc2023/10006/?time=293))
+
+URLSession download pause/resume is based on HTTP Range requests. The server declares range support via the `Accept-Ranges` response header and identifies resource versions via `ETag`. After interruption, the client sends a `Range` request with an `If-Range` header to ensure the resource has not changed.
+
+After creating a download task, use `cancelByProducingResumeData()` instead of ordinary `cancel()`:
+
+```swift
+let downloadTask = session.downloadTask(with: request)
+downloadTask.resume()
+
+guard let resumeData = await downloadTask.cancelByProducingResumeData() else {
+    // Download cannot be resumed
+    return
+}
+```
+
+Resume data is a binary blob containing downloaded bytes, the original request, and server validation information. Use it to create a new download task and continue from the breakpoint:
+
+```swift
+let downloadTask = session.downloadTask(with: request)
+downloadTask.resume()
+
+guard let resumeData = await downloadTask.cancelByProducingResumeData() else {
+    // Download cannot be resumed
+    return
+}
+
+let newDownloadTask = session.downloadTask(withResumeData: resumeData)
+newDownloadTask.resume()
+```
+
+**Key points:**
+- `cancelByProducingResumeData()` is async and waits for the system to generate resume data before returning
+- Resume data cannot be serialized locally—it may contain temporary file paths that become invalid after app restart
+- Returning `nil` means the server does not support resume; you must download from the beginning
+
+If a download is unexpectedly interrupted by a network error, resume data can be extracted from `URLError` ([06:34](https://developer.apple.com/videos/play/wwdc2023/10006/?time=394)):
+
+```swift
+do {
+    let (url, response) = try await session.download(for: request)
+} catch let error as URLError {
+    guard let resumeData = error.downloadTaskResumeData else {
+        // Download cannot be resumed
+        return
+    }
+}
+```
+
+**Key points:**
+- `URLError.downloadTaskResumeData` is only included in download task errors
+- When handling errors, check whether resume data exists before deciding to retry from scratch
+
+### Pausing and resuming upload tasks ([08:29](https://developer.apple.com/videos/play/wwdc2023/10006/?time=509))
+
+Before iOS 17, upload tasks could only be fully cancelled with `cancel()`—no recovery mechanism. The new API is fully symmetric with download tasks.
+
+Pause upload:
+
+```swift
+let uploadTask = session.uploadTask(with: request, fromFile: fileURL)
+uploadTask.resume()
+
+guard let resumeData = await uploadTask.cancelByProducingResumeData() else {
+    // Upload cannot be resumed
+    return
+}
+```
+
+Resume upload:
+
+```swift
+let uploadTask = session.uploadTask(with: request, fromFile: fileURL)
+uploadTask.resume()
+
+guard let resumeData = await uploadTask.cancelByProducingResumeData() else {
+    // Upload cannot be resumed
+    return
+}
+
+let newUploadTask = session.uploadTask(withResumeData: resumeData)
+newUploadTask.resume()
+```
+
+Recover upload from error ([09:22](https://developer.apple.com/videos/play/wwdc2023/10006/?time=562)):
+
+```swift
+do {
+    let (data, response) = try await session.upload(for: request, fromFile: fileURL)
+} catch let error as URLError {
+    guard let resumeData = error.uploadTaskResumeData else {
+        // Upload cannot be resumed
+        return
+    }
+}
+```
+
+**Key points:**
+- Upload resume data and download resume data are different types and cannot be mixed
+- For brief interruptions when the server is reachable, URLSession automatically attempts upload recovery without manual handling
+- Upload resume requires server support for the latest IETF resumable upload protocol draft
+
+### Resumable upload protocol and SwiftNIO server implementation ([13:15](https://developer.apple.com/videos/play/wwdc2023/10006/?time=795))
+
+After the client pauses an upload, resuming sends a special HTTP request asking "how many bytes have I uploaded, and where do I continue?" The server returns an offset based on previously received data; the client continues sending from that offset.
+
+This protocol requires server-side implementation. Apple provides the ready-to-use `NIOResumableUpload` module in SwiftNIO.
+
+SwiftNIO server code without resumable upload support:
+
+```swift
+NIOTSListenerBootstrap(group: NIOTSEventLoopGroup())
+    .childChannelInitializer { channel in
+        channel.configureHTTP2Pipeline(mode: .server) { channel in
+            channel.pipeline.addHandlers([
+                HTTP2FramePayloadToHTTPServerCodec(),
+                ExampleChannelHandler()
+            ])
+        }.map { _ in () }
+    }
+    .tlsOptions(tlsOptions)
+```
+
+After adding resumable upload support ([14:06](https://developer.apple.com/videos/play/wwdc2023/10006/?time=846)):
+
+```swift
+import NIOResumableUpload
+
+let uploadContext = HTTPResumableUploadContext(origin: "https://example.com")
+
+NIOTSListenerBootstrap(group: NIOTSEventLoopGroup())
+    .childChannelInitializer { channel in
+        channel.configureHTTP2Pipeline(mode: .server) { channel in
+            channel.pipeline.addHandlers([
+                HTTP2FramePayloadToHTTPServerCodec(),
+                HTTPResumableUploadHandler(context: uploadContext, handlers: [
+                    ExampleChannelHandler()
+                ])
+            ])
+        }.map { _ in () }
+    }
+    .tlsOptions(tlsOptions)
+```
+
+**Key points:**
+- `HTTPResumableUploadContext` uses the `origin` parameter to declare the domain allowed for resumable uploads
+- `HTTPResumableUploadHandler` wraps the original business handler and automatically handles protocol handshakes
+- This module is HTTP/2-based; configure the HTTP/2 pipeline first
+- `NIOResumableUpload` is a separate Swift package and must be imported separately
+
+### Informational response delegate method ([15:48](https://developer.apple.com/videos/play/wwdc2023/10006/?time=948))
+
+The resumable upload protocol relies on HTTP informational responses (1xx status codes) to negotiate resume parameters. iOS 17 adds a new `URLSessionTaskDelegate` method to receive these responses:
+
+```swift
+protocol URLSessionTaskDelegate : URLSessionDelegate {
+    optional func urlSession(_ session: URLSession, task: URLSessionTask,
+                             didReceiveInformationalResponse response: HTTPURLResponse)
+}
+```
+
+**Key points:**
+- Informational responses (such as `100 Continue`, `104 Upload Resumption`) are not treated as final responses
+- This method is called once for each informational response received
+- For resumable uploads, the system uses this mechanism internally for protocol negotiation; manual intervention is usually unnecessary
+
+### Background URLSession best practices ([18:19](https://developer.apple.com/videos/play/wwdc2023/10006/?time=1099))
+
+Background URLSession lets transfer tasks continue after the app is suspended. iOS 17 adds finer control options:
+
+```swift
+// Configuring your background session
+let configuration = URLSessionConfiguration.background(withIdentifier: "com.example.app")
+configuration.isDiscretionary = true
+configuration.allowsConstrainedNetworkAccess = false
+let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+
+// Configuring your background task
+let backgroundTask = session.uploadTask(with: url, fromFile: fileURL)
+backgroundTask.earliestBeginDate = .now.addingTimeInterval(60 * 60)
+backgroundTask.countOfBytesClientExpectsToSend = 500 * 1024
+backgroundTask.countOfBytesClientExpectsToReceive = 200
+```
+
+**Key points:**
+- `isDiscretionary = true`: System runs transfers only on Wi-Fi with sufficient battery—suitable for non-urgent content
+- `allowsConstrainedNetworkAccess = false`: Prohibits low data mode, hotspot, and other constrained networks
+- `earliestBeginDate`: Sets earliest start time for the task, e.g., defer to off-peak hours
+- `countOfBytesClientExpectsToSend/Receive`: Estimates transfer bytes to help the system optimize scheduling and power consumption
+- Background URLSession delegate must be set; otherwise completion callbacks cannot be received
+
+---
+
+## Core Takeaways
+
+**1. Build a resumable download manager with progress bars**
+
+URLSession download pause/resume APIs are mature enough. Combined with `URLSessionDownloadDelegate` progress callbacks, wrap a `ResumableDownloadManager` managing multiple download task states (downloading/paused/completed), progress, and resume data. On manual pause, call `cancelByProducingResumeData()` and store resume data locally (handle temporary file path invalidation). Rebuild tasks on next launch.
+
+**2. Add large video resume upload for social apps**
+
+Use the new upload resume API for a WeChat Moments-like video upload experience: start uploading immediately after the user selects a video, automatically pause and save resume data when leaving the app or going to background, and auto-continue on next open. Key point: resume data lifecycle management—serialize resume data to disk and clean up after recovery.
+
+**3. Provide SwiftNIO resumable upload integration for backend teams**
+
+If your team uses a Swift backend (Vapor or bare SwiftNIO), directly import the `NIOResumableUpload` module and integrate using the session code template. Key configuration: `HTTPResumableUploadContext`'s `origin` parameter and pipeline handler order. No extra client code needed—URLSession upload resume API automatically uses the standard protocol.
+
+**4. Background content preloading system**
+
+Combine Background URLSession's `earliestBeginDate` and `isDiscretionary` for offline preloading in news or video apps. While the app is in foreground, create background tasks for each resource to preload, scheduled for early morning. The system completes downloads automatically on Wi-Fi + charging; content is ready when users open the app in the morning.
+
+---
+
+## Related Sessions
+
+- [Ready, set, relay: Protect app traffic with network relays](/articles/wwdc2023-10002) — How to use relays to protect app network traffic privacy
+- [Reduce network delays with L4S](/articles/wwdc2023-10004) — How L4S reduces network latency and improves real-time app responsiveness
+- [What's new in Background Assets](/articles/wwdc2023-10108) — How Background Assets pre-download content before app launch

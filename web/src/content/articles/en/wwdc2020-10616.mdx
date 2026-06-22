@@ -1,0 +1,169 @@
+---
+title: "Debug GPU-side errors in Metal"
+description: "track down even the trickiest gpu-side programming errors with enhanced reporting in xcode 12. while metal's api validation layer can catch most problems in a project, gpu errors can cause a host of difficult-to-debug issues.\n\nget an introduction to gpu-side errors and learn how to find and eliminate problems like visual corruption, infinite loop timeouts, out of bounds memory accesses, nil resource access, or invalid resource residency with xcode 12. discover how to enable enhanced command buffer error reporting and shader validation, use them effectively as part of your debugging strategy, and automate them in your production pipeline."
+date: "2020-06-25"
+tags: ["Metal", "Developer Tools"]
+thumbnail: "/images/sessions/2020/10616.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10616/"
+sessionId: "wwdc2020-10616"
+year: "2020"
+relatedSessions:
+  - title: "Gain insights into your Metal app with Xcode 12"
+    code: "10605"
+    description: "Use Xcode 12's Metal Debugger and performance tools to locate graphics issues."
+  - title: "Optimize Metal apps and games with GPU counters"
+    code: "10603"
+    description: "Use GPU counters to measure Metal workloads and find performance bottlenecks."
+  - title: "Build GPU binaries with Metal"
+    code: "10615"
+    description: "Improve the Metal shader compilation pipeline and reduce pipeline state object loading time."
+  - title: "Get to know Metal function pointers"
+    code: "10013"
+    description: "Understand Metal function pointers to organize more flexible shader calls."
+---
+## Highlight
+
+> Xcode 12 adds Enhanced Command Buffer Errors and Shader Validation to Metal. Developers can locate GPU-side errors to encoder, draw call, Metal functions, and shader line numbers in some scenarios.
+
+## Core Content
+
+The trouble with Metal is that a lot of bugs happen on the GPU. When the CPU-side API is used incorrectly, Metal API Validation will provide the function entry, error type, call stack and source code location. Shader errors on the GPU side often manifest themselves simply as command buffer failures, corrupted graphics, missing shadows, or occasional data contamination.
+
+Such errors include global memory or threadgroup memory out of bounds, access to nil texture, invalid argument buffer resource resident, long running or infinite loop. In the past, I often saw a general command buffer error. There may be hundreds of encoders in a command buffer, and developers can only narrow down the range manually.
+
+Xcode 12 adds two layers of information to the Metal debugging process. The first layer is Enhanced Command Buffer Errors, which breaks down command buffer errors to the encoder level and tells you which encoders are completed, pending, affected, faulted or unknown. The second layer is Shader Validation, which inserts the Metal shader on the GPU, detects undefined behavior, and locates the error to draw call, Metal function, and GPU backtrace. When the conditions are met, the file and line number will also be given.
+
+These two layers of tools correspond to a clear troubleshooting path: first detect the error, then locate the scope, then classify, and finally repair the code. Enhanced Command Buffer Errors is suitable for normal use in development and QA. In low-overhead scenarios, it can also be brought online to collect telemetry. Shader Validation is more expensive and suitable for Xcode debugging, automated testing, and pre-release verification.
+
+## Detailed Content
+
+### Let command buffer report encoder level status
+
+([03:40](https://developer.apple.com/videos/play/wwdc2020/10616/?time=220)) Enhanced Command Buffer Errors are enabled through the new descriptor API. The key switch is`errorOptions = .encoderExecutionStatus`。
+
+```swift
+let desc = MTLCommandBufferDescriptor()
+desc.errorOptions = .encoderExecutionStatus
+let commandBuffer = commandQueue.makeCommandBuffer(descriptor: desc)
+```
+
+Key points:
+
+- `MTLCommandBufferDescriptor()`Create a command buffer description object.
+-`desc.errorOptions = .encoderExecutionStatus`Requires Metal to log encoder execution status when an error occurs.
+-`makeCommandBuffer(descriptor:)`Use this description object to create a command buffer, and subsequent errors will bring encoder information.
+
+([03:55](https://developer.apple.com/videos/play/wwdc2020/10616/?time=235)) After the error occurs, the encoder information is placed in`NSError.userInfo`of`MTLCommandBufferEncoderInfoErrorKey`inside. each`MTLCommandBufferEncoderInfo`All come with label, debug signposts and error state.
+
+```swift
+if let error = commandBuffer.error as NSError? {
+
+    if let encoderInfos =
+        error.userInfo[MTLCommandBufferEncoderInfoErrorKey]
+        as? [MTLCommandBufferEncoderInfo] {
+
+        for info in encoderInfos {
+            print(info.label + info.debugSignposts.joined())
+            if info.errorState == .faulted {
+                print(info.label + " faulted!")
+            }
+        }
+    }
+}
+```
+
+Key points:
+
+- `commandBuffer.error as NSError?`Get the error object after the command buffer is completed.
+-`MTLCommandBufferEncoderInfoErrorKey`Corresponding to a set of encoder info, arranged in recorded order.
+-`info.label`and`info.debugSignposts`Rely on the debugging flag that developers usually add to the encoder.
+-`info.errorState == .faulted`Indicates that this encoder directly causes command buffer fault.
+-`affected`Representatives may have been affected by the glitch, but Metal cannot confirm it is the source.
+
+This mechanism first solves the problem of "where to start looking". The video clearly recommends that development and QA phases enable it for every command buffer. Because it is integrated directly into Metal, the overhead is low, and it can also be brought to the user device after performance evaluation, using telemetry to gradually narrow down the scope of the problem.
+
+### Use Shader Validation to find undefined behavior in shaders
+
+([07:08](https://developer.apple.com/videos/play/wwdc2020/10616/?time=428)) Shader Validation is a verification layer that runs on the GPU. It instruments the Metal shader and detects operations that cause undefined behavior. When a problem is detected, the tool will prevent the operation and generate logs to help locate draw calls, Metal functions, and specific shader lines in some scenarios.
+
+The range it can detect includes:
+
+- Device memory and constant memory are accessed out of bounds.
+- Threadgroup memory out-of-bounds access.
+- Call texturing functions on null texture object.
+
+The example in the video is typical. An out-of-bounds read sometimes falls into unallocated virtual memory, triggering a command buffer fault; sometimes it falls into an adjacent buffer, reading incorrect data or corrupting another buffer. In the latter case, there may be no command buffer error, but only intermittent rendering errors. This is the value of Shader Validation: even without fault, some undefined behaviors can be discovered.
+
+([09:47](https://developer.apple.com/videos/play/wwdc2020/10616/?time=587)) When using it in Xcode, open Diagnostics in scheme settings and check Shader Validation in the Metal area. Xcode will turn on Enhanced Command Buffer Errors for all command buffers at the same time. Then add Metal diagnostics breakpoint. When the program hits shader validation error, it will stop and display GPU and CPU backtrace.
+
+In the demo, the Ray Tracing example has missing shadows and screen lines. When Shader Validation is enabled, Xcode flags out-of-bounds memory reads in the Metal shader. The developer followed the GPU backtrace back to the calling point and found that when converting two-dimensional coordinates to one-dimensional array index,`gridX`Multiply by the width and correct to`gridY * width + gridX`Post-rendering resumes.
+
+### Enable validation outside Xcode and read logs
+
+([15:05](https://developer.apple.com/videos/play/wwdc2020/10616/?time=905)) Automated tests or non-Xcode runtime environments can also enable the verification layer.`MTL_DEBUG_LAYER`Set to a non-zero value to turn on API Validation.`MTL_SHADER_VALIDATION`Set to a non-zero value to turn on Shader Validation. The two variables can be set at the same time or used separately, but they must be created earlier than the Metal device; after the device is created, these values ​​will be locked, and subsequent modifications in this process will not take effect.
+
+([15:39](https://developer.apple.com/videos/play/wwdc2020/10616/?time=939)) command buffer now has`logs`property. It is only valid after the command buffer is completed, so the reading logic must be put into the completion handler.
+
+```swift
+commandBuffer.addCompletedHandler { (commandBuffer) in
+    for log in commandBuffer.logs {
+        let encoderLabel = log.encoderLabel ?? "Unknown Label"
+        print("Faulting encoder \"\(encoderLabel)\"")
+        guard let debugLocation = log.debugLocation,
+              let functionName = debugLocation.functionName
+        else {
+            return
+        }
+        print("Faulting function \(functionName):\(debugLocation.line):\(debugLocation.column)")
+    }
+}
+```
+
+Key points:
+
+- `addCompletedHandler`Make sure the code runs after the command buffer completes.
+-`commandBuffer.logs`May contain multiple Shader Validation errors.
+-`log.encoderLabel`Associate errors back to the encoder.
+-`log.debugLocation`Provides the source code location when the library is compiled from source or with debug symbols.
+-`functionName`、`line`、`column`Have automated test logs point directly to shader functions and locations.
+
+([15:40](https://developer.apple.com/videos/play/wwdc2020/10616/?time=940)) The same type of information will also enter the system log. You can use`log stream`Filter Metal GPU debug logs.
+
+```bash
+log stream --predicate "subsystem = 'com.apple.Metal' and category = 'GPUDebug'"
+```
+
+Key points:
+
+- `subsystem = 'com.apple.Metal'`Just look at the Metal subsystem.
+-`category = 'GPUDebug'`Filter GPU debug related logs.
+- The log will contain information such as process name, error type, error details, and Metal file name and line number.
+
+### Costs to know before turning on Shader Validation
+
+([17:17](https://developer.apple.com/videos/play/wwdc2020/10616/?time=1037)) Shader Validation will increase pipeline compilation time. The video recommends using asynchronous compilation methods to spread compilation across multiple threads to reduce waiting during development.
+
+([17:34](https://developer.apple.com/videos/play/wwdc2020/10616/?time=1054)) Metal library must have debug symbols. Xcode debug scheme will handle it automatically; when calling Metal frontend manually, you need to add`-g`. When compiling a library from source at runtime, it is recommended to use`#line`directive, giving backtracer a recognizable file name.
+
+([18:26](https://developer.apple.com/videos/play/wwdc2020/10616/?time=1106)) Shader Validation is a process-level switch. When turned on, all Metal commands in the process, including UI rendering, will go through the verification layer. It will bring high performance and memory overhead. Video is recommended for development and QA, and is not recommended for users.
+
+([18:57](https://developer.apple.com/videos/play/wwdc2020/10616/?time=1137)) After turning on, some query results may change. Computing pipeline`maxTotalThreadsPerThreadgroup`and`threadExecutionWidth`All need to be read again. Some instrumentation can be turned off through environment variables. For example, when you have checked for null texture yourself, you can set`MTL_SHADER_VALIDATION_TEXTURE_USAGE = 0`Turn off texture usage instrumentation, but will give up the corresponding detection capabilities.
+
+## Core Takeaways
+
+- **Make a Metal error telemetry channel**: used in QA builds`MTLCommandBufferDescriptor`Enable encoder execution status and upload the label, signposts and device information of the faulted encoder together. This turns "occasional GPU crashes" into an aggregated problem list.
+
+- **Integrate Shader Validation into rendering regression testing**: Set in the graphics test task of CI`MTL_DEBUG_LAYER=1`and`MTL_SHADER_VALIDATION=1`, read after running the critical rendering path`commandBuffer.logs`. Test failure information directly outputs faulting encoder, function, line and column.
+
+- **Establish a naming convention for each render pass**: Set a stable label for the command encoder and insert debug signposts in complex passes. Enhanced Command Buffer Errors and Xcode Metal Debugger will reuse these identifiers, and fault reports can be directed to business modules.
+
+- **Preserve debug symbols mode for shader compilation pipeline**: Enable Metal debug symbols uniformly for debugging and QA builds. Runtime compiled shader source code plus`#line`directive, allowing Shader Validation's backtrace to point to the real file or generator output location.
+
+- **Make a pre-release GPU undefined behavior checklist**: Cover out-of-bounds device memory, threadgroup memory, null texture, argument buffer resource persistence and timeout. Enhanced Command Buffer Errors is responsible for encoder-level positioning, and Shader Validation is responsible for undefined behavior that can be discovered by instrumentation.
+
+## Related Sessions
+
+- [Gain insights into your Metal app with Xcode 12](/articles/wwdc2020-10605) — Continue learning about Xcode 12’s Metal Debugger, capture, and diagnostic tools.
+- [Optimize Metal apps and games with GPU counters](/articles/wwdc2020-10603) — After fixing GPU errors, use counters to find performance bottlenecks.
+- [Build GPU binaries with Metal](/articles/wwdc2020-10615) — Cooperate with shader debugging symbols and compilation pipelines to improve Metal pipeline loading and diagnosis.
+- [Get to know Metal function pointers](/articles/wwdc2020-10013) — Understand the more complex Metal shader call structure to facilitate reading GPU backtrace during debugging.

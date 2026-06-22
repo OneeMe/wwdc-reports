@@ -1,0 +1,562 @@
+---
+title: "Foundation Models フレームワークでエージェント App 体験を構築する"
+description: "学習"
+date: "2026-06-10"
+tags: ["基盤モデル", "DynamicProfile", "エージェント AI", "LanguageModelSession", "Private Cloud Compute"]
+thumbnail: "/images/sessions/2026/242.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2026/242/"
+sessionId: "wwdc2026-242"
+year: "2026"
+relatedSessions:
+  - title: "セッション 241 - 自分のモデルを Apple Intelligence に持ち込む"
+    code: "241"
+    description: "PrivateCloudComputeLanguageModel の詳しい機能と接続方法を学ぶ"
+  - title: "セッション 243 - Foundation Models 機能をデバッグしてプロファイルする"
+    code: "243"
+    description: "Xcode Instruments で KV Cache の無効化と性能ボトルネックを検出する方法を学ぶ"
+  - title: "セッション 298 - AI 機能を評価する"
+    code: "298"
+    description: "Evaluations フレームワークを使ってコンテキストエンジニアリング戦略の効果を定量化する方法を学ぶ"
+  - title: "セッション 324 - Core AI を App に統合する"
+    code: "324"
+    description: "Core AI フレームワークと Foundation Models の統合方法を学ぶ"
+  - title: "セッション 347 - 安全なエージェント体験を構築する"
+    code: "347"
+    description: "マルチ Agent システムでプライバシー境界と安全ポリシーを設定する方法を学ぶ"
+---
+
+## ハイライト
+
+> Apple は Foundation Models フレームワークに `DynamicProfile` API を導入しました。これにより、同じ `LanguageModelSession` がタスク段階に応じてモデル、指示、ツール構成を動的に切り替えられます。あわせて、会話履歴の切り詰めとマルチ Agent 編成を管理する `FoundationModelsUtilities` ツールキットもオープンソース化されました。
+
+## 主要内容
+
+### 折り紙 App のジレンマ
+
+Origami という手芸チュートリアル App を作っていると想像してください。ユーザーが写真をアップロードすると、App はまず創作アイデアのブレインストーミングを手伝い、その後に詳しいチュートリアルを生成し、制作中には進捗写真をアップロードしてコツを受け取れるようにします。
+
+この 3 段階は同じ会話コンテキストを共有しますが、必要なものはまったく異なります。ブレインストーミングには創造性が必要で、チュートリアル生成には深い推論が必要で、制作中の助言には高速な応答が必要です。従来の方法では、3 つの独立した `LanguageModelSession` を作り、要約を手動で渡すため、コンテキストが頻繁に途切れました。あるいは 1 つの Session ですべてを無理に処理し、Token が増え続けてモデルがだんだん鈍くなる、という形でした。
+
+Apple が今年提示した解決策が `DynamicProfile` です。
+
+### 動的なモデル切り替え：帽子を替えるように Agent を替える
+
+（[02:08](https://developer.apple.com/videos/play/wwdc2026/242/?time=128)）`DynamicProfile` により、同じ Session 内で現在のタスク段階に応じて、基盤モデル、temperature、`reasoningLevel` などの設定を切り替えられます。モデルを呼び出すたびに `body` 属性が再評価され、Session の「人格」が変わります。
+
+折り紙 App の例は典型的です。ブレインストーミング段階では `PrivateCloudComputeLanguageModel` を使い、temperature を 1 にして創造性を高めます。チュートリアル計画段階では同じクラウドモデルを使いますが、深い推論を有効にします。最後のレビューと助言段階では `SystemLanguageModel` に切り替え、コストを節約します。
+
+### 会話履歴管理：根を傷つけずに剪定する
+
+（[07:56](https://developer.apple.com/videos/play/wwdc2026/242/?time=476)）モデルを切り替えるとき、モデルごとにコンテキストウィンドウの大きさが異なります。`DynamicProfile` は履歴管理の方法を 2 つ提供します。
+
+1 つ目は `historyTransform` です。これは各リクエストの前に履歴を局所的に変換し、モデルに送るスナップショットだけに影響します。Session の実際の履歴は変更しません。このステートレスな設計により、状態同期の難しさを避けられます。
+
+2 つ目は `@SessionProperty` を通じて `history` を直接読み書きする方法です。この方法は「有損」で、変更は Session 内のすべての Profile に反映されます。`onResponse` コールバックで 50 件の履歴を 1 つの要約に圧縮するなど、応答境界で要約や切り詰めを行う場合に適しています。
+
+### 2 つの編成パターン：接力と相談
+
+（[12:49](https://developer.apple.com/videos/play/wwdc2026/242/?time=769)）複数の Profile が協力する必要がある場合、Apple は 2 つのパターンを推奨しています。
+
+**Baton-pass（接力）**：複数の Profile が完全な会話履歴を共有し、Tool を通じて現在有効な Profile を切り替えます。受け取った Profile が最終回答を担当します。コンテキストの連続性が重要な協調場面に適しています。
+
+**Phone-a-friend（相談）**：メイン Profile が Tool を使って短命の子 Session を派生させます。子 Session はサブタスクを独立して処理し、結果を返したあと破棄されます。コンテキストを隔離したい相談場面に適しています。
+
+### Tool 呼び出しのタイミングを制御する
+
+（[15:29](https://developer.apple.com/videos/play/wwdc2026/242/?time=929)）新しく導入された `ToolCallingMode` には 3 つの選択肢があります。`allowed`（デフォルト。モデルが自分で判断）、`disallowed`（Tool 呼び出しを禁止）、`required`（必ず Tool を呼び出す）です。
+
+`required` モードは Agent システムで有用ですが、落とし穴があります。モデルが無限に Tool を呼び出すループに入ることです。状態変数でモード切り替えを条件化する、あるいは例外を投げる「最終回答」Tool を用意して強制的に抜けるなど、終了条件を必ず用意する必要があります。
+
+### 性能と正確性のトレードオフ
+
+（[18:29](https://developer.apple.com/videos/play/wwdc2026/242/?time=1109)）会話履歴を変更すると、基盤となる KV Cache（キー値キャッシュ）に影響します。履歴の追加は通常キャッシュを保持できますが、履歴項目の削除や変更、ツールの変更はキャッシュ無効化を引き起こし、最初の Token までの遅延を増やします。Apple はこれを自動処理するのではなく、Xcode の Foundation Models Instrument を強化し、開発者自身が測定して最適化できるようにしました。
+
+もう 1 つのリスクは正確性です。Session に新しい Tool を追加したのに、履歴上ではモデルが以前 Tool なしで似たタスクを完了していた場合、モデルが混乱する可能性があります。Apple の推奨は、Evaluations フレームワークで評価セットを作り、コンテキストエンジニアリング戦略をデータ駆動で検証することです。
+
+## 詳細
+
+### DynamicInstructions で指示を組み合わせて宣言する
+
+（[04:58](https://developer.apple.com/videos/play/wwdc2026/242/?time=298)）`DynamicInstructions` は関連する指示とツールを再利用可能なコンポーネントにまとめ、SwiftUI ビューのようにネストして組み合わせられます。
+
+```swift
+struct BrainstormFacilitator: DynamicInstructions {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicInstructions {
+        Instructions {
+            "あなたは温かく親しみやすい、手芸ブレインストーミングの専門ファシリテーターです。"
+        }
+        GenerateProjectTitle()
+        if orchestrator.techniques.contains(.origami) {
+            OrigamiExpert()
+        }
+    }
+}
+```
+
+要点：
+- `DynamicInstructions` は条件付きで内容を含められる。たとえばユーザーが折り紙を選んだときだけ `OrigamiExpert` を読み込む
+- ネストされた指示とツールは自動で連結され、手動の文字列連結は不要
+- 領域知識を再利用可能なモジュールとして封装するのに適している
+
+### DynamicProfile で多段階構成を宣言する
+
+（[06:41](https://developer.apple.com/videos/play/wwdc2026/242/?time=401)）`DynamicProfile` の `body` は外部状態に応じて異なる `Profile` 構成を返します。
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .brainstorming:
+            Profile { BrainstormFacilitator(orchestrator: orchestrator) }
+                .model(orchestrator.pccLanguageModel)
+                .temperature(1)
+        case .planning:
+            Profile { TutorialAuthor(orchestrator: orchestrator) }
+                .model(orchestrator.pccLanguageModel)
+                .reasoningLevel(.deep)
+        case .reviewing:
+            Profile { CraftCoach() }
+                .model(orchestrator.systemLanguageModel)
+        }
+    }
+}
+```
+
+要点：
+- `body` は prompt ごとに再評価されるため、状態変化は次のモデル呼び出しに自動反映される
+- `.model()` は基盤モデルを指定し、`.temperature()` は創造性の度合いを制御し、`.reasoningLevel(.deep)` は深い推論を有効にする
+- 複数の Session を作る必要はなく、`orchestrator.mode` を切り替えるだけで Agent の振る舞いを変えられる
+
+Session 初期化時に DynamicProfile を渡します。
+
+```swift
+let session = LanguageModelSession(profile: CraftProfile(orchestrator: orchestrator))
+```
+
+### historyTransform で履歴を切り詰める
+
+（[08:33](https://developer.apple.com/videos/play/wwdc2026/242/?time=513)）`historyTransform` は各リクエスト前に履歴項目をフィルタし、Session の実際の transcript には影響しません。
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .reviewing:
+            Profile { CraftCoach() }
+                .model(orchestrator.systemLanguageModel)
+                .historyTransform { history in
+                    guard let latestResponseIndex = lastResponseEntryIndex(history) else {
+                        return history
+                    }
+                    let filteredHistory = history[0..<latestResponseIndex].filter { entry in
+                        isToolCallsOrToolOutput(entry)
+                    }
+                    return filteredHistory + history[latestResponseIndex...]
+                }
+        }
+    }
+}
+```
+
+要点：
+- `historyTransform` はモデルに送るスナップショットだけを変更し、Session の完全な履歴は保持される
+- 特定の Profile 向けに無損失変換を行う場合に適している
+- 端側モデルでは、履歴を切り詰めることでコンテキストウィンドウ超過を防げる
+
+### カスタム Modifier で再利用ロジックを封装する
+
+（[09:15](https://developer.apple.com/videos/play/wwdc2026/242/?time=555)）複雑な `historyTransform` を再利用可能な Modifier として封装します。
+
+```swift
+struct DroppingToolCallsProfileModifier: LanguageModelSession.DynamicProfileModifier {
+    func body(content: Content) -> some DynamicProfile {
+        content
+            .historyTransform { history in
+                guard let latestResponseIndex = lastResponseEntryIndex(history) else {
+                    return history
+                }
+                let filteredHistory = history[0..<latestResponseIndex].filter { entry in
+                    isToolCallsOrToolOutput(entry)
+                }
+                return filteredHistory + history[latestResponseIndex...]
+            }
+    }
+}
+
+extension LanguageModelSession.DynamicProfile {
+    func droppingCompletedToolCalls() -> some DynamicProfile {
+        self.modifier(DroppingToolCallsProfileModifier())
+    }
+}
+```
+
+要点：
+- カスタム Modifier は `DynamicProfileModifier` プロトコルに準拠する
+- `extension` により `DynamicProfile` にチェーン可能なメソッドを追加できる
+- `FoundationModelsUtilities` パッケージには、`.rollingWindow` や `.droppingCompletedToolCalls` などの一般的な Modifier がすでに組み込まれている
+
+### FoundationModelsUtilities で履歴ウィンドウを管理する
+
+（[09:27](https://developer.apple.com/videos/play/wwdc2026/242/?time=567)）
+
+```swift
+import FoundationModelsUtilities
+
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .reviewing:
+            Profile { CraftCoach() }
+                .rollingWindow(size: .entries(10))
+                .droppingCompletedToolCalls()
+        }
+    }
+}
+```
+
+要点：
+- `FoundationModelsUtilities` は Apple がオープンソース化した Swift パッケージで、OS リリース周期の間にも更新される
+- `.rollingWindow(size: .entries(10))` は直近 10 件の履歴だけを保持する
+- `.droppingCompletedToolCalls()` は完了済みの Tool 呼び出し記録を捨てる
+- Modifier の呼び出し順は最終結果に影響する
+
+### Lifecycle Modifier で応答境界に要約を行う
+
+（[10:48](https://developer.apple.com/videos/play/wwdc2026/242/?time=648)）`onResponse` は各モデル応答後に実行され、状態更新や履歴変更に適しています。
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    @SessionProperty(\.history) var history
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .planning:
+            Profile { TutorialAuthor(orchestrator: orchestrator) }
+                .model(orchestrator.pccLanguageModel)
+                .reasoningLevel(.deep)
+                .onResponse {
+                    if history.count > 50, let responseIndex = lastResponseIndex(history) {
+                        history = history[responseIndex...]
+                    }
+                }
+        }
+    }
+}
+```
+
+要点：
+- `@SessionProperty(\.history)` は Session の組み込み履歴属性にアクセスする
+- `history` を直接変更すると、Session 内のすべての Profile に影響する
+- 応答境界で有損の要約や切り詰めを行う場合に適している
+
+### カスタム Session 属性を宣言する
+
+（[11:40](https://developer.apple.com/videos/play/wwdc2026/242/?time=700)）
+
+```swift
+extension SessionPropertyValues {
+    @SessionPropertyEntry var summary: String?
+}
+```
+
+Profile 内で読み書きします。
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    @SessionProperty(\.history) var history
+    @SessionProperty(\.summary) var summary
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .planning:
+            Profile {
+                TutorialAuthor(orchestrator: orchestrator)
+                if let summary {
+                    Instructions { "要約: \(summary)" }
+                }
+            }
+            .onResponse {
+                if history.count > 50, let responseIndex = lastResponse(history.prefix(40)) {
+                    summary = try await summarize(history[0..<responseIndex])
+                    history = history[responseIndex...]
+                }
+            }
+        }
+    }
+}
+```
+
+要点：
+- `@SessionPropertyEntry` でカスタム属性を宣言し、すべての属性には初期値が必要
+- `summary` は Profile 間で共有され、捨てられた履歴の重要情報を要約として保持できる
+- どの Profile からも読み書きでき、変更はすべてのコンポーネントから見える
+
+### Baton-pass 編成パターン
+
+（[13:02](https://developer.apple.com/videos/play/wwdc2026/242/?time=782)）複数の Profile が完全な履歴を共有し、Tool によって有効状態を切り替えます。
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var orchestrator: CraftOrchestrator
+    var body: some DynamicProfile {
+        switch orchestrator.mode {
+        case .brainstorm:
+            Profile {
+                BrainstormInstructions()
+                BatonPassTool()
+            }
+            .onToolCall { orchestrator.mode = .tutorial }
+            .model(orchestrator.serverModel)
+        case .tutorial:
+            Profile {
+                TutorialInstructions()
+                BatonPassTool()
+            }
+            .onToolCall { orchestrator.mode = .brainstorm }
+            .model(orchestrator.systemModel)
+        }
+    }
+}
+```
+
+要点：
+- `.onToolCall` は Tool が呼ばれたときにモード切り替えなどの副作用を実行する
+- 2 つの Profile はどちらも完全な会話履歴を見られる
+- 引き継いだ Profile が最終回答を担当する
+
+### Phone-a-friend 編成パターン
+
+（[14:14](https://developer.apple.com/videos/play/wwdc2026/242/?time=854)）メイン Profile が子 Session を派生させ、サブタスクを処理させます。
+
+```swift
+struct CraftProfile: LanguageModelSession.DynamicProfile {
+    var body: some DynamicProfile {
+        Profile {
+            BrainstormInstructions()
+            PhoneFriendTool(
+                name: "generate_title",
+                description: "創造的なプロジェクトタイトルを生成する",
+                profile: TitleProfile()
+            )
+        }
+    }
+}
+
+struct PhoneFriendTool<P: LanguageModelSession.DynamicProfile>: Tool {
+    func call(arguments: GeneratedContent) async throws -> String {
+        let session = LanguageModelSession(profile: profile())
+        let response = try await session.respond(to: arguments)
+        return response.content
+    }
+}
+```
+
+要点：
+- 子 Session は独立した transcript を持ち、親 Session から隔離される
+- 子 Session は処理後に結果を返し、そのまま破棄される
+- 最終回答の責任は常に親 Profile にある
+
+### Skills モードで領域知識を読み込む
+
+（[15:15](https://developer.apple.com/videos/play/wwdc2026/242/?time=915)）
+
+```swift
+struct CraftingSkills: LanguageModelSession.DynamicInstructions {
+    var activations: SkillActivations
+    var body: some DynamicInstructions {
+        Skills(activations: activations) {
+            Skill(
+                name: "origami_folds",
+                description: "特定の折り方の詳細",
+                prompt: """
+                    谷折り: 紙を自分の方へ折り、V 字型の折り目を作る
+                    山折り: 紙を自分から離れる方向へ折り、逆 V 字を作る
+                    ...
+                    """
+            )
+            Skill(...)
+            Skill(...)
+        }
+    }
+}
+```
+
+要点：
+- `Skills` は `FoundationModelsUtilities` パッケージ内の型
+- 各 `Skill` は名前、説明、詳細 prompt を含む
+- `activations` がどの Skill を有効にするか制御し、一度に過剰な領域知識を読み込むことを避ける
+
+### Tool Calling Mode の制御
+
+（[15:31](https://developer.apple.com/videos/play/wwdc2026/242/?time=931)）
+
+```swift
+public struct ToolCallingMode: Sendable {
+    public static let allowed: ToolCallingMode
+    public static let disallowed: ToolCallingMode
+    public static let required: ToolCallingMode
+}
+
+struct OrigamiExpert: LanguageModelSession.DynamicProfile {
+    var body: some LanguageModelSession.DynamicProfile {
+        Profile {
+            Instructions("あなたは折り紙の専門家です")
+            QueryOrigamiDatabaseTool()
+            ShowDirectionsTool()
+        }
+        .toolCallingMode(.required)
+    }
+}
+```
+
+生成オプションとして渡します。
+
+```swift
+let response = try await session.respond(
+    to: "紙の鶴の折り方を手順として書いてください。",
+    options: GenerationOptions(toolCallingMode: .required)
+)
+```
+
+要点：
+- `allowed`：モデルが自分で判断する。最もよく使われる
+- `disallowed`：Tool 呼び出しを禁止する。ユーザーが関係ないページにいる場合に適している
+- `required`：モデルは Tool だけを呼び出せる。終了条件と必ず組み合わせる必要がある
+
+### Tool 呼び出しループから抜ける
+
+（[16:47](https://developer.apple.com/videos/play/wwdc2026/242/?time=1007)）条件化されたモード切り替えです。
+
+```swift
+struct OrigamiExpert: LanguageModelSession.DynamicProfile {
+    let state: OrigamiAppState
+
+    var body: some LanguageModelSession.DynamicProfile {
+        Profile {
+            Instructions("折り紙の折り方についての質問に答えてください")
+            QueryOrigamiDatabaseTool()
+        }
+        .toolCallingMode(state.queriedDatabase ? .disallowed : .required)
+        .onToolCall { state.queriedDatabase = true }
+    }
+}
+```
+
+例外を投げる Tool で強制的に抜けます。
+
+```swift
+struct FinalAnswerTool: Tool {
+    var output: String?
+
+    @Generable struct Arguments {
+        var answer: String
+    }
+
+    func call(arguments: Arguments) async throws -> Never {
+        output = arguments.answer
+        throw CancellationError()
+    }
+}
+```
+
+要点：
+- 条件化された `toolCallingMode` はより穏やかな終了方法
+- `CancellationError()` を投げるとループが即座に中断され、制御が開発者に戻る
+- デフォルトでは Tool のエラーにより transcript はロールバックされる
+
+### Transcript のエラー処理ポリシーを制御する
+
+（[17:28](https://developer.apple.com/videos/play/wwdc2026/242/?time=1048)）
+
+```swift
+struct OrigamiExpert: LanguageModelSession.DynamicProfile {
+    let state: OrigamiAppState
+
+    var body: some LanguageModelSession.DynamicProfile {
+        Profile {
+            Instructions("折り紙の折り方についての質問に答えてください")
+            QueryOrigamiDatabaseTool()
+        }
+        .transcriptErrorHandlingPolicy(.preserveTranscript)
+    }
+}
+
+let session = LanguageModelSession()
+session.transcriptErrorHandlingPolicy = .preserveTranscript
+```
+
+要点：
+- `.revertTranscript`（デフォルト）：Tool エラー後に以前の状態へロールバックする
+- `.preserveTranscript`：エラー現場を保持し、手動で修復して続行できる
+- `.preserveTranscript` を選ぶ場合、transcript が有効な状態であることを自分で保証する必要がある
+
+### Transcript を手動で変更する
+
+（[17:51](https://developer.apple.com/videos/play/wwdc2026/242/?time=1071)）
+
+```swift
+public final class LanguageModelSession: Sendable {
+    public var transcriptErrorHandlingPolicy: TranscriptErrorHandlingPolicy { get set }
+    public var transcript: Transcript { get set }
+    public var isResponding: Bool { get }
+}
+```
+
+要点：
+- `transcript` は可変になったが、変更できるのは `isResponding == false` のときだけ
+- 応答中に transcript を変更するのはプログラミングエラーで、クラッシュにつながる
+- `.preserveTranscript` と組み合わせると、Tool エラー後に履歴を手動修復できる
+
+## 核心的な示唆
+
+### 1. 多段階 AI ライティングアシスタントを作る
+
+**作るもの**：長文執筆 App を「アウトラインのブレインストーミング -> 段落ごとの展開 -> 推敲と校正」の 3 段階に分け、各段階で最適なモデル設定へ自動切り替えする。
+
+**作る価値**：`DynamicProfile` により 3 段階は同じ Session を共有できるため、アウトライン段階の文脈が自然に展開段階へ渡る。手動で Prompt をつなぎ合わせる必要はない。ブレインストーミングでは高温度の PCC モデルで創造性を引き出し、推敲では端側モデルで素早く応答する。
+
+**始め方**：現在の段階を追跡する `WritingOrchestrator` を定義し、`DynamicProfile` の `body` 内で `switch` により異なる設定を返す。展開段階では `.reasoningLevel(.deep)`、推敲段階では `.temperature(0.3)` を使う。
+
+### 2. 領域知識ベースを持つカスタマーサポート Agent を作る
+
+**作るもの**：EC カスタマーサポート App で、ユーザーの問い合わせ時に該当カテゴリの知識 Skill を自動読み込みし、相談終了後にアンロードしてコンテキストを節約する。
+
+**作る価値**：`Skills` パターンにより、各カテゴリの知識を独立した `Skill` として封装し、`SkillActivations` で動的に読み込める。すべての知識を巨大な System Prompt に詰め込む必要がない。
+
+**始め方**：`FoundationModelsUtilities` の `Skills` 型で各カテゴリの知識を定義し、ユーザーが現在閲覧しているカテゴリに応じて `DynamicInstructions` 内でどの `Skill` を有効化するか決める。
+
+### 3. 無限に長い会話に対応する AI コンパニオンを作る
+
+**作るもの**：数か月分の会話を覚える必要がある AI コンパニオン App で、`onResponse` により履歴を定期的に要約し、`@SessionPropertyEntry` で重要な事実を保存する。
+
+**作る価値**：`SessionProperty` により Profile 間の状態共有は宣言的になる。ユーザーが話した誕生日や好みなどの重要情報を属性として保存でき、履歴が切り詰められても失われない。
+
+**始め方**：`@SessionPropertyEntry var keyFacts: [String]` を宣言し、`onResponse` 内で小さなモデルを使って重要事実を抽出して追加する。履歴がしきい値を超えたら要約し、その要約を Instructions に注入する。
+
+### 4. 端末とクラウドを組み合わせたコードアシスタントを作る
+
+**作るもの**：簡単な補完は端側モデルで即座に返し、複雑なリファクタリングは自動的にクラウドモデルへ昇格し、完了後に端側へ戻るプログラミングアシスタント。
+
+**作る価値**：`DynamicProfile` の `baton-pass` モードにより、端側モデルとクラウドモデルは自然に接力できる。簡単な質問ではクラウド Token を使わず、複雑な質問でも品質を犠牲にしない。
+
+**始め方**：`.quickComplete` と `.deepRefactor` の 2 つのモードを定義する。前者は `SystemLanguageModel`、後者は `PCCLanguageModel` + `.reasoningLevel(.deep)` を使う。ユーザーまたはモデルがモード切り替えを起動できる Tool を用意する。
+
+### 5. 複数 Agent が協力するリサーチツールを作る
+
+**作るもの**：「検索 Agent -> 分析 Agent -> 執筆 Agent」の 3 役を持つリサーチアシスタントを作り、`phone-a-friend` パターンでそれぞれのコンテキストを隔離する。
+
+**作る価値**：検索 Agent のコンテキストには雑多な検索結果が大量に含まれ、分析 Agent の推論を汚染すべきではない。`phone-a-friend` により各 Agent は自分のタスクに集中し、Tool を通じて精選された情報だけを渡せる。
+
+**始め方**：メイン Session で `BrainstormProfile` を使う。検索 Tool の内部で独立した `SearchProfile` Session を作り、構造化結果を返してから破棄する。分析段階では別の `AnalysisProfile` Session を作り、検索結果を処理する。
+
+## 関連セッション
+
+- [セッション 241 - 自分のモデルを Apple Intelligence に持ち込む](/articles/wwdc2026-241) — PrivateCloudComputeLanguageModel の詳しい機能と接続方法を学ぶ
+- [セッション 243 - Foundation Models 機能をデバッグしてプロファイルする](/articles/wwdc2026-243) — Xcode Instruments で KV Cache の無効化と性能ボトルネックを検出する方法を学ぶ
+- [セッション 298 - AI 機能を評価する](/articles/wwdc2026-298) — Evaluations フレームワークを使ってコンテキストエンジニアリング戦略の効果を定量化する方法を学ぶ
+- [セッション 324 - Core AI を App に統合する](/articles/wwdc2026-324) — Core AI フレームワークと Foundation Models の統合方法を学ぶ
+- [セッション 347 - 安全なエージェント体験を構築する](/articles/wwdc2026-347) — マルチ Agent システムでプライバシー境界と安全ポリシーを設定する方法を学ぶ

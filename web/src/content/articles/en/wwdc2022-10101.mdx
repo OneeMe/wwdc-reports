@@ -1,0 +1,348 @@
+---
+title: "Go bindless with Metal 3"
+description: "learn how you can unleash powerful rendering techniques like ray tracing when you go bindless with metal 3. we'll show you how to make your app's bindless journey a joy by simplifying argument buffers, allocating acceleration structures from heaps, and benefitting from the improvements to the metal's validation layer and debugger tools. we'll also explore how you can command more cpu and gpu performance with long-term resource structures."
+date: 2026-06-10
+tags: ["Graphics & Games", "Metal"]
+thumbnail: "/images/sessions/2022/10101.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/10101/"
+sessionId: "wwdc2022-10101"
+year: "2022"
+relatedSessions:
+  - title: "Discover Metal 3"
+    code: "10066"
+    description: "Overview of Metal 3, covering asset loading, offline compilation, MetalFX, Mesh Shaders, ray tracing, and tool updates"
+  - title: "Maximize your Metal ray tracing performance"
+    code: "10105"
+    description: "In-depth explanation of Metal 3 ray tracing performance optimization and accelerated structure update"
+  - title: "Target and optimize GPU binaries with Metal 3"
+    code: "10102"
+    description: "Move GPU binary generation to the build stage to reduce runtime shader compilation lags"
+  - title: "Load resources faster with Metal 3"
+    code: "10104"
+    description: "Improve resource streaming for games and graphics apps with Metal 3 Fast Resource Loading"
+  - title: "Program Metal in C++ with metal-cpp"
+    code: "10160"
+    description: "Use header-only metal-cpp to call the Metal API directly from the C++ code base"
+---
+## Highlight
+
+> Metal 3 enables bindless rendering to write directly to Argument Buffers and unbounded arrays, allocate ray tracing acceleration structures from the Heap, and locate missing persistence and erroneous resource accesses through shader validation and Xcode 14 tools.
+
+## Core Content
+
+The traditional binding model will bind resources to fixed slots of the pipeline one by one. When the scene becomes complex, the shader needs to access mesh, material, texture, skybox and ray tracing data, and the CPU side has to maintain a large number of binding calls.
+
+Bindless rendering changes its organization method: first aggregate resource references into memory, and then bind only one buffer. The shader can find the required data along the pointers and resource IDs in the Argument Buffer. ([00:59](https://developer.apple.com/videos/play/wwdc2022/10101/?time=59))
+
+This is important for ray tracing. The reflection shader requires access to a number of assets such as floors, trucks, materials, and skies. After putting these resources into the Argument Buffer, the ray tracing shader can fetch data on demand at runtime. ([01:32](https://developer.apple.com/videos/play/wwdc2022/10101/?time=92))
+
+Metal 3 solves the engineering cost of using bindless. It allows Argument Buffer to be written like a C structure; it allows unbounded arrays to be filled like ordinary structure arrays; it allows`MTLHeap`Allocate a ray tracing acceleration structure; also let the shader validation layer report an error directly if the resource does not reside in GPU memory. ([02:02](https://developer.apple.com/videos/play/wwdc2022/10101/?time=122))
+
+## Detailed Content
+
+### Write Argument Buffer directly
+
+([04:00](https://developer.apple.com/videos/play/wwdc2022/10101/?time=240)) In the Metal 2 era, writing an Argument Buffer usually required creating an Argument Encoder first. This encoder can be created through shader function reflection, or it can be described by handwriting struct member. Be extra careful when using multi-threading.
+
+Metal 3 simplifies this step to writing a C struct. The CPU side gets the buffer contents, casts it into a structure pointer, and then writes the GPU address or Resource ID of the resource. Metal will understand these references, and the effect is equivalent to using the Argument Encoder to encode the references in the past. ([04:09](https://developer.apple.com/videos/play/wwdc2022/10101/?time=249))
+
+```objc
+// Write argument buffers in Metal 3
+
+struct Mesh
+{
+   uint64_t normals; // 64-bit uint for constant packed_float3*
+};
+
+NSUInteger meshArgumentSize = sizeof(struct Mesh);
+
+id<MTLBuffer> meshArgumentBuffer = [device newBufferWithLength:meshArgumentSize
+                                                       options:storageMode];
+
+struct Mesh* meshes = (struct Mesh *)(meshArgumentBuffer.contents); 
+ 
+meshes->normals = normalBuffer.gpuAddress + normalBufferOffset;
+```
+
+Key points:
+
+- `uint64_t normals`Corresponds to the shader`constant packed_float3* normals`, the CPU side saves the 64-bit GPU address.
+-`sizeof(struct Mesh)`Directly give the size of a single Argument Buffer structure, and no longer need the Argument Encoder to calculate the layout.
+-`newBufferWithLength:options:`Create the actual content of the Argument Buffer`MTLBuffer`。
+- `meshArgumentBuffer.contents`exist`Managed`or`Shared`CPU writable pointers are provided in storage mode.
+-`normalBuffer.gpuAddress + normalBufferOffset`Write the GPU address of the target buffer into the structure member; the offset needs to be aligned according to GPU memory requirements.
+
+This capability requires the device to support Argument Buffers Tier 2. The scope given by session is 2016 or newer Macs, and A13 Bionic or newer iOS devices. ([04:37](https://developer.apple.com/videos/play/wwdc2022/10101/?time=277))
+
+### Use shared header files to keep the CPU/GPU structure consistent
+
+([06:32](https://developer.apple.com/videos/play/wwdc2022/10101/?time=392)) The Argument Buffer structure does not look exactly the same on the shader side and the host side. The shader side should write the pointer type, and the host side should write`uint64_t`. Metal 3 ensures that structure sizes and alignments match under clang and the Metal shader compiler, but the declaration itself is still prone to being written twice.
+
+The official example first shows two statements:
+
+```cpp
+// Shader struct:
+
+struct Mesh
+{
+   constant packed_float3* normals;
+};
+
+// Host-side struct:
+
+struct Mesh
+{
+    uint64_t normals;
+};
+```
+
+Key points:
+
+- shader side`constant packed_float3*`Is the pointer type used by the GPU when accessing the normal array.
+- host side`uint64_t`Is the address representation used by the CPU when writing to the Argument Buffer.
+- The order of fields on both sides must be consistent, otherwise the address read by the shader will be misaligned.
+
+A safer approach is to put the declaration in the shared header file, using`__METAL_VERSION__`Differentiate the compilation environment. ([06:53](https://developer.apple.com/videos/play/wwdc2022/10101/?time=413))
+
+```cpp
+// Shared struct:
+
+#if __METAL_VERSION__
+#define CONSTANT_PTR(x) constant x*
+#else
+#define CONSTANT_PTR(x) uint64_t
+#endif
+
+struct Mesh
+{
+    CONSTANT_PTR(packed_float3) normals;
+};
+```
+
+Key points:
+
+- `__METAL_VERSION__`Only defined when compiling Metal shader code.
+- When shader is compiled,`CONSTANT_PTR(packed_float3)`expand into`constant packed_float3*`.
+- When compiling host, the macro expands into`uint64_t`。
+- `Mesh`Only one field list is maintained to reduce the probability of structure drift on both sides of the CPU/GPU.
+
+### Unbounded array is a structure array
+
+([07:18](https://developer.apple.com/videos/play/wwdc2022/10101/?time=438)) Bindless scenes usually do not write only one mesh. You need to hand over the mesh array, material array, and texture array of the entire scene to the shader. Metal 3 also simplifies the writing of unbounded arrays: allocate a large enough buffer, and then loop to fill the structure array.
+
+```objc
+// Write unbounded arrays of resources in Metal 3
+
+struct Mesh
+{
+   uint64_t normals; // 64-bit uint for constant packed_float3*
+};
+
+NSUInteger meshArgumentSize = sizeof(struct Mesh) * meshes.count;
+
+id<MTLBuffer> meshArgumentBuffer = [device newBufferWithLength:meshArgumentSize
+                                                        options:storageMode];
+
+struct Mesh* meshes = (struct Mesh *)(meshArgumentBuffer.contents); 
+
+for ( NSUInteger i = 0; i < meshes.count; ++i )
+{
+   meshes[i].normals = normalBuffers[i].gpuAddress + normalBufferOffsets[i];
+}
+```
+
+Key points:
+
+- `sizeof(struct Mesh) * meshes.count`Determines the actual space occupied by the unbounded array.
+- The shader does not need to hard-code the array size in the declaration.
+-`struct Mesh* meshes`Access buffer contents as an array of structures.
+-`for`Loop to write the normal buffer address of each mesh one by one.
+- Each element can point to a different buffer and offset, suitable for scene-level resource tables.
+
+The shader side can pass this unbounded array as the buffer parameter. ([09:03](https://developer.apple.com/videos/play/wwdc2022/10101/?time=543))
+
+```metal
+// Metal shading language:
+
+struct Mesh
+{
+   constant packed_float3* normals;
+};
+
+
+fragment half4 fragmentShader(ColorInOut v          [[stage_in]],
+                              constant Mesh* meshes [[buffer(0)]] )
+{
+    /* determine mesh to read, e.g. geometry_id */
+
+    packed_float3 n0 = meshes[ geometry_id ].normals[0];
+    packed_float3 n1 = meshes[ geometry_id ].normals[1];
+    packed_float3 n2 = meshes[ geometry_id ].normals[2];
+
+    /* interpolate normals and calculate shading */
+}
+```
+
+Key points:
+
+- `constant Mesh* meshes [[buffer(0)]]`Think of Argument Buffer as`Mesh`Array passed to shader.
+-`geometry_id`Determine which mesh the current fragment should access.
+-`meshes[geometry_id].normals[0]`First index the mesh array and then read the normals along the GPU pointer in it.
+- The shader accesses this array in the same way as a C array.
+
+Another way to write it is to put multiple unbounded arrays into one`Scene`Structure, allowing the shader to bind only one scene buffer. ([09:25](https://developer.apple.com/videos/play/wwdc2022/10101/?time=565))
+
+```metal
+// Metal shading language:
+struct Mesh
+{
+   constant packed_float3* normals;
+};
+
+struct Scene
+{
+   constant Mesh*     meshes;     // mesh array
+   constant Material* materials;  // material array
+};
+
+fragment half4 fragmentShader(ColorInOut v          [[stage_in]],
+                              constant Scene& scene [[buffer(0)]] )
+{
+    /* determine mesh to read, e.g. geometry_id */
+    packed_float3 n0 = scene.meshes[ geometry_id ].normals[0];
+    packed_float3 n1 = scene.meshes[ geometry_id ].normals[1];
+    packed_float3 n2 = scene.meshes[ geometry_id ].normals[2];
+    /* interpolate normals and calculate shading */
+}
+```
+
+Key points:
+
+- `Scene`Aggregate mesh array and material array.
+- The shader entry only accepts`constant Scene& scene`.
+-The access path becomes`scene.meshes[geometry_id]`, the resource entrance is more concentrated.
+- This organizational method is suitable for long-term storage of scene resource tables in an Argument Buffer.
+
+### Allocate ray tracing acceleration structure from Heap
+
+([10:12](https://developer.apple.com/videos/play/wwdc2022/10101/?time=612)) Metal 3 allows ray tracing acceleration structure from`MTLHeap`distribute. In this way, acceleration structures can be managed together with buffer and texture.
+
+The benefits are more direct in resident management. After putting a group of acceleration structures into the heap, you can adjust the entire heap once`useHeap:`, allowing these resources to reside together. session explicitly says that this is better than calling resource-by-resource`useResource`Faster and reduces CPU cost on render thread. ([10:26](https://developer.apple.com/videos/play/wwdc2022/10101/?time=626))
+
+```objc
+heapAccelerationStructureSizeAndAlignWithDescriptor:
+```
+
+Key points:
+
+- Before allocating the acceleration structure from the heap, query its size and alignment in the heap.
+- using`MTLDevice`on`heapAccelerationStructureSizeAndAlignWithDescriptor:`.
+- This query is different from ordinary`accelerationStructureSizesWithDescriptor:`.
+- If hazard tracking is not enabled on the heap, Metal will not automatically prevent race conditions of resources in the heap; the application needs to synchronize acceleration structure build and ray tracing work by itself.
+
+### Shader Validation Layer Check for Missing Residency
+
+([12:06](https://developer.apple.com/videos/play/wwdc2022/10101/?time=726)) A common bug in Bindless is forgetting to make indirect access resources resident. When the resource is not resident, the underlying memory page may not be available when rendering, and the result may be a command buffer failure, GPU restart, or image corruption.
+
+Metal 3's shader validation layer reports such errors during command buffer execution. The error message will include the shader function that triggered the problem, pass name, Metal file and line number, buffer label, buffer size, and the fact that the resource is not resident. ([14:53](https://developer.apple.com/videos/play/wwdc2022/10101/?time=893))
+
+The session example comes from the Hybrid Rendering app. Reflection sometimes displays errors, and it is finally discovered that the index buffer is written into the Argument Buffer, but is not added to the resident resource collection. ([13:01](https://developer.apple.com/videos/play/wwdc2022/10101/?time=781))
+
+```objc
+// Argument buffer loading
+for (NSUInteger i = 0; i < mesh.submeshes.count; ++i) {
+
+    Submesh*      submesh     = mesh.submeshes[i];
+    id<MTLBuffer> indexBuffer = submesh.indexBuffer;
+    NSArray*      textures    = submesh.textures;
+
+    // Copy index buffer into argument buffer
+   submeshAB[i].indices = indexBuffer.gpuAddress;
+
+    // Copy material textures into argument buffer
+   for (NSUInteger m = 0; m < textures.count; ++m) {
+        submeshAB[i].textures[m] = textures[m].gpuResourceID;
+    }
+
+    // Remember indirect resources
+    [sceneResources addObject:indexBuffer];
+    [sceneResources addObjectsFromArray:textures];
+}
+```
+
+Key points:
+
+- `indexBuffer.gpuAddress`be written into`submeshAB[i].indices`, the shader will access it indirectly through the Argument Buffer.
+-`textures[m].gpuResourceID`are written into the material texture array, and the shader will also access these textures indirectly.
+-`sceneResources`Records all indirect resources not hosted by the heap.
+-`[sceneResources addObject:indexBuffer]`This is the fix for this bug: the index buffer must also be recorded before it can be passed during rendering.`useResource`Marker resides.
+-`[sceneResources addObjectsFromArray:textures]`Let the material texture reside before ray tracing dispatch.
+
+This code also gives a debugging habit: set a label for the Metal object. Validation errors will display labels, which Xcode can also use to help locate specific resources. ([15:20](https://developer.apple.com/videos/play/wwdc2022/10101/?time=920))
+
+### Long life cycle resources can turn off automatic retain
+
+([16:44](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1004)) By default, the Metal command buffer will have a strong reference to the resources it uses, preventing the CPU from releasing the object before the GPU is used up. This security guarantee has a CPU cost.
+
+Bindless applications often aggregate resources into the heap, and the life cycle is often consistent with the level or scene. If the application can already guarantee the resource life cycle, it can create a command buffer using unretained references so that Metal will no longer create additional strong references for these references. ([18:41](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1121))
+
+The conclusion given by session is very specific: in a microbenchmark, only switching to unretained references command buffer will reduce the CPU usage in the command buffer life cycle by 2%; the time saved comes from no longer creating and destroying unnecessary strong references. ([19:19](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1159))
+
+This is an optimization with a strong premise. This is only suitable if the application itself can guarantee that resources will not be released during GPU use. The granularity of this setting is the entire command buffer: either all referenced resources are retained, or none are retained. ([19:09](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1149))
+
+### Untracked resources reduce false sharing of heap
+
+([19:46](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1186)) Metal can track resource hazards by default and automatically insert synchronization on the GPU timeline to avoid read-after-write or write-after-write problems.
+
+Heap aggregates multiple sub-resources. Metal sees the same heap resource and may conservatively believe that there are dependencies between the two passes, even if they actually access different sub-resources in the heap. This situation is called false sharing and will increase the wall-clock time of GPU work. ([21:38](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1298))
+
+The solution is to change the resource descriptor`hazardTracking`set to`Untracked`, and then the application explicitly expresses fine-grained dependencies. Session mentioned that the heap is untracked by default to give the GPU more opportunities to execute work in parallel. ([22:10](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1330))
+
+Available synchronization primitives are selected by scenario:
+
+- `MTLFence`: Suitable for common scenarios in a single command queue where the producer submits or enqueues before the consumer, with the lowest overhead. ([25:51](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1551))
+-`MTLEvent`: Suitable for scenarios where the submission order cannot be guaranteed, or synchronization across multiple command queues is required. ([26:04](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1564))
+-`MTLSharedEvent`: Suitable for synchronization across Metal devices, or between GPU and CPU. ([26:11](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1571))
+- Memory Barrier: suitable for synchronization within the pass; do not use barrier after fragment stage, validation error will be triggered on Apple GPU, it is recommended to use Fence. ([26:20](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1580))
+
+### Dependent views and resource lists for Xcode 14
+
+([27:50](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1670)) Writing bindless code is only half the battle. The other half is confirming what resources the GPU is actually seeing, and which passes are being synchronized and stuck.
+
+Metal Debugger in Xcode 14 adds a dependency viewer. It represents the workload as a graph: nodes represent passes and output resources, and edges represent resource dependencies between passes. The solid line represents data flow, and the dashed line represents synchronization. ([28:08](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1688))
+
+This tool can directly locate false sharing caused by tracked heap. In the session demo, the dependency viewer shows a tracked heap that adds synchronization between the two passes, but the compute encoder does not actually use the resources of the previous encoder. After changing the app to untracked heap and inserting Fence where it is really needed, the two passes can be executed in parallel. ([29:37](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1777))
+
+Metal Debugger also adds a new resource list. Open for a draw call`Accessed`After mode, only the resources actually accessed by this draw call are displayed, as well as the access type. In a bindless scenario, the GPU can see hundreds or thousands of resources at the same time. This filtering can narrow the problem to the few that the shader has actually touched. ([30:55](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1855))
+
+If an unexpected resource is accessed, you can continue into the shader debugger. It displays the shader execution process and resource access line by line, which is suitable for locating the problem that the shader accesses the wrong Argument Buffer element. ([32:01](https://developer.apple.com/videos/play/wwdc2022/10101/?time=1921))
+
+## Core Takeaways
+
+- **What to do**: Change the material texture table to a bindless Argument Buffer.  
+  **Why is it worth doing**: The shader can access the texture resources through the material index, and the CPU does not need to bind the material texture one by one for each draw.  
+  **How ​​to start**: Define the shared material struct and write it on the CPU side`gpuResourceID`, the shader side passes`constant Material*`Read.
+
+- **What**: Create scene level for ray tracing reflection pass`Scene`structure.  
+  **Why it’s worth doing**: The reflection shader needs to access resources such as mesh, material, texture, and sky. A single scene buffer can centrally manage these entrances.  
+  **How ​​to start**: Put`constant Mesh* meshes`and`constant Material* materials`put in`Scene`,Will`Scene`as`[[buffer(0)]]`Passed to ray tracing or fragment shader.
+
+- **What to do**: Put acceleration structures into the same`MTLHeap`.  
+  **Why it’s worth doing**: Can be used once`useHeap:`Mark the entire group of resources where they reside, reducing the`useResource`CPU overhead.  
+  **How ​​to start**: Use first`heapAccelerationStructureSizeAndAlignWithDescriptor:`Query size/alignment, and then arrange build and ray tracing work according to the heap's synchronization strategy.
+
+- **What**: Create an automatic checklist for bindless resource residency.  
+  **Why it's worth it**: Missing an index buffer or texture may cause missing reflections, command buffer failure, or image corruption.  
+  **How ​​to start**: In the same piece of code where you write Argument Buffer, add each indirect access resource`NSMutableSet`, unified before rendering`useResource`;Open the shader validation layer during development.
+
+- **What to do**: Use the dependency viewer to check whether the heap is causing invalid synchronization.  
+  **Why is it worth doing**: The tracked heap may cause the parallel passes to be executed serially due to false sharing.  
+  **How ​​to start**: In Xcode 14 Metal Debugger, only view synchronization dependency, locate the dotted dependency of tracked heap, and then consider using untracked heap and`MTLFence`。
+
+## Related Sessions
+
+- [Discover Metal 3](/articles/wwdc2022-10066) — Overview of Metal 3, suitable for understanding the full picture of graphics and toolchain updates this year.
+- [Maximize your Metal ray tracing performance](/articles/wwdc2022-10105) — In-depth supplement to the ray tracing performance and acceleration structure updates mentioned in this session.
+- [Target and optimize GPU binaries with Metal 3](/articles/wwdc2022-10102) — Explain how Metal 3 moves GPU binary generation forward to the build phase.
+- [Load resources faster with Metal 3](/articles/wwdc2022-10104) — Explains how graphics and game resources asynchronously enter Metal resources through Fast Resource Loading.
+- [Program Metal in C++ with metal-cpp](/articles/wwdc2022-10160) — Supplement the Metal object lifecycle and C++ API usage mentioned in the session.

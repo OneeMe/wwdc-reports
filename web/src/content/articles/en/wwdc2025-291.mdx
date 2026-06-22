@@ -1,0 +1,193 @@
+---
+title: "SwiftData: Dive into inheritance and schema migration"
+description: "discover how to use class inheritance to model your data. learn how to optimize queries and seamlessly migrate your app"
+date: 2026-06-10
+tags: ["App Services", "Swift"]
+thumbnail: "/images/sessions/2025/291.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/291/"
+sessionId: "wwdc2025-291"
+year: "2025"
+relatedSessions:
+  - title: "Discover Apple-Hosted Background Assets"
+    code: "325"
+    description: "building on background assets, this session will introduce the new capability to"
+  - title: "Dive deeper into Writing Tools"
+    code: "265"
+    description: "with writing tools, people can proofread, rewrite, and transform text directly w"
+  - title: "Dive into App Store server APIs for In-App Purchase"
+    code: "249"
+    description: "discover the latest updates for the app store server api, app store server notif"
+  - title: "Enhance child safety with PermissionKit"
+    code: "293"
+    description: "discover how permissionkit helps you enhance communication safety for children i"
+---
+
+## Highlight
+
+> Starting with iOS 26, SwiftData supports inheritance between `@Model` classes. Combined with a lightweight migration stage, you can move an existing schema to V4 with subclasses without disruption.
+
+## Core content
+
+The SampleTrips example app evolved from iOS 17 all the way to iOS 26. The first model had only one `Trip` class. Every kind of trip — family, business, wellness — went into the same table. The problems showed up over time. A business trip needs a `perdiem` field. A personal trip needs a `Reason` enum (family/reunion/wellness). Adding both to `Trip` bloats the base class, and most fields make no sense for the other kind. Splitting into flat tables (`PersonalTrip`, `BusinessTrip` standing alone) loses the unified base-class view of "list all my trips."
+
+iOS 26 adds class inheritance to SwiftData: `@Model` classes can inherit from each other. `Trip` is the base class with shared fields. `PersonalTrip` and `BusinessTrip` are subclasses, each with their own properties. When `@Query` uses the base type, the result includes every subclass instance (deep search). The `is` keyword inside a predicate filters down to one subclass (shallow search). Rishi Verma also walks through the full migration chain from V1 to V4: V1→V2 custom dedup, V2→V3 unique/index, V3→V4 lightweight migration that wires the subclasses straight in.
+
+## Detailed content
+
+**How to write a subclass.** Subclasses must be marked `@available(iOS 26, *)`, otherwise the code will not compile on older versions.
+
+```swift
+@Model
+class Trip {
+  var name: String
+  var destination: String
+  var startDate: Date
+  var endDate: Date
+
+  var bucketList: [BucketListItem] = [BucketListItem]()
+  var livingAccommodation: LivingAccommodation?
+}
+
+@available(iOS 26, *)
+@Model
+class BusinessTrip: Trip {
+  var perdiem: Double = 0.0
+}
+
+@available(iOS 26, *)
+@Model
+class PersonalTrip: Trip {
+  enum Reason: String, CaseIterable, Codable {
+    case family
+    case reunion
+    case wellness
+  }
+  var reason: Reason
+}
+```
+
+Key points ([03:28](https://developer.apple.com/videos/play/wwdc2025/291/?time=208)):
+- `BusinessTrip: Trip` inherits every property of the base class. No need to redeclare them.
+- New properties on a subclass must have a default value (`perdiem = 0.0`), otherwise old data has nothing to fill in during migration.
+- `Reason` must conform to `Codable` for SwiftData to persist it.
+
+**Register the subclasses.** List them in the `modelContainer` when registering the schema:
+
+```swift
+.modelContainer(for: [Trip.self, BusinessTrip.self, PersonalTrip.self])
+```
+
+Key point ([04:03](https://developer.apple.com/videos/play/wwdc2025/291/?time=243)): if you only register the base class, fetches for subclasses return nothing.
+
+**Use `is` for shallow search.** When a segmented control filters by type, the predicate uses `$0 is PersonalTrip`:
+
+```swift
+let classPredicate: Predicate<Trip>? = {
+  switch segment.wrappedValue {
+  case .personal:
+    return #Predicate { $0 is PersonalTrip }
+  case .business:
+    return #Predicate { $0 is BusinessTrip }
+  default:
+    return nil
+  }
+}()
+_trips = Query(filter: classPredicate, sort: \.startDate, order: .forward)
+```
+
+Key points ([07:06](https://developer.apple.com/videos/play/wwdc2025/291/?time=426)):
+- `Predicate<Trip>` takes the base class as its type parameter, so the same `@Query` can fetch every Trip and also filter by type at runtime.
+- The `default` branch returns `nil`, dropping the type filter — the same as a deep search.
+
+**The full migration plan chain.** Connect V1 through V4 with `SchemaMigrationPlan`:
+
+```swift
+enum SampleTripsMigrationPlan: SchemaMigrationPlan {
+  static var schemas: [any VersionedSchema.Type] {
+    var currentSchemas: [any VersionedSchema.Type] =
+      [SampleTripsSchemaV1.self, SampleTripsSchemaV2.self, SampleTripsSchemaV3.self]
+    if #available(iOS 26, *) {
+      currentSchemas.append(SampleTripsSchemaV4.self)
+    }
+    return currentSchemas
+  }
+
+  static var stages: [MigrationStage] {
+    var currentStages = [migrateV1toV2, migrateV2toV3]
+    if #available(iOS 26, *) {
+      currentStages.append(migrateV3toV4)
+    }
+    return currentStages
+  }
+}
+```
+
+Key points ([10:24](https://developer.apple.com/videos/play/wwdc2025/291/?time=624)):
+- The `schemas` array lists every schema version in release order. SwiftData uses it to find which version the user is on.
+- `stages` is a chain of migration steps: V1→V2 and V2→V3 each dedup, V3→V4 is lightweight.
+- `#available` wraps V4 so an older OS running the older app never touches the unsupported subclass types.
+
+**A lightweight stage takes one line.** Adding a subclass is a schema-compatible change, so no `willMigrate` is needed:
+
+```swift
+@available(iOS 26, *)
+static let migrateV3toV4 = MigrationStage.lightweight(
+  fromVersion: SampleTripsSchemaV3.self,
+  toVersion: SampleTripsSchemaV4.self
+)
+```
+
+Key point ([10:03](https://developer.apple.com/videos/play/wwdc2025/291/?time=603)): a lightweight migration only declares the source and target versions. The storage engine updates the schema and keeps every existing record.
+
+**Three tricks to speed up fetch.** Custom migration stages and widgets can tune the same `FetchDescriptor`:
+
+```swift
+var fetchDesc = FetchDescriptor<SampleTripsSchemaV1.Trip>()
+fetchDesc.propertiesToFetch = [\.name]
+fetchDesc.relationshipKeyPathsForPrefetching = [\.livingAccommodation]
+```
+
+Key points ([13:11](https://developer.apple.com/videos/play/wwdc2025/291/?time=791)):
+- `propertiesToFetch` loads only the columns you actually use. When migration dedup needs only `name`, IO drops sharply.
+- `relationshipKeyPathsForPrefetching` pulls relationships in one shot, dodging later N+1 queries.
+- Pair it with `fetchLimit = 1` ([13:28](https://developer.apple.com/videos/play/wwdc2025/291/?time=808)) so the widget grabs only the latest trip.
+
+**Efficient History token fetch.** Cross-process changes ride on SwiftData History. The new `sortBy` and `fetchLimit` mean finding the latest token no longer scans the full table:
+
+```swift
+var historyDesc = HistoryDescriptor<DefaultHistoryTransaction>()
+historyDesc.sortBy = [.init(\.transactionIdentifier, order: .reverse)]
+historyDesc.fetchLimit = 1
+
+let transactions = try context.fetchHistory(historyDesc)
+if let transaction = transactions.last {
+  historyToken = transaction.token
+}
+```
+
+Key point ([16:24](https://developer.apple.com/videos/play/wwdc2025/291/?time=984)): sorting by `transactionIdentifier` descending with limit 1 is the same as `ORDER BY ... DESC LIMIT 1` in SQL. You get the latest token in O(log n) and skip rescanning the whole history at every launch.
+
+## Takeaways
+
+- **What to do**: spot a group of "is-a" models in an existing SwiftData app and introduce subclasses.
+  - Why it pays off: when business fields keep piling up, subclasses express domain meaning better than optional fields, and you stop scattering `if let perdiem` checks everywhere.
+  - How to start: list every optional field in your current models that only matters for some instances. Cluster them by use case. Each cluster is a subclass candidate.
+
+- **What to do**: use "deep search vs shallow search" as the test for inheritance.
+  - Why it pays off: it stops you from wiring inheritance everywhere and tanking query performance. If you only query by base class, demote the subclass to a property. If you only query by subclass, flatten the model.
+  - How to start: scan every `@Query` and `FetchDescriptor` in your code. Count base-class queries against subclass queries. Only consider inheritance if both counts are non-zero.
+
+- **What to do**: build a complete `SchemaMigrationPlan` covering every version from V1 to today.
+  - Why it pays off: users do not upgrade in order. They might jump from a two-year-old version straight to the latest. A missing stage means lost data or a crash.
+  - How to start: tag each release with a `Schema.Version` in `VersionedSchema`, and chain the matching `MigrationStage` into the plan's `stages` array.
+
+- **What to do**: use `propertiesToFetch` + `fetchLimit` in read-only, low-memory contexts like widgets and share extensions.
+  - Why it pays off: a widget has only tens of MB of memory budget. Loading every Trip can OOM outright. Pulling only the needed columns and the most recent record is enough to render the card.
+  - How to start: review every `FetchDescriptor`. If the UI shows only a few fields, write them into `propertiesToFetch`. If you only show a count or the latest entry, add `fetchLimit`.
+
+## Related Sessions
+
+- [Discover Apple-Hosted Background Assets](/articles/wwdc2025-325) — use Apple-hosted background assets to pre-download large resources while the app is idle
+- [Dive deeper into Writing Tools](/articles/wwdc2025-265) — integrate proofreading, rewriting, and text transforms via the system Writing Tools
+- [Dive into App Store server APIs for In-App Purchase](/articles/wwdc2025-249) — manage subscriptions, refunds, and server-side notifications through the App Store Server API
+- [Enhance child safety with PermissionKit](/articles/wwdc2025-293) — use PermissionKit to strengthen child safety in communication scenarios

@@ -1,0 +1,146 @@
+---
+title: "Filter and tunnel network traffic with NetworkExtension"
+description: "learn about the apis in the networkextension framework that give your app the power and flexibility to extend the system"
+date: 2026-06-10
+tags: ["System Services"]
+thumbnail: "/images/sessions/2025/234.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/234/"
+sessionId: "wwdc2025-234"
+year: "2025"
+relatedSessions:
+  - title: "Deliver age-appropriate experiences in your app"
+    code: "299"
+    description: "learn how to deliver age-appropriate experiences in your app with the new declar"
+  - title: "Finish tasks in the background"
+    code: "227"
+    description: "discover background execution advancements and understand how the system schedul"
+  - title: "Get ahead with quantum-secure cryptography"
+    code: "314"
+    description: "learn how to protect your app"
+  - title: "Optimize home electricity usage with EnergyKit"
+    code: "257"
+    description: "learn how to support energykit in your app so people can optimize electricity us"
+---
+
+## Highlight
+
+> iOS 26 adds a URL Filter API to NetworkExtension. It filters content by full URL, and uses Bloom filters, PIR, Privacy Pass, and an Apple-hosted OHTTP Relay to run the lookup without exposing the URL or the device identity.
+
+## Core content
+
+Developers who build parental control apps or school network management apps have long been stuck on one problem: HTTPS encrypts the traffic, and the old NEFilterDataProvider only sees host and port. Blocking a specific path on a site — a share link, a game page — is not possible. Either you block the whole site and take down a lot of legitimate content, or you let it through. To filter at the URL level, you had to build your own VPN, install your own man-in-the-middle CA, and pull every URL back to your server for inspection. That meant the app held the user's full browsing history, a serious privacy risk.
+
+iOS 26 answers with URL Filter. It turns "filter decisions on the full URL" into a system service. The app sits outside the filtering path and never sees any traffic data. The app supplies only two things: a local Bloom filter, and a remote PIR server. The system runs the Bloom filter on the device first; a miss lets the request through. A hit (a real match or a false positive) triggers a PIR query. PIR uses homomorphic encryption, so the server runs the lookup on the ciphertext and never sees the URL in plaintext. Every query is then forwarded through an Apple-hosted Oblivious HTTP Relay, which strips the device IP. The developer gets URL-level filtering, and the user's URL and identity leak to no one — not Apple, not the developer, not the PIR server itself. This path fits parental control, campus apps, enterprise blocklists, and every other case where you need to see the full URL but must not keep the browsing history.
+
+## Details
+
+URL Filter stacks four techniques: Bloom filter for on-device prefiltering, PIR (Private Information Retrieval) so the server queries the database on ciphertext, Privacy Pass for anonymous authentication, and OHTTP Relay to hide the source IP. The system runs the whole flow. The app and the app extension are not on the data path ([19:01](https://developer.apple.com/videos/play/wwdc2025/234/?time=1141)).
+
+Requests from WebKit and URLSession go through the system check automatically, but a browser or app that ships its own network stack does not. In that case, call the participation API to ask the system for a verdict ([22:15](https://developer.apple.com/videos/play/wwdc2025/234/?time=1335)):
+
+```swift
+// Use participation API to check URLs before sending requests
+
+import NetworkExtension
+
+func checkURL(url: URL) async throws -> Bool {
+  var passRequest : Bool = true
+
+  let verdict = await NEURLFilter.verdict(for: url)
+
+  if verdict == .deny {
+    passRequest = false
+  }
+  return passRequest
+}
+```
+
+Key points:
+
+- `import NetworkExtension`: every URL Filter API lives in this framework.
+- `NEURLFilter.verdict(for:)` is async. The system runs the Bloom filter prefilter and, if needed, the PIR query, then returns the final verdict.
+- The return value is an enum. `.deny` means a blocklist hit; `.allow` or any non-deny value lets the request through.
+- The app never learns whether the URL is in the dataset. It gets only a boolean-level pass-or-block.
+
+Next, here is how the app configures its own URL Filter ([25:01](https://developer.apple.com/videos/play/wwdc2025/234/?time=1501)):
+
+```swift
+// Configure and manage URL Filter
+
+import NetworkExtension
+
+let manager = NEURLFilterManager.shared
+
+try await manager.loadFromPreferences()
+
+try manager.setConfiguration(
+    pirServerURL: URL(string:"https://pir.example.com")!,
+    pirPrivacyPassIssuerURL: URL(string:"https://privacypass.example.com")!,
+    pirAuthenticationToken: "1234",
+    controlProviderBundleIdentifier: "com.example.myURLFilter.extension")
+
+manager.prefilterFetchInterval = 86400 // fetch every 1 day
+manager.shouldFailClosed = false
+manager.localizedDescription = "Alice's URL Filter"
+manager.isEnabled = true
+
+try await manager.saveToPreferences()
+```
+
+Key points:
+
+- `NEURLFilterManager.shared`: a singleton. Read and write every URL Filter setting through it.
+- `loadFromPreferences()`: load the existing configuration from disk. Load before set is the standard pattern across NetworkExtension.
+- The three URL/Token parameters of `setConfiguration` point to your own PIR server, your Privacy Pass Issuer, and the auth token. Apple does not host these; the developer deploys them.
+- `controlProviderBundleIdentifier`: the bundle id of your app extension. The system uses it to wake the extension to fetch the Bloom filter.
+- `prefilterFetchInterval = 86400`: in seconds. It controls how often the system calls back into the extension's `fetchPrefilter`. Here it runs once a day.
+- `shouldFailClosed = false`: when PIR fails, allow the request (false) or deny it (true). Parental control cases often want true.
+- `isEnabled = true` plus `saveToPreferences()`: the filter only takes effect once the configuration is on disk.
+
+On the app extension side, implement the `NEURLFilterControlProvider` protocol. It hands the Bloom filter data to the system ([26:41](https://developer.apple.com/videos/play/wwdc2025/234/?time=1601)):
+
+```swift
+// Implement NEURLFilterControlProvider protocol
+
+import NetworkExtension
+
+class URLFilterControlProvider: NEURLFilterControlProvider {
+
+  func fetchPrefilter() async throws -> NEURLFilterPrefilter? {
+        
+    // Fetch your Bloom filters data from your app bundle or from your server
+    let data = NEURLFilterPrefilter.PrefilterData.temporaryFilepath(fileURL)
+    let result = NEURLFilterPrefilter(data: data,
+                                      bitCount: numberOfBits,
+                                      hashCount: numberOfHashes,
+                                      murmurSeed: murmurSeed)
+    return result
+  }
+}
+```
+
+Key points:
+
+- Subclass `NEURLFilterControlProvider`. The Xcode URL Filter app extension template generates the skeleton.
+- The system calls `fetchPrefilter()` on the schedule set by `prefilterFetchInterval`. The extension can pull data from the app bundle or from your own server.
+- `NEURLFilterPrefilter.PrefilterData.temporaryFilepath(fileURL)`: hand the data to the system through a temporary file path rather than an in-memory buffer. This fits large datasets.
+- When constructing `NEURLFilterPrefilter`, you must pass `bitCount`, `hashCount`, and `murmurSeed`. These three parameters set the Bloom filter size, the number of hash functions, and the seed for the murmur hash. They must match the values you used to build the Bloom filter on the server, or the matching breaks.
+
+Two more points on deployment. URL Filter exits through an OHTTP Relay, so you must apply for Relay capability with Apple in advance. Development builds get a waiver, but App Store, TestFlight, Ad-hoc, and enterprise distribution all have to clear the approval process ([19:38](https://developer.apple.com/videos/play/wwdc2025/234/?time=1178)). On the PIR server, the use case name must start with the app's bundle id followed by the string `url.filtering`. The record format uses the URL string as the key and the integer 1 as the value ([23:22](https://developer.apple.com/videos/play/wwdc2025/234/?time=1402)).
+
+## Takeaways
+
+- **Move parental control or campus network management apps to URL Filter**. Why it pays off: the old NEFilterDataProvider cannot see the full HTTPS URL and can only block whole sites, a blunt experience. URL Filter targets the resource level and is open to consumer devices, no longer limited to supervised devices. How to start: get the server side running with Apple's [PIRService sample code](https://swiftpackageindex.com/apple/pir-service-example/main/documentation/pirservice). On the app side, request the `url-filter-provider` entitlement, and use the three code skeletons above to build the Manager configuration, the Extension that fetches the Bloom filter, and the participation API for custom network stacks.
+
+- **Replace traditional VPN with Network Relay for enterprise intranet access**. Why it pays off: the MASQUE protocol is tuned for TCP/UDP application traffic, the platform supports it natively, and you do not write an NEPacketTunnelProvider. Enterprise mail and cloud collaboration apps are the best fit for this path ([03:53](https://developer.apple.com/videos/play/wwdc2025/234/?time=233)). A full-tunnel IP VPN is only needed for a handful of high-compliance cases. How to start: configure the relay and the authentication with the NERelayManager API, or push it down through an MDM profile. The user does not have to install an extra extension.
+
+- **Audit your existing VPN app for Packet Filter use or direct route table edits**. Why it pays off: the session states clearly that this is unsupported. It conflicts with the system's own filter and routing rules and with those of other apps, and it breaks AirDrop, Mac Virtual Display, Sidecar, and similar features ([07:34](https://developer.apple.com/videos/play/wwdc2025/234/?time=454)). How to start: read TN3165 and TN3120, move the custom tunnel logic to NEPacketTunnelProvider, and set `enforceRoutes` (split tunnel) or `includeAllNetworks` (full tunnel) per case. Pair it with `excludeLocalNetworks` so local services like AirDrop bypass the tunnel.
+
+- **Do not build content filtering on NEPacketTunnelProvider**. Why it pays off: it runs at the IP layer and has no flow-level or application-level metadata, so it cannot make host or URL decisions ([08:26](https://developer.apple.com/videos/play/wwdc2025/234/?time=506)). How to start: pick the API by the goal. For traffic, use NEFilterDataProvider or NEFilterPacketProvider. For URLs, use the new NEURLFilter. For DNS security, use the DNS Configuration & Proxy API.
+
+## Related sessions
+
+- [Deliver age-appropriate experiences in your app](/articles/wwdc2025-299) — pair with URL Filter to build tiered experiences for minors
+- [Finish tasks in the background](/articles/wwdc2025-227) — understand extension background scheduling, used to fetch the Bloom filter on a schedule
+- [Get ahead with quantum-secure cryptography](/articles/wwdc2025-314) — Network Extension also relies on modern cryptography to protect the link
+- [Optimize home electricity usage with EnergyKit](/articles/wwdc2025-257) — another privacy pattern where the system runs the work and the app never touches the sensitive data

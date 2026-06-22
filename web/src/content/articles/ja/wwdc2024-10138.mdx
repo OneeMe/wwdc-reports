@@ -1,0 +1,192 @@
+---
+title: "Create a custom data store with SwiftData"
+description: "combine the power of swiftdata's expressive, declarative modeling api with your own persistence backend. learn how to build a custom data store and explore how to progressively add persistence features in your app. to get the most out of this session, watch \"meet swiftdata\" and \"model your schema with swiftdata\" from wwdc23."
+date: 2026-06-10
+tags: ["WWDC 2024"]
+thumbnail: "/images/sessions/2024/10138.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2024/10138/"
+sessionId: "wwdc2024-10138"
+year: "2024"
+relatedSessions:
+  - title: "What's new in SwiftData"
+    code: "10080"
+    description: "explore new features in swiftdata including indexing unique constraints and more"
+  - title: "Track model changes with SwiftData History"
+    code: "10082"
+    description: "learn how to examine the history of changes made to a swiftdata store"
+  - title: "Model your schema with SwiftData"
+    code: "10195"
+    description: "learn how to define and evolve your data schema using swiftdata macros"
+  - title: "Meet SwiftData"
+    code: "10187"
+    description: "get started with swiftdata and learn the fundamentals of persistent models"
+---
+
+## ハイライト
+
+> SwiftData は iOS 18 で DataStore プロトコルを追加し、1 行の設定でストレージバックエンド — JSON ファイル、REST API、Realm — を切り替え可能に。Model 定義と SwiftUI ビューコードは一切変更不要です。
+
+---
+
+## 主要内容
+
+SwiftData は iOS 17 登場時、Core Data の複雑さをクリーンな Swift ネイティブ API の背後に隠しましたが、基盤ストレージは固定 — Apple 提供の DefaultStore（Core Data ベース）のみ使用可能でした。大多数のシナリオでは問題ありませんが、カスタムストレージ形式、既存バックエンド連携、軽量 JSON ファイル永続化が必要な場合は壁にぶつかりました。コミュニティのフィードバックは明確：SwiftData の API がどれほどエレガントでも、ストレージ交換不可は致命的な欠点でした。
+
+iOS 18 は 3 つの重要プロトコルを導入：`DataStoreConfiguration`、`DataStoreSnapshot`、`DataStore` — 完全なストレージ抽象化レイヤーを構成。SwiftData の `ModelContext` は DefaultStore に直接結合せず、`DataStoreSnapshot`（Sendable + Codable 値型コンテナ）経由で具体 Store と通信。ModelContext は `DataStoreFetchRequest` または `DataStoreSaveChangesRequest` を送信、Store は対応する結果タイプを返却。`fetch` と `save` の 2 メソッドを実装するだけでストレージバックエンド全体を置き換え可能。
+
+セッションは SampleTrips サンプル app を通じて説明。この app は旅行リストを表示し CRUD をサポート。JSONStore に切り替え後、全機能が正常動作し、データは JSON ファイルに永続化。鍵：`ModelConfiguration` を `JSONStoreConfiguration` に置き換えるだけ — Model 定義、SwiftUI View、`@Query` は一切変更不要（[00:40](https://developer.apple.com/videos/play/wwdc2024/10138/?time=40)）。
+
+---
+
+## 詳細
+
+### 通信モデル：Snapshot が架け橋
+
+ModelContext と Store 間の通信は Snapshot ベース。ModelContext がデータ保存時、変更された各 Model の Snapshot を作成し `DataStoreSaveChangesRequest` に入れて Store へ送信。逆に Store がデータ読み取り後、各レコードの Snapshot を作成し `DataStoreFetchResult` に入れて ModelContext へ返却、ModelContext が PersistentModel に復元（[03:42](https://developer.apple.com/videos/play/wwdc2024/10138/?time=222)）。
+
+Snapshot は Sendable かつ Codable のため、JSONEncoder/JSONDecoder で直接シリアライズ可能 — 公式 JSONStore 例のアプローチ。
+
+### 一時識別子と永久識別子のマッピング
+
+新規挿入 Model は ModelContext 内で一時識別子（`Trip-t1` など）を保持。Store が挿入処理時に永久識別子（`Trip-5` など）を割り当て、`DataStoreSaveChangesResult` の `remappedPersistentIdentifiers` に一時→永久マッピングを返却（[02:52](https://developer.apple.com/videos/play/wwdc2024/10138/?time=172)）。ModelContext が受信後状態を更新し、UI が正しくレンダリング。
+
+### 完全コード：JSONStore の実装
+
+以下は公式例からのコード（[08:15](https://developer.apple.com/videos/play/wwdc2024/10138/?time=495)）、完全な JSON ファイルストレージ実装：
+
+```swift
+@available(swift 5.9) @available(macOS 15, iOS 18, tvOS 18, watchOS 11, visionOS 2, *)
+final class JSONStoreConfiguration: DataStoreConfiguration {
+    typealias StoreType = JSONStore
+
+    var name: String
+    var schema: Schema?
+    var fileURL: URL
+
+    init(name: String, schema: Schema? = nil, fileURL: URL) {
+        self.name = name
+        self.schema = schema
+        self.fileURL = fileURL
+    }
+
+    static func == (lhs: JSONStoreConfiguration, rhs: JSONStoreConfiguration) -> Bool {
+        return lhs.name == rhs.name
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+    }
+}
+
+@available(swift 5.9) @available(macOS 15, iOS 18, tvOS 18, watchOS 11, visionOS 2, *)
+final class JSONStore: DataStore {
+    typealias Configuration = JSONStoreConfiguration
+    typealias Snapshot = DefaultSnapshot
+
+    var configuration: JSONStoreConfiguration
+    var name: String
+    var schema: Schema
+    var identifier: String
+
+    init(_ configuration: JSONStoreConfiguration, migrationPlan: (any SchemaMigrationPlan.Type)?) throws {
+        self.configuration = configuration
+        self.name = configuration.name
+        self.schema = configuration.schema!
+        self.identifier = configuration.fileURL.lastPathComponent
+    }
+
+    func save(_ request: DataStoreSaveChangesRequest<DefaultSnapshot>) throws -> DataStoreSaveChangesResult<DefaultSnapshot> {
+        var remappedIdentifiers = [PersistentIdentifier: PersistentIdentifier]()
+        var serializedTrips = try self.read()
+
+        for snapshot in request.inserted {
+            let permanentIdentifier = try PersistentIdentifier.identifier(for: identifier,
+                                                                          entityName: snapshot.persistentIdentifier.entityName,
+                                                                          primaryKey: UUID())
+            let permanentSnapshot = snapshot.copy(persistentIdentifier: permanentIdentifier)
+            serializedTrips[permanentIdentifier] = permanentSnapshot
+            remappedIdentifiers[snapshot.persistentIdentifier] = permanentIdentifier
+        }
+
+        for snapshot in request.updated {
+            serializedTrips[snapshot.persistentIdentifier] = snapshot
+        }
+
+        for snapshot in request.deleted {
+            serializedTrips[snapshot.persistentIdentifier] = nil
+        }
+
+        try self.write(serializedTrips)
+        return DataStoreSaveChangesResult<DefaultSnapshot>(for: self.identifier,
+                                                           remappedPersistentIdentifiers: remappedIdentifiers,
+                                                           deletedIdentifiers: request.deleted.map({ $0.persistentIdentifier }))
+    }
+
+    func fetch<T>(_ request: DataStoreFetchRequest<T>) throws -> DataStoreFetchResult<T, DefaultSnapshot> where T : PersistentModel {
+        if request.descriptor.predicate != nil {
+            throw DataStoreError.preferInMemoryFilter
+        } else if request.descriptor.sortBy.count > 0 {
+            throw DataStoreError.preferInMemorySort
+        }
+
+        let objs = try self.read()
+        let snapshots = objs.values.map({ $0 })
+        return DataStoreFetchResult(descriptor: request.descriptor, fetchedSnapshots: snapshots, relatedSnapshots: objs)
+    }
+
+    func read() throws -> [PersistentIdentifier: DefaultSnapshot] {
+        if FileManager.default.fileExists(atPath: configuration.fileURL.path(percentEncoded: false)) {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+
+            let trips = try decoder.decode([DefaultSnapshot].self, from: try Data(contentsOf: configuration.fileURL))
+            var result = [PersistentIdentifier: DefaultSnapshot]()
+            trips.forEach { s in
+                result[s.persistentIdentifier] = s
+            }
+            return result
+        } else {
+            return [:]
+        }
+    }
+
+    func write(_ trips: [PersistentIdentifier: DefaultSnapshot]) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let jsonData = try encoder.encode(trips.values.map({ $0 }))
+        try jsonData.write(to: configuration.fileURL)
+    }
+}
+```
+
+キーポイント:
+
+- `JSONStoreConfiguration` は `StoreType = JSONStore` を宣言、SwiftData がこの関連型で Store 実装を特定
+- `JSONStore` は `Snapshot = DefaultSnapshot` を宣言、カスタムエンコード不要 — SwiftData 提供の値型コンテナを再利用
+- `fetch` で述語やソート記述子を含むリクエスト時、`DataStoreError.preferInMemoryFilter` / `preferInMemorySort` を throw し ModelContext がメモリ内でフィルタ・ソート — 小データセットでは最も簡単なアプローチ（[09:47](https://developer.apple.com/videos/play/wwdc2024/10138/?time=587)）
+- `save` は 3 種類の変更を処理：`request.inserted` は永久識別子割り当てとマッピング、`request.updated` は直接上書き、`request.deleted` は辞書から削除（[10:13](https://developer.apple.com/videos/play/wwdc2024/10138/?time=613)）
+- `read` と `write` は Foundation の JSONEncoder/JSONDecoder を使うヘルパー、`DefaultSnapshot` は Codable で直接シリアライズ可能
+
+### DefaultStore が依然として最適
+
+セッションは明確に DefaultStore が Migration、History Tracking、CloudKit 同期など SwiftData 全高度機能をサポートし、プラットフォームレベルの性能・スケーラビリティベストプラクティスをカプセル化していると述べています（[05:37](https://developer.apple.com/videos/play/wwdc2024/10138/?time=337)）。非 Apple ストレージバックエンド連携が明確に必要な場合のみカスタム Store が必要。
+
+---
+
+## 重要ポイント
+
+1. **カスタム Store で既存 REST API バックエンドに接続**：app に既存バックエンド API がある場合、CustomStore で `save` を POST/PUT、`fetch` を GET にマッピング — SwiftUI 側 `@Query` と Model 定義は一切不変。なぜ価値があるか：フロントエンドチームが UI コード変更なしでローカルストレージからリモート API へシームレス切替。始め方：`DataStore` プロトコルに準拠、`fetch` で API 呼び出しと JSON→`DefaultSnapshot` 変換、`save` で inserted/updated/deleted 別にリクエスト送信。
+
+2. **JSONStore で軽量設定ファイル永続化**：多くのユーティリティ app は数十件の設定データのみ — Core Data は重すぎ、UserDefaults は弱すぎ。JSONStore で SwiftData の Model マクロ、`@Query` リアクティブ更新を享受し、データファイルは人間可読 JSON。なぜ価値があるか：永続化複雑度を下げつつ SwiftData 宣言的 API の利点を維持。始め方：公式 JSONStore 例をコピー、`fileURL` を App Support 内 JSON ファイルに指定。
+
+3. **段階的移行：カスタム Store で旧永続化方案をラップ**：Realm や Firebase から SwiftData へ移行中なら、まず旧方案をラップしたカスタム Store を書いて app を稼働させ、後続バージョンで DefaultStore へ段階的切替。なぜ価値があるか：永続化レイヤー一括書き換えリスクを回避、移行を段階的に。始め方：`fetch` と `save` で旧 SDK 読み書きインターフェースを呼び出し、データモデル不変、後で `ModelConfiguration` を DefaultStore に戻すだけ。
+
+---
+
+## 関連セッション
+
+- [What's new in SwiftData](/articles/wwdc2024-10080) — SwiftData 新機能：インデックス、一意制約など
+- [Track model changes with SwiftData History](/articles/wwdc2024-10082) — Store 変更履歴の確認方法
+- [Model your schema with SwiftData](/articles/wwdc2024-10195) — SwiftData マクロでデータモデルを定義・進化
+- [Meet SwiftData](/articles/wwdc2024-10187) — SwiftData 基礎：PersistentModel 入門

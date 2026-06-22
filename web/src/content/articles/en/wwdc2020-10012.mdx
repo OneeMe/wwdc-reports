@@ -1,0 +1,409 @@
+---
+title: "Discover ray tracing with Metal"
+description: "achieve photorealistic 3d scenes in your apps and games through ray tracing — a core part of the metal graphics framework and shading language. discover the fundamentals of the metal ray tracing api and shading language extensions for ray tracing, find out how to use them in your graphics apps and games, and learn how to take control of your kernels and combine them into a single compute kernel for optimal performance."
+date: 2020-06-10
+tags: ["Metal", "Graphics & Games", "Ray Tracing"]
+thumbnail: "/images/sessions/2020/10012.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10012/"
+sessionId: "wwdc2020-10012"
+year: "2020"
+relatedSessions:
+  - title: "Get to know Metal function pointers"
+    code: "10013"
+    description: "Learn how Metal function pointers support dynamic shader calls and custom intersection functions in ray tracing renderers."
+  - title: "Harness Apple GPUs with Metal"
+    code: "10602"
+    description: "Review Apple GPU architecture and how Metal maps modern rendering techniques onto tile-based deferred rendering."
+  - title: "Optimize Metal apps and games with GPU counters"
+    code: "10603"
+    description: "Use GPU counters to profile Metal workloads and decide where ray tracing kernels need optimization."
+  - title: "Gain insights into your Metal app with Xcode 12"
+    code: "10605"
+    description: "Use Xcode 12 Metal debugging and performance tools to diagnose graphics issues in Metal apps."
+  - title: "Bring your Metal app to Apple silicon Macs"
+    code: "10631"
+    description: "Understand Apple silicon Mac GPU architecture and porting considerations for graphics-intensive Metal apps."
+---
+
+## Highlight
+
+> Metal's 2020 ray tracing API brings the ray intersector into Metal Shading Language so developers can generate rays, intersect, and shade in a single compute kernel, and use intersection functions to customize hit logic for transparent materials and custom geometry.
+
+---
+
+## Core Content
+
+Before this session, Apple had already covered ray tracing with Metal Performance Shaders. That path worked: launch a compute kernel to generate rays, write them to a Metal buffer, intersect with `MPSRayIntersector`, then launch another compute kernel to read intersection results and shade. On each additional bounce the app shuttled rays and intersections between buffers. ([01:33](https://developer.apple.com/videos/play/wwdc2020/10012/?time=93))
+
+Metal's 2020 ray tracing API changes that model. The `intersector` can now be created and called directly in Metal Shading Language, merging work that lived across multiple kernels and intermediate buffers into one compute kernel. That cuts memory traffic for ray and intersection data and lets multi-bounce outer loops stay in shader code. ([02:14](https://developer.apple.com/videos/play/wwdc2020/10012/?time=134))
+
+Another core piece is the acceleration structure. You supply geometry such as triangles or bounding boxes; Metal builds the intersection structure. The new control is that the app decides when acceleration structure memory is allocated, how scratch buffers are created, and which GPU command queue and command buffer host the build. ([03:48](https://developer.apple.com/videos/play/wwdc2020/10012/?time=228))
+
+The second half tackles harder cases: transparent materials and custom geometry. Alpha-tested foliage that re-fires a ray on every transparent pixel retraces from the acceleration structure root at high cost. Metal's triangle intersection function can accept or reject a hit during traversal; bounding box intersection functions connect spheres, curves, and hair strands into the same intersection flow. ([10:01](https://developer.apple.com/videos/play/wwdc2020/10012/?time=601))
+
+Apple's demo shows scale: the Advanced Content Team built a path tracing scene—one sample per pixel for interactive editing, 400 samples per pixel for an offline fly-through—with Quixel Megascans assets and more than 32 million triangles. ([08:28](https://developer.apple.com/videos/play/wwdc2020/10012/?time=508))
+
+---
+
+## Detailed Content
+
+### Intersect directly in a compute kernel
+
+([02:42](https://developer.apple.com/videos/play/wwdc2020/10012/?time=162)) The basic kernel shape is straightforward: generate a ray per pixel, create `intersector<triangle_data>`, pass the ray and `primitive_acceleration_structure`, get `intersection_result<triangle_data>`, then shade.
+
+```metal
+[[kernel]]
+void rtKernel(primitive_acceleration_structure accelerationStructure [[buffer(0)]],
+              /* ... */)
+{
+    // Generate ray
+    ray r = generateCameraRay(tid);
+
+    // Create an intersector
+    intersector<triangle_data> intersector;
+
+    // Intersect with scene
+    intersection_result<triangle_data> intersection;
+
+    intersection = intersector.intersect(r, accelerationStructure);
+
+    // shading...
+}
+```
+
+Key points:
+
+- `primitive_acceleration_structure` is a normal buffer binding bound via the compute command encoder.
+- `ray` comes from per-pixel camera math; the session does not expand `generateCameraRay`.
+- `intersector<triangle_data>` is created in the shader, avoiding MPS ray and intersection buffer round trips.
+- `intersection_result<triangle_data>` feeds shading; if shading is heavy, profile whether to split the kernel.
+
+([07:25](https://developer.apple.com/videos/play/wwdc2020/10012/?time=445)) On the CPU, bind the acceleration structure with a dedicated encoder API.
+
+```swift
+computeEncoder.setAccelerationStructure(accelerationStructure, bufferIndex: 0)
+```
+
+Key points:
+
+- `bufferIndex: 0` matches `[[buffer(0)]]` on the kernel.
+- An acceleration structure is not an `MTLBuffer` but uses the same binding model.
+- Argument encoders have a corresponding bind method per the transcript.
+
+### Build a primitive acceleration structure
+
+([04:48](https://developer.apple.com/videos/play/wwdc2020/10012/?time=288)) Building starts from a descriptor. Here triangle geometry fills `MTLAccelerationStructureTriangleGeometryDescriptor` with vertex buffer and triangle count.
+
+```swift
+let accelerationStructureDescriptor = MTLPrimitiveAccelerationStructureDescriptor()
+
+// Create geometry descriptor(s)
+let geometryDescriptor = MTLAccelerationStructureTriangleGeometryDescriptor()
+
+geometryDescriptor.vertexBuffer = vertexBuffer
+geometryDescriptor.triangleCount = triangleCount
+
+accelerationStructureDescriptor.geometryDescriptors = [ geometryDescriptor ]
+```
+
+Key points:
+
+- `MTLPrimitiveAccelerationStructureDescriptor` describes a primitive acceleration structure.
+- `MTLAccelerationStructureTriangleGeometryDescriptor` describes triangle geometry.
+- Triangle geometry can have its own vertex buffer, index buffer, triangle count, and more; this snippet shows the minimal path.
+- Triangle data is embedded in the acceleration structure; you need not keep the original vertex buffer for intersection after the build.
+
+([05:46](https://developer.apple.com/videos/play/wwdc2020/10012/?time=346)) Metal queries required sizes first; the app allocates the acceleration structure and scratch buffer.
+
+```swift
+// Query for acceleration structure sizes
+let sizes = device.accelerationStructureSizes(descriptor: accelerationStructureDescriptor)
+
+// Allocate acceleration structure
+let accelerationStructure =
+    device.makeAccelerationStructure(size: sizes.accelerationStructureSize)!
+
+// Allocate scratch buffer
+let scratchBuffer = device.makeBuffer(length: sizes.buildScratchBufferSize,
+                                      options: .storageModePrivate)!
+```
+
+Key points:
+
+- `device.accelerationStructureSizes` returns acceleration structure and build scratch sizes.
+- `makeAccelerationStructure` lets the app control when and where allocation happens.
+- The scratch buffer is temporary storage during the build only.
+- The session uses `.storageModePrivate` because the CPU does not access that data.
+
+([06:24](https://developer.apple.com/videos/play/wwdc2020/10012/?time=384)) The build is encoded into a GPU command buffer.
+
+```swift
+// Create command buffer/encoder
+let commandBuffer = commandQueue.makeCommandBuffer()!
+let commandEncoder = commandBuffer.makeAccelerationStructureCommandEncoder()!
+
+// Encode acceleration structure build
+commandEncoder.build(accelerationStructure: accelerationStructure,
+                     descriptor: accelerationStructureDescriptor,
+                     scratchBuffer: scratchBuffer,
+                     scratchBufferOffset: 0)
+
+// Commit command buffer
+commandEncoder.endEncoding()
+commandBuffer.commit()
+```
+
+Key points:
+
+- `makeAccelerationStructureCommandEncoder` creates the acceleration structure encoder.
+- The build command takes descriptor, target acceleration structure, and scratch buffer.
+- The build runs on the GPU timeline without CPU synchronization.
+- After the build you can safely schedule intersection work on the GPU.
+
+### Alpha test with a triangle intersection function
+
+([12:16](https://developer.apple.com/videos/play/wwdc2020/10012/?time=736)) The inefficiency with transparency is re-tracing from the root on every transparent hit. A triangle intersection function can sample an alpha texture during traversal and accept or reject the intersection.
+
+```metal
+[[intersection(triangle, triangle_data)]]
+bool alphaTestIntersectionFunction(uint primitiveIndex        [[primitive_id]],
+                                   uint geometryIndex         [[geometry_id]],
+                                   float2 barycentricCoords   [[barycentric_coord]],
+                                   device Material *materials [[buffer(0)]])
+{
+    texture2d<float> alphaTexture = materials[geometryIndex].alphaTexture;
+
+    float2 UV = interpolateUVs(materials[geometryIndex].UVs,
+        primitiveIndex, barycentricCoords);
+
+    float alpha = alphaTexture.sample(sampler, UV).x;
+
+    return alpha > 0.5f;
+}
+```
+
+Key points:
+
+- `[[intersection(triangle, triangle_data)]]` declares a triangle intersection function requiring barycentric coordinates.
+- `primitiveIndex`, `geometryIndex`, and `barycentricCoords` come from the intersector.
+- The function can bind its own resources; here `materials` supplies alpha texture and UVs.
+- Return `true` to accept the hit, `false` to continue traversal.
+
+### Custom primitives via bounding box functions
+
+([14:38](https://developer.apple.com/videos/play/wwdc2020/10012/?time=878)) Custom primitives start with bounding boxes. You supply boxes; Metal builds an acceleration structure over them; sphere, curve, or hair intersection runs in a bounding box intersection function.
+
+```swift
+// Create a primitive acceleration structure descriptor
+let accelerationStructureDescriptor = MTLPrimitiveAccelerationStructureDescriptor()
+
+// Create one or more bounding box geometry descriptors:
+let geometryDescriptor = MTLAccelerationStructureBoundingBoxGeometryDescriptor()
+
+geometryDescriptor.boundingBoxBuffer = boundingBoxBuffer
+geometryDescriptor.boundingBoxCount = boundingBoxCount
+
+accelerationStructureDescriptor.geometryDescriptors = [ geometryDescriptor ]
+```
+
+Key points:
+
+- The descriptor is still `MTLPrimitiveAccelerationStructureDescriptor`.
+- Use `MTLAccelerationStructureBoundingBoxGeometryDescriptor` for geometry.
+- `boundingBoxBuffer` holds axis-aligned bounding boxes.
+- Metal finds ray–box candidates then calls your intersection function.
+
+([15:38](https://developer.apple.com/videos/play/wwdc2020/10012/?time=938)) The sphere example shows math intersection, distance range checks, and returning accept plus intersection distance.
+
+```metal
+struct BoundingBoxResult {
+    bool accept [[accept_intersection]];
+    float distance [[distance]];
+};
+
+[[intersection(bounding_box)]]
+BoundingBoxResult sphereIntersectionFunction(float3 origin            [[origin]],
+                                             float3 direction         [[direction]],
+                                             float minDistance        [[min_distance]],
+                                             float maxDistance        [[max_distance]],
+                                             uint primitiveIndex      [[primitive_id]],
+                                             device Sphere *spheres   [[buffer(0)]])
+{
+    float distance;
+
+    if (!intersectRaySphere(origin, direction, spheres[primitiveIndex], &distance))
+        return { false, 0.0f };
+
+    if (distance < minDistance || distance > maxDistance)
+        return { false, 0.0f };
+
+    return { true, distance };
+}
+```
+
+Key points:
+
+- `BoundingBoxResult` marks accept and hit distance with attributes.
+- `origin`, `direction`, `minDistance`, and `maxDistance` come from the intersector.
+- The function runs `intersectRaySphere`; the session does not show that helper.
+- Returned `distance` participates in nearest-hit comparison across the scene.
+
+([16:20](https://developer.apple.com/videos/play/wwdc2020/10012/?time=980)) Use ray payload to bring extra data from the intersection function back to the compute kernel.
+
+```metal
+[[intersection(bounding_box)]]
+BoundingBoxResult sphereIntersectionFunction(/* ... */,
+                                             ray_data float3 & normal [[payload]])
+{
+    // ...
+
+    if (distance < minDistance || distance > maxDistance)
+        return { false, 0.0f };
+
+    float3 intersectionPoint = origin + direction * distance;
+    normal = normalize(intersectionPoint - spheres[primitiveIndex].origin);
+
+    return { true, distance };
+}
+```
+
+Key points:
+
+- `ray_data float3 & normal [[payload]]` is a payload reference.
+- After the intersection function writes `normal`, the intersecting kernel can read it.
+- Payload writes are visible on accept and reject; usually write payload only when accepting.
+
+### Connect intersection functions and the function table
+
+([17:18](https://developer.apple.com/videos/play/wwdc2020/10012/?time=1038)) The intersector must link intersection functions into the compute pipeline state before calling them.
+
+```swift
+// Load functions from Metal library
+let sphereIntersectionFunction = library.makeFunction(name: "sphereIntersectionFunction")!
+// other functions...
+
+// Attach functions to ray tracing compute pipeline descriptor
+let linkedFunctions = MTLLinkedFunctions()
+
+linkedFunctions.functions = [ sphereIntersectionFunction, alphaTestFunction, ... ]
+
+computePipelineDescriptor.linkedFunctions = linkedFunctions
+
+// Compile and link ray tracing compute pipeline
+let computePipeline = try device.makeComputePipeline(descriptor: computePipelineDescriptor,
+                                                     options: [],
+                                                     reflection: nil)
+```
+
+Key points:
+
+- Intersection functions load from the Metal library like ordinary functions.
+- `MTLLinkedFunctions` attaches them to the compute pipeline descriptor.
+- Pipeline compilation links the compute kernel and intersection functions.
+- That lets the in-kernel ray intersector call custom intersection functions.
+
+([18:35](https://developer.apple.com/videos/play/wwdc2020/10012/?time=1115)) After linking, map functions to geometry or instances with an intersection function table.
+
+```swift
+// Allocate intersection function table
+let descriptor = MTLIntersectionFunctionTableDescriptor()
+
+descriptor.functionCount = intersectionFunctions.count
+
+let functionTable = computePipeline.makeIntersectionFunctionTable(descriptor: descriptor)
+
+for i in 0 ..< intersectionFunctions.count {
+    // Get a handle to the linked intersection function in the pipeline state
+    let functionHandle = computePipeline.functionHandle(function: intersectionFunctions[i])
+
+    // Insert the function handle into the table
+    functionTable.setFunction(functionHandle, index: i)
+}
+
+// Bind intersection function resources
+functionTable.setBuffer(sphereBuffer, offset: 0, index: 0)
+```
+
+Key points:
+
+- `MTLIntersectionFunctionTableDescriptor` sets table capacity.
+- The table is created from a specific `computePipeline` and used only with that pipeline or derivatives.
+- `functionHandle` points to executable code linked into the pipeline state.
+- The function table is also a resource binding point; the example binds a sphere buffer at index 0.
+
+([19:26](https://developer.apple.com/videos/play/wwdc2020/10012/?time=1166)) Pass the function table as another buffer parameter to the intersector in the kernel.
+
+```metal
+[[kernel]]
+void rtKernel(primitive_acceleration_structure accelerationStructure   [[buffer(0)]],
+              intersection_function_table<triangle_data> functionTable [[buffer(1)]],
+              /* ... */)
+{
+    // generate ray, create intersector...
+
+    intersection = intersector.intersect(r, accelerationStructure, functionTable);
+
+    // shading...
+}
+```
+
+Key points:
+
+- `intersection_function_table<triangle_data>` is the shader-side table type.
+- Acceleration structure and function table sit at `[[buffer(0)]]` and `[[buffer(1)]]`.
+- The intersector picks entries using table offsets on geometry and instance descriptors.
+- On the CPU, bind with `encoder.setIntersectionFunctionTable(functionTable, bufferIndex: 1)`.
+
+---
+
+## Core Takeaways
+
+1. **Interactive path tracing preview**
+
+What: Add a noisy preview to a 3D scene editor—one ray per pixel while the camera moves, accumulating samples after motion stops.
+
+Why: The session demo uses this workflow: interactive editing favors speed, offline rendering favors convergence.
+
+How: Start with one thread per pixel in `rtKernel`, put ray generation, intersection, and shading in one compute kernel, then add sample accumulation.
+
+2. **Ray traced shadows for transparent foliage and cutout materials**
+
+What: Handle alpha textures correctly in ray traced shadows so leaves, fences, and mesh fabric are not solid triangles.
+
+Why: Triangle intersection functions reject transparent hits during traversal without re-firing rays from the root.
+
+How: Set an intersection function table entry for alpha-textured geometry; interpolate UVs with barycentric coordinates, sample alpha, return accept/reject.
+
+3. **Render spheres, curves, or hair with math primitives**
+
+What: Connect spheres, curves, and hair strands as bounding box primitives to reduce triangulation memory and quality issues.
+
+Why: The session shows spheres and cubic Bezier hair strands; curves stay smooth and hair needs few control points.
+
+How: Generate an axis-aligned bounding box per primitive, build with `MTLAccelerationStructureBoundingBoxGeometryDescriptor`, write an `[[intersection(bounding_box)]]` function.
+
+4. **Kernel split experiment switch in your renderer**
+
+What: Keep single-kernel and multi-kernel paths and compare occupancy, memory traffic, and frame time on real scenes.
+
+Why: Intersection is heavy; complex shading in one kernel can hurt occupancy.
+
+How: Implement the single-kernel path first, move heavy shading to another compute pass, compare with GPU counters or Xcode Metal tools.
+
+5. **Put acceleration structure builds in your resource scheduler**
+
+What: Let the scene loader decide when to allocate, build, refit, or compact acceleration structures instead of managing large blocks in the render loop.
+
+Why: The new API controls allocation and GPU-timeline builds; instancing, refitting, and compaction help dynamic geometry and memory reuse.
+
+How: Wrap a build job around `device.accelerationStructureSizes`, `makeAccelerationStructure`, scratch buffers, and `makeAccelerationStructureCommandEncoder`.
+
+---
+
+## Related Sessions
+
+- [Get to know Metal function pointers](/articles/wwdc2020-10013) — Companion session recommended at the end for arbitrary material code, dynamic shader calls, and ray tracing function tables.
+- [Harness Apple GPUs with Metal](/articles/wwdc2020-10602) — Apple GPU and Metal rendering architecture background for high-performance renderer constraints.
+- [Optimize Metal apps and games with GPU counters](/articles/wwdc2020-10603) — GPU counters for profiling and kernel-split decisions from this session.
+- [Gain insights into your Metal app with Xcode 12](/articles/wwdc2020-10605) — Xcode 12 Metal debugger and performance guidance for ray tracing resource and bandwidth issues.
+- [Bring your Metal app to Apple silicon Macs](/articles/wwdc2020-10631) — Metal/TBDR on Apple silicon Macs for porting graphics-intensive apps.

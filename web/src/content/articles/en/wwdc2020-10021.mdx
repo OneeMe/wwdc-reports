@@ -1,0 +1,137 @@
+---
+title: "Build Metal-based Core Image kernels with Xcode"
+description: "learn how to integrate and load core image kernels written in the metal shading language into your application, and discover how you can apply these image filters to create unique effects. explore how to use xcode rules and naming conventions for core image kernels written in metal shading language. we'll explain how to best use core image apis effectively and optimally with metal and the metal shading language."
+date: 2020-06-10
+tags: ["Core Image", "Metal", "Xcode", "WWDC 2020"]
+thumbnail: "/images/sessions/2020/10021.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2020/10021/"
+sessionId: "wwdc2020-10021"
+year: "2020"
+relatedSessions:
+  - title: "Optimize the Core Image pipeline for your video app"
+    code: "10008"
+    description: "Explains Core Image pipelines, CIContext reuse, Metal queues, and performance boundaries for custom kernels in video apps."
+  - title: "Discover Core Image debugging techniques"
+    code: "10089"
+    description: "Shows how to generate and read a Core Image graph to diagnose rendering, color, and performance issues."
+  - title: "Edit and play back HDR video with AVFoundation"
+    code: "10009"
+    description: "Explains how to edit and play HDR video with AVFoundation and create video compositions with Core Image filters."
+  - title: "Export HDR media in your app with AVFoundation"
+    code: "10010"
+    description: "Introduces the HDR media export workflow, supported formats, and AVFoundation export entry points."
+  - title: "Build GPU binaries with Metal"
+    code: "10615"
+    description: "Explains the Metal shader compilation model, GPU binaries, binary archives, and dynamic library workflows."
+---
+
+## Highlight
+
+> Apple provides a `.ci.metal` build workflow for Core Image kernels: Xcode uses `-fcikernel` and `-cikernel` at build time to produce `.ci.metallib`, which the app loads at runtime with `CIColorKernel` and applies to `CIImage`—reducing runtime compilation and gaining Metal syntax checking.
+
+## Core Content
+
+When writing custom Core Image filters, developers care about two things: whether filters can enter Core Image's automatic tiling and concatenation pipeline, and whether shader syntax errors surface early in development. This session's answer is to write CIKernel in Metal Shading Language and let Xcode complete Core Image-specific compilation and linking during the app build.
+
+The path breaks into five steps. Add `.ci.metal` and `.ci.air` build rules to the target; put kernels in source files ending with `.ci.metal`; write Metal functions following Core Image function signatures; finally load `.ci.metallib` in Swift and generate a new `CIImage` through `CIColorKernel.apply`.
+
+The demo is an HDR zebra stripe filter. It reads an input pixel and destination coordinates, drawing red zebra stripes in HDR regions above SDR white point. The example is small but covers the full chain: `.ci.metal` source, Metal types provided by Core Image, runtime loading, and `outputImage` on a `CIFilter` subclass.
+
+## Detailed Content
+
+### 1. Add `.ci.metal` to the Xcode build first ([01:20](https://developer.apple.com/videos/play/wwdc2020/10021/?time=80))
+
+Core Image Metal code cannot use ordinary Metal compute or graphics shader compilation. The session recommends adding two custom build rules to the target.
+
+- The first matches `.ci.metal` files, invokes the Metal compiler with `-fcikernel`, and produces `.ci.air`.
+- The second matches `.ci.air` files, invokes the Metal linker with `-cikernel`, and puts the product in app resources with a `.ci.metallib` suffix.
+- When creating new source files, the filename must end with `.ci.metal` so the first build rule matches.
+
+Key points:
+- `-fcikernel` and `-cikernel` come from the transcript build steps—not default Metal shader parameters.
+- After compilation results enter app resources, Swift can find them with `Bundle.main.url(forResource:withExtension:)`.
+- This moves kernel compilation from runtime to build time while keeping Xcode syntax highlighting and build-time syntax checking.
+
+### 2. Write Core Image kernels in `.ci.metal` files ([03:08](https://developer.apple.com/videos/play/wwdc2020/10021/?time=188))
+
+The example kernel comes from an HDR video scenario. It receives an input pixel, a time parameter, and destination coordinates, outputting red pixels in highlight regions.
+
+```metal
+// MyKernels.ci.metal
+#include <CoreImage/CoreImage.h> // includes CIKernelMetalLib.h
+using namespace metal;
+
+extern "C" float4 HDRZebra(coreimage::sample_t s, float time, coreimage::destination dest)
+{
+    float diagLine = dest.coord().x + dest.coord().y;
+    float zebra = fract(diagLine / 20.0 + time * 2.0);
+    if ((zebra > 0.5) && (s.r > 1 || s.g > 1 || s.b > 1))
+        return float4(2.0, 0.0, 0.0, 1.0);
+    return s;
+}
+```
+
+Key points:
+- `#include <CoreImage/CoreImage.h>` brings in ordinary Metal classes and Core Image kernel types.
+- `extern "C"` is a Core Image kernel function declaration requirement.
+- `coreimage::sample_t` represents one pixel from the input image; the transcript states it is a linear, premultiplied-alpha RGBA `float4` usable for SDR or HDR images.
+- `coreimage::destination` provides destination pixel coordinates; the example uses `dest.coord().x + dest.coord().y` for diagonal stripes.
+- The condition `s.r > 1 || s.g > 1 || s.b > 1` corresponds to HDR pixels above normal SDR white 1.
+
+### 3. Load `.ci.metallib` with `CIColorKernel` ([04:58](https://developer.apple.com/videos/play/wwdc2020/10021/?time=298))
+
+After Metal kernels compile into resources, the Swift side typically wraps them in a `CIFilter` subclass. The session recommends putting the `CIKernel` object in a static property so metallib reading and initialization happen only once.
+
+```swift
+class HDRZebraFilter: CIFilter {
+    var inputImage: CIImage?
+    var inputTime: Float = 0.0
+
+    static var kernel: CIColorKernel = { () -> CIColorKernel in
+        let url = Bundle.main.url(forResource: "MyKernels",
+                                  withExtension: "ci.metallib")!
+        let data = try! Data(contentsOf: url)
+        return try! CIColorKernel(functionName: "HDRzebra",
+                                  fromMetalLibraryData: data)
+    }()
+
+    override var outputImage: CIImage? {
+        get {
+            guard let input = inputImage else { return nil }
+            return HDRZebraFilter.kernel.apply(extent: input.extent,
+                                               arguments: [input, inputTime])
+        }
+    }
+}
+```
+
+Key points:
+- `Bundle.main.url(forResource: "MyKernels", withExtension: "ci.metallib")` corresponds to the resource file from the build rules.
+- `Data(contentsOf:)` reads metallib binary data.
+- `CIColorKernel(functionName:fromMetalLibraryData:)` retrieves the specified kernel from the Metal library.
+- The static property loads and initializes only on first use, avoiding per-frame resource reads.
+- `outputImage` checks `inputImage` first, then uses `apply(extent:arguments:)` to create a new `CIImage` recipe.
+
+### 4. Remember what this path is good for ([00:20](https://developer.apple.com/videos/play/wwdc2020/10021/?time=20))
+
+The session's opening benefits are specific. Metal-based Core Image kernels still use CIKernel automatic tiling and concatenation; compilation moves to app build time, reducing runtime compilation overhead; the Metal version also accesses high-performance capabilities like gather reads, group writes, and half-float math.
+
+Developer experience is more direct too. `.ci.metal` is written in Xcode with syntax highlighting at input and syntax checking at build. For filters that need constant visual tweaking, earlier error exposure means lower iteration cost.
+
+## Core Takeaways
+
+- **What to do**: Add an overexposure zebra overlay to HDR video preview. **Why it's worth doing**: The session's `HDRZebra` kernel already shows how to detect pixels above SDR white 1 and mark regions with red stripes. **How to start**: Put the example in `MyKernels.ci.metal`, then have `HDRZebraFilter` accept `inputImage` and animation time parameters.
+
+- **What to do**: Migrate custom filters in a photo editing app to `.ci.metal`. **Why it's worth doing**: Build time runs Core Image-specific Metal compilation and linking, exposing syntax errors during build. **How to start**: Add `.ci.metal` and `.ci.air` build rules to the target, declare filter functions as `extern "C"`, and load with `CIColorKernel` from `.ci.metallib`.
+
+- **What to do**: Add real-time speed control to filter preview. **Why it's worth doing**: The example's `inputTime` passes to the kernel as a parameter; `apply(extent:arguments:)` supports passing the input image and time value together to generate a new `CIImage`. **How to start**: Keep `inputTime` on the `CIFilter` subclass, update it with a slider or playback clock, and pass `[input, inputTime]` in the `arguments` array.
+
+- **What to do**: Establish a "build failure stops the line" shader validation flow for video tools. **Why it's worth doing**: The session explicitly puts Metal kernel syntax checking at build time—suitable for blocking errors early in CI or local builds. **How to start**: Name all Core Image Metal sources `.ci.metal`, ensure target build rules generate `.ci.metallib`, and have the app load only build artifacts at launch.
+
+## Related Sessions
+
+- [Optimize the Core Image pipeline for your video app](/articles/wwdc2020-10008) — Covers `CIContext` reuse, Metal command queues, and video filter pipelines—good to read before this session.
+- [Discover Core Image debugging techniques](/articles/wwdc2020-10089) — Supplements Core Image graph generation and interpretation for rendering, color, and performance issues after custom kernel integration.
+- [Edit and play back HDR video with AVFoundation](/articles/wwdc2020-10009) — Expands HDR video editing and playback, including creating `AVMutableVideoComposition` with Core Image filters.
+- [Export HDR media in your app with AVFoundation](/articles/wwdc2020-10010) — Continues HDR content export—suitable for extending Core Image filters from preview to output workflow.
+- [Build GPU binaries with Metal](/articles/wwdc2020-10615) — Deep dive on Metal shader compilation, GPU binaries, binary archives, and dynamic libraries—background for build-time compilation.

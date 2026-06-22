@@ -1,0 +1,299 @@
+---
+title: "Meet distributed actors in Swift"
+description: "Discover distributed actors — an extension of Swift's actor model that simplifies development of distributed systems. We'll explore how distributed actor isolation and location transparency can help you avoid the accidental complexity of networking, serialization, and other transport concerns when working with distributed apps and systems."
+date: "2022-06-07"
+tags: ["Swift", "Concurrency", "Distributed", "Actor"]
+thumbnail: "/images/sessions/2022/110356.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2022/110356/"
+sessionId: "wwdc2022-110356"
+year: "2022"
+relatedSessions:
+  - title: "What's new in Swift"
+    code: "110354"
+    description: "分散アクターの紹介を含む、Swift 5.7 の新機能の概要"
+  - title: "Meet Swift Async Algorithms"
+    code: "110355"
+    description: "分散アクターと連携してストリーミング データを処理できる Swift 非同期アルゴリズム ライブラリ"
+  - title: "Design protocol interfaces in Swift"
+    code: "110353"
+    description: "Swift 5.7 プロトコルとジェネリックスの改善、分散アクターは言語機能の恩恵を受ける"
+---
+## ハイライト
+
+> Swift 5.7 の分散アクターは、アクター モデルを単一プロセスからマルチプロセス シナリオに拡張します。シリアル化要件とコンパイラによってチェックされる位置の透明性を通じて、リモート呼び出しとローカル呼び出しはまったく同じ方法で記述されます。
+
+## 主要内容
+
+### ローカル アクターから分散アクターへ
+
+現在、三目並べゲームにはシングル プレイヤー モードのみがあります。人間のプレイヤーと AI の対戦相手はどちらも、非同期メッセージを介して通信するローカル アクターです。 2 つのデバイス上のプレーヤーが相互に接続できるようにするマルチプレーヤー機能を追加したいと考えています。
+
+以前のアプローチは、WebSocket 接続、メッセージのシリアル化、および状態の同期を手動で処理することでした。コードがいっぱいです`encode`/`decode`、再接続ロジック、ハートビート検出、およびゲーム ロジックはネットワーク コードによって圧倒されます。
+
+([00:30](https://developer.apple.com/videos/play/wwdc2022/110356/?time=30)) 分散アクターの中心となるアイデアは、「アクターはすでにメッセージ パッシングを通じて通信しているのに、なぜこれらのメッセージを別のデバイスに送信できないのか?」というものです。
+
+Swift アクターの「同時実行の海」モデルでは、各アクターは孤立した島であり、非同期メッセージを通じてデータを交換します。分散アクターは、このモデルを「分散海」に拡張します。各島は、異なるデバイス、サーバー、またはプロセス上に配置できます。
+
+### 移行の最初のステップ: アクターを分散アクターに変更する
+
+([04:47](https://developer.apple.com/videos/play/wwdc2022/110356/?time=287)) 最初にオリジナルのローカル アクターを見てみましょう。
+
+```swift
+public actor BotPlayer: Identifiable {
+    nonisolated public let id: ActorIdentity = .random
+
+    var ai: RandomPlayerBotAI
+    var gameState: GameState
+
+    public init(team: CharacterTeam) {
+        self.gameState = .init()
+        self.ai = RandomPlayerBotAI(playerID: self.id, team: team)
+    }
+
+    public func makeMove() throws -> GameMove {
+        return try ai.decideNextMove(given: &gameState)
+    }
+
+    public func opponentMoved(_ move: GameMove) async throws {
+        try gameState.mark(move)
+    }
+}
+```
+
+([06:11](https://developer.apple.com/videos/play/wwdc2022/110356/?time=371)) 分散アクターへの変更には、いくつかの手順のみが必要です。
+
+```swift
+import Distributed
+
+public distributed actor BotPlayer: Identifiable {
+    typealias ActorSystem = LocalTestingDistributedActorSystem
+
+    var ai: RandomPlayerBotAI
+    var gameState: GameState
+
+    public init(team: CharacterTeam, actorSystem: ActorSystem) {
+        self.actorSystem = actorSystem
+        self.gameState = .init()
+        self.ai = RandomPlayerBotAI(playerID: self.id, team: team)
+    }
+
+    public distributed func makeMove() throws -> GameMove {
+        return try ai.decideNextMove(given: &gameState)
+    }
+
+    public distributed func opponentMoved(_ move: GameMove) async throws {
+        try gameState.mark(move)
+    }
+}
+```
+
+キーポイント:
+- `distributed actor`代わりの`actor`、自動的に一致します`DistributedActor`プロトコル
+- `ActorSystem`型エイリアスは、このアクターが使用する分散システムを宣言します。
+- `actorSystem`これはコンパイラによって合成されるプロパティであり、初期化子で割り当てる必要があります。
+- `id`プロパティはアクター システムによって自動的に割り当てられ、手動で宣言することはできません
+- `distributed func`リモートから呼び出せるメソッドにマークを付ける
+
+### 場所の透明性
+
+([03:41](https://developer.apple.com/videos/play/wwdc2022/110356/?time=221)) 分散アクターの最も重要な機能は、位置の透過性です。アクターがローカルであってもリモートであっても、呼び出しコードはまったく同じです。
+
+```swift
+// ローカル actor
+let localBot = BotPlayer(team: .fish, actorSystem: system)
+let move = try await localBot.makeMove()
+
+// リモート actor（resolve で参照を取得）
+let remoteBot = try BotPlayer.resolve(id: opponentID, using: webSocketSystem)
+let move = try await remoteBot.makeMove()  // 構文はまったく同じ！
+```
+
+キーポイント:
+- `resolve(id:using:)`インスタンスを作成するのではなく、リモート アクターへの参照を取得します
+- 返された参照は、ローカル インスタンスとまったく同じ API を使用します。
+- ネットワーキング、シリアル化、送信の詳細はすべてアクター システムによって処理されます
+
+### サーバー側の実装
+
+([13:35](https://developer.apple.com/videos/play/wwdc2022/110356/?time=815)) BotPlayer をサーバー上で実行するように移動すると、クライアントは WebSocket 経由で接続します。
+
+```swift
+import Distributed
+import TicTacFishShared
+
+@main struct Boot {
+    static func main() {
+        let system = try! SampleWebSocketActorSystem(
+            mode: .serverOnly(host: "localhost", port: 8888)
+        )
+
+        system.registerOnDemandResolveHandler { id in
+            if system.isBotID(id) {
+                return system.makeActorWithID(id) {
+                    OnlineBotPlayer(team: .rodents, actorSystem: system)
+                }
+            }
+            return nil
+        }
+
+        try await server.terminated
+    }
+}
+```
+
+キーポイント:
+- `registerOnDemandResolveHandler`オンデマンドでアクターを作成する
+- クライアントによって送信されたメッセージが指す ID には、対応するインスタンスがまだない可能性があります。
+- サーバーは、ID 特性に基づいて新しい BotPlayer を作成する必要があるかどうかを判断します。
+
+### ローカルネットワーク対戦：受付モード
+
+([16:32](https://developer.apple.com/videos/play/wwdc2022/110356/?time=992)) クライアント/サーバー モードに加えて、分散アクターはピアツーピア通信もサポートします。ローカル Wi-Fi 環境では、2 つのデバイスが直接お互いを検出し、ゲームを確立します。
+
+受付モードを使用してリモート アクターを検出します。
+
+```swift
+let opponentTeam = model.team == .fish ? CharacterTeam.rodents : CharacterTeam.fish
+
+let listing = await localNetworkSystem.receptionist.listing(
+    of: OpponentPlayer.self,
+    tag: opponentTeam.tag
+)
+
+for try await opponent in listing where opponent.id != self.player.id {
+    model.foundOpponent(opponent, myself: self.player, informOpponent: true)
+    return
+}
+```
+
+キーポイント:
+- `receptionist.listing(of:tag:)`AsyncSequenceを返します
+- 新しいデバイスがネットワークに参加すると、リストに新しい値が自動的に生成されます
+- `for try await`を使って、見つかった対戦相手を走査します
+
+([20:23](https://developer.apple.com/videos/play/wwdc2022/110356/?time=1223)) 人間のプレーヤーが分散アクターとして機能する場合、ローカル UI へのリモート呼び出しを処理する必要があります。
+
+```swift
+public distributed actor LocalNetworkPlayer: GamePlayer {
+    public typealias ActorSystem = SampleLocalNetworkActorSystem
+
+    let team: CharacterTeam
+    let model: GameViewModel
+
+    public distributed func makeMove() async -> GameMove {
+        let field = await model.humanSelectedField()
+        movesMade += 1
+        let move = GameMove(
+            playerID: self.id,
+            position: field,
+            team: team,
+            teamCharacterID: movesMade % 2
+        )
+        return move
+    }
+}
+```
+
+キーポイント:
+- `makeMove()`リモートで呼び出された場合、人間のプレイヤーがローカル UI で操作するまで待つ必要があります。
+- `await model.humanSelectedField()`ユーザーがクリックするまでリモート通話を一時停止します
+- 返された`GameMove`はアクターシステムを介して自動的にシリアル化され、リモート呼び出し元へ戻されます
+
+## 詳細
+
+### コンパイラーによる分散アクターのチェック
+
+分散アクターには、通常のアクターよりも 3 層多くのコンパイラ チェックがあります。
+
+```swift
+// 1. distributed メソッドだけがリモート呼び出し可能
+public distributed func makeMove() throws -> GameMove  // OK
+public func helper() { }  // リモート参照では呼び出せない
+
+// 2. パラメーターと戻り値はシリアル化要件を満たす必要がある
+distributed func sendMessage(_ text: String)  // OK、String は Codable
+distributed func sendImage(_ image: UIImage)  // コンパイルエラー！UIImage は Codable ではない
+
+// 3. Actor system の型が一致している必要がある
+let bot: BotPlayer  // BotPlayer の ActorSystem は LocalTestingDistributedActorSystem
+let remoteBot = try BotPlayer.resolve(id: id, using: otherSystem)  // 型が一致しないためエラーになる
+```
+
+キーポイント:
+- `distributed`キーワードはリモート API 境界を明示的にマークします
+- デフォルトのシリアル化要件は次のとおりです。`Codable`、アクターシステムはカスタマイズ可能
+- コンパイラは、コンパイル時にリモート呼び出しの型安全性を保証します。
+
+### アクターシステムの責任
+
+アクター システムは分散アクターの中核的な抽象化であり、次の役割を果たします。
+
+1. **ID の割り当て**: 各アクターには、作成時にグローバルに一意の識別子が割り当てられます。
+2. **シリアル化/逆シリアル化**: メソッド呼び出しをネットワーク メッセージにエンコードします
+3. **ルーティング**: ID に基づいてターゲット アクターの場所を見つけます。
+4. **送信**: ネットワーク経由でメッセージを送信します。
+
+```swift
+// Swift 5.7 組み込みのローカルテストシステム
+typealias ActorSystem = LocalTestingDistributedActorSystem
+
+// カスタム WebSocket システム
+typealias ActorSystem = SampleWebSocketActorSystem
+
+// オープンソースのクラスタシステム（SwiftNIO 実装）
+// https://github.com/apple/swift-distributed-actors/
+```
+
+### シリアル化の要件
+
+([10:21](https://developer.apple.com/videos/play/wwdc2022/110356/?time=621)) 分散アクターのすべて`distributed func`パラメーターと戻り値の型は、アクター システムのシリアル化要件を満たしている必要があります。デフォルトは`Codable`：
+
+```swift
+struct GameMove: Codable {
+    let playerID: ActorIdentity
+    let position: Int
+    let team: CharacterTeam
+    let teamCharacterID: Int
+}
+```
+
+アクター システムが他のシリアル化スキーム (プロトコル バッファーなど) を使用する場合、別の要件を宣言できます。
+
+```swift
+distributed actor BotPlayer {
+    typealias ActorSystem = ProtobufActorSystem
+    // この場合、パラメーターと戻り値は ProtobufSerializable に準拠する必要がある
+}
+```
+
+## 重要ポイント
+
+**1.手動ネットワーク層の代わりに分散アクターを使用する**
+
+デバイス間通信に WebSocket、URLSession、またはサードパーティ ライブラリを使用している場合は、分散アクターを使用したリファクタリングを検討してください。ゲームステータスの同期、共同編集、リアルタイムチャットなどのシナリオに特に適しています。まず`LocalTestingDistributedActorSystem`から始め、ローカル テストに合格した後、実際のネットワークに接続します。
+
+入り口：`import Distributed`，`distributed actor`
+
+**2.ローカル マルチプレイヤー エクスペリエンスを構築する**
+
+ネットワーク フレームワークと分散アクターを活用して、サーバー コストゼロでローカル マルチプレイヤー ゲームを実装します。受付モードでは、ユーザーが手動で IP アドレスを入力したり、QR コードをスキャンしたりする必要がなく、近くのデバイスが自動的に検出されます。
+
+入り口：`receptionist.listing(of:tag:)`，`SampleLocalNetworkActorSystem`
+
+**3.アクター システムを使用してさまざまなデプロイメント モードを抽象化します**
+
+同じゲーム ロジック一式を、異なるアクターシステムでデプロイできます。ローカルテストには`LocalTestingDistributedActorSystem`、ローカルネットワーク対戦にはカスタム Network Framework システム、オンライン対戦には WebSocket システム、大規模クラスタには Swift Distributed Actors ライブラリを使用できます。ビジネスロジックを変更する必要はまったくありません。
+
+入り口：`typealias ActorSystem = ...`，`resolve(id:using:)`
+
+**4.サーバーサイド Swift の新しい選択肢**
+
+分散アクターは、サーバー側 Swift にタイプセーフな RPC 抽象化を提供します。 Vapor のルート プロセッサと比較すると、分散アクターによりクライアントとサーバーがインターフェイス定義を共有でき、コンパイラーは両端の型の一貫性を保証します。
+
+入り口：`SampleWebSocketActorSystem(mode: .serverOnly)`，`registerOnDemandResolveHandler`
+
+## 関連セッション
+
+- [Swift の新機能](/articles/wwdc2022-110354) — 分散アクターの言語レベルのサポートを含む、Swift 5.7 の新機能の概要
+- [Swift 非同期アルゴリズムの紹介](/articles/wwdc2022-110355) — 分散アクターと連携してリアルタイム データ ストリームを処理できる非同期アルゴリズム ライブラリ
+- [Swift でのプロトコル インターフェイスの設計](/articles/wwdc2022-110353) — Swift 5.7`some`/`any`構文と主関連付けタイプ、分散アクターの API 設計は、これらの改善の恩恵を受けます。

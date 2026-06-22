@@ -1,0 +1,197 @@
+---
+title: "Explore large language models on Apple silicon with MLX"
+description: "discover mlx lm – designed specifically to make working with large language models simple and efficient on apple silicon. we"
+date: 2026-06-10
+tags: ["Machine Learning"]
+thumbnail: "/images/sessions/2025/298.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/298/"
+sessionId: "wwdc2025-298"
+year: "2025"
+relatedSessions:
+  - title: "Bring advanced speech-to-text to your app with SpeechAnalyzer"
+    code: "277"
+    description: "discover the new speechanalyzer api for speech to text. we"
+  - title: "Code-along: Bring on-device AI to your app using the Foundation Models framework"
+    code: "259"
+    description: "develop generative ai features for your swiftui apps using the foundation models"
+  - title: "Deep dive into the Foundation Models framework"
+    code: "301"
+    description: "level up with the foundation models framework. learn how guided generation works"
+  - title: "Design interactive snippets"
+    code: "281"
+    description: "snippets are compact views invoked from app intents that display information fro"
+---
+
+## Highlight
+
+> On an M3 Ultra with 512GB of unified memory, MLX LM runs DeepSeek 670B at 4.5-bit quantization (about 380GB of weights) with a single command.
+
+## Core content
+
+Running a large model locally used to mean a PC with a discrete GPU, the CUDA toolchain, Hugging Face conversion scripts, quantization plugins, and various offload tricks when VRAM ran out. Mac users were left out, since there was no NVIDIA card and no tens of GB of VRAM to spare.
+
+At WWDC 2025, Apple shipped MLX LM and collapsed that chain into two steps: `pip install mlx-lm`, then one command. MLX is an open-source machine learning library built on Metal acceleration and unified memory, where CPU and GPU share the same data and you no longer copy back and forth between VRAM and RAM. On top of MLX, MLX LM wraps a CLI and a Python API that cover text generation, model quantization, LoRA fine-tuning, and adapter fusion end-to-end, and talks directly to Hugging Face. In the demo, Angelos ran DeepSeek V3 with 670B parameters at 4.5-bit quantization on an M3 Ultra. The weights are about 380GB, and the generation rate beats reading speed. This is the first time consumer hardware can interact with a model of this size locally.
+
+## Details
+
+**Minimal text generation ([03:51](https://developer.apple.com/videos/play/wwdc2025/298/?time=231)).** A single CLI command handles download, load, and inference:
+
+```bash
+mlx_lm.generate --model "mlx-community/Mistral-7B-Instruct-v0.3-4bit" \
+                --prompt "Write a quick sort in Swift"
+```
+
+Key points:
+- `--model` accepts a Hugging Face repo ID or a local path. The model is downloaded automatically if it is not on disk.
+- `--prompt` is the input text. The tool wraps it in a chat template internally.
+- You can also pass `--top-p`, `--temp`, and `--max-tokens` to tune sampling, with the same flags as mainstream inference tools.
+
+**Python API gives you the full model object ([05:26](https://developer.apple.com/videos/play/wwdc2025/298/?time=326)).** `load` returns a real MLX neural network whose structure and parameters you can inspect:
+
+```python
+from mlx_lm import load, generate
+
+model, tokenizer = load("mlx-community/Mistral-7B-Instruct-v0.3-4bit")
+
+prompt = "Write a quick sort in Swift"
+messages = [{"role": "user", "content": prompt}]
+prompt = tokenizer.apply_chat_template(
+    messages, add_generation_prompt=True
+)
+
+text = generate(model, tokenizer, prompt=prompt, verbose=True)
+```
+
+Key points:
+- `load` returns both the model and the tokenizer, fetched from Hugging Face and cached.
+- `apply_chat_template` renders the messages into the prompt string the model expects.
+- `generate` is a blocking call. With `verbose=True`, it prints tokens and throughput as it generates.
+- The returned `model` lets you call `print(model.layers[0].self_attn)` to inspect its structure, which makes layer swaps and low-level surgery straightforward.
+
+**KV cache for multi-turn dialogue ([08:01](https://developer.apple.com/videos/play/wwdc2025/298/?time=481)).** With long prompts and multi-turn sessions, recomputing attention is very expensive:
+
+```python
+from mlx_lm import load, generate
+from mlx_lm.models.cache import make_prompt_cache
+
+model, tokenizer = load("mlx-community/Mistral-7B-Instruct-v0.3-4bit")
+
+prompt = "Write a quick sort in Swift"
+messages = [{"role": "user", "content": prompt}]
+prompt = tokenizer.apply_chat_template(
+    messages, add_generation_prompt=True
+)
+
+cache = make_prompt_cache(model)
+
+text = generate(model, tokenizer, prompt=prompt, prompt_cache=cache, verbose=True)
+```
+
+Key points:
+- `make_prompt_cache(model)` builds a reusable KV cache object.
+- Pass the cache through `prompt_cache=` to `generate`, and each call resumes from the last token position.
+- The cache can be edited in place, saved, and swapped between sessions, which fits chatbots and agents.
+
+**Per-layer mixed-precision quantization ([10:33](https://developer.apple.com/videos/play/wwdc2025/298/?time=633)).** Embedding layers and `lm_head` are more sensitive to quantization, so you can keep them at higher precision:
+
+```python
+from mlx_lm.convert import convert
+
+def mixed_quantization(layer_path, layer, model_config):
+    if "lm_head" in layer_path or "embed_tokens" in layer_path:
+        return {"bits": 6, "group_size": 64}
+    elif hasattr(layer, "to_quantized"):
+        return {"bits": 4, "group_size": 64}
+    else:
+        return False
+
+convert(
+    hf_path="mistralai/Mistral-7B-Instruct-v0.3",
+    mlx_path="./mistral-7b-v0.3-mixed-4-6-bit",
+    quantize=True,
+    quant_predicate=mixed_quantization
+)
+```
+
+Key points:
+- `quant_predicate` is a function called per layer that returns the quantization parameters for that layer or `False` to skip.
+- `lm_head` and `embed_tokens` use 6-bit with `group_size` 64; the rest go to 4-bit.
+- `convert` downloads, converts, and saves in one step. Add `upload_repo` to push the result back to Hugging Face.
+
+**LoRA fine-tuning ([13:37](https://developer.apple.com/videos/play/wwdc2025/298/?time=817)).** Train an adapter directly on a 4-bit quantized model:
+
+```bash
+mlx_lm.lora --model "mlx-community/Mistral-7B-Instruct-v0.3-4bit" \
+            --train \
+            --data /path/to/our/data/folder \
+            --iters 300 \
+            --batch-size 16
+```
+
+Key points:
+- Training an adapter on a quantized model uses far less memory than training the full-precision model.
+- `--data` points to a local data directory in the standard Hugging Face dataset format.
+- After training, the adapter is saved separately and loaded at inference time with `--adapter`.
+- Then `mlx_lm.fuse` ([16:29](https://developer.apple.com/videos/play/wwdc2025/298/?time=989)) merges the adapter back into the base model, so deployment ships a single quantized model file.
+
+**Swift integration ([17:14](https://developer.apple.com/videos/play/wwdc2025/298/?time=1034)).** Drop LLM inference into a Mac or iOS app:
+
+```swift
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXLLM
+
+@main
+struct LLM {
+    static func main() async throws {
+        let modelId = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+        let modelFactory = LLMModelFactory.shared
+        let configuration = ModelConfiguration(id: modelId)
+        let model = try await modelFactory.loadContainer(configuration: configuration)
+
+        try await model.perform({context in
+            let prompt = "Write a quicksort in Swift"
+            let input = try await context.processor.prepare(input: UserInput(prompt: prompt))
+
+            let params = GenerateParameters(temperature: 0.0)
+            let tokenStream = try generate(input: input, parameters: params, context: context)
+            for await part in tokenStream {
+                print(part.chunk ?? "", terminator: "")
+            }
+        })
+    }
+}
+```
+
+Key points:
+- `LLMModelFactory.shared.loadContainer(configuration:)` returns a `ModelContainer`, a Swift 6 actor that handles concurrency safety on its own.
+- `context.processor.prepare(input:)` runs tokenization and applies the chat template.
+- `generate(...)` returns an `AsyncSequence`, so you can stream tokens with `for await`.
+- For multi-turn dialogue, call `context.model.newCache(parameters:)` before `generate` to build a KV cache and pass it into the `TokenIterator` ([18:00](https://developer.apple.com/videos/play/wwdc2025/298/?time=1080)).
+
+## Takeaways
+
+- **What to do: stand up a local inference service on a Mac to replace cloud APIs for privacy-sensitive data**
+  - Why it pays off: unified memory on M-series Macs lets a 70B 4-bit model run on a 64–128GB machine. Sensitive data never leaves the box, and inference cost drops to zero.
+  - How to start: `pip install mlx-lm`, get `mlx_lm.generate --model "mlx-community/Mistral-7B-Instruct-v0.3-4bit"` running first, then wrap it in an HTTP endpoint with the Python API.
+
+- **What to do: use LoRA fine-tuning to inject domain knowledge into a quantized base model**
+  - Why it pays off: training an adapter on a 4-bit model uses little memory and fits on a 32GB Mac. The adapter is only tens of MB, which makes per-customer or per-scenario distribution easy.
+  - How to start: format your data as standard Hugging Face jsonl, run `mlx_lm.lora --train --data ./data --iters 300`, then merge with `mlx_lm.fuse` for deployment.
+
+- **What to do: embed MLX Swift directly into a Mac or iOS app for on-device chat or code completion**
+  - Why it pays off: the built-in model in the Foundation Models framework is size-limited. Bringing your own MLX model lets you pick anything from 7B to 70B and raises the quality ceiling.
+  - How to start: add the MLXLLM dependency to your Xcode project, follow the 28-line example at 17:14 to set up a `ModelContainer`, then add a KV cache for multi-turn dialogue.
+
+- **What to do: use per-layer mixed-precision quantization as a middle ground for quality-sensitive workloads**
+  - Why it pays off: pure 4-bit can drop scores noticeably, especially on math and code tasks. Lifting `embed_tokens` and `lm_head` to 6-bit usually recovers most of the loss and only adds a few percent to the file size.
+  - How to start: reuse the `mixed_quantization` function above, call `convert(quant_predicate=...)`, and compare scores on your own evaluation set before and after.
+
+## Related sessions
+
+- [Get started with MLX for Apple silicon](/articles/wwdc2025-315) — an introduction to the MLX framework, covering unified memory and Metal acceleration.
+- [Code-along: Bring on-device AI to your app using the Foundation Models framework](/articles/wwdc2025-259) — building on-device AI with Apple's Foundation Models framework, a counterpart to self-hosted MLX models.
+- [Deep dive into the Foundation Models framework](/articles/wwdc2025-301) — a deeper look at guided generation and tool use in Foundation Models.
+- [Bring advanced speech-to-text to your app with SpeechAnalyzer](/articles/wwdc2025-277) — another core on-device ML capability: the new SpeechAnalyzer speech-to-text API.
+- [Design interactive snippets](/articles/wwdc2025-281) — design guidance for App Intents snippets, which pair well with local LLM output for interactive presentation.

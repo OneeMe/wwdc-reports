@@ -1,0 +1,189 @@
+---
+title: "Learn about Apple Immersive Video technologies"
+description: "explore the capabilities of apple immersive video and apple spatial audio format technologies to create truly immersive experiences. meet the new immersivemediasupport framework, which offers function"
+date: 2026-06-10
+tags: ["Audio & Video", "空間コンピューティング"]
+thumbnail: "/images/sessions/2025/403.jpg"
+videoUrl: "https://developer.apple.com/videos/play/wwdc2025/403/"
+sessionId: "wwdc2025-403"
+year: "2025"
+relatedSessions:
+  - title: "Explore video experiences for visionOS"
+    code: "304"
+    description: "visionOS 26 のビデオ profile 総覧。このセッションの前提知識"
+  - title: "Learn about the Apple Projected Media Profile"
+    code: "297"
+    description: "180/360 度投影形式 APMP の詳細解説"
+  - title: "Support immersive video playback in visionOS apps"
+    code: "296"
+    description: "自分の visionOS アプリで AIVU/HLS 没入型ビデオを再生する方法"
+  - title: "Create a seamless multiview playback experience"
+    code: "302"
+    description: "マルチビュー再生体験の構築方法"
+---
+
+## ハイライト
+
+> macOS と visionOS 26 で新登場した ImmersiveMediaSupport フレームワーク。AIVU ファイルコンテナと ASAF/APAC オーディオフォーマットの組み合わせにより、サードパーティツールでも Apple Immersive Video のメタデータを読み書きできるようになりました。
+
+---
+
+## 主要内容
+
+Apple Immersive Video（AIV）は Apple Vision Pro 上で最高の画質を誇る没入型ビデオフォーマットで、Blackmagic URSA Cine Immersive といったカメラのために設計されています。このカメラは出荷時に個体ごとのファクトリーキャリブレーション（factory calibration）が行われ、各ステレオレンズの曲率パラメータをビデオファイルに書き込みます。レンダリング時にはこれらのパラメータに基づいてパラメトリック投影が行われます。しかし、これまではこのメタデータを Apple 内部ツールでしか扱えないという問題がありました。サードパーティの NLE、トランスコードツール、ストリーミングプラットフォームが AIV 素材を受け取っても、カメラキャリブレーション、shot flop、フェードイン/アウトといった重要な情報を読み書きできず、制作チェーンの途中で行き詰まってしまうのです。
+
+このセッションで Blake は、このチェーンを繋ぐソリューションを発表しました。macOS と visionOS 26 に新たに追加された ImmersiveMediaSupport フレームワークは、`VenueDescriptor`（複数カメラの組み合わせ + エッジブレンドマスク + 背景環境）と `PresentationDescriptor`（フレームごとのキャリブレーション切り替え、shot flop、フェードなどの動的指示）という 2 つのデータ型を提供します。また、AIVU（Apple Immersive Video Universal）ファイルコンテナを定義し、ビデオトラック、PresentationDescriptor、VenueDescriptor を単一のファイルにパッケージングして、visionOS の Files アプリで Quick Look による直接プレビューを可能にします。読み書きはすべて AVFoundation 経由で行います：`quickTimeMetadataAIMEData` 識別子でメタデータをフィルタリングして VenueDescriptor を取得し、`quickTimeMetadataPresentationImmersiveMedia` で PresentationDescriptor を取得します。書き込み時は投影タイプを `AppleImmersiveVideo` に設定し、AVAssetWriter でメタデータを mux します。オーディオ側では、制作フォーマットとして ASAF（Apple Spatial Audio Format）、配信フォーマットとして APAC（Apple Positional Audio Codec）が新たに登場し、APAC は AIV 体験の必須要件となります。
+
+---
+
+## 詳細
+
+**AIVU ファイルから VenueDescriptor を読み込む**（[06:23](https://developer.apple.com/videos/play/wwdc2025/403/?time=383)）：
+
+```swift
+func readAIMEData(from aivuFile: URL) async throws -> VenueDescriptor? {
+    let avAsset = AVURLAsset(url: aivuFile)
+    let metadata = try await avAsset.load(.metadata)
+    let aimeData = metadata.filter({ $0.identifier == .quickTimeMetadataAIMEData }).first
+    if let dataValue = try await aimeData.load(.value) as? NSData {
+        return try await VenueDescriptor(aimeData: dataValue as Data)
+    }
+    return nil
+}
+```
+
+重要ポイント：
+- `AVURLAsset(url:)` は AIVU を通常の QuickTime リソースとして読み込みます。
+- `load(.metadata)` でリソースレベルのメタデータ全体を非同期に取得します。
+- `quickTimeMetadataAIMEData` は ImmersiveMediaSupport で新たに追加された識別子で、AIME（Apple Immersive Media Embedded）データをフィルタリングするために使用します。
+- `VenueDescriptor(aimeData:)` は生の `Data` をカメラ組み合わせ記述子にデシリアライズします。
+
+**フレームごとの PresentationDescriptor を読み込む**（[06:50](https://developer.apple.com/videos/play/wwdc2025/403/?time=410)）：
+
+```swift
+func presentation(timedMetadata: [AVTimedMetadataGroup]) async throws ->   
+[PresentationDescriptor] {
+    var presentations: [PresentationDescriptor] = [] 
+    for group in timedMetadata {
+        for metadata in group.items {
+            if metadata.identifier == .quickTimeMetadataPresentationImmersiveMedia {
+                let data = try await metadata.load(.dataValue) {
+                    presentations.append(
+                        try JSONDecoder().decode(PresentationDescriptor.self, from: data)
+                    )
+                }
+            }
+        }
+    }
+    return presentations
+}
+```
+
+重要ポイント：
+- 引数は `AVTimedMetadataGroup` の配列で、各グループがビデオフレームの PTS 区間に対応します。
+- `quickTimeMetadataPresentationImmersiveMedia` 識別子で Presentation コマンドをフィルタリングします。
+- コマンドは JSON エンコードされており、`JSONDecoder` で `PresentationDescriptor` をデコードします。この中には、該当時点でのカメラキャリブレーション切り替え、shot flop、フェードなどの指示が含まれています。
+- timed metadata の詳細な取得方法については `AVPlayerItemMetadataOutput` を参照してください。
+
+**AVMetadataItem への VenueDescriptor 書き込み**（[07:52](https://developer.apple.com/videos/play/wwdc2025/403/?time=472)）：
+
+```swift
+func getMetadataItem(from metadata: VenueDescriptor) async throws -> AVMetadataItem {
+    let aimeData = try await metadata.aimeData
+    let aimeMetadataItem = AVMutableMetadataItem()
+    aimeMetadataItem.identifier = .quickTimeMetadataAIMEData
+    aimeMetadataItem.dataType = String(kCMMetadataBaseDataType_RawData)
+    aimeMetadataItem.value = aimeData as NSData
+        
+    return aimeMetadataItem
+}
+```
+
+重要ポイント：
+- `metadata.aimeData` は VenueDescriptor を生のバイト列にシリアライズします。
+- `dataType = kCMMetadataBaseDataType_RawData` は、これが生のバイナリデータであることをコンテナに伝え、文字列として誤処理されるのを防ぎます。
+- この項目はリソースレベルのメタデータとして書き込まれ、AVAssetWriter と組み合わせることで再生可能な AIVU を生成できます。
+
+**フレーム時系列に沿った PresentationDescriptor の書き込み**（[08:02](https://developer.apple.com/videos/play/wwdc2025/403/?time=482)）：
+
+```swift
+func getMetadataItem(reader: PresentationDescriptorReader, 
+                     time: CMTime, frameDuration: CMTime) -> AVMetadataItem? {
+    let commands = reader.outputPresentationCommands(for: time) ?? []
+    if commands.isEmpty { return nil }
+
+    let descriptor = PresentationDescriptor(commands: commands)
+    let encodedData = try JSONEncoder().encode(descriptor)
+    let presentationMetadata = AVMutableMetadataItem()
+    presentationMetadata.identifier = .quickTimeMetadataPresentationImmersiveMedia
+    presentationMetadata.dataType = String(kCMMetadataBaseDataType_RawData)
+    presentationMetadata.value = encodedData as NSData
+    presentationMetadata.time = time
+    presentationMetadata.duration = frameDuration
+    
+    return presentationMetadata
+}
+```
+
+重要ポイント：
+- `PresentationDescriptorReader.outputPresentationCommands(for:)` は、指定時刻に実行すべきコマンドシーケンスを時間順に取得します。
+- コマンドが空の場合は nil を返し、冗長なメタデータエントリの書き込みを防ぎます。
+- `time` と `duration` はビデオフレームバッファの PTS とフレーム長に正確に合わせる必要があります。プレイヤーはこれに基づいてキャリブレーション切り替えや shot flop をトリガーします。
+- エンコードは JSON を継続使用し、書き込み側と読み込み側の対称性を保ちます。
+
+**AIVU ファイルの検証**（[08:20](https://developer.apple.com/videos/play/wwdc2025/403/?time=500)）：
+
+```swift
+func validAIVU(file aivuFile: URL) async throws -> Bool { 
+    return try await AIVUValidator.validate(url: aivuFile)
+}
+```
+
+重要ポイント：
+- `AIVUValidator.validate(url:)` は書き込みパイプラインの最後で一度実行し、メタデータの欠損や不整合を早期発見します。
+- 検証失敗時はエラーをスローし、成功時は true を返します。
+
+**HLS 配信の要点**（[09:31](https://developer.apple.com/videos/play/wwdc2025/403/?time=571) 以降）：
+
+- 推奨パラメータ：片眼 4320×4320、90fps、P3-D65-PQ 色空間、MV-HEVC。
+- ビットレート：平均 25–100 Mbps、ピーク 50–150 Mbps。階層化時は解像度とフレームレートを統一し、ビットレートの次元だけでトレードオフを行います。
+- `venueDescriptor.save(to:)` で `.aime` ファイルを別途エクスポートし、HLS プレイリストの横に配置します。
+- マルチバリアントプレイリストは HLS version ≥ 12 が必要で、venue description data ID、`content type=fully immersive`、ステレオビデオレイアウト、`AppleImmersiveVideo` 投影、APAC オーディオを明記します。
+- スライス時は PresentationDescriptor を含む timed metadata トラックを必ず保持してください。そうしないと、再生側でフレームレベルのキャリブレーション切り替えができません。
+
+**プレビューの流れ**：`ImmersiveMediaRemotePreviewSender` と `ImmersiveMediaRemotePreviewReceiver` は、低ビットレートのフレームを Mac から Vision Pro へプッシュし、カスタム compositor と組み合わせて visionOS アプリでリアルタイム表示します。編集段階に特化した機能です。
+
+**オーディオ部分**（[11:21](https://developer.apple.com/videos/play/wwdc2025/403/?time=681) 以降）：ASAF は broadcast Wave + リニア PCM + メタデータに基づいており、レンダリングは完全に適応型です。オブジェクトと聴取者の位置に基づいてリアルタイムに計算され、ベイク処理はありません。APAC は ASAF の mp4 配信用エンコーディングで、64 kbps から始まり、Channels、Objects、HOA、Dialogue、Binaural、インタラクティブ要素をサポート。watchOS を除く全プラットフォームで再生可能。制作ツールは Apple Pro Tools プラグインと DaVinci Resolve Studio Editor。HLS 側では media タグにオーディオチャンネル情報を記述し、stream info タグで APAC コーデックを指定する必要があります。
+
+---
+
+## 重要ポイント
+
+- **何をするか**：自社のアルバムアプリや動画管理アプリに AIVU 直接読み込みパイプラインを追加する。
+  - なぜやる価値があるか：visionOS 26 以降、AIVU は Apple が推奨する単一ファイル配布フォーマットとなり、Files + Quick Look でネイティブ対応済みです。まず AIVU を一等市民として扱い、同僚や NLE から受け取った AIVU をそのまま消費できるようにします。
+  - どこから始めるか：`AVURLAsset` で読み込み → `quickTimeMetadataAIMEData` でフィルタリングして VenueDescriptor を取得 → timed metadata グループを監視して PresentationDescriptor を取得 → システム再生スタックでレンダリング。読み書きコードは百行程度で済みます。
+
+- **何をするか**：NLE/トランスコードツールに "Export as AIVU" ボタンを追加する。
+  - なぜやる価値があるか：AIV メタデータが中間段階で失われると、下流で正しいカメラキャリブレーションを取得できず、画像が歪んでしまいます。AIVU を統一された中間配布フォーマットとすることでメタデータを保持できます。
+  - どこから始めるか：AVAssetWriter を使用し、投影タイプを `AppleImmersiveVideo` に設定。VenueDescriptor はリソースレベルメタデータ、PresentationDescriptor は timed metadata として書き込み、最後に `AIVUValidator.validate(url:)` で自己検証を行います。
+
+- **何をするか**：Mac → Vision Pro のリアルタイムプレビューの流れを構築する。
+  - なぜやる価値があるか：編集中の素材は通常、完全なエンコードを経ていないため、これまではいったんエクスポートしてからインポートし直す必要があり、フィードバックサイクルが長すぎました。`ImmersiveMediaRemotePreviewSender/Receiver` はこのプロセスをフレームレベルまで圧縮します。
+  - どこから始めるか：Mac 側は Sender で低ビットレートフレームをプッシュし、Vision Pro 側はカスタム compositor を搭載した visionOS アプリを作成して Receiver を受け取ります。プレビュー品質を犠牲にして低レイテンシを優先します。
+
+- **何をするか**：ストリーミングバックエンドで HLS の AIV 関連フィールドを補完する。
+  - なぜやる価値があるか：Apple Vision Pro は AIV HLS に対して厳格な要件を課しています（version 12、AIME サイドロードファイル、fully immersive content type、APAC オーディオ）。いずれかが欠けるとプレイヤーは再生を拒否します。
+  - どこから始めるか：推奨ティア（平均 25/50/100 Mbps、ピーク 50/100/150 Mbps）でスライスし、timed metadata トラックを保持。`venueDescriptor.save(to:)` で出力した `.aime` ファイルをプレイリストディレクトリに配置し、マルチバリアントプレイリストに対応するタグを追加します。
+
+- **何をするか**：オーディオ側で ASAF → APAC のワークフローを整備する。
+  - なぜやる価値があるか：APAC は AIV 体験の必須項目であり、64 kbps から没入型の空間オーディオを実現でき、帯域に優しいです。
+  - どこから始めるか：制作側は Apple Pro Tools プラグインまたは DaVinci Resolve Studio Editor で ASAF（broadcast Wave + メタデータ）を出力し、mp4 APAC にエンコード。HLS 側は media タグでチャンネル情報を記述し、stream info タグで APAC コーデックを指定します。
+
+---
+
+## 関連セッション
+
+- [Explore video experiences for visionOS](/articles/wwdc2025-304) — visionOS 26 ビデオプロファイル概要、本セッションの前提知識
+- [Learn about the Apple Projected Media Profile](/articles/wwdc2025-297) — 180/360 度投影フォーマット APMP 詳解
+- [Support immersive video playback in visionOS apps](/articles/wwdc2025-296) — 自社の visionOS アプリで AIVU/HLS 没入型ビデオを再生する方法
+- [Create a seamless multiview playback experience](/articles/wwdc2025-302) — マルチビュー再生体験の構築方法
