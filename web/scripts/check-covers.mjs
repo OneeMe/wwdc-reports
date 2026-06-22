@@ -35,6 +35,10 @@ function getThumbnail(frontmatter) {
 }
 
 const files = walk(articlesDir);
+const renderedArticleSlugs = new Set(
+  files.map((file) => path.basename(file, path.extname(file))),
+);
+const referencedThumbnails = new Set();
 const missing = [];
 
 for (const file of files) {
@@ -46,6 +50,8 @@ for (const file of files) {
     missing.push({ file: rel, reason: "missing thumbnail field" });
     continue;
   }
+
+  referencedThumbnails.add(thumbnail);
 
   const imagePath = path.join(publicDir, thumbnail);
   if (!fs.existsSync(imagePath)) {
@@ -75,6 +81,9 @@ for (const s of sessionsJson.s) {
   if (isExcludedSession(s)) continue;
   const year = s[0];
   const contentId = s[1];
+  const articleSlug = `wwdc${year}-${contentId}`;
+  if (!renderedArticleSlugs.has(articleSlug)) continue;
+
   sessionsByYear[year] = sessionsByYear[year] || new Set();
   sessionsByYear[year].add(contentId);
 }
@@ -102,7 +111,8 @@ for (const year of Object.keys(sessionsByYear).sort()) {
   }
 
   for (const id of existingIds) {
-    if (!expectedIds.has(id)) {
+    const imagePath = `/images/sessions/${year}/${id}.jpg`;
+    if (!expectedIds.has(id) && !referencedThumbnails.has(imagePath)) {
       extraSessionCovers.push({ year, id });
     }
   }
