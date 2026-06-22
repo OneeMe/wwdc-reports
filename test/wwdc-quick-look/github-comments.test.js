@@ -18,19 +18,23 @@ describe("GitHub issue comments", () => {
     assert.match(component, /issue-term=\{articleSlug\}/);
     assert.match(component, /label=\{utterancesLabel\}/);
     assert.match(component, /theme="github-light"/);
+    assert.match(component, /copy\.commentsTitle/);
     assert.match(component, /GitHub Issues · utterances/);
   });
 
   it("passes stable article identity into the comments component", () => {
     const page = readProjectFile("web/src/pages/articles/[slug].astro");
+    const localizedPage = readProjectFile("web/src/pages/[lang]/articles/[slug].astro");
     const layout = readProjectFile("web/src/layouts/ArticleLayout.astro");
 
     assert.match(page, /articleSlug=\{entry\.id\}/);
+    assert.match(localizedPage, /articleSlug: `\$\{lang\}\/\$\{slug\}`/);
+    assert.match(localizedPage, /articleSlug=\{articleSlug\}/);
     assert.doesNotMatch(page, /articleUrl/);
     assert.match(layout, /import GitHubComments from "\.\.\/components\/GitHubComments\.astro"/);
     assert.match(layout, /articleSlug\?: string/);
     assert.doesNotMatch(layout, /articleUrl/);
-    assert.match(layout, /<GitHubComments articleSlug=\{articleSlug\}/);
+    assert.match(layout, /<GitHubComments articleSlug=\{articleSlug\} lang=\{lang\}/);
   });
 
   it("does not ship a custom GitHub OAuth comments backend", () => {
