@@ -17,6 +17,8 @@ describe("Cloudflare Pages build configuration", () => {
     assert.match(config, /syntaxHighlight:\s*"shiki"/);
     assert.doesNotMatch(config, /syntaxHighlight:\s*false/);
     assert.match(config, /concurrency:\s*1/);
+    assert.match(config, /WWDC_ASTRO_CACHE_DIR/);
+    assert.match(config, /cacheDir/);
   });
 
   it("builds localized article collections in separate Astro processes", () => {
@@ -32,7 +34,13 @@ describe("Cloudflare Pages build configuration", () => {
     assert.match(contentConfig, /WWDC_ARTICLE_BUILD_LANG/);
     assert.match(contentConfig, /articlePatternsByLang/);
     assert.match(buildLocales, /WWDC_ARTICLE_BUILD_LANG/);
-    assert.match(buildLocales, /localized-builds/);
+    assert.match(buildLocales, /WWDC_ASTRO_CACHE_DIR/);
+    assert.match(buildLocales, /mkdtemp/);
+    assert.match(buildLocales, /tmpdir/);
+    assert.match(buildLocales, /createBuildWorkspace/);
+    assert.match(buildLocales, /symlink/);
     assert.match(buildLocales, /runAstroBuild/);
+    assert.doesNotMatch(buildLocales, /path\.join\(webRoot,\s*["']\.astro["']\)/);
+    assert.doesNotMatch(buildLocales, /localized-builds/);
   });
 });

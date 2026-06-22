@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
-import { cp, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const astroBin = path.join(webRoot, "node_modules", ".bin", "astro");
 const finalDist = path.join(webRoot, "dist");
-const chunkRoot = path.join(webRoot, ".astro", "localized-builds");
 
 const chunks = [
   { lang: "en", label: "English articles" },
@@ -14,13 +14,39 @@ const chunks = [
   { lang: "zh", label: "Chinese articles and root pages" },
 ];
 
-function runAstroBuild(lang, outDir) {
+const buildWorkspaceLinkedDirectories = ["node_modules", "public"];
+const buildWorkspaceCopiedDirectories = ["src"];
+const buildWorkspaceFiles = [
+  "astro.config.mjs",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+];
+
+async function createBuildWorkspace(buildRoot) {
+  await mkdir(buildRoot, { recursive: true });
+
+  await Promise.all([
+    ...buildWorkspaceLinkedDirectories.map((directory) =>
+      symlink(path.join(webRoot, directory), path.join(buildRoot, directory), "dir")
+    ),
+    ...buildWorkspaceCopiedDirectories.map((directory) =>
+      cp(path.join(webRoot, directory), path.join(buildRoot, directory), { recursive: true })
+    ),
+    ...buildWorkspaceFiles.map((file) =>
+      cp(path.join(webRoot, file), path.join(buildRoot, file))
+    ),
+  ]);
+}
+
+function runAstroBuild(lang, buildRoot, outDir, cacheDir) {
   return new Promise((resolve, reject) => {
     const child = spawn(astroBin, ["build", "--outDir", outDir], {
-      cwd: webRoot,
+      cwd: buildRoot,
       env: {
         ...process.env,
         WWDC_ARTICLE_BUILD_LANG: lang,
+        WWDC_ASTRO_CACHE_DIR: cacheDir,
       },
       stdio: "inherit",
     });
@@ -37,15 +63,21 @@ function runAstroBuild(lang, outDir) {
 }
 
 await rm(finalDist, { recursive: true, force: true });
-await rm(chunkRoot, { recursive: true, force: true });
+const chunkRoot = await mkdtemp(path.join(tmpdir(), "wwdc-quick-look-localized-build-"));
 
-for (const chunk of chunks) {
-  const outDir = path.join(chunkRoot, chunk.lang);
-  console.log(`\nBuilding ${chunk.label} (${chunk.lang})...`);
-  await rm(path.join(webRoot, ".astro"), { recursive: true, force: true });
-  await runAstroBuild(chunk.lang, outDir);
-  await cp(outDir, finalDist, { recursive: true, force: true });
+try {
+  for (const chunk of chunks) {
+    const buildRoot = path.join(chunkRoot, "workspaces", chunk.lang);
+    const outDir = path.join(chunkRoot, "dist", chunk.lang);
+    const cacheDir = path.join(chunkRoot, "cache", chunk.lang);
+
+    console.log(`\nBuilding ${chunk.label} (${chunk.lang})...`);
+    await createBuildWorkspace(buildRoot);
+    await runAstroBuild(chunk.lang, buildRoot, outDir, cacheDir);
+    await cp(outDir, finalDist, { recursive: true, force: true });
+  }
+} finally {
+  await rm(chunkRoot, { recursive: true, force: true });
 }
 
-await rm(chunkRoot, { recursive: true, force: true });
 console.log("\nLocalized Astro build complete.");

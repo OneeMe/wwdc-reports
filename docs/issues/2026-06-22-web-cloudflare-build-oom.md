@@ -42,7 +42,7 @@ Cloudflare Pages 在构建 Web 站点时触发 JavaScript heap out of memory。�
 - 保留 Markdown 代码块的 Shiki 高亮，避免文章代码块退化成纯文本展示。
 - 显式设置 `build.concurrency: 1`，把页面渲染并发固定在最低值，防止未来配置漂移。
 - 新增 `web/scripts/build-locales.mjs`，把生产构建拆成 `en`、`ja`、`zh` 三个顺序执行的 Astro 子进程。
-- 每个子进程通过 `WWDC_ARTICLE_BUILD_LANG` 只加载当前语言的文章集合，只生成当前语言对应的路由；构建产物先写入 `.astro/localized-builds/<lang>`，再合并到最终 `dist`。
+- 每个子进程通过 `WWDC_ARTICLE_BUILD_LANG` 只加载当前语言的文章集合，只生成当前语言对应的路由；构建产物先写入系统临时目录下的 isolated workspace，再合并到最终 `dist`。
 - 将 build 脚本的 V8 heap 从 8192MB 下调到 6144MB，避免在 Cloudflare 8GB 级别环境中把 JS heap 顶到容器边界。
 - 增加自动化测试，锁定 Cloudflare 构建继续保留 Shiki，同时必须走分语言构建入口。
 
