@@ -140,6 +140,24 @@ function translateArticle(slug, lang) {
   console.log(`Wrote ${lang}/${slug}.mdx (${Object.keys(segments).length} segments)`);
 }
 
+function hasTranslatedHeaders(content, lang) {
+  if (lang === "en") {
+    return (
+      content.includes("## Core Content") ||
+      content.includes("## Detailed Content") ||
+      content.includes("## Core Takeaways")
+    );
+  }
+  if (lang === "ja") {
+    return (
+      content.includes("## 主要内容") ||
+      content.includes("## 詳細") ||
+      content.includes("## 重要ポイント")
+    );
+  }
+  return false;
+}
+
 const opts = parseArgs();
 let codes = opts.codes;
 if (codes.length === 0) {
@@ -167,14 +185,9 @@ for (const code of codes) {
         loc.includes("## 核心内容") ||
         loc.includes("## 详细内容") ||
         loc.includes("## 核心启发");
-      if (!hasZhHeaders && !loc.includes("## 主要内容")) {
-        // EN: no Chinese headers; JA: has Japanese section headers
-        const jaOk = lang === "ja" && loc.includes("## 主要内容");
-        const enOk = lang === "en" && loc.includes("## Core Content");
-        if (jaOk || enOk) {
-          console.log(`Skip ${lang}/${slug}.mdx (already translated)`);
-          continue;
-        }
+      if (!hasZhHeaders && hasTranslatedHeaders(loc, lang)) {
+        console.log(`Skip ${lang}/${slug}.mdx (already translated)`);
+        continue;
       }
     }
     translateArticle(slug, lang);
