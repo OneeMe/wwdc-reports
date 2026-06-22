@@ -1,9 +1,17 @@
 import { defineCollection, z } from 'astro:content';
 import { glob } from 'astro/loaders';
 
+const articleBuildLang = process.env.WWDC_ARTICLE_BUILD_LANG;
+const articlePatternsByLang: Record<string, string> = {
+  zh: '*.{md,mdx}',
+  en: 'en/*.{md,mdx}',
+  ja: 'ja/*.{md,mdx}',
+};
+const articlePattern = articleBuildLang ? articlePatternsByLang[articleBuildLang] : undefined;
+
 const articles = defineCollection({
   loader: glob({
-    pattern: '**/*.{md,mdx}',
+    pattern: articlePattern ?? '**/*.{md,mdx}',
     base: './src/content/articles',
     generateId: ({ entry, base }) => {
       return entry.replace(/\.mdx?$/, '');

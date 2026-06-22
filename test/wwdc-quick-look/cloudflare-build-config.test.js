@@ -10,19 +10,29 @@ function readProjectFile(path) {
 }
 
 describe("Cloudflare Pages build configuration", () => {
-  it("does not use Shiki for Markdown code blocks during the static build", () => {
+  it("keeps Shiki syntax highlighting enabled for Markdown code blocks", () => {
     const config = readProjectFile("web/astro.config.mjs");
 
     assert.match(config, /markdown:\s*{/);
-    assert.match(config, /syntaxHighlight:\s*false/);
+    assert.match(config, /syntaxHighlight:\s*"shiki"/);
+    assert.doesNotMatch(config, /syntaxHighlight:\s*false/);
+    assert.match(config, /concurrency:\s*1/);
   });
 
-  it("keeps the Node heap below the Cloudflare build container boundary", () => {
+  it("builds localized article collections in separate Astro processes", () => {
     const packageJson = JSON.parse(readProjectFile("web/package.json"));
     const buildScript = packageJson.scripts.build;
+    const contentConfig = readProjectFile("web/src/content.config.ts");
+    const buildLocales = readProjectFile("web/scripts/build-locales.mjs");
 
-    assert.match(buildScript, /astro build/);
+    assert.match(buildScript, /scripts\/build-locales\.mjs/);
     assert.match(buildScript, /--max-old-space-size=6144/);
     assert.doesNotMatch(buildScript, /--max-old-space-size=8192/);
+
+    assert.match(contentConfig, /WWDC_ARTICLE_BUILD_LANG/);
+    assert.match(contentConfig, /articlePatternsByLang/);
+    assert.match(buildLocales, /WWDC_ARTICLE_BUILD_LANG/);
+    assert.match(buildLocales, /localized-builds/);
+    assert.match(buildLocales, /runAstroBuild/);
   });
 });
