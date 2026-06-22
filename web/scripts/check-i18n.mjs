@@ -67,8 +67,12 @@ if (!enArticles.includes("Search sessions") || !enArticles.includes('data-articl
   fail("English session browser should render English copy and localized article base path");
 }
 
-if (!jaArticle.includes("Go further with MapKit") || !jaArticle.includes("MapKit 在 2025 推出")) {
-  fail("Japanese article route should reuse the Chinese MDX article content");
+if (
+  !jaArticle.includes("Go further with MapKit") ||
+  !jaArticle.includes("MapKit は 2025 年に") ||
+  jaArticle.includes("MapKit 在 2025 推出")
+) {
+  fail("Japanese article route should render translated Japanese MDX article content");
 }
 
 console.log("i18n check passed");
