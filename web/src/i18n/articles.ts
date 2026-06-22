@@ -26,6 +26,7 @@ export interface ArticlesLocale {
   cardCode: string;
   loading: string;
   watchVideo: string;
+  commentsTitle: string;
 }
 
 export const articlesI18n: Record<LangCode, ArticlesLocale> = {
@@ -54,6 +55,7 @@ export const articlesI18n: Record<LangCode, ArticlesLocale> = {
     cardCode: "代码",
     loading: "加载中...",
     watchVideo: "观看原视频",
+    commentsTitle: "评论",
   },
   en: {
     documentTitle: "WWDC Quick Look · Session Browser",
@@ -80,6 +82,7 @@ export const articlesI18n: Record<LangCode, ArticlesLocale> = {
     cardCode: "code snippets",
     loading: "Loading...",
     watchVideo: "Watch original video",
+    commentsTitle: "Comments",
   },
   ja: {
     documentTitle: "WWDC Quick Look · セッションブラウザ",
@@ -106,6 +109,7 @@ export const articlesI18n: Record<LangCode, ArticlesLocale> = {
     cardCode: "コード",
     loading: "読み込み中...",
     watchVideo: "元の動画を見る",
+    commentsTitle: "コメント",
   },
 } as const;
 
