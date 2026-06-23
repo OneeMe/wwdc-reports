@@ -18,6 +18,27 @@ npm run preview  # 本地预览构建结果
 
 本站点通过 **Cloudflare Pages Git 集成** 自动部署。
 
+### Google 统计配置
+
+站点在 `web/src/layouts/BaseLayout.astro` 中支持 Google Analytics 和 Google Search Console。相关代码只读取公开的构建期环境变量，未配置时不会输出对应标签。
+
+| 变量 | 用途 | 示例 |
+| --- | --- | --- |
+| `PUBLIC_GOOGLE_ANALYTICS_ID` | Google Analytics 4 Measurement ID | `G-XXXXXXXXXX` |
+| `PUBLIC_GA_MEASUREMENT_ID` | GA Measurement ID 的兼容别名 | `G-XXXXXXXXXX` |
+| `PUBLIC_GOOGLE_SITE_VERIFICATION` | Search Console HTML meta 验证 token | `xxxxxxxxxxxxxxxx` |
+
+本地验证：
+
+```bash
+cd web
+PUBLIC_GOOGLE_ANALYTICS_ID=G-XXXXXXXXXX \
+PUBLIC_GOOGLE_SITE_VERIFICATION=xxxxxxxxxxxxxxxx \
+npm run build
+```
+
+Cloudflare Pages 中需要在项目设置的 **Environment variables** 里添加以上变量，然后重新部署。Search Console 侧选择 **HTML tag** 验证方式，并把 `content="..."` 中的值填入 `PUBLIC_GOOGLE_SITE_VERIFICATION`。
+
 ### 配置方式
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com) → **Workers & Pages** → **Create application** → **Pages** → **Connect to Git**
