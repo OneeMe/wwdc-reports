@@ -5,7 +5,6 @@
 [README-中文](README-CN.md)
 [README-English](README.md)
 [README-日本語](README-JP.md)
-[![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look-skill)](https://www.skills.sh/swiftggteam/wwdc-quick-look-skill)
 [HomePage](https://wwdc-quick-look.swiftgg.team)
 
 WWDC Quick Look は、Apple WWDC セッションのメタデータ、トランスクリプト、Code タブのスニペット、Resources リンクへすばやくアクセスするための、ローカルエージェント向け skill です。

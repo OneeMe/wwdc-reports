@@ -22,7 +22,6 @@ export interface LocaleData {
   title: string;
   subtitle: string;
   installStep: string;
-  installLink: string;
   githubStar: string;
   installCmd: string;
   artCommandLabel: string;
@@ -61,7 +60,6 @@ export const localeData: Record<LangCode, LocaleData> = {
     title: "wwdc-quick-look",
     subtitle: "一条命令安装到你的智能体。之后直接用提示词检索 WWDC 课程、资源链接、代码片段和逐字稿。",
     installStep: "一键安装",
-    installLink: "去 skills.sh 查看",
     githubStar: "在 GitHub 上加星标",
     installCmd: "npx skills add SwiftGGTeam/wwdc-quick-look-skill",
     artCommandLabel: "安装命令",
@@ -112,7 +110,6 @@ export const localeData: Record<LangCode, LocaleData> = {
     title: "wwdc-quick-look",
     subtitle: "Install it into your agent with one command. Then query WWDC sessions, Resources, Code tabs, and transcripts directly from prompts.",
     installStep: "Install",
-    installLink: "Open on skills.sh",
     githubStar: "Star on GitHub",
     installCmd: "npx skills add SwiftGGTeam/wwdc-quick-look-skill",
     artCommandLabel: "Install command",
@@ -163,7 +160,6 @@ export const localeData: Record<LangCode, LocaleData> = {
     title: "wwdc-quick-look",
     subtitle: "1コマンドでAgentにインストール。プロンプトからWWDCセッション、リソース、コードタブ、文字起こしを直接検索できます。",
     installStep: "インストール",
-    installLink: "skills.sh を開く",
     githubStar: "Star on GitHub",
     installCmd: "npx skills add SwiftGGTeam/wwdc-quick-look-skill",
     artCommandLabel: "インストールコマンド",
