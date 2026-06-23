@@ -7,7 +7,6 @@ const repoRoot = new URL('../..', import.meta.url).pathname;
 const skillRepo = 'SwiftGGTeam/wwdc-quick-look-skill';
 const skillRepoUrl = 'https://github.com/SwiftGGTeam/wwdc-quick-look-skill.git';
 const installCommand = `npx skills add ${skillRepo}`;
-const skillsUrl = 'https://www.skills.sh/swiftggteam/wwdc-quick-look-skill';
 
 function readProjectFile(path) {
   return readFileSync(join(repoRoot, path), 'utf8');
@@ -25,19 +24,26 @@ describe('skill distribution', () => {
   it('documents the standalone skills.sh install command', () => {
     const readme = readProjectFile('README.md');
     const readmeCn = readProjectFile('README-CN.md');
+    const readmeJp = readProjectFile('README-JP.md');
 
     assert.match(readme, new RegExp(installCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.match(readmeCn, new RegExp(installCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.match(readme, new RegExp(skillsUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.match(readmeCn, new RegExp(skillsUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(readmeJp, new RegExp(installCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(readme, /https?:\/\/[^\s)\]]*skills\.sh/);
+    assert.doesNotMatch(readmeCn, /https?:\/\/[^\s)\]]*skills\.sh/);
+    assert.doesNotMatch(readmeJp, /https?:\/\/[^\s)\]]*skills\.sh/);
   });
 
-  it('shows the standalone install command on the landing page', () => {
-    const page = readProjectFile('web/src/pages/index.astro');
+  it('shows the standalone install command on the landing page without a skills.sh button', () => {
+    const page = readProjectFile('web/src/templates/LandingPage.astro');
+    const staticHomePage = readProjectFile('web/index.html');
     const landingCopy = readProjectFile('web/src/i18n/landing.ts');
 
-    assert.match(page, new RegExp(skillsUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.match(page, new RegExp(installCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(page, /skills\.sh/);
+    assert.doesNotMatch(page, /button-skill/);
+    assert.doesNotMatch(staticHomePage, /https?:\/\/[^\s"')\]]*skills\.sh/);
+    assert.doesNotMatch(staticHomePage, /data-i18n="navSkill"/);
+    assert.match(page, /data\.installCmd/);
     assert.match(landingCopy, new RegExp(installCommand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   });
 });
