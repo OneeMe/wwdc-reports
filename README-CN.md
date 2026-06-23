@@ -2,10 +2,11 @@
 
 # WWDC Quick Look Skill
 
-[English README](README.md)
-[日本語 README](README-JP.md)
+[README-Chinese](README-CN.md)
+[README-English](README.md)
+[README-Japanese](README-JP.md)
 [![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look-skill)](https://www.skills.sh/swiftggteam/wwdc-quick-look-skill)
-[落地页](https://wwdc-quick-look.swiftgg.team)
+[HomePage](https://wwdc-quick-look.swiftgg.team)
 
 WWDC Quick Look 是一个面向 Agent 的本地 skill，用来快速查询 Apple WWDC session 的元数据、视频逐字稿、Code tab 代码片段和 Resources 链接。
 
