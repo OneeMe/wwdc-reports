@@ -3,6 +3,7 @@
 # WWDC Quick Look Skill
 
 [中文说明](README-CN.md)
+[日本語 README](README-JP.md)
 [![skills.sh](https://skills.sh/b/SwiftGGTeam/wwdc-quick-look-skill)](https://www.skills.sh/swiftggteam/wwdc-quick-look-skill)
 [Landing Page](https://wwdc-quick-look.swiftgg.team)
 
