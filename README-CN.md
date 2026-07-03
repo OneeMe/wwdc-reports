@@ -37,13 +37,16 @@ skills CLI 会从独立的 `SwiftGGTeam/wwdc-quick-look-skill` 仓库安装，�
 ```text
 skills/
 └── wwdc-quick-look/          # Submodule: SwiftGGTeam/wwdc-quick-look-skill
-    ├── SKILL.md
-    ├── scripts/query.mjs
-    └── references/data-schema.md
+    ├── README.md
+    ├── scripts/query.mjs    # 本地 workflow 兼容入口
+    └── wwdc-quick-look/     # 可安装的 skill 目录
+        ├── SKILL.md
+        ├── scripts/query.mjs
+        └── references/data-schema.md
 
 playground/
-├── .agents/skills -> ../../skills
-└── .claude/skills -> ../../skills
+├── .agents/skills/wwdc-quick-look -> ../../../skills/wwdc-quick-look/wwdc-quick-look
+└── .claude/skills/wwdc-quick-look -> ../../../skills/wwdc-quick-look/wwdc-quick-look
 
 data/
 ├── index.json
@@ -56,7 +59,7 @@ data/
 └── wwdc26/
 ```
 
-`skills/wwdc-quick-look` 是指向独立 skill 仓库的 submodule。`playground` 下的两个软链接让需要 `.agents/skills` 或 `.claude/skills` 的 Agent 运行时都能加载同一份 skill。仓库根目录不再保留 `.agents/skills` 副本。
+`skills/wwdc-quick-look` 是指向独立 skill 仓库的 submodule。可安装的 skill 实际位于 `skills/wwdc-quick-look/wwdc-quick-look`，这样 skills CLI 会安装完整目录，包括 bundled scripts 和 references，而不是只安装 `SKILL.md`。`playground` 下的两个软链接让需要 `.agents/skills` 或 `.claude/skills` 的 Agent 运行时都能加载这个可安装目录。
 
 ## 直接运行查询脚本
 

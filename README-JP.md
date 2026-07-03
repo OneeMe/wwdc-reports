@@ -37,13 +37,16 @@ skills CLI は独立した `SwiftGGTeam/wwdc-quick-look-skill` リポジトリ�
 ```text
 skills/
 └── wwdc-quick-look/          # Submodule: SwiftGGTeam/wwdc-quick-look-skill
-    ├── SKILL.md
-    ├── scripts/query.mjs
-    └── references/data-schema.md
+    ├── README.md
+    ├── scripts/query.mjs    # Local workflow compatibility wrapper
+    └── wwdc-quick-look/     # Installable skill directory
+        ├── SKILL.md
+        ├── scripts/query.mjs
+        └── references/data-schema.md
 
 playground/
-├── .agents/skills -> ../../skills
-└── .claude/skills -> ../../skills
+├── .agents/skills/wwdc-quick-look -> ../../../skills/wwdc-quick-look/wwdc-quick-look
+└── .claude/skills/wwdc-quick-look -> ../../../skills/wwdc-quick-look/wwdc-quick-look
 
 data/
 ├── index.json
@@ -56,7 +59,7 @@ data/
 └── wwdc26/
 ```
 
-`skills/wwdc-quick-look` は、独立した skill リポジトリを指す submodule です。`playground` のリンクは、`.agents/skills` または `.claude/skills` を期待するエージェントランタイムに同じ skill を公開します。リポジトリルートには意図的に `.agents/skills` のコピーを置いていません。
+`skills/wwdc-quick-look` は、独立した skill リポジトリを指す submodule です。インストール可能な skill は `skills/wwdc-quick-look/wwdc-quick-look` にあり、これにより skills CLI は `SKILL.md` だけでなく bundled scripts と references を含む完全なディレクトリをインストールします。`playground` のリンクは、`.agents/skills` または `.claude/skills` を期待するエージェントランタイムにこのインストール可能なディレクトリを公開します。
 
 ## クエリスクリプトを直接使う
 

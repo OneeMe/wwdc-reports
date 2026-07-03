@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 
 const execFileAsync = promisify(execFile);
 const SCRIPT = path.resolve('skills/wwdc-quick-look/scripts/query.mjs');
+const INSTALLABLE_SCRIPT = path.resolve('skills/wwdc-quick-look/wwdc-quick-look/scripts/query.mjs');
 
 const RAW_DATA = {
   events: {
@@ -88,7 +89,7 @@ async function runQuery(baseUrl, args) {
 
 describe('wwdc-quick-look query script', () => {
   it('defaults to the renamed GitHub repository on the main branch', async () => {
-    const source = await fs.readFile(SCRIPT, 'utf8');
+    const source = await fs.readFile(INSTALLABLE_SCRIPT, 'utf8');
     assert.match(source, /https:\/\/cdn\.jsdelivr\.net\/gh\/SwiftGGTeam\/wwdc-quick-look@main\/data/);
   });
 

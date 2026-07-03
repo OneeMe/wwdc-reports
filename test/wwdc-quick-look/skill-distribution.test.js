@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
@@ -19,6 +19,26 @@ describe('skill distribution', () => {
     assert.match(gitmodules, /\[submodule "skills\/wwdc-quick-look"\]/);
     assert.match(gitmodules, /path = skills\/wwdc-quick-look/);
     assert.match(gitmodules, new RegExp(`url = ${skillRepoUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  });
+
+  it('exposes the installable submodule skill directory to agent runtimes', () => {
+    const rootLink = join(repoRoot, '.agents/skills/wwdc-quick-look');
+    const playgroundAgentsLink = join(repoRoot, 'playground/.agents/skills/wwdc-quick-look');
+    const playgroundClaudeLink = join(repoRoot, 'playground/.claude/skills/wwdc-quick-look');
+
+    assert.equal(lstatSync(rootLink).isSymbolicLink(), true);
+    assert.equal(lstatSync(playgroundAgentsLink).isSymbolicLink(), true);
+    assert.equal(lstatSync(playgroundClaudeLink).isSymbolicLink(), true);
+    assert.equal(readlinkSync(rootLink), '../../skills/wwdc-quick-look/wwdc-quick-look');
+    assert.equal(readlinkSync(playgroundAgentsLink), '../../../skills/wwdc-quick-look/wwdc-quick-look');
+    assert.equal(readlinkSync(playgroundClaudeLink), '../../../skills/wwdc-quick-look/wwdc-quick-look');
+  });
+
+  it('keeps bundled skill resources in a nested installable directory when initialized', { skip: !existsSync(join(repoRoot, 'skills/wwdc-quick-look/README.md')) }, () => {
+    assert.equal(existsSync(join(repoRoot, 'skills/wwdc-quick-look/SKILL.md')), false);
+    assert.equal(existsSync(join(repoRoot, 'skills/wwdc-quick-look/wwdc-quick-look/SKILL.md')), true);
+    assert.equal(existsSync(join(repoRoot, 'skills/wwdc-quick-look/wwdc-quick-look/scripts/query.mjs')), true);
+    assert.equal(existsSync(join(repoRoot, 'skills/wwdc-quick-look/wwdc-quick-look/references/data-schema.md')), true);
   });
 
   it('documents the standalone skills.sh install command', () => {

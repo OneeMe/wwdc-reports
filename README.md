@@ -37,13 +37,16 @@ The skill can:
 ```text
 skills/
 └── wwdc-quick-look/          # Submodule: SwiftGGTeam/wwdc-quick-look-skill
-    ├── SKILL.md
-    ├── scripts/query.mjs
-    └── references/data-schema.md
+    ├── README.md
+    ├── scripts/query.mjs    # Compatibility wrapper for local workflows
+    └── wwdc-quick-look/     # Installable skill directory
+        ├── SKILL.md
+        ├── scripts/query.mjs
+        └── references/data-schema.md
 
 playground/
-├── .agents/skills -> ../../skills
-└── .claude/skills -> ../../skills
+├── .agents/skills/wwdc-quick-look -> ../../../skills/wwdc-quick-look/wwdc-quick-look
+└── .claude/skills/wwdc-quick-look -> ../../../skills/wwdc-quick-look/wwdc-quick-look
 
 data/
 ├── index.json
@@ -56,7 +59,7 @@ data/
 └── wwdc26/
 ```
 
-`skills/wwdc-quick-look` is a submodule that points to the standalone skill repository. The playground links expose the same skill to agent runtimes that expect either `.agents/skills` or `.claude/skills`. The repository root intentionally does not keep a `.agents/skills` copy.
+`skills/wwdc-quick-look` is a submodule that points to the standalone skill repository. The installable skill lives one level deeper at `skills/wwdc-quick-look/wwdc-quick-look` so the skills CLI installs bundled scripts and references instead of only `SKILL.md`. The playground links expose that installable directory to agent runtimes that expect either `.agents/skills` or `.claude/skills`.
 
 ## Use The Query Script Directly
 
