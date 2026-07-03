@@ -27,11 +27,13 @@ describe('web article related sessions', () => {
   it('renders the source video link from article frontmatter', () => {
     const page = readProjectFile('web/src/pages/articles/[slug].astro');
     const layout = readProjectFile('web/src/layouts/ArticleLayout.astro');
+    const articlesI18n = readProjectFile('web/src/i18n/articles.ts');
 
     assert.match(page, /videoUrl=\{entry\.data\.videoUrl\}/);
     assert.match(layout, /videoUrl\?: string/);
     assert.match(layout, /href=\{videoUrl\}/);
-    assert.match(layout, /观看原视频/);
+    assert.match(layout, /copy\.watchVideo/);
+    assert.match(articlesI18n, /watchVideo: "观看原视频"/);
   });
 
   it('keeps the article title in the layout instead of duplicating it in MDX', () => {
