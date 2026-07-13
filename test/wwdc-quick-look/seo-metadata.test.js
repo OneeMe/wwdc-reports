@@ -10,25 +10,34 @@ function readProjectFile(path) {
 }
 
 describe("SEO and social sharing metadata", () => {
-  it("ships a 1200 by 630 default social image", () => {
-    const imagePath = join(repoRoot, "web/public/assets/wwdc-quick-look-social.png");
+  it("ships a localized 1200 by 630 default social image for every language", () => {
     const htmlSourcePath = join(repoRoot, "web/assets/wwdc-quick-look-social.html");
     const svgSourcePath = join(repoRoot, "web/assets/wwdc-quick-look-social.svg");
 
-    assert.ok(existsSync(imagePath), "default social image should exist");
-    assert.ok(existsSync(htmlSourcePath), "social image should have an HTML source");
-    assert.equal(existsSync(svgSourcePath), false, "social image should not keep an SVG source");
+    for (const lang of ["zh", "en", "ja"]) {
+      const imagePath = join(
+        repoRoot,
+        `web/public/assets/wwdc-quick-look-social-${lang}.png`,
+      );
 
-    const image = readFileSync(imagePath);
-    assert.equal(image.toString("ascii", 1, 4), "PNG");
-    assert.equal(image.readUInt32BE(16), 1200);
-    assert.equal(image.readUInt32BE(20), 630);
+      assert.ok(existsSync(imagePath), `${lang} social image should exist`);
 
-    const htmlSource = readFileSync(htmlSourcePath, "utf8");
-    assert.match(htmlSource, /data-social-card/);
-    assert.match(htmlSource, /wwdc/);
-    assert.match(htmlSource, /quick look/);
-    assert.match(htmlSource, /Meet SwiftUI spatial layout/);
+      const image = readFileSync(imagePath);
+      assert.equal(image.toString("ascii", 1, 4), "PNG");
+      assert.equal(image.readUInt32BE(16), 1200);
+      assert.equal(image.readUInt32BE(20), 630);
+    }
+
+    assert.equal(
+      existsSync(htmlSourcePath),
+      false,
+      "social images should not keep an HTML source",
+    );
+    assert.equal(
+      existsSync(svgSourcePath),
+      false,
+      "social image should not keep an SVG source",
+    );
   });
 
   it("renders canonical, Open Graph, and large Twitter Card metadata", () => {
@@ -43,7 +52,10 @@ describe("SEO and social sharing metadata", () => {
     assert.match(layout, /name="twitter:card" content="summary_large_image"/);
     assert.match(layout, /name="twitter:image" content=\{socialImageUrl\}/);
     assert.match(layout, /max-image-preview:large/);
-    assert.match(layout, /\/assets\/wwdc-quick-look-social\.png/);
+    assert.match(layout, /zh: "\/assets\/wwdc-quick-look-social-zh\.png"/);
+    assert.match(layout, /en: "\/assets\/wwdc-quick-look-social-en\.png"/);
+    assert.match(layout, /ja: "\/assets\/wwdc-quick-look-social-ja\.png"/);
+    assert.match(layout, /const resolvedImage = image \?\? defaultSocialImages\[lang\]/);
   });
 
   it("uses each article thumbnail and article-specific metadata", () => {
