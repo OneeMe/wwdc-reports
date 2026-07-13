@@ -40,6 +40,7 @@ describe("Cloudflare Pages build configuration", () => {
     assert.match(buildLocales, /createBuildWorkspace/);
     assert.match(buildLocales, /symlink/);
     assert.match(buildLocales, /runAstroBuild/);
+    assert.match(buildLocales, /site-config\.mjs/);
     assert.doesNotMatch(buildLocales, /path\.join\(webRoot,\s*["']\.astro["']\)/);
     assert.doesNotMatch(buildLocales, /localized-builds/);
   });
