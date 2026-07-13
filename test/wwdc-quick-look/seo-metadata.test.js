@@ -12,13 +12,23 @@ function readProjectFile(path) {
 describe("SEO and social sharing metadata", () => {
   it("ships a 1200 by 630 default social image", () => {
     const imagePath = join(repoRoot, "web/public/assets/wwdc-quick-look-social.png");
+    const htmlSourcePath = join(repoRoot, "web/assets/wwdc-quick-look-social.html");
+    const svgSourcePath = join(repoRoot, "web/assets/wwdc-quick-look-social.svg");
 
     assert.ok(existsSync(imagePath), "default social image should exist");
+    assert.ok(existsSync(htmlSourcePath), "social image should have an HTML source");
+    assert.equal(existsSync(svgSourcePath), false, "social image should not keep an SVG source");
 
     const image = readFileSync(imagePath);
     assert.equal(image.toString("ascii", 1, 4), "PNG");
     assert.equal(image.readUInt32BE(16), 1200);
     assert.equal(image.readUInt32BE(20), 630);
+
+    const htmlSource = readFileSync(htmlSourcePath, "utf8");
+    assert.match(htmlSource, /data-social-card/);
+    assert.match(htmlSource, /wwdc/);
+    assert.match(htmlSource, /quick look/);
+    assert.match(htmlSource, /Meet SwiftUI spatial layout/);
   });
 
   it("renders canonical, Open Graph, and large Twitter Card metadata", () => {
