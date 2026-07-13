@@ -1,5 +1,4 @@
 import type { LangCode } from "../../i18n/routing";
-import { normalizeMetaDescription } from "../../seo";
 
 export function cleanMarkdownText(text: string): string {
   return text
@@ -40,13 +39,4 @@ export function getArticleDescription(
   const localizedDescription = getLocalizedDescription(description, lang);
   const selected = localizedDescription || getArticleExcerpt(body) || fallback;
   return cleanMarkdownText(selected);
-}
-
-export function getArticleMetaDescription(
-  description: string | undefined,
-  body: string,
-  lang: LangCode,
-  fallback = "",
-): string {
-  return normalizeMetaDescription(getArticleDescription(description, body, lang, fallback));
 }
