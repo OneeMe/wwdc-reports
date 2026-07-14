@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/wwdc-quick-look-logo.png" alt="WWDC Quick Look ロゴ" width="180" />
+</p>
+
 ![WWDC Quick Look banner](assets/wwdc-quick-look-banner.png)
 
 # WWDC Quick Look Skill
@@ -155,4 +159,4 @@ node ./bin/wwdc-quick-look.js help
 
 Apple、WWDC、Apple Developer、Swift、Xcode、iOS、macOS、watchOS、tvOS、visionOS は Apple Inc. の商標です。Apple のセッションメタデータ、transcripts、動画、画像、コードスニペット、関連リソースは、Apple またはそれぞれの権利者に帰属します。このリポジトリの MIT license は、このプロジェクトの独自コードとドキュメントのみを対象とします。
 
-バナーアートワークは、このリポジトリのために生成された WWDC 風のプロジェクトブランディングです。Apple または WWDC の公式ロゴではありません。
+プロジェクトロゴとバナーは、このリポジトリのために制作された WWDC 風のブランドビジュアルです。Apple または WWDC の公式ロゴではありません。プロジェクトロゴには SwiftGG のブランドマークが含まれています。

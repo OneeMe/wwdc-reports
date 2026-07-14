@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/wwdc-quick-look-logo.png" alt="WWDC Quick Look Logo" width="180" />
+</p>
+
 ![WWDC Quick Look banner](assets/wwdc-quick-look-banner.png)
 
 # WWDC Quick Look Skill
@@ -155,4 +159,4 @@ node ./bin/wwdc-quick-look.js help
 
 Apple、WWDC、Apple Developer、Swift、Xcode、iOS、macOS、watchOS、tvOS 和 visionOS 是 Apple Inc. 的商标。Apple session 元数据、transcript、视频、图片、代码片段和相关资源归 Apple 或对应权利方所有。本仓库的 MIT license 只覆盖项目原创代码和文档。
 
-头图是为本仓库生成的 WWDC 风格项目视觉，不是 Apple 或 WWDC 官方 logo。
+项目 Logo 与头图是为本仓库创作的 WWDC 风格品牌视觉，不是 Apple 或 WWDC 官方 Logo。项目 Logo 中使用了 SwiftGG 品牌标志。
