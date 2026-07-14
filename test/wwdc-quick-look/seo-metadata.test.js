@@ -10,6 +10,40 @@ function readProjectFile(path) {
 }
 
 describe("SEO and social sharing metadata", () => {
+  it("uses dedicated lightweight favicon and Apple touch icon assets", () => {
+    const icons = [
+      {
+        file: "web/public/assets/wwdc-quick-look-favicon-32.png",
+        width: 32,
+        maxBytes: 16 * 1024,
+      },
+      {
+        file: "web/public/assets/wwdc-quick-look-apple-touch-icon-180.png",
+        width: 180,
+        maxBytes: 128 * 1024,
+      },
+    ];
+
+    for (const { file, width, maxBytes } of icons) {
+      const imagePath = join(repoRoot, file);
+      assert.ok(existsSync(imagePath), `${file} should exist`);
+
+      const image = readFileSync(imagePath);
+      assert.equal(image.toString("ascii", 1, 4), "PNG");
+      assert.equal(image.readUInt32BE(16), width);
+      assert.equal(image.readUInt32BE(20), width);
+      assert.ok(image.length <= maxBytes, `${file} should stay lightweight`);
+    }
+
+    const layout = readProjectFile("web/src/layouts/BaseLayout.astro").toString("utf8");
+    assert.match(layout, /wwdc-quick-look-favicon-32\.png/);
+    assert.match(layout, /wwdc-quick-look-apple-touch-icon-180\.png/);
+    assert.doesNotMatch(
+      layout,
+      /rel="(?:shortcut )?icon" href="\/assets\/wwdc-quick-look-logo\.png"/,
+    );
+  });
+
   it("ships a localized 1200 by 630 default social image for every language", () => {
     const htmlSourcePath = join(repoRoot, "web/assets/wwdc-quick-look-social.html");
     const svgSourcePath = join(repoRoot, "web/assets/wwdc-quick-look-social.svg");
