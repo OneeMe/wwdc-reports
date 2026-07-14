@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/wwdc-quick-look-logo.png" alt="WWDC Quick Look logo" width="180" />
+</p>
+
 ![WWDC Quick Look banner](assets/wwdc-quick-look-banner.png)
 
 # WWDC Quick Look Skill
@@ -155,4 +159,4 @@ The package has no runtime npm dependencies and requires Node.js 20 or newer.
 
 Apple, WWDC, Apple Developer, Swift, Xcode, iOS, macOS, watchOS, tvOS, and visionOS are trademarks of Apple Inc. Apple session metadata, transcripts, videos, images, code snippets, and related resources belong to Apple or their respective rights holders. This repository's MIT license covers only the original code and documentation in this project.
 
-The banner artwork is WWDC-inspired project branding generated for this repository. It is not an official Apple or WWDC logo.
+The project logo and banner are WWDC-inspired branding created for this repository. They are not official Apple or WWDC logos. The project logo incorporates the SwiftGG brand mark.
