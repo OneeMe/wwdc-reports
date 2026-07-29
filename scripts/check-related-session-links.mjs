@@ -18,7 +18,52 @@ const LOCALES = [
   { id: "en", directory: join(ARTICLES_DIR, "en") },
   { id: "ja", directory: join(ARTICLES_DIR, "ja") },
 ];
-const STRICT_TITLE_YEARS = new Set(["2020", "2021", "2022", "2023"]);
+const GENERIC_TITLE_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "app",
+  "apps",
+  "apple",
+  "build",
+  "bring",
+  "create",
+  "custom",
+  "design",
+  "discover",
+  "dive",
+  "explore",
+  "for",
+  "from",
+  "get",
+  "go",
+  "great",
+  "how",
+  "improve",
+  "in",
+  "into",
+  "introduce",
+  "learn",
+  "make",
+  "meet",
+  "more",
+  "new",
+  "of",
+  "on",
+  "optimize",
+  "powerful",
+  "session",
+  "take",
+  "the",
+  "to",
+  "use",
+  "using",
+  "what",
+  "whats",
+  "with",
+  "work",
+  "your",
+]);
 
 function parseArguments(argv) {
   const fix = argv.includes("--fix");
@@ -42,6 +87,21 @@ function normalizeTitle(title) {
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+}
+
+function meaningfulTitleWords(title) {
+  return new Set(
+    (normalizeTitle(title).match(/[\p{L}\p{N}]+/gu) ?? []).filter(
+      (word) => word.length >= 3 && !GENERIC_TITLE_WORDS.has(word),
+    ),
+  );
+}
+
+function titlesShareMeaningfulTopic(leftTitle, rightTitle) {
+  const leftWords = meaningfulTitleWords(leftTitle);
+  const rightWords = meaningfulTitleWords(rightTitle);
+
+  return [...leftWords].some((word) => rightWords.has(word));
 }
 
 function loadSessionIndex() {
@@ -139,15 +199,23 @@ function findIssues(
   links.forEach((link, bodyIndex) => {
     const candidates = index.byTitle.get(normalizeTitle(link.label)) ?? [];
     if (candidates.length === 0) {
+      const target = index.bySlug.get(`${link.year}-${link.code}`);
+      const targetArticleExists =
+        link.internal && rootArticleExists(link.year, link.code);
+      const titleMatchesTargetTopic =
+        target && titlesShareMeaningfulTopic(link.label, target.title);
       if (
         link.internal &&
-        (!rootArticleExists(link.year, link.code) ||
-          (strictUnknownTitles && STRICT_TITLE_YEARS.has(sourceYear)))
+        (!targetArticleExists ||
+          !target ||
+          (strictUnknownTitles && target && !titleMatchesTargetTopic))
       ) {
         issues.push({
-          type: rootArticleExists(link.year, link.code)
-            ? "unverified-session-title"
-            : "unresolved-internal-link",
+          type: !targetArticleExists
+            ? "unresolved-internal-link"
+            : target
+              ? "unverified-session-title"
+              : "missing-session",
           fileName,
           sourceYear,
           bodyIndex,
@@ -199,6 +267,33 @@ function findIssues(
   const matchedBodyIndexes = new Set();
 
   frontmatterItems.forEach((item, frontmatterItemIndex) => {
+    const itemYear = item.year ?? sourceYear;
+    const itemCandidates =
+      index.byTitle.get(normalizeTitle(item.title)) ?? [];
+    if (itemCandidates.length > 0) {
+      const itemMatchesTitle = itemCandidates.some(
+        (candidate) =>
+          candidate.year === itemYear && candidate.code === item.code,
+      );
+      if (!itemMatchesTitle) {
+        issues.push({
+          type: "frontmatter-wrong-session",
+          fileName,
+          sourceYear,
+          frontmatterItemIndex,
+          line: lineNumberAt(content, item.start),
+          link: {
+            label: item.title,
+            year: itemYear,
+            code: item.code,
+          },
+          expected: chooseExpectedSession(itemCandidates, sourceYear),
+          replaceBody: false,
+        });
+      }
+      return;
+    }
+
     const bodyIndex = links.findIndex(
       (link, index) =>
         !matchedBodyIndexes.has(index) &&
@@ -211,7 +306,6 @@ function findIssues(
     const target = index.bySlug.get(`${link.year}-${link.code}`);
     if (!target) return;
 
-    const itemYear = item.year ?? sourceYear;
     if (item.code === target.code && itemYear === target.year) return;
     if (issues.some((issue) => issue.bodyIndex === bodyIndex)) return;
 
@@ -482,7 +576,8 @@ function applyIssuesToLocale(
   for (const issue of issues) {
     next = updateFrontmatterItem(
       next,
-      frontmatterItemIndexes.get(issue.bodyIndex),
+      issue.frontmatterItemIndex ??
+        frontmatterItemIndexes.get(issue.bodyIndex),
       issue.expected,
       sourceYear,
     );

@@ -66,10 +66,18 @@ function createFixture(t) {
           "",
           "",
         ],
+        [
+          "2024",
+          "10144",
+          "What’s new in SwiftUI",
+          "",
+          "",
+          "",
+        ],
       ],
     }),
   );
-  for (const code of ["10138", "10151"]) {
+  for (const code of ["10138", "10144", "10151"]) {
     writeFileSync(
       join(
         fixtureRoot,
@@ -131,6 +139,45 @@ describe("article related-session identity", () => {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /wrong-session/);
     assert.match(result.stderr, /expected wwdc2024-10138/);
+  });
+
+  it("rejects an unknown newer title that is unrelated to its target session", (t) => {
+    const fixtureRoot = createFixture(t);
+    writeFileSync(
+      join(
+        fixtureRoot,
+        "web/src/content/articles/wwdc2024-10137.mdx",
+      ),
+      article("Build complex queries with SwiftData", "10144"),
+    );
+
+    const result = runFixture(fixtureRoot);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /unverified-session-title/);
+  });
+
+  it("validates a frontmatter item independently of its body label", (t) => {
+    const fixtureRoot = createFixture(t);
+    writeFileSync(
+      join(
+        fixtureRoot,
+        "web/src/content/articles/wwdc2024-10137.mdx",
+      ),
+      article(
+        "Create a custom data store with SwiftData",
+        "10138",
+      ).replace(
+        '  - title: "Create a custom data store with SwiftData"',
+        '  - title: "Create custom visual effects with SwiftUI"',
+      ),
+    );
+
+    const result = runFixture(fixtureRoot);
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /frontmatter-wrong-session/);
+    assert.match(result.stderr, /expected wwdc2024-10151/);
   });
 
   it("rejects a locale-only related-session target mismatch", (t) => {
