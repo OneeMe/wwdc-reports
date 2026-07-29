@@ -112,6 +112,8 @@ web/src/content/articles/wwdc{YYYY}-{code}.mdx
 - [ ] 每个代码示例后都有"关键点"解释
 - [ ] 核心启发 ≥3 个可执行 feature 点，且必须来自该 session 的具体内容
 - [ ] 关联 Session 3-5 个，必须是真正相关的同主题/前后置/共享框架 session
+- [ ] 每个关联 Session 的 title、year、code 已按 session 元数据核对，正文链接使用目标 session 的实际年份
+- [ ] `node scripts/check-related-session-links.mjs --years={YYYY}` 通过
 - [ ] 无 AI 风格短语
 - [ ] 无编造技术细节或代码；代码块必须来自 query.mjs code 或 transcript 明确支持
 - [ ] 文件名和 sessionId 使用 `wwdc{YYYY}-{code}` 四位年份格式
