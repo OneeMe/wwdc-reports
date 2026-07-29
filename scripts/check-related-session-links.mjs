@@ -18,65 +18,14 @@ const LOCALES = [
   { id: "en", directory: join(ARTICLES_DIR, "en") },
   { id: "ja", directory: join(ARTICLES_DIR, "ja") },
 ];
-
-const STOP_WORDS = new Set(
-  [
-    "a",
-    "an",
-    "and",
-    "app",
-    "apps",
-    "apple",
-    "build",
-    "bring",
-    "code",
-    "along",
-    "create",
-    "deep",
-    "design",
-    "discover",
-    "dive",
-    "enhance",
-    "explore",
-    "for",
-    "from",
-    "further",
-    "get",
-    "go",
-    "great",
-    "how",
-    "improve",
-    "in",
-    "integrate",
-    "into",
-    "make",
-    "meet",
-    "more",
-    "new",
-    "of",
-    "on",
-    "optimize",
-    "say",
-    "session",
-    "started",
-    "support",
-    "take",
-    "the",
-    "to",
-    "use",
-    "using",
-    "what",
-    "whats",
-    "with",
-    "your",
-  ],
-);
+const STRICT_TITLE_YEARS = new Set(["2020", "2021", "2022", "2023"]);
 
 function parseArguments(argv) {
   const fix = argv.includes("--fix");
   const yearsArgument = argv.find((argument) => argument.startsWith("--years="));
   const years = new Set(
-    (yearsArgument?.slice("--years=".length) ?? "2024,2025,2026")
+    (yearsArgument?.slice("--years=".length) ??
+      "2020,2021,2022,2023,2024,2025,2026")
       .split(",")
       .map((year) => year.trim())
       .filter(Boolean),
@@ -93,29 +42,6 @@ function normalizeTitle(title) {
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
-}
-
-function topicTokens(title) {
-  return new Set(
-    title
-      .normalize("NFKC")
-      .toLowerCase()
-      .replace(/[’‘]/g, "'")
-      .replace(/[^a-z0-9+]+/g, " ")
-      .split(/\s+/)
-      .filter(
-        (token) =>
-          token.length > 2 &&
-          !STOP_WORDS.has(token) &&
-          !/^(?:20|[0-9])\d+$/.test(token),
-      ),
-  );
-}
-
-function sharesTopic(leftTitle, rightTitle) {
-  const left = topicTokens(leftTitle);
-  const right = topicTokens(rightTitle);
-  return [...left].some((token) => right.has(token));
 }
 
 function loadSessionIndex() {
@@ -166,7 +92,7 @@ function chooseExpectedSession(candidates, sourceYear) {
 }
 
 const RELATED_LINK_PATTERN =
-  /\[([^\]]+)\]\(((?:\/articles\/wwdc(\d{4})-([^)]+))|(?:https:\/\/developer\.apple\.com\/videos\/play\/wwdc(\d{4})\/([^/)\s]+)\/?))\)/g;
+  /\[([^\]]+)\]\(((?:\/articles\/(?:(?:en|ja)\/)?wwdc(\d{4})-([^)]+))|(?:https:\/\/developer\.apple\.com\/videos\/play\/wwdc(\d{4})\/([^/)\s]+)\/?))\)/g;
 
 function parseRelatedLinks(content) {
   const frontmatter = content.match(/^---\n[\s\S]*?\n---/)?.[0] ?? "";
@@ -200,16 +126,28 @@ function lineNumberAt(content, offset) {
   return content.slice(0, offset).split("\n").length;
 }
 
-function findIssues(content, fileName, sourceYear, index) {
+function findIssues(
+  content,
+  fileName,
+  sourceYear,
+  index,
+  { strictUnknownTitles = true } = {},
+) {
   const links = parseRelatedLinks(content);
   const issues = [];
 
   links.forEach((link, bodyIndex) => {
     const candidates = index.byTitle.get(normalizeTitle(link.label)) ?? [];
     if (candidates.length === 0) {
-      if (link.internal && !rootArticleExists(link.year, link.code)) {
+      if (
+        link.internal &&
+        (!rootArticleExists(link.year, link.code) ||
+          (strictUnknownTitles && STRICT_TITLE_YEARS.has(sourceYear)))
+      ) {
         issues.push({
-          type: "unresolved-internal-link",
+          type: rootArticleExists(link.year, link.code)
+            ? "unverified-session-title"
+            : "unresolved-internal-link",
           fileName,
           sourceYear,
           bodyIndex,
@@ -245,8 +183,6 @@ function findIssues(content, fileName, sourceYear, index) {
       }
       return;
     }
-
-    if (target && sharesTopic(link.label, target.title)) return;
 
     issues.push({
       type: target ? "wrong-session" : "missing-session",
@@ -290,6 +226,117 @@ function findIssues(content, fileName, sourceYear, index) {
       expected: target,
       replaceBody: false,
     });
+  });
+
+  return issues;
+}
+
+function findLocalizedFrontmatterIssues(
+  sourceContent,
+  localizedContent,
+  fileName,
+  localeId,
+  sourceYear,
+  index,
+) {
+  const sourceItems = parseFrontmatterItems(sourceContent);
+  const localizedItems = parseFrontmatterItems(localizedContent);
+  const localizedFileName = `${localeId}/${fileName}`;
+
+  if (sourceItems.length !== localizedItems.length) {
+    return [
+      {
+        type: "localized-frontmatter-count-mismatch",
+        fileName: localizedFileName,
+        sourceYear,
+        line: 1,
+        link: {
+          label: "relatedSessions",
+          year: sourceYear,
+          code: "?",
+        },
+        expected: undefined,
+        replaceBody: false,
+      },
+    ];
+  }
+
+  const sourceLinks = parseRelatedLinks(sourceContent);
+  const localizedLinks = parseRelatedLinks(localizedContent);
+  const usedSourceBodyIndexes = new Set();
+  const usedBodyIndexes = new Set();
+  const issues = [];
+
+  sourceItems.forEach((sourceItem, frontmatterItemIndex) => {
+    const localizedItem = localizedItems[frontmatterItemIndex];
+    if (
+      (index.byTitle.get(normalizeTitle(localizedItem.title)) ?? []).length > 0
+    ) {
+      return;
+    }
+    const sourceBodyIndex = sourceLinks.findIndex(
+      (link, bodyIndex) =>
+        !usedSourceBodyIndexes.has(bodyIndex) &&
+        normalizeTitle(link.label) === normalizeTitle(sourceItem.title),
+    );
+    if (sourceBodyIndex >= 0) usedSourceBodyIndexes.add(sourceBodyIndex);
+    const sourceLink =
+      sourceBodyIndex >= 0 ? sourceLinks[sourceBodyIndex] : undefined;
+    const expectedFrontmatterYear = sourceItem.year ?? sourceYear;
+    const expectedBodyYear =
+      sourceLink?.year ?? expectedFrontmatterYear;
+    const expectedBodyCode = sourceLink?.code ?? sourceItem.code;
+    const localizedYear = localizedItem.year ?? sourceYear;
+    const bodyIndex = localizedLinks.findIndex(
+      (link, index) =>
+        !usedBodyIndexes.has(index) &&
+        normalizeTitle(link.label) === normalizeTitle(localizedItem.title),
+    );
+    if (bodyIndex >= 0) usedBodyIndexes.add(bodyIndex);
+    const localizedLink =
+      bodyIndex >= 0 ? localizedLinks[bodyIndex] : undefined;
+    const frontmatterMatches =
+      sourceItem.code === localizedItem.code &&
+      expectedFrontmatterYear === localizedYear;
+    const bodyMatches =
+      !localizedLink ||
+      (localizedLink.code === expectedBodyCode &&
+        localizedLink.year === expectedBodyYear);
+    if (frontmatterMatches && bodyMatches) return;
+
+    if (!frontmatterMatches) {
+      issues.push({
+        type: "localized-target-mismatch",
+        fileName: localizedFileName,
+        sourceYear,
+        frontmatterItemIndex,
+        line: lineNumberAt(localizedContent, localizedItem.start),
+        link: {
+          label: localizedItem.title,
+          year: localizedYear,
+          code: localizedItem.code,
+        },
+        expected: {
+          year: expectedFrontmatterYear,
+          code: sourceItem.code,
+        },
+        replaceBody: false,
+      });
+    }
+    if (!bodyMatches) {
+      issues.push({
+        type: "localized-target-mismatch",
+        fileName: localizedFileName,
+        sourceYear,
+        bodyIndex,
+        line: lineNumberAt(localizedContent, localizedLink.fullStart),
+        link: localizedLink,
+        expected: {
+          year: expectedBodyYear,
+          code: expectedBodyCode,
+        },
+      });
+    }
   });
 
   return issues;
@@ -398,9 +445,11 @@ function findFrontmatterItemIndexes(content, issues) {
   return indexes;
 }
 
-function fixedHref(expected) {
+function fixedHref(expected, originalHref) {
   if (rootArticleExists(expected.year, expected.code)) {
-    return `/articles/wwdc${expected.year}-${expected.code}`;
+    const localePrefix =
+      originalHref.match(/^\/articles\/((?:en|ja)\/)/)?.[1] ?? "";
+    return `/articles/${localePrefix}wwdc${expected.year}-${expected.code}`;
   }
   return `https://developer.apple.com/videos/play/wwdc${expected.year}/${expected.code}/`;
 }
@@ -425,7 +474,7 @@ function applyIssuesToLocale(
     replacements.push({
       start: localeLink.hrefStart,
       end: localeLink.hrefEnd,
-      value: fixedHref(issue.expected),
+      value: fixedHref(issue.expected, localeLink.href),
     });
   }
 
@@ -449,42 +498,68 @@ function main() {
     .filter((fileName) => years.has(fileName.slice(4, 8)))
     .sort();
   const allIssues = [];
-  let changedFiles = 0;
+  const changedPaths = new Set();
 
   for (const fileName of rootFiles) {
     const sourceYear = fileName.slice(4, 8);
-    const rootPath = join(ARTICLES_DIR, fileName);
-    const rootContent = readFileSync(rootPath, "utf8");
-    const issues = findIssues(
-      rootContent,
-      fileName,
-      sourceYear,
-      index,
-    );
-    allIssues.push(...issues);
-
-    const repairableIssues = issues.filter((issue) => issue.expected);
-    if (!fix || repairableIssues.length === 0) continue;
-
-    const frontmatterItemIndexes = findFrontmatterItemIndexes(
-      rootContent,
-      repairableIssues,
-    );
-
+    const rootContent = readFileSync(join(ARTICLES_DIR, fileName), "utf8");
     for (const locale of LOCALES) {
       const localePath = join(locale.directory, fileName);
       if (!existsSync(localePath)) continue;
-
       const content = readFileSync(localePath, "utf8");
-      const next = applyIssuesToLocale(
+      const localizedFileName =
+        locale.id === "zh" ? fileName : `${locale.id}/${fileName}`;
+      let issues = findIssues(
         content,
-        repairableIssues,
+        localizedFileName,
         sourceYear,
-        frontmatterItemIndexes,
+        index,
+        { strictUnknownTitles: locale.id === "zh" },
       );
+      if (locale.id !== "zh") {
+        const crossLocaleIssues = findLocalizedFrontmatterIssues(
+          rootContent,
+          content,
+          fileName,
+          locale.id,
+          sourceYear,
+          index,
+        );
+        const crossBodyIndexes = new Set(
+          crossLocaleIssues
+            .map((issue) => issue.bodyIndex)
+            .filter((bodyIndex) => bodyIndex !== undefined),
+        );
+        const crossFrontmatterIndexes = new Set(
+          crossLocaleIssues
+            .map((issue) => issue.frontmatterItemIndex)
+            .filter((itemIndex) => itemIndex !== undefined),
+        );
+        issues = [
+          ...issues.filter(
+            (issue) =>
+              !crossBodyIndexes.has(issue.bodyIndex) &&
+              !crossFrontmatterIndexes.has(issue.frontmatterItemIndex),
+          ),
+          ...crossLocaleIssues,
+        ];
+      }
+      allIssues.push(...issues);
+
+      if (!fix) continue;
+      const repairableIssues = issues.filter((issue) => issue.expected);
+      let next = content;
+      if (repairableIssues.length > 0) {
+        next = applyIssuesToLocale(
+          next,
+          repairableIssues,
+          sourceYear,
+          findFrontmatterItemIndexes(content, repairableIssues),
+        );
+      }
       if (next !== content) {
         writeFileSync(localePath, next);
-        changedFiles += 1;
+        changedPaths.add(localePath);
       }
     }
   }
@@ -501,7 +576,7 @@ function main() {
   if (fix) {
     const unresolved = allIssues.filter((issue) => !issue.expected);
     console.log(
-      `Fixed ${allIssues.length - unresolved.length} high-confidence related-session link issue(s) in ${changedFiles} localized file(s).`,
+      `Fixed ${allIssues.length - unresolved.length} high-confidence related-session link issue(s) in ${changedPaths.size} file(s).`,
     );
     console.log(`By source year: ${JSON.stringify(counts)}`);
     if (unresolved.length > 0) {
