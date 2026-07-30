@@ -139,4 +139,6 @@ relatedSessions:
 - [ ] 没有 AI 风格短语（"不是...而是..."、"众所周知"等）
 - [ ] 没有编造的技术细节（所有描述都能在逐字稿/代码片段中找到依据）
 - [ ] relatedSessions 选择 3-5 个真正相关的 session
+- [ ] 每个 relatedSessions 项的 title、year、code 已按 session 元数据核对，正文链接使用目标 session 的实际年份
+- [ ] `node scripts/check-related-session-links.mjs --years={YYYY}` 通过
 - [ ] 能通过 highlight-format 测试
