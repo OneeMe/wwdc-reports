@@ -29,6 +29,7 @@ sessionId: "wwdc{YY}-{code}"
 year: "{YYYY}"
 relatedSessions:
   - title: "相关 session 标题"
+    year: "相关 session 的实际四位年份"
     code: "xxx"
     description: "描述"
 ---
@@ -80,9 +81,10 @@ relatedSessions:
 
 ## 关联 Session
 
-从同主题 session 中选择 3-5 个最相关的，格式：
+从同主题 session 中选择 3-5 个最相关的。可以跨年份，但每一项都必须先用
+session 元数据核对实际年份和 code，不能沿用当前文章年份，也不能凭标题猜 code。
 
-- [标题](/articles/wwdc{YY}-{code}) — 一句话描述
+- [标题](/articles/wwdc{RELATED_YEAR}-{code}) — 一句话描述
 ```
 
 ## 写作规则
@@ -143,4 +145,6 @@ node scripts/query.mjs transcript --year {YYYY} --code {code} --limit 50
 - [ ] 没有 AI 风格短语
 - [ ] 没有编造的技术细节
 - [ ] relatedSessions 选择了 3-5 个真正相关的 session
+- [ ] relatedSessions 的 title、year、code 与实际目标 session 一致，正文链接使用目标年份
+- [ ] `node scripts/check-related-session-links.mjs --years={YYYY}` 通过
 - [ ] 文章能通过 highlight-format 测试（## Highlight 后是 blockquote）

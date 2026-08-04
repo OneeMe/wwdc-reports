@@ -3,6 +3,8 @@ import { cp, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { siteUrl } from "../site-config.mjs";
+import { generateSeoFiles } from "./generate-seo-files.mjs";
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const astroBin = path.join(webRoot, "node_modules", ".bin", "astro");
@@ -20,6 +22,7 @@ const buildWorkspaceFiles = [
   "astro.config.mjs",
   "package.json",
   "package-lock.json",
+  "site-config.mjs",
   "tsconfig.json",
 ];
 
@@ -80,4 +83,5 @@ try {
   await rm(chunkRoot, { recursive: true, force: true });
 }
 
-console.log("\nLocalized Astro build complete.");
+const { urlCount } = await generateSeoFiles(finalDist, siteUrl);
+console.log(`\nLocalized Astro build complete. Generated sitemap for ${urlCount} pages.`);

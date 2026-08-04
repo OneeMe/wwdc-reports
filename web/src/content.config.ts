@@ -30,6 +30,7 @@ const articles = defineCollection({
       z.object({
         title: z.string(),
         code: z.string(),
+        year: z.string().optional(),
         description: z.string(),
       })
     ).optional().default([]),
